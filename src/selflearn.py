@@ -142,12 +142,24 @@ def normalize_run_id(run_id):
 def make_run_dirs(data_root, model_root, run_id):
     data_run_dir = os.path.abspath(os.path.join(data_root, run_id))
     model_run_dir = os.path.abspath(os.path.join(model_root, run_id))
-    if os.path.exists(data_run_dir) or os.path.exists(model_run_dir):
+    allowed_preexisting_data_files = {"info.log", "pid"}
+    data_dir_exists = os.path.exists(data_run_dir)
+    if data_dir_exists:
+        if not os.path.isdir(data_run_dir):
+            raise FileExistsError(f"selflearn data run path is not a directory: {data_run_dir}")
+        unexpected_files = set(os.listdir(data_run_dir)) - allowed_preexisting_data_files
+        if unexpected_files:
+            raise FileExistsError(
+                "selflearn data run directory already contains run data: "
+                f"{data_run_dir}"
+            )
+    if os.path.exists(model_run_dir):
         raise FileExistsError(
             "selflearn run already exists: "
             f"data={data_run_dir} model={model_run_dir}"
         )
-    os.makedirs(data_run_dir, exist_ok=False)
+    if not data_dir_exists:
+        os.makedirs(data_run_dir, exist_ok=False)
     try:
         os.makedirs(model_run_dir, exist_ok=False)
     except Exception:
