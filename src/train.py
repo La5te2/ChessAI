@@ -80,7 +80,6 @@ def _run_resume_validation(args, candidate_path):
         mate_guard_nodes=args.eval_mate_guard_nodes,
         mate_guard_time_fraction=args.eval_mate_guard_time_fraction,
         q_tiebreak=args.eval_q_tiebreak,
-        q_tiebreak_min_visits=args.eval_q_tiebreak_min_visits,
         q_tiebreak_p_ratio=args.eval_q_tiebreak_p_ratio,
         q_tiebreak_visit_ratio=args.eval_q_tiebreak_visit_ratio,
         q_tiebreak_margin=args.eval_q_tiebreak_margin,
@@ -318,7 +317,6 @@ def parse_args():
         dest="eval_q_tiebreak",
         action="store_false",
     )
-    parser.add_argument("--eval-q-tiebreak-min-visits", type=int, default=32)
     parser.add_argument("--eval-q-tiebreak-p-ratio", type=float, default=0.90)
     parser.add_argument(
         "--eval-q-tiebreak-visit-ratio",

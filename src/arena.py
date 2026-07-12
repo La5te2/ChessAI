@@ -257,7 +257,6 @@ def _worker(job):
         mate_guard_nodes,
         mate_guard_time_fraction,
         q_tiebreak,
-        q_tiebreak_min_visits,
         q_tiebreak_p_ratio,
         q_tiebreak_visit_ratio,
         q_tiebreak_margin,
@@ -282,7 +281,6 @@ def _worker(job):
         mate_guard_nodes=mate_guard_nodes,
         mate_guard_time_fraction=mate_guard_time_fraction,
         q_tiebreak=q_tiebreak,
-        q_tiebreak_min_visits=q_tiebreak_min_visits,
         q_tiebreak_p_ratio=q_tiebreak_p_ratio,
         q_tiebreak_visit_ratio=q_tiebreak_visit_ratio,
         q_tiebreak_margin=q_tiebreak_margin,
@@ -490,7 +488,6 @@ def evaluate_models(
     mate_guard_nodes=20000,
     mate_guard_time_fraction=0.10,
     q_tiebreak=True,
-    q_tiebreak_min_visits=32,
     q_tiebreak_p_ratio=0.90,
     q_tiebreak_visit_ratio=0.80,
     q_tiebreak_margin=0.25,
@@ -569,7 +566,6 @@ def evaluate_models(
             mate_guard_nodes,
             mate_guard_time_fraction,
             q_tiebreak,
-            q_tiebreak_min_visits,
             q_tiebreak_p_ratio,
             q_tiebreak_visit_ratio,
             q_tiebreak_margin,
@@ -683,7 +679,6 @@ def evaluate_models(
         "mate_guard_nodes": int(mate_guard_nodes),
         "mate_guard_time_fraction": float(mate_guard_time_fraction),
         "q_tiebreak": bool(q_tiebreak),
-        "q_tiebreak_min_visits": int(q_tiebreak_min_visits),
         "q_tiebreak_p_ratio": float(q_tiebreak_p_ratio),
         "q_tiebreak_visit_ratio": float(q_tiebreak_visit_ratio),
         "q_tiebreak_margin": float(q_tiebreak_margin),
@@ -719,7 +714,6 @@ def parse_args():
     parser.add_argument("--mate-guard-time-fraction", type=float, default=0.10)
     parser.add_argument("--q-tiebreak", action="store_true", default=True)
     parser.add_argument("--no-q-tiebreak", dest="q_tiebreak", action="store_false")
-    parser.add_argument("--q-tiebreak-min-visits", type=int, default=32)
     parser.add_argument("--q-tiebreak-p-ratio", type=float, default=0.90)
     parser.add_argument("--q-tiebreak-visit-ratio", type=float, default=0.80)
     parser.add_argument("--q-tiebreak-margin", type=float, default=0.25)
@@ -762,7 +756,6 @@ def main():
         mate_guard_nodes=args.mate_guard_nodes,
         mate_guard_time_fraction=args.mate_guard_time_fraction,
         q_tiebreak=args.q_tiebreak,
-        q_tiebreak_min_visits=args.q_tiebreak_min_visits,
         q_tiebreak_p_ratio=args.q_tiebreak_p_ratio,
         q_tiebreak_visit_ratio=args.q_tiebreak_visit_ratio,
         q_tiebreak_margin=args.q_tiebreak_margin,

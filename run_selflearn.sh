@@ -59,7 +59,6 @@ MATE_GUARD_PLIES=3
 MATE_GUARD_TOPK=8
 MATE_GUARD_NODES=20000
 MATE_GUARD_TIME_FRACTION=0.10
-Q_TIEBREAK_MIN_VISITS=32
 Q_TIEBREAK_P_RATIO=0.9
 Q_TIEBREAK_VISIT_RATIO=0.9
 Q_TIEBREAK_MARGIN=0.03
@@ -139,7 +138,6 @@ exec python src/selflearn.py \
   --mate-guard-topk "${MATE_GUARD_TOPK}" \
   --mate-guard-nodes "${MATE_GUARD_NODES}" \
   --mate-guard-time-fraction "${MATE_GUARD_TIME_FRACTION}" \
-  --q-tiebreak-min-visits "${Q_TIEBREAK_MIN_VISITS}" \
   --q-tiebreak-p-ratio "${Q_TIEBREAK_P_RATIO}" \
   --q-tiebreak-visit-ratio "${Q_TIEBREAK_VISIT_RATIO}" \
   --q-tiebreak-margin "${Q_TIEBREAK_MARGIN}" \
@@ -178,7 +176,6 @@ exec python src/selflearn.py \
   --eval-mate-guard-topk "${MATE_GUARD_TOPK}" \
   --eval-mate-guard-nodes "${MATE_GUARD_NODES}" \
   --eval-mate-guard-time-fraction "${MATE_GUARD_TIME_FRACTION}" \
-  --eval-q-tiebreak-min-visits "${Q_TIEBREAK_MIN_VISITS}" \
   --eval-q-tiebreak-p-ratio "${Q_TIEBREAK_P_RATIO}" \
   --eval-q-tiebreak-visit-ratio "${Q_TIEBREAK_VISIT_RATIO}" \
   --eval-q-tiebreak-margin "${Q_TIEBREAK_MARGIN}" \

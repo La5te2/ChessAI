@@ -426,7 +426,6 @@ python src/train.py \
   --eval-mate-guard-topk 8 \
   --eval-mate-guard-nodes 20000 \
   --eval-mate-guard-time-fraction 0.10 \
-  --eval-q-tiebreak-min-visits 32 \
   --eval-q-tiebreak-p-ratio 0.70 \
   --eval-q-tiebreak-visit-ratio 0.70 \
   --eval-q-tiebreak-margin 0.02 \
@@ -465,14 +464,13 @@ python src/search.py \
   --mate-guard-topk 8 \
   --mate-guard-nodes 20000 \
   --mate-guard-time-fraction 0.10 \
-  --q-tiebreak-min-visits 32 \
   --q-tiebreak-p-ratio 0.70 \
   --q-tiebreak-visit-ratio 0.70 \
   --q-tiebreak-margin 0.02 \
   --root-topn 16
 ```
 
-`--mcts-sims` 表示 MCTS 软上限。`--movetime-ms` 表示完整 Search 的时间上限。`--c-puct` 控制 MCTS 探索强度，手动局面分析使用 `0.4~0.5` 更集中。`--mate-guard-*` 控制短深度强制将杀检查的 ply、候选数、节点数与时间预留。`--q-tiebreak-*` 控制 Q 值接管：动态最小访问数、概率比例、访问比例和动态 Q 领先上限。
+`--mcts-sims` 表示 MCTS 软上限。`--movetime-ms` 表示完整 Search 的时间上限。`--c-puct` 控制 MCTS 探索强度，手动局面分析使用 `0.4~0.5` 更集中。`--mate-guard-*` 控制短深度强制将杀检查的 ply、候选数、节点数与时间预留。`--q-tiebreak-*` 控制 Q 值接管：概率比例、访问比例和动态 Q 领先上限；访问门槛由当前首选 visits 乘以 `--q-tiebreak-visit-ratio` 得到。
 
 ---
 
@@ -497,7 +495,6 @@ python src/arena.py \
   --mate-guard-topk 8 \
   --mate-guard-nodes 20000 \
   --mate-guard-time-fraction 0.10 \
-  --q-tiebreak-min-visits 32 \
   --q-tiebreak-p-ratio 0.70 \
   --q-tiebreak-visit-ratio 0.70 \
   --q-tiebreak-margin 0.02 \
@@ -556,7 +553,6 @@ python src/selflearn.py \
   --mate-guard-topk 8 \
   --mate-guard-nodes 20000 \
   --mate-guard-time-fraction 0.10 \
-  --q-tiebreak-min-visits 32 \
   --q-tiebreak-p-ratio 0.9 \
   --q-tiebreak-visit-ratio 0.9 \
   --q-tiebreak-margin 0.03 \
@@ -595,7 +591,6 @@ python src/selflearn.py \
   --eval-mate-guard-topk 8 \
   --eval-mate-guard-nodes 20000 \
   --eval-mate-guard-time-fraction 0.10 \
-  --eval-q-tiebreak-min-visits 32 \
   --eval-q-tiebreak-p-ratio 0.9 \
   --eval-q-tiebreak-visit-ratio 0.9 \
   --eval-q-tiebreak-margin 0.03 \
@@ -816,14 +811,13 @@ python src/board.py \
   --mate-guard-topk 8 \
   --mate-guard-nodes 20000 \
   --mate-guard-time-fraction 0.10 \
-  --q-tiebreak-min-visits 32 \
   --q-tiebreak-p-ratio 0.70 \
   --q-tiebreak-visit-ratio 0.70 \
   --q-tiebreak-margin 0.02 \
   --root-topn 16
 ```
 
-在 `Simulator` 模式中，加载模型后会自动分析当前局面；之后每次走子、撤销、重置、导入 PGN 或修改模型参数，都会重新分析当前局面。`Close` 暂停自动候选走法，按钮文字变为 `Open`；`Open` 恢复自动候选走法并分析当前局面。`Play` 模式由 AI 回合触发自动行棋，用户回合显示当前对局信息。`Settings` 中可调整 `c_puct`、mate guard 参数、`q_tiebreak`、`q_tiebreak_min_visits`、`q_tiebreak_p_ratio`、`q_tiebreak_visit_ratio` 和 `q_tiebreak_margin`。
+在 `Simulator` 模式中，加载模型后会自动分析当前局面；之后每次走子、撤销、重置、导入 PGN 或修改模型参数，都会重新分析当前局面。`Close` 暂停自动候选走法，按钮文字变为 `Open`；`Open` 恢复自动候选走法并分析当前局面。`Play` 模式由 AI 回合触发自动行棋，用户回合显示当前对局信息。`Settings` 中可调整 `c_puct`、mate guard 参数、`q_tiebreak`、`q_tiebreak_p_ratio`、`q_tiebreak_visit_ratio` 和 `q_tiebreak_margin`。
 
 ---
 
@@ -843,7 +837,6 @@ python src/board.py \
   --mate-guard-topk 8 \
   --mate-guard-nodes 20000 \
   --mate-guard-time-fraction 0.10 \
-  --q-tiebreak-min-visits 32 \
   --q-tiebreak-p-ratio 0.70 \
   --q-tiebreak-visit-ratio 0.70 \
   --q-tiebreak-margin 0.02 \

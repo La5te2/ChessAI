@@ -950,7 +950,6 @@ def evaluate_candidate(args, candidate_path: str, baseline_path: str) -> Dict:
         mate_guard_nodes=args.eval_mate_guard_nodes,
         mate_guard_time_fraction=args.eval_mate_guard_time_fraction,
         q_tiebreak=args.eval_q_tiebreak,
-        q_tiebreak_min_visits=args.eval_q_tiebreak_min_visits,
         q_tiebreak_p_ratio=args.eval_q_tiebreak_p_ratio,
         q_tiebreak_visit_ratio=args.eval_q_tiebreak_visit_ratio,
         q_tiebreak_margin=args.eval_q_tiebreak_margin,
@@ -1165,7 +1164,6 @@ def build_parser():
     parser.add_argument("--eval-mate-guard-time-fraction", type=float, default=0.10)
     parser.add_argument("--eval-q-tiebreak", action="store_true", default=True)
     parser.add_argument("--no-eval-q-tiebreak", dest="eval_q_tiebreak", action="store_false")
-    parser.add_argument("--eval-q-tiebreak-min-visits", type=int, default=32)
     parser.add_argument("--eval-q-tiebreak-p-ratio", type=float, default=0.70)
     parser.add_argument("--eval-q-tiebreak-visit-ratio", type=float, default=0.70)
     parser.add_argument("--eval-q-tiebreak-margin", type=float, default=0.02)

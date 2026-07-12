@@ -348,7 +348,6 @@ def search_options_from_args(args, evaluation=False):
             evaluation,
         ),
         q_tiebreak=search_arg(args, "q_tiebreak", evaluation),
-        q_tiebreak_min_visits=search_arg(args, "q_tiebreak_min_visits", evaluation),
         q_tiebreak_p_ratio=search_arg(args, "q_tiebreak_p_ratio", evaluation),
         q_tiebreak_visit_ratio=search_arg(args, "q_tiebreak_visit_ratio", evaluation),
         q_tiebreak_margin=search_arg(args, "q_tiebreak_margin", evaluation),
@@ -711,7 +710,6 @@ def generate_selflearn_data(args, model_path, output_path, iteration):
         "mate_guard_nodes": int(args.mate_guard_nodes),
         "mate_guard_time_fraction": float(args.mate_guard_time_fraction),
         "q_tiebreak": bool(args.q_tiebreak),
-        "q_tiebreak_min_visits": int(args.q_tiebreak_min_visits),
         "q_tiebreak_p_ratio": float(args.q_tiebreak_p_ratio),
         "q_tiebreak_visit_ratio": float(args.q_tiebreak_visit_ratio),
         "q_tiebreak_margin": float(args.q_tiebreak_margin),
@@ -1062,11 +1060,6 @@ def regression_validation(model, cases, args, label="model"):
             evaluation=True,
         ),
         q_tiebreak=search_arg(args, "q_tiebreak", evaluation=True),
-        q_tiebreak_min_visits=search_arg(
-            args,
-            "q_tiebreak_min_visits",
-            evaluation=True,
-        ),
         q_tiebreak_p_ratio=search_arg(args, "q_tiebreak_p_ratio", evaluation=True),
         q_tiebreak_visit_ratio=search_arg(
             args,
@@ -1258,11 +1251,6 @@ def validate_candidate(
             evaluation=True,
         ),
         q_tiebreak=search_arg(args, "q_tiebreak", evaluation=True),
-        q_tiebreak_min_visits=search_arg(
-            args,
-            "q_tiebreak_min_visits",
-            evaluation=True,
-        ),
         q_tiebreak_p_ratio=search_arg(args, "q_tiebreak_p_ratio", evaluation=True),
         q_tiebreak_visit_ratio=search_arg(
             args,
@@ -1442,7 +1430,6 @@ def parse_args():
     parser.add_argument("--mate-guard-time-fraction", type=float, default=0.10)
     parser.add_argument("--q-tiebreak", action="store_true", default=True)
     parser.add_argument("--no-q-tiebreak", dest="q_tiebreak", action="store_false")
-    parser.add_argument("--q-tiebreak-min-visits", type=int, default=32)
     parser.add_argument("--q-tiebreak-p-ratio", type=float, default=0.90)
     parser.add_argument("--q-tiebreak-visit-ratio", type=float, default=0.80)
     parser.add_argument("--q-tiebreak-margin", type=float, default=0.25)
@@ -1573,7 +1560,6 @@ def parse_args():
         dest="eval_q_tiebreak",
         action="store_false",
     )
-    parser.add_argument("--eval-q-tiebreak-min-visits", type=int, default=None)
     parser.add_argument("--eval-q-tiebreak-p-ratio", type=float, default=None)
     parser.add_argument("--eval-q-tiebreak-visit-ratio", type=float, default=None)
     parser.add_argument("--eval-q-tiebreak-margin", type=float, default=None)
