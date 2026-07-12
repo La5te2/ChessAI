@@ -166,6 +166,22 @@ def expanded_position_count_from_moves(
     return len(positions)
 
 
+def refresh_readable_fens(
+    moves_by_key,
+    current: int,
+    book_plies: int,
+    min_fens: int,
+) -> int:
+    if not moves_by_key:
+        return int(current)
+    readable = expanded_position_count_from_moves(
+        moves_by_key,
+        book_plies=book_plies,
+        min_positions=min_fens,
+    )
+    return max(int(current), int(readable))
+
+
 def _commit_path_entries(path_entries, accepted_entries, accepted_keys, moves_by_key=None):
     for entry in path_entries:
         key = _entry_key(entry)
@@ -425,10 +441,11 @@ def verify_opening_book(args):
                             moves_by_key,
                         )
                         if len(endpoint_fens) >= min_fens:
-                            readable_fens = expanded_position_count_from_moves(
+                            readable_fens = refresh_readable_fens(
                                 moves_by_key,
+                                readable_fens,
                                 book_plies=max_plies,
-                                min_positions=min_fens,
+                                min_fens=min_fens,
                             )
                     continue
 
@@ -467,10 +484,11 @@ def verify_opening_book(args):
                                 moves_by_key,
                             )
                             if len(endpoint_fens) >= min_fens:
-                                readable_fens = expanded_position_count_from_moves(
+                                readable_fens = refresh_readable_fens(
                                     moves_by_key,
+                                    readable_fens,
                                     book_plies=max_plies,
-                                    min_positions=min_fens,
+                                    min_fens=min_fens,
                                 )
                             if readable_fens >= min_fens:
                                 queue.clear()
@@ -481,6 +499,12 @@ def verify_opening_book(args):
                         rejected += 1
 
                     if log_every and checked % log_every == 0:
+                        readable_fens = refresh_readable_fens(
+                            moves_by_key,
+                            readable_fens,
+                            book_plies=max_plies,
+                            min_fens=min_fens,
+                        )
                         print(
                             "opening verify:",
                             f"checked={checked}",
@@ -502,19 +526,21 @@ def verify_opening_book(args):
                         moves_by_key,
                     )
                     if len(endpoint_fens) >= min_fens:
-                        readable_fens = expanded_position_count_from_moves(
+                        readable_fens = refresh_readable_fens(
                             moves_by_key,
+                            readable_fens,
                             book_plies=max_plies,
-                            min_positions=min_fens,
+                            min_fens=min_fens,
                         )
 
     if not accepted_entries:
         raise RuntimeError("no balanced opening entries found")
     if readable_fens < min_fens:
-        readable_fens = expanded_position_count_from_moves(
+        readable_fens = refresh_readable_fens(
             moves_by_key,
+            readable_fens,
             book_plies=max_plies,
-            min_positions=min_fens,
+            min_fens=min_fens,
         )
     if readable_fens < min_fens:
         raise RuntimeError(
@@ -640,6 +666,12 @@ def generate_opening_book_from_pgn(args):
                         break
 
                     if log_every and checked % log_every == 0:
+                        readable_fens = refresh_readable_fens(
+                            moves_by_key,
+                            readable_fens,
+                            book_plies=max_plies,
+                            min_fens=min_fens,
+                        )
                         print(
                             "opening pgn:",
                             f"games={games}",
@@ -661,11 +693,16 @@ def generate_opening_book_from_pgn(args):
                             edge = (key, raw_move)
                             counts[edge] = counts.get(edge, 0) + 1
                             _record_book_move(moves_by_key, key, raw_move, move)
-                        if len(endpoint_fens) >= min_fens:
-                            readable_fens = expanded_position_count_from_moves(
+                        refresh_interval = max(1, min(100, min_fens // 50))
+                        if (
+                            len(endpoint_fens) >= min_fens
+                            or accepted_lines % refresh_interval == 0
+                        ):
+                            readable_fens = refresh_readable_fens(
                                 moves_by_key,
+                                readable_fens,
                                 book_plies=max_plies,
-                                min_positions=min_fens,
+                                min_fens=min_fens,
                             )
                         if readable_fens >= min_fens:
                             stop = True
@@ -673,10 +710,11 @@ def generate_opening_book_from_pgn(args):
     if not counts:
         raise RuntimeError("no balanced PGN opening entries found")
     if readable_fens < min_fens:
-        readable_fens = expanded_position_count_from_moves(
+        readable_fens = refresh_readable_fens(
             moves_by_key,
+            readable_fens,
             book_plies=max_plies,
-            min_positions=min_fens,
+            min_fens=min_fens,
         )
     if readable_fens < min_fens:
         raise RuntimeError(

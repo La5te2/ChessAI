@@ -117,11 +117,11 @@ champion 自博弈
 ↓
 Search 生成策略分布
 ↓
-Stockfish 生成 policy、WDL value、regret 和可接受答案集合
+Stockfish 评价 root top-k 候选并生成 policy、WDL value、regret 和可接受答案集合
 ↓
 teacher veto 修正高 regret 自博弈落子
 ↓
-policy target、terminal value、teacher value、KL、监督 replay
+top1 policy、teacher-labeled top-k policy、terminal value、teacher value、KL、监督 replay
 ↓
 candidate
 ↓
@@ -238,6 +238,12 @@ python src/opening_book.py \
 ```
 
 `--pgn` 从 PGN 主线开局中筛选均势路径，并写入到达 endpoint FEN 的 Polyglot entry。省略 `--output` 时写入 `data/openings.gen.bin`。
+
+脚本入口：
+
+```bash
+bash run_opening.sh data/games.pgn 50000 data/openings.gen.bin
+```
 
 ### 2.2 控制台输出
 
@@ -484,23 +490,23 @@ python src/selflearn.py \
   --supervised-data data/games.h5 \
   --uci models/stockfish/stockfish \
   --device cuda \
-  --iterations 4 \
-  --games-per-iter 200 \
+  --iterations 1 \
+  --games-per-iter 1000 \
   --parallel 10 \
   --max-plies 150 \
   --opening-book data/openings.gen.bin \
   --book-plies 8 \
-  --max-book-positions 500 \
+  --max-book-positions 1000 \
   --sims 32 \
   --mcts-batch-size 64 \
   --movetime-ms 1000 \
   --c-puct 0.5 \
-  --alpha-beta-depth 0 \
-  --alpha-beta-topk 0 \
-  --alpha-beta-nodes 0 \
-  --alpha-beta-quiescence 0 \
+  --alpha-beta-depth 3 \
+  --alpha-beta-topk 4 \
+  --alpha-beta-nodes 20000 \
+  --alpha-beta-quiescence 2 \
   --alpha-beta-margin 0.02 \
-  --alpha-beta-time-fraction 0 \
+  --alpha-beta-time-fraction 0.20 \
   --mate-guard-plies 3 \
   --q-tiebreak-min-visits 32 \
   --q-tiebreak-p-ratio 0.85 \
@@ -513,16 +519,20 @@ python src/selflearn.py \
   --teacher-start-ply 0 \
   --teacher-every 1 \
   --teacher-sample-rate 1 \
+  --teacher-label-topk 4 \
+  --teacher-label-min-weight 0.20 \
   --teacher-veto-regret-cp 200 \
   --teacher-veto-min-weight 0.70 \
-  --epochs-per-iter 16 \
-  --train-max-steps 1000 \
+  --epochs-per-iter 64 \
+  --train-max-steps 2500 \
   --batch-size 256 \
   --train-workers 4 \
-  --replay-window 3 \
+  --replay-window 5 \
   --lr 2e-5 \
   --supervised-weight 0.50 \
   --kl-weight 0.20 \
+  --max-supervised-loss-increase 0.25 \
+  --max-target-ce-increase 0.02 \
   --regression-sims 200 \
   --regression-movetime-ms 1000 \
   --min-regression-accuracy 0.0 \
@@ -533,12 +543,12 @@ python src/selflearn.py \
   --eval-mcts-batch-size 64 \
   --eval-movetime-ms 1000 \
   --eval-c-puct 0.5 \
-  --eval-alpha-beta-depth 0 \
-  --eval-alpha-beta-topk 0 \
-  --eval-alpha-beta-nodes 0 \
-  --eval-alpha-beta-quiescence 0 \
+  --eval-alpha-beta-depth 3 \
+  --eval-alpha-beta-topk 4 \
+  --eval-alpha-beta-nodes 20000 \
+  --eval-alpha-beta-quiescence 2 \
   --eval-alpha-beta-margin 0.02 \
-  --eval-alpha-beta-time-fraction 0 \
+  --eval-alpha-beta-time-fraction 0.20 \
   --eval-mate-guard-plies 3 \
   --eval-q-tiebreak-min-visits 32 \
   --eval-q-tiebreak-p-ratio 0.85 \
@@ -547,13 +557,15 @@ python src/selflearn.py \
   --eval-opening-book data/openings.gen.bin \
   --eval-book-plies 8 \
   --eval-max-book-positions 500 \
-  --eval-min-net-wins 5 \
+  --eval-min-net-wins 0 \
+  --eval-min-acpl-improvement 0.0 \
+  --eval-min-accuracy-improvement 0.0 \
   --eval-uci-depth 12 \
   --eval-uci-multipv 6 \
   --log-every 50
 ```
 
-自学习每个 iteration 会从 `--opening-book` 展开的起始局面中分配 `--games-per-iter` 个唯一开局，走子使用与 board 和 arena 一致的 deterministic top1。`--parallel` 同时设置 selfplay worker 与 eval worker；采样对局、候选验收对局和 arena move-quality 分析按 worker 分片执行。采样与候选验收使用同一组 MCTS/search 预算，训练阶段以模型 top1 one-hot 作为 policy target 基底，并按 `teacher_weight` 混入教师 policy。teacher analyse 每步执行，teacher veto 按 `regret_cp` 与 `teacher_weight` 修正高风险自博弈落子。达到 `--max-plies` 的棋局由 Stockfish 对当前局面裁定结果。
+自学习每个 iteration 会从 `--opening-book` 展开的起始局面中分配 `--games-per-iter` 个唯一开局，走子使用与 board 和 arena 一致的 deterministic top1。`--parallel` 同时设置 selfplay worker 与 eval worker；采样对局、候选验收对局和 arena move-quality 分析按 worker 分片执行。采样与候选验收使用同一组 MCTS/search 预算。训练阶段以模型 top1 one-hot 作为实际落子基底，并用 Stockfish 评价 root top-k 候选生成 teacher-labeled policy；`--teacher-label-topk` 控制候选数量，`--teacher-label-min-weight` 控制 teacher-labeled policy 的最小混入权重。teacher analyse 每步执行，teacher veto 按 `regret_cp` 与 `teacher_weight` 修正高风险自博弈落子。达到 `--max-plies` 的棋局由 Stockfish 对当前局面裁定结果。
 
 脚本默认采用 `--min-regression-accuracy 0.0 --max-regression-drop 0`，回归验收以 champion 的当前回归正确数作为基准。candidate 的回归正确数达到 champion 水平时通过该项验收。
 

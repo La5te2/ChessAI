@@ -8,8 +8,8 @@ SUPERVISED_DATA="data/games.h5"
 UCI="models/stockfish/stockfish"
 DEVICE="cuda"
 
-ITERATIONS=5
-GAMES_PER_ITER=2000
+ITERATIONS=1
+GAMES_PER_ITER=1000
 PARALLEL=10
 MAX_PLIES=150
 OPENING_BOOK="data/openings.gen.bin"
@@ -38,11 +38,13 @@ UCI_THREADS=2
 UCI_HASH_MB=512
 TEACHER_EVERY=1
 TEACHER_SAMPLE_RATE=1
+TEACHER_LABEL_TOPK=4
+TEACHER_LABEL_MIN_WEIGHT=0.20
 TEACHER_VETO_REGRET_CP=200
 TEACHER_VETO_MIN_WEIGHT=0.70
 
-EPOCHS_PER_ITER=128
-TRAIN_MAX_STEPS=5000
+EPOCHS_PER_ITER=64
+TRAIN_MAX_STEPS=2500
 BATCH_SIZE=256
 TRAIN_WORKERS=4
 REPLAY_WINDOW=5
@@ -79,7 +81,7 @@ echo "selflearn data: games_per_iter=${GAMES_PER_ITER} iterations=${ITERATIONS} 
 echo "selflearn workers: parallel=${PARALLEL} train_workers=${TRAIN_WORKERS} device=${DEVICE}"
 echo "selflearn search: sims=${SIMS} movetime_ms=${MOVETIME_MS} c_puct=${C_PUCT} alpha_beta=${ALPHA_BETA_DEPTH}/${ALPHA_BETA_TOPK}/${ALPHA_BETA_NODES}/${ALPHA_BETA_QUIESCENCE} ab_time_fraction=${ALPHA_BETA_TIME_FRACTION} mate_guard_plies=${MATE_GUARD_PLIES}"
 echo "selflearn move selection: deterministic top1"
-echo "selflearn teacher: uci_depth=${UCI_DEPTH} uci_multipv=${UCI_MULTIPV} uci_threads=${UCI_THREADS} veto_regret_cp=${TEACHER_VETO_REGRET_CP} veto_min_weight=${TEACHER_VETO_MIN_WEIGHT}"
+echo "selflearn teacher: uci_depth=${UCI_DEPTH} uci_multipv=${UCI_MULTIPV} uci_threads=${UCI_THREADS} label_topk=${TEACHER_LABEL_TOPK} label_min_weight=${TEACHER_LABEL_MIN_WEIGHT} veto_regret_cp=${TEACHER_VETO_REGRET_CP} veto_min_weight=${TEACHER_VETO_MIN_WEIGHT}"
 echo "selflearn train: epochs_per_iter=${EPOCHS_PER_ITER} train_max_steps=${TRAIN_MAX_STEPS} batch_size=${BATCH_SIZE} replay_window=${REPLAY_WINDOW} lr=${LR} supervised_weight=${SUPERVISED_WEIGHT} kl_weight=${KL_WEIGHT}"
 echo "selflearn validation: max_supervised_loss_increase=${MAX_SUPERVISED_LOSS_INCREASE} max_target_ce_increase=${MAX_TARGET_CE_INCREASE}"
 echo "selflearn eval: games=${EVAL_GAMES} sims=${EVAL_SIMS} movetime_ms=${EVAL_MOVETIME_MS} min_net_wins=${EVAL_MIN_NET_WINS} min_acpl_improvement=${EVAL_MIN_ACPL_IMPROVEMENT} min_accuracy_improvement=${EVAL_MIN_ACCURACY_IMPROVEMENT}"
@@ -118,6 +120,8 @@ python src/selflearn.py \
   --teacher-start-ply 0 \
   --teacher-every "${TEACHER_EVERY}" \
   --teacher-sample-rate "${TEACHER_SAMPLE_RATE}" \
+  --teacher-label-topk "${TEACHER_LABEL_TOPK}" \
+  --teacher-label-min-weight "${TEACHER_LABEL_MIN_WEIGHT}" \
   --teacher-veto-regret-cp "${TEACHER_VETO_REGRET_CP}" \
   --teacher-veto-min-weight "${TEACHER_VETO_MIN_WEIGHT}" \
   --epochs-per-iter "${EPOCHS_PER_ITER}" \

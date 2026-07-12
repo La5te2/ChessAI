@@ -131,6 +131,31 @@ class StockfishTeacher:
             return 0.0
         return float(np.tanh(float(cp) / 600.0))
 
+    def _score_child_move(self, board, move, pov):
+        child = board.copy(stack=False)
+        child.push(move)
+        info = self.engine.analyse(child, self._limit())
+        return self._score_cp(info, pov)
+
+    def _policy_from_move_scores(self, move_scores):
+        rows = [
+            {"move": move, "score_cp": int(score)}
+            for move, score in move_scores.items()
+        ]
+        rows.sort(key=lambda row: (-row["score_cp"], row["move"]))
+        if not rows:
+            return {}
+
+        scores = np.asarray([row["score_cp"] for row in rows], dtype=np.float64)
+        temperature = max(1e-6, float(self.config.policy_temperature_cp))
+        logits = (scores - scores.max()) / temperature
+        probabilities = np.exp(logits)
+        probabilities /= max(1e-12, probabilities.sum())
+        return {
+            row["move"]: float(probability)
+            for row, probability in zip(rows, probabilities)
+        }
+
     def _cache_key(self, board, played_move):
         raw = "|".join([
             CACHE_VERSION,
@@ -192,17 +217,8 @@ class StockfishTeacher:
             return payload
 
         rows.sort(key=lambda row: row["score_cp"], reverse=True)
-        scores = np.asarray([row["score_cp"] for row in rows], dtype=np.float64)
-        temperature = max(1e-6, float(self.config.policy_temperature_cp))
-        logits = (scores - scores.max()) / temperature
-        probabilities = np.exp(logits)
-        probabilities /= max(1e-12, probabilities.sum())
-
-        policy_moves = {
-            row["move"]: float(probability)
-            for row, probability in zip(rows, probabilities)
-        }
         move_scores = {row["move"]: int(row["score_cp"]) for row in rows}
+        policy_moves = self._policy_from_move_scores(move_scores)
 
         best_move = rows[0]["move"]
         best_score = int(rows[0]["score_cp"])
@@ -216,10 +232,7 @@ class StockfishTeacher:
             if played_uci in move_scores:
                 played_score = int(move_scores[played_uci])
             else:
-                child = board.copy(stack=False)
-                child.push(played_move)
-                child_info = self.engine.analyse(child, self._limit())
-                child_score = self._score_cp(child_info, mover)
+                child_score = self._score_child_move(board, played_move, mover)
                 played_score = int(child_score) if child_score is not None else best_score
 
         payload = {
@@ -234,6 +247,72 @@ class StockfishTeacher:
         }
         self.cache.put(cache_key, payload)
         return payload
+
+    def analyse_candidates(
+        self,
+        board: chess.Board,
+        candidate_moves: List[chess.Move],
+        played_move: Optional[chess.Move] = None,
+    ) -> Dict:
+        result = dict(self.analyse(board, played_move=played_move))
+        legal_moves = set(board.legal_moves)
+        candidates = []
+        seen = set()
+        for move in candidate_moves:
+            if move not in legal_moves:
+                continue
+            uci = move.uci()
+            if uci in seen:
+                continue
+            seen.add(uci)
+            candidates.append(move)
+
+        if not candidates:
+            result["teacher_label_moves"] = []
+            result["teacher_label_topk"] = 0
+            return result
+
+        mover = board.turn
+        move_scores = {
+            str(move): int(score)
+            for move, score in (result.get("move_scores_cp") or {}).items()
+        }
+        scored_candidates = []
+        for move in candidates:
+            uci = move.uci()
+            if uci not in move_scores:
+                child_score = self._score_child_move(board, move, mover)
+                if child_score is not None:
+                    move_scores[uci] = int(child_score)
+            if uci in move_scores:
+                scored_candidates.append(uci)
+
+        if move_scores:
+            result["move_scores_cp"] = move_scores
+            result["policy_moves"] = self._policy_from_move_scores(move_scores)
+            ordered = sorted(
+                move_scores.items(),
+                key=lambda item: (-int(item[1]), item[0]),
+            )
+            best_move, best_score = ordered[0]
+            previous_best = result.get("best_move")
+            result["best_move"] = best_move
+            result["best_score_cp"] = int(best_score)
+            if best_move != previous_best:
+                result["value"] = self._value({}, mover, int(best_score))
+            if len(ordered) > 1:
+                result["margin_cp"] = int(
+                    max(0, int(ordered[0][1]) - int(ordered[1][1]))
+                )
+            played_uci = played_move.uci() if played_move is not None else best_move
+            if played_uci in move_scores:
+                played_score = int(move_scores[played_uci])
+                result["played_score_cp"] = played_score
+                result["regret_cp"] = int(max(0, int(best_score) - played_score))
+
+        result["teacher_label_moves"] = scored_candidates
+        result["teacher_label_topk"] = len(scored_candidates)
+        return result
 
     @staticmethod
     def dense_policy(board: chess.Board, result: Dict) -> np.ndarray:

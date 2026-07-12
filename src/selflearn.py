@@ -71,6 +71,45 @@ def one_hot_move_policy(board, move):
     return policy
 
 
+def root_topk_moves(board, search_result, selected_move, topk):
+    limit = max(1, int(topk))
+    legal_moves = set(board.legal_moves)
+    moves = []
+    seen = set()
+
+    def add(move):
+        if move not in legal_moves:
+            return
+        uci = move.uci()
+        if uci in seen:
+            return
+        seen.add(uci)
+        moves.append(move)
+
+    add(selected_move)
+    for row in search_result.info.get("root", []):
+        if len(moves) >= limit:
+            break
+        try:
+            add(chess.Move.from_uci(str(row.get("move"))))
+        except Exception:
+            continue
+
+    if len(moves) < limit:
+        policy = np.asarray(search_result.policy, dtype=np.float32)
+        ordered = sorted(
+            board.legal_moves,
+            key=lambda move: (float(policy[move_to_index(move)]), move.uci()),
+            reverse=True,
+        )
+        for move in ordered:
+            if len(moves) >= limit:
+                break
+            add(move)
+
+    return moves[:limit]
+
+
 def board_ply_number(board: chess.Board) -> int:
     return max(
         0,
@@ -348,6 +387,8 @@ def run_selflearn_worker(job):
     truncated_games = 0
     regret_sum = 0.0
     weight_sum = 0.0
+    label_weight_sum = 0.0
+    label_move_sum = 0
     teacher_vetoed_moves = 0
     used_openings = set()
 
@@ -377,6 +418,7 @@ def run_selflearn_worker(job):
                 teacher_policy = normalize_policy(search_result.policy)
                 teacher_value = 0.0
                 teacher_weight = 0.0
+                teacher_label_weight = 0.0
                 regret_cp = 0
 
                 use_teacher = (
@@ -387,14 +429,33 @@ def run_selflearn_worker(job):
                     and random.random() <= args.teacher_sample_rate
                 )
                 if use_teacher:
-                    teacher_result = teacher.analyse(board, played_move=model_move)
+                    label_moves = root_topk_moves(
+                        board,
+                        search_result,
+                        model_move,
+                        args.teacher_label_topk,
+                    )
+                    teacher_result = teacher.analyse_candidates(
+                        board,
+                        label_moves,
+                        played_move=model_move,
+                    )
                     teacher_policy = teacher.dense_policy(board, teacher_result)
                     teacher_value = float(teacher_result.get("value", 0.0))
                     teacher_weight = teacher_weight_from_result(teacher_result)
+                    teacher_label_weight = max(
+                        float(teacher_weight),
+                        float(args.teacher_label_min_weight),
+                    )
+                    teacher_label_weight = min(0.95, max(0.0, teacher_label_weight))
                     regret_cp = int(teacher_result.get("regret_cp", 0))
                     teacher_positions += 1
                     regret_sum += float(regret_cp)
                     weight_sum += float(teacher_weight)
+                    label_weight_sum += float(teacher_label_weight)
+                    label_move_sum += int(
+                        teacher_result.get("teacher_label_topk", len(label_moves))
+                    )
 
                     answers = acceptable_moves(
                         teacher_result,
@@ -439,8 +500,8 @@ def run_selflearn_worker(job):
                             game_vetoes += 1
 
                 target_policy = normalize_policy(
-                    (1.0 - teacher_weight) * model_policy
-                    + teacher_weight * teacher_policy
+                    (1.0 - teacher_label_weight) * model_policy
+                    + teacher_label_weight * teacher_policy
                 )
                 game_rows.append({
                     "state": board_to_packed(board),
@@ -499,6 +560,8 @@ def run_selflearn_worker(job):
         "truncated_games": truncated_games,
         "regret_sum": regret_sum,
         "weight_sum": weight_sum,
+        "label_weight_sum": label_weight_sum,
+        "label_move_sum": label_move_sum,
         "teacher_vetoed_moves": teacher_vetoed_moves,
         "used_openings": list(used_openings),
     }
@@ -570,6 +633,8 @@ def generate_selflearn_data(args, model_path, output_path, iteration):
     truncated_games = 0
     regret_sum = 0.0
     weight_sum = 0.0
+    label_weight_sum = 0.0
+    label_move_sum = 0
     teacher_vetoed_moves = 0
     used_openings = set()
 
@@ -582,6 +647,8 @@ def generate_selflearn_data(args, model_path, output_path, iteration):
         truncated_games += int(output["truncated_games"])
         regret_sum += float(output["regret_sum"])
         weight_sum += float(output["weight_sum"])
+        label_weight_sum += float(output["label_weight_sum"])
+        label_move_sum += int(output["label_move_sum"])
         teacher_vetoed_moves += int(output["teacher_vetoed_moves"])
         used_openings.update(output["used_openings"])
 
@@ -609,14 +676,22 @@ def generate_selflearn_data(args, model_path, output_path, iteration):
         "mean_teacher_weight": (
             float(weight_sum / teacher_positions) if teacher_positions else 0.0
         ),
+        "mean_teacher_label_weight": (
+            float(label_weight_sum / teacher_positions) if teacher_positions else 0.0
+        ),
+        "mean_teacher_label_moves": (
+            float(label_move_sum / teacher_positions) if teacher_positions else 0.0
+        ),
         "teacher_vetoed_moves": int(teacher_vetoed_moves),
         "teacher_veto": bool(args.teacher_veto),
         "teacher_veto_regret_cp": int(args.teacher_veto_regret_cp),
         "teacher_veto_min_weight": float(args.teacher_veto_min_weight),
+        "teacher_label_topk": int(args.teacher_label_topk),
+        "teacher_label_min_weight": float(args.teacher_label_min_weight),
         "truncate_adjudication_cp": int(args.truncate_adjudication_cp),
         "search_type": "uncertainty_mcts_alpha_beta",
         "move_selection": "top1",
-        "target_policy_base": "top1",
+        "target_policy_base": "top1_teacher_labeled_topk",
         "sims_soft_cap": int(args.sims),
         "mate_guard_plies": int(args.mate_guard_plies),
         "q_tiebreak": bool(args.q_tiebreak),
@@ -644,6 +719,8 @@ def generate_selflearn_data(args, model_path, output_path, iteration):
         "regression_cases": len(cases),
         "mean_regret_cp": attrs["mean_regret_cp"],
         "mean_teacher_weight": attrs["mean_teacher_weight"],
+        "mean_teacher_label_weight": attrs["mean_teacher_label_weight"],
+        "mean_teacher_label_moves": attrs["mean_teacher_label_moves"],
         "teacher_vetoed_moves": teacher_vetoed_moves,
         "move_selection": attrs["move_selection"],
         "target_policy_base": attrs["target_policy_base"],
@@ -1384,6 +1461,8 @@ def parse_args():
     parser.add_argument("--teacher-start-ply", type=int, default=4)
     parser.add_argument("--teacher-every", type=int, default=1)
     parser.add_argument("--teacher-sample-rate", type=float, default=1.0)
+    parser.add_argument("--teacher-label-topk", type=int, default=4)
+    parser.add_argument("--teacher-label-min-weight", type=float, default=0.20)
     parser.add_argument("--teacher-veto", action="store_true", default=True)
     parser.add_argument("--no-teacher-veto", dest="teacher_veto", action="store_false")
     parser.add_argument("--teacher-veto-regret-cp", type=int, default=300)
