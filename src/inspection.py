@@ -7,6 +7,7 @@ import h5py
 import numpy as np
 
 from chess_env import board_to_packed
+from config import NUM_ACTIONS
 from move_encoder import move_to_index
 
 
@@ -47,7 +48,7 @@ def check_probability_datasets(path, count):
         for row_index in range(total_rows):
             for name in present:
                 row = np.asarray(h5[name][row_index], dtype=np.float32)
-                if row.shape != (4672,):
+                if row.shape != (NUM_ACTIONS,):
                     print(f"[ERROR] {name}[{row_index}] shape={row.shape}")
                     errors += 1
                     continue
