@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import replace
+import hashlib
 import json
 import math
 import multiprocessing as mp
@@ -28,6 +29,84 @@ from teacher import (
 def progress_print(enabled: bool, *parts):
     if enabled:
         print(*parts, flush=True)
+
+
+def file_sha256(path: str) -> str:
+    hasher = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def safe_san(board: chess.Board, move: chess.Move) -> str:
+    try:
+        return board.san(move)
+    except Exception:
+        return move.uci()
+
+
+def json_safe(value):
+    if isinstance(value, dict):
+        return {str(key): json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    return value
+
+
+def trace_search_info(info: Dict, root_topn: int) -> Dict:
+    root_topn = max(0, int(root_topn))
+    keys = (
+        "best_move",
+        "best_san",
+        "value",
+        "mcts_completed",
+        "mcts_dynamic_target",
+        "mcts_soft_cap",
+        "uncertainty",
+        "expanded_nodes",
+        "nn_batches",
+        "alpha_beta_nodes",
+        "alpha_beta_overrode_mcts",
+        "q_tiebreak_enabled",
+        "q_tiebreak_overrode",
+        "q_tiebreak_move",
+        "q_tiebreak",
+        "elapsed_ms",
+    )
+    payload = {key: info.get(key) for key in keys if key in info}
+    if root_topn > 0:
+        payload["root"] = list(info.get("root") or [])[:root_topn]
+    return json_safe(payload)
+
+
+def pgn_search_comment(owner: str, info: Dict) -> str:
+    parts = [
+        f"owner={owner}",
+        f"best={info.get('best_san', info.get('best_move', '?'))}",
+    ]
+    if "mcts_completed" in info and "mcts_soft_cap" in info:
+        parts.append(f"sims={info.get('mcts_completed')}/{info.get('mcts_soft_cap')}")
+    if "value" in info:
+        parts.append(f"value={float(info.get('value')):+.3f}")
+    if "alpha_beta_overrode_mcts" in info:
+        parts.append(f"ab_override={bool(info.get('alpha_beta_overrode_mcts'))}")
+    if "q_tiebreak_overrode" in info:
+        parts.append(f"q_tiebreak={bool(info.get('q_tiebreak_overrode'))}")
+    root = []
+    for row in list(info.get("root") or [])[:3]:
+        root.append(
+            f"{row.get('san', row.get('uci', '?'))}:"
+            f"v{row.get('visits', 0)}:"
+            f"q{float(row.get('q', 0.0)):+.3f}"
+        )
+    if root:
+        parts.append("root=" + ",".join(root))
+    return " ".join(parts).replace("{", "(").replace("}", ")")
 
 
 def worker_cache_path(cache_path, worker_index, worker_count):
@@ -84,6 +163,8 @@ def play_arena_game(
     max_plies,
     start_fen,
     game_id=None,
+    pgn_comments=False,
+    trace_root_topn=12,
 ):
     board = chess.Board(start_fen)
     game = chess.pgn.Game()
@@ -101,21 +182,34 @@ def play_arena_game(
 
     while not board.is_game_over(claim_draw=True) and ply < int(max_plies):
         candidate_turn = board.turn == candidate_color
+        owner = "candidate" if candidate_turn else "baseline"
         searcher = candidate_searcher if candidate_turn else baseline_searcher
         result = searcher.search(board.copy(stack=False))
+        info = dict(result.info or {})
         move = result.move
         if move not in board.legal_moves:
-            legal = list(board.legal_moves)
-            if not legal:
-                break
-            move = legal[0]
+            raise RuntimeError(
+                "arena search returned illegal move: "
+                f"game={game_id} ply={ply + 1} owner={owner} "
+                f"move={move.uci() if move is not None else None} "
+                f"fen={board.fen()} best={info.get('best_move')} "
+                f"root={json.dumps(trace_search_info(info, trace_root_topn), ensure_ascii=False)}"
+            )
 
+        san = safe_san(board, move)
         trace.append({
+            "game_id": game_id,
+            "ply": ply + 1,
             "fen": board.fen(),
             "move": move.uci(),
-            "owner": "candidate" if candidate_turn else "baseline",
+            "san": san,
+            "owner": owner,
+            "candidate_color": "white" if candidate_color == chess.WHITE else "black",
+            "search": trace_search_info(info, trace_root_topn),
         })
         node = node.add_variation(move)
+        if pgn_comments:
+            node.comment = pgn_search_comment(owner, info)
         board.push(move)
         ply += 1
 
@@ -156,6 +250,8 @@ def _worker(job):
         q_tiebreak_p_ratio,
         q_tiebreak_visit_ratio,
         q_tiebreak_margin,
+        pgn_comments,
+        trace_root_topn,
         progress,
     ) = job
 
@@ -202,6 +298,8 @@ def _worker(job):
             max_plies,
             fen,
             game_index,
+            pgn_comments,
+            trace_root_topn,
         )
         scores.append(score)
         counts[outcome_from_score(score)] += 1
@@ -398,14 +496,21 @@ def evaluate_models(
     teacher_cache="data/selflearn/teacher_cache.sqlite",
     quality_loss_cap_cp=1000,
     pgn_output=None,
+    trace_output=None,
+    pgn_comments=False,
+    trace_root_topn=12,
     log_every=1000,
     progress=True,
 ):
+    candidate_hash = file_sha256(candidate_path)
+    baseline_hash = file_sha256(baseline_path)
     progress_print(
         progress,
         "arena: start",
         f"candidate={candidate_path}",
+        f"candidate_sha256={candidate_hash}",
         f"baseline={baseline_path}",
+        f"baseline_sha256={baseline_hash}",
         f"games={games}",
         f"sims={sims}",
         f"device={device}",
@@ -462,6 +567,8 @@ def evaluate_models(
             q_tiebreak_p_ratio,
             q_tiebreak_visit_ratio,
             q_tiebreak_margin,
+            pgn_comments,
+            trace_root_topn,
             progress,
         ))
 
@@ -547,9 +654,17 @@ def evaluate_models(
             handle.write("\n\n".join(pgns))
             handle.write("\n")
         progress_print(progress, f"arena PGN saved: {pgn_output}")
+    if trace_output:
+        os.makedirs(os.path.dirname(trace_output) or ".", exist_ok=True)
+        with open(trace_output, "w", encoding="utf-8") as handle:
+            for row in traces:
+                handle.write(json.dumps(json_safe(row), ensure_ascii=False) + "\n")
+        progress_print(progress, f"arena trace saved: {trace_output}")
     return {
         "candidate": candidate_path,
+        "candidate_sha256": candidate_hash,
         "baseline": baseline_path,
+        "baseline_sha256": baseline_hash,
         **game_summary,
         "quality": quality,
         "quality_loss_cap_cp": int(quality_loss_cap_cp),
@@ -567,6 +682,7 @@ def evaluate_models(
         "book_plies": int(book_plies),
         "paired_openings": True,
         "unique_start_positions": len({fen for fen, _ in specs}),
+        "trace_output": trace_output,
     }
 
 
@@ -611,6 +727,9 @@ def parse_args():
     parser.add_argument("--teacher-cache", default="data/selflearn/teacher_cache.sqlite")
     parser.add_argument("--quality-loss-cap-cp", type=int, default=1000)
     parser.add_argument("--pgn-output", default=None)
+    parser.add_argument("--trace-output", default=None)
+    parser.add_argument("--pgn-comments", action="store_true", default=False)
+    parser.add_argument("--trace-root-topn", type=int, default=12)
     parser.add_argument("--log-every", type=int, default=1000)
     return parser.parse_args()
 
@@ -653,6 +772,9 @@ def main():
         teacher_cache=args.teacher_cache,
         quality_loss_cap_cp=args.quality_loss_cap_cp,
         pgn_output=args.pgn_output,
+        trace_output=args.trace_output,
+        pgn_comments=args.pgn_comments,
+        trace_root_topn=args.trace_root_topn,
         log_every=args.log_every,
         progress=True,
     )

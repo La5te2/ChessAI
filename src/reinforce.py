@@ -6,7 +6,6 @@ import math
 import multiprocessing as mp
 import os
 import random
-import shutil
 import time
 import uuid
 from pathlib import Path
@@ -21,6 +20,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from acceptance import attach_arena_acceptance
 from arena import evaluate_models, worker_cache_path
+from checkpoint_io import atomic_copy_with_backup
 from chess_env import board_to_packed, packed_to_tensor
 from config import (
     DEVICE,
@@ -52,11 +52,11 @@ def ensure_dir(path: str) -> str:
     return path
 
 
-def copy_if_needed(src: str, dst: str):
+def copy_if_needed(src: str, dst: str, make_backup: bool = True):
     ensure_dir(os.path.dirname(dst) or ".")
     if os.path.abspath(src) == os.path.abspath(dst):
-        return
-    shutil.copy2(src, dst)
+        return {"dst": dst, "backup": None, "skipped": True}
+    return atomic_copy_with_backup(src, dst, make_backup=make_backup)
 
 
 def cp_to_value(cp: Optional[float]) -> float:
@@ -989,7 +989,7 @@ def run(args):
 
     current_model = os.path.join(args.model_run_dir, "current.pth")
     if not os.path.exists(current_model):
-        copy_if_needed(args.model, current_model)
+        copy_if_needed(args.model, current_model, make_backup=False)
 
     print(
         "reinforce start:",
@@ -1043,9 +1043,19 @@ def run(args):
         )
         arena_summary = evaluate_candidate(args, candidate_path, current_model)
         accepted = bool(arena_summary.get("accepted"))
+        promotion_summary = None
         if accepted and args.promote_if_accepted:
-            copy_if_needed(candidate_path, current_model)
-            print("reinforce candidate accepted:", current_model, flush=True)
+            promotion_summary = copy_if_needed(
+                candidate_path,
+                current_model,
+                make_backup=True,
+            )
+            print(
+                "reinforce candidate accepted:",
+                current_model,
+                f"backup={promotion_summary.get('backup')}",
+                flush=True,
+            )
         else:
             print("reinforce candidate rejected:", candidate_path, flush=True)
 
@@ -1058,6 +1068,7 @@ def run(args):
             "current_model": current_model,
             "candidate_model": candidate_path,
             "rollout_path": rollout_path,
+            "promotion": promotion_summary,
         }
         all_summaries.append(summary)
         with open(summary_path, "w", encoding="utf-8") as f:
