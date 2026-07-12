@@ -67,6 +67,10 @@ EVAL_WORKERS=10
 EVAL_MAX_PLIES=150
 EVAL_OPENING_BOOK="data/openings.gen.bin"
 EVAL_MOVETIME_MS=1000
+EVAL_MATE_GUARD_PLIES=3
+EVAL_MATE_GUARD_TOPK=8
+EVAL_MATE_GUARD_NODES=20000
+EVAL_MATE_GUARD_TIME_FRACTION=0.10
 EVAL_UCI_DEPTH=16
 EVAL_UCI_MULTIPV=4
 EVAL_MIN_NET_WINS=4
@@ -82,7 +86,7 @@ echo "sampling: temperature=${SAMPLE_TEMPERATURE} topk=${SAMPLE_TOPK} sharp_gap_
 echo "reward: delta_weight=${DELTA_WEIGHT} regret_weight=${REGRET_WEIGHT} regret_scale_cp=${REGRET_SCALE_CP} blunder_cp=${BLUNDER_CP} blunder_weight=${BLUNDER_WEIGHT}"
 echo "teacher: uci=${UCI} depth=${UCI_DEPTH} multipv=${UCI_MULTIPV} threads=${UCI_THREADS}"
 echo "train: ppo_epochs=${PPO_EPOCHS} train_max_steps=${TRAIN_MAX_STEPS} batch_size=${BATCH_SIZE} critic_target=${CRITIC_TARGET}"
-echo "eval: games=${EVAL_GAMES} sims=${EVAL_SIMS} movetime_ms=${EVAL_MOVETIME_MS} opening_book=${EVAL_OPENING_BOOK}"
+echo "eval: games=${EVAL_GAMES} sims=${EVAL_SIMS} movetime_ms=${EVAL_MOVETIME_MS} mate_guard=${EVAL_MATE_GUARD_PLIES}/${EVAL_MATE_GUARD_TOPK}/${EVAL_MATE_GUARD_NODES} mate_guard_time_fraction=${EVAL_MATE_GUARD_TIME_FRACTION} opening_book=${EVAL_OPENING_BOOK}"
 
 exec python src/reinforce.py \
   --run-id "${RUN_ID}" \
@@ -128,6 +132,10 @@ exec python src/reinforce.py \
   --eval-max-plies "${EVAL_MAX_PLIES}" \
   --eval-opening-book "${EVAL_OPENING_BOOK}" \
   --eval-movetime-ms "${EVAL_MOVETIME_MS}" \
+  --eval-mate-guard-plies "${EVAL_MATE_GUARD_PLIES}" \
+  --eval-mate-guard-topk "${EVAL_MATE_GUARD_TOPK}" \
+  --eval-mate-guard-nodes "${EVAL_MATE_GUARD_NODES}" \
+  --eval-mate-guard-time-fraction "${EVAL_MATE_GUARD_TIME_FRACTION}" \
   --eval-uci-depth "${EVAL_UCI_DEPTH}" \
   --eval-uci-multipv "${EVAL_UCI_MULTIPV}" \
   --eval-min-net-wins "${EVAL_MIN_NET_WINS}" \

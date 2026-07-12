@@ -96,9 +96,9 @@ extra
 
 ### 1.3 Search
 
-`search.py` 组合动态预算 MCTS、Alpha-Beta 根候选验证与 Q tiebreak 确定性选棋。
+`search.py` 组合动态预算 MCTS、mate guard 与 Q tiebreak 确定性选棋。
 
-MCTS 根据根节点访问分布熵、候选访问差距和 Q 值差距计算不确定性，并在软上限范围内分配模拟次数。Alpha-Beta 对根候选执行统一验证，搜索叶节点由 policy/value 网络估值。
+MCTS 根据根节点访问分布熵、候选访问差距和 Q 值差距计算不确定性，并在软上限范围内分配模拟次数。mate guard 对根候选执行短深度强制将杀检查，可直接选择己方强制将杀首步或过滤允许对方强制将杀的候选。
 
 Q tiebreak 在确定性选棋中扫描根候选：当候选的访问数与概率接近当前首选时，按接近程度动态降低所需 Q 领先幅度，并由排序更高的候选接管首选。低预算局面会按首选访问数动态收缩最小访问数门槛。
 
@@ -171,7 +171,7 @@ FEN
 
 `board.py` 启动后进入 `Simulator` 模式，双方按照当前行棋方轮流走子。
 
-模型文件与搜索参数通过 `Settings` 统一应用。每次应用参数都会重新加载模型。处于 `Simulator` 模式且模型已载入时，当前局面会自动生成候选走法，并受 `movetime`、`mcts_sims`、Alpha-Beta 节点数等搜索预算约束。
+模型文件与搜索参数通过 `Settings` 统一应用。每次应用参数都会重新加载模型。处于 `Simulator` 模式且模型已载入时，当前局面会自动生成候选走法，并受 `movetime`、`mcts_sims`、mate guard 节点数等搜索预算约束。
 
 `Play` 启动人机对弈，并提示选择：
 
@@ -422,12 +422,10 @@ python src/train.py \
   --eval-mcts-batch-size 64 \
   --eval-movetime-ms 10000 \
   --eval-c-puct 0.5 \
-  --eval-alpha-beta-depth 5 \
-  --eval-alpha-beta-topk 16 \
-  --eval-alpha-beta-nodes 100000 \
-  --eval-alpha-beta-quiescence 4 \
-  --eval-alpha-beta-margin 0.02 \
-  --eval-alpha-beta-time-fraction 0.45 \
+  --eval-mate-guard-plies 5 \
+  --eval-mate-guard-topk 8 \
+  --eval-mate-guard-nodes 20000 \
+  --eval-mate-guard-time-fraction 0.10 \
   --eval-q-tiebreak-min-visits 32 \
   --eval-q-tiebreak-p-ratio 0.70 \
   --eval-q-tiebreak-visit-ratio 0.70 \
@@ -463,13 +461,10 @@ python src/search.py \
   --mcts-batch-size 32 \
   --movetime-ms 30000 \
   --c-puct 0.5 \
-  --alpha-beta-depth 0 \
-  --alpha-beta-topk 1 \
-  --alpha-beta-nodes 0 \
-  --alpha-beta-quiescence 0 \
-  --alpha-beta-margin 0.02 \
-  --alpha-beta-time-fraction 0.00 \
   --mate-guard-plies 5 \
+  --mate-guard-topk 8 \
+  --mate-guard-nodes 20000 \
+  --mate-guard-time-fraction 0.10 \
   --q-tiebreak-min-visits 32 \
   --q-tiebreak-p-ratio 0.70 \
   --q-tiebreak-visit-ratio 0.70 \
@@ -477,7 +472,7 @@ python src/search.py \
   --root-topn 16
 ```
 
-`--mcts-sims` 表示 MCTS 软上限。`--movetime-ms` 表示完整 Search 的时间上限。`--c-puct` 控制 MCTS 探索强度，手动局面分析使用 `0.4~0.5` 更集中。`--mate-guard-plies` 对根候选执行短深度强制将杀检查。`--q-tiebreak-*` 控制 Q 值接管：动态最小访问数、概率比例、访问比例和动态 Q 领先上限；候选带有 Alpha-Beta 分数时，Q 接管候选的 Alpha-Beta 分数需要达到当前首选水平。
+`--mcts-sims` 表示 MCTS 软上限。`--movetime-ms` 表示完整 Search 的时间上限。`--c-puct` 控制 MCTS 探索强度，手动局面分析使用 `0.4~0.5` 更集中。`--mate-guard-*` 控制短深度强制将杀检查的 ply、候选数、节点数与时间预留。`--q-tiebreak-*` 控制 Q 值接管：动态最小访问数、概率比例、访问比例和动态 Q 领先上限。
 
 ---
 
@@ -498,13 +493,10 @@ python src/arena.py \
   --mcts-batch-size 64 \
   --movetime-ms 10000 \
   --c-puct 0.5 \
-  --alpha-beta-depth 5 \
-  --alpha-beta-topk 16 \
-  --alpha-beta-nodes 100000 \
-  --alpha-beta-quiescence 4 \
-  --alpha-beta-margin 0.02 \
-  --alpha-beta-time-fraction 0.25 \
   --mate-guard-plies 5 \
+  --mate-guard-topk 8 \
+  --mate-guard-nodes 20000 \
+  --mate-guard-time-fraction 0.10 \
   --q-tiebreak-min-visits 32 \
   --q-tiebreak-p-ratio 0.70 \
   --q-tiebreak-visit-ratio 0.70 \
@@ -560,13 +552,10 @@ python src/selflearn.py \
   --mcts-batch-size 64 \
   --movetime-ms 1000 \
   --c-puct 0.5 \
-  --alpha-beta-depth 3 \
-  --alpha-beta-topk 4 \
-  --alpha-beta-nodes 20000 \
-  --alpha-beta-quiescence 2 \
-  --alpha-beta-margin 0.02 \
-  --alpha-beta-time-fraction 0.20 \
   --mate-guard-plies 3 \
+  --mate-guard-topk 8 \
+  --mate-guard-nodes 20000 \
+  --mate-guard-time-fraction 0.10 \
   --q-tiebreak-min-visits 32 \
   --q-tiebreak-p-ratio 0.9 \
   --q-tiebreak-visit-ratio 0.9 \
@@ -602,13 +591,10 @@ python src/selflearn.py \
   --eval-mcts-batch-size 64 \
   --eval-movetime-ms 1000 \
   --eval-c-puct 0.5 \
-  --eval-alpha-beta-depth 3 \
-  --eval-alpha-beta-topk 4 \
-  --eval-alpha-beta-nodes 20000 \
-  --eval-alpha-beta-quiescence 2 \
-  --eval-alpha-beta-margin 0.02 \
-  --eval-alpha-beta-time-fraction 0.20 \
   --eval-mate-guard-plies 3 \
+  --eval-mate-guard-topk 8 \
+  --eval-mate-guard-nodes 20000 \
+  --eval-mate-guard-time-fraction 0.10 \
   --eval-q-tiebreak-min-visits 32 \
   --eval-q-tiebreak-p-ratio 0.9 \
   --eval-q-tiebreak-visit-ratio 0.9 \
@@ -826,13 +812,10 @@ python src/board.py \
   --mcts-batch-size 32 \
   --movetime-ms 30000 \
   --c-puct 0.5 \
-  --alpha-beta-depth 0 \
-  --alpha-beta-topk 1 \
-  --alpha-beta-nodes 0 \
-  --alpha-beta-quiescence 0 \
-  --alpha-beta-margin 0.02 \
-  --alpha-beta-time-fraction 0.00 \
   --mate-guard-plies 5 \
+  --mate-guard-topk 8 \
+  --mate-guard-nodes 20000 \
+  --mate-guard-time-fraction 0.10 \
   --q-tiebreak-min-visits 32 \
   --q-tiebreak-p-ratio 0.70 \
   --q-tiebreak-visit-ratio 0.70 \
@@ -840,7 +823,7 @@ python src/board.py \
   --root-topn 16
 ```
 
-在 `Simulator` 模式中，加载模型后会自动分析当前局面；之后每次走子、撤销、重置、导入 PGN 或修改模型参数，都会重新分析当前局面。`Close` 暂停自动候选走法，按钮文字变为 `Open`；`Open` 恢复自动候选走法并分析当前局面。`Play` 模式由 AI 回合触发自动行棋，用户回合显示当前对局信息。`Settings` 中可调整 `c_puct`、Alpha-Beta 参数、`q_tiebreak`、`q_tiebreak_min_visits`、`q_tiebreak_p_ratio`、`q_tiebreak_visit_ratio` 和 `q_tiebreak_margin`。
+在 `Simulator` 模式中，加载模型后会自动分析当前局面；之后每次走子、撤销、重置、导入 PGN 或修改模型参数，都会重新分析当前局面。`Close` 暂停自动候选走法，按钮文字变为 `Open`；`Open` 恢复自动候选走法并分析当前局面。`Play` 模式由 AI 回合触发自动行棋，用户回合显示当前对局信息。`Settings` 中可调整 `c_puct`、mate guard 参数、`q_tiebreak`、`q_tiebreak_min_visits`、`q_tiebreak_p_ratio`、`q_tiebreak_visit_ratio` 和 `q_tiebreak_margin`。
 
 ---
 
@@ -856,13 +839,10 @@ python src/board.py \
   --mcts-batch-size 32 \
   --movetime-ms 30000 \
   --c-puct 0.5 \
-  --alpha-beta-depth 0 \
-  --alpha-beta-topk 1 \
-  --alpha-beta-nodes 0 \
-  --alpha-beta-quiescence 0 \
-  --alpha-beta-margin 0.02 \
-  --alpha-beta-time-fraction 0.00 \
   --mate-guard-plies 5 \
+  --mate-guard-topk 8 \
+  --mate-guard-nodes 20000 \
+  --mate-guard-time-fraction 0.10 \
   --q-tiebreak-min-visits 32 \
   --q-tiebreak-p-ratio 0.70 \
   --q-tiebreak-visit-ratio 0.70 \

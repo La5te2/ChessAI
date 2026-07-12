@@ -945,13 +945,10 @@ def evaluate_candidate(args, candidate_path: str, baseline_path: str) -> Dict:
         mcts_batch_size=args.eval_mcts_batch_size,
         movetime_ms=args.eval_movetime_ms,
         c_puct=args.eval_c_puct,
-        alpha_beta_depth=args.eval_alpha_beta_depth,
-        alpha_beta_topk=args.eval_alpha_beta_topk,
-        alpha_beta_nodes=args.eval_alpha_beta_nodes,
-        alpha_beta_quiescence=args.eval_alpha_beta_quiescence,
-        alpha_beta_margin=args.eval_alpha_beta_margin,
-        alpha_beta_time_fraction=args.eval_alpha_beta_time_fraction,
         mate_guard_plies=args.eval_mate_guard_plies,
+        mate_guard_topk=args.eval_mate_guard_topk,
+        mate_guard_nodes=args.eval_mate_guard_nodes,
+        mate_guard_time_fraction=args.eval_mate_guard_time_fraction,
         q_tiebreak=args.eval_q_tiebreak,
         q_tiebreak_min_visits=args.eval_q_tiebreak_min_visits,
         q_tiebreak_p_ratio=args.eval_q_tiebreak_p_ratio,
@@ -1162,13 +1159,10 @@ def build_parser():
     parser.add_argument("--eval-mcts-batch-size", type=int, default=64)
     parser.add_argument("--eval-movetime-ms", type=int, default=1000)
     parser.add_argument("--eval-c-puct", type=float, default=0.5)
-    parser.add_argument("--eval-alpha-beta-depth", type=int, default=3)
-    parser.add_argument("--eval-alpha-beta-topk", type=int, default=4)
-    parser.add_argument("--eval-alpha-beta-nodes", type=int, default=20000)
-    parser.add_argument("--eval-alpha-beta-quiescence", type=int, default=2)
-    parser.add_argument("--eval-alpha-beta-margin", type=float, default=0.02)
-    parser.add_argument("--eval-alpha-beta-time-fraction", type=float, default=0.20)
     parser.add_argument("--eval-mate-guard-plies", type=int, default=3)
+    parser.add_argument("--eval-mate-guard-topk", type=int, default=8)
+    parser.add_argument("--eval-mate-guard-nodes", type=int, default=20000)
+    parser.add_argument("--eval-mate-guard-time-fraction", type=float, default=0.10)
     parser.add_argument("--eval-q-tiebreak", action="store_true", default=True)
     parser.add_argument("--no-eval-q-tiebreak", dest="eval_q_tiebreak", action="store_false")
     parser.add_argument("--eval-q-tiebreak-min-visits", type=int, default=32)

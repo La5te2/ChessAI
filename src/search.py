@@ -93,16 +93,10 @@ class SearchOptions:
     root_topn: int = 10
     virtual_loss: float = 1.0
 
-    # When enabled, Alpha-Beta verifies MCTS root candidates directly; there is
-    # no position-stage classifier.
-    alpha_beta_depth: int = 4
-    alpha_beta_topk: int = 4
-    alpha_beta_nodes: int = 20000
-    alpha_beta_quiescence: int = 3
-    alpha_beta_margin: float = 0.10
-    alpha_beta_time_fraction: float = 0.25
-    alpha_beta_policy_weight: float = 0.35
     mate_guard_plies: int = 3
+    mate_guard_topk: int = 8
+    mate_guard_nodes: int = 20000
+    mate_guard_time_fraction: float = 0.10
 
     q_tiebreak: bool = True
     q_tiebreak_min_visits: int = 32
@@ -364,39 +358,34 @@ class MCTS:
         }
 
 
-class VerificationLimit(Exception):
+class GuardLimit(Exception):
     pass
 
 
-class AlphaBetaVerifier:
-    """Universal root-candidate verifier with neural leaves and bounded search."""
+class MateGuard:
+    """Mate-only tactical guard for root candidates.
+
+    The guard is deliberately narrow: it may force a short mate for the side to
+    move or ban candidates that allow the opponent a short mate. It does not
+    score ordinary positions.
+    """
 
     def __init__(
         self,
-        evaluator: BatchedEvaluator,
         options: SearchOptions,
         deadline: Optional[float],
     ):
-        self.evaluator = evaluator
         self.options = options
         self.deadline = deadline
         self.nodes = 0
-        self.leaf_cache: Dict[str, float] = {}
 
     def _check_limit(self):
         if self.deadline is not None and time.monotonic() >= self.deadline:
-            raise VerificationLimit()
-        if self.options.alpha_beta_nodes > 0 and self.nodes >= int(
-            self.options.alpha_beta_nodes
+            raise GuardLimit()
+        if self.options.mate_guard_nodes > 0 and self.nodes >= int(
+            self.options.mate_guard_nodes
         ):
-            raise VerificationLimit()
-
-    def _leaf_value(self, board: chess.Board) -> float:
-        key = board.fen()
-        if key not in self.leaf_cache:
-            _policy, value = self.evaluator.evaluate_one(board)
-            self.leaf_cache[key] = float(value)
-        return self.leaf_cache[key]
+            raise GuardLimit()
 
     @staticmethod
     def _move_order_score(board: chess.Board, move: chess.Move, prior=0.0):
@@ -460,16 +449,6 @@ class AlphaBetaVerifier:
                 return True
         return False
 
-    def _root_tactical_score(self, child: chess.Board):
-        terminal = terminal_value_side_to_move(child)
-        if terminal is not None:
-            return -float(terminal)
-
-        guard_plies = max(0, int(self.options.mate_guard_plies))
-        if guard_plies > 0 and self._side_can_force_checkmate(child, guard_plies):
-            return -1.0
-        return None
-
     def _ordered_moves(self, board: chess.Board, priors=None):
         priors = priors or {}
         moves = list(board.legal_moves)
@@ -482,129 +461,91 @@ class AlphaBetaVerifier:
         )
         return moves
 
-    def _stability_moves(self, board: chess.Board):
-        if board.is_check():
-            return self._ordered_moves(board)
-        moves = []
-        for move in board.legal_moves:
-            include = board.is_capture(move) or bool(move.promotion)
-            if not include:
-                try:
-                    include = board.gives_check(move)
-                except Exception:
-                    include = False
-            if include:
-                moves.append(move)
-        moves.sort(
-            key=lambda move: (self._move_order_score(board, move), move.uci()),
-            reverse=True,
-        )
-        return moves
-
-    def _quiescence(self, board, alpha, beta, depth):
-        self._check_limit()
-        self.nodes += 1
-
-        terminal = terminal_value_side_to_move(board)
-        if terminal is not None:
-            return float(terminal)
-
-        stand_pat = self._leaf_value(board)
-        in_check = board.is_check()
-        if not in_check:
-            if stand_pat >= beta:
-                return beta
-            alpha = max(alpha, stand_pat)
-            if depth <= 0:
-                return alpha
-
-        for move in self._stability_moves(board):
-            board.push(move)
-            if in_check and depth <= 0:
-                terminal = terminal_value_side_to_move(board)
-                child_value = (
-                    float(terminal)
-                    if terminal is not None
-                    else self._leaf_value(board)
-                )
-                score = -child_value
-            else:
-                score = -self._quiescence(
-                    board,
-                    -beta,
-                    -alpha,
-                    depth - 1,
-                )
-            board.pop()
-            if score >= beta:
-                return beta
-            alpha = max(alpha, score)
-        return alpha
-
-    def _negamax(self, board, depth, alpha, beta):
-        self._check_limit()
-        self.nodes += 1
-
-        terminal = terminal_value_side_to_move(board)
-        if terminal is not None:
-            return float(terminal)
-
-        if depth <= 0:
-            return self._quiescence(
-                board,
-                alpha,
-                beta,
-                max(0, int(self.options.alpha_beta_quiescence)),
-            )
-
-        best = -1.1
+    def _find_forcing_mate_move(self, board: chess.Board, plies: int):
         for move in self._ordered_moves(board):
-            board.push(move)
-            score = -self._negamax(board, depth - 1, -beta, -alpha)
-            board.pop()
-            best = max(best, score)
-            alpha = max(alpha, score)
-            if alpha >= beta:
-                break
-        return float(best)
+            self._check_limit()
+            self.nodes += 1
+            if not board.gives_check(move):
+                continue
 
-    def verify(self, board: chess.Board, candidates: List[chess.Move]):
-        scores = {}
+            board.push(move)
+            if board.is_checkmate():
+                board.pop()
+                return move, "mate_in_1"
+
+            legal_replies = list(self._ordered_moves(board))
+            forced = bool(legal_replies)
+            for reply in legal_replies:
+                board.push(reply)
+                reply_allows_mate = self._side_can_force_checkmate(
+                    board,
+                    plies - 2,
+                )
+                board.pop()
+                if not reply_allows_mate:
+                    forced = False
+                    break
+
+            board.pop()
+            if forced:
+                return move, f"forces_mate_within_{plies}_plies"
+        return None, None
+
+    def analyze(self, board: chess.Board, candidates: List[chess.Move]):
+        forced_move = None
+        banned_moves = set()
+        reasons: Dict[str, str] = {}
         completed = True
-        pending = []
+        guard_plies = max(0, int(self.options.mate_guard_plies))
+
+        if guard_plies <= 0:
+            return {
+                "forced_move": None,
+                "banned_moves": set(),
+                "reasons": {},
+                "nodes": 0,
+                "completed": True,
+            }
+
+        try:
+            forced_move, reason = self._find_forcing_mate_move(
+                board,
+                guard_plies,
+            )
+            if forced_move is not None and reason is not None:
+                reasons[forced_move.uci()] = reason
+        except GuardLimit:
+            completed = False
 
         for move in candidates:
+            if forced_move is not None:
+                break
             try:
+                if move not in board.legal_moves:
+                    continue
                 child = board.copy(stack=False)
                 child.push(move)
-                quick_score = self._root_tactical_score(child)
-                if quick_score is not None:
-                    scores[move] = float(quick_score)
+                terminal = terminal_value_side_to_move(child)
+                if terminal is not None:
                     continue
-                scores[move] = float(-self._leaf_value(child))
-                pending.append((move, child))
-            except VerificationLimit:
+                if self._side_can_force_checkmate(child, guard_plies):
+                    banned_moves.add(move)
+                    reasons[move.uci()] = f"allows_mate_within_{guard_plies}_plies"
+            except GuardLimit:
                 completed = False
                 break
 
-        for move, child in pending:
-            try:
-                self._check_limit()
-                score = -self._negamax(
-                    child,
-                    max(0, int(self.options.alpha_beta_depth) - 1),
-                    -1.1,
-                    1.1,
-                )
-                scores[move] = float(score)
-            except VerificationLimit:
-                completed = False
-                break
-        return scores, completed
+        return {
+            "forced_move": forced_move,
+            "banned_moves": banned_moves,
+            "reasons": reasons,
+            "nodes": int(self.nodes),
+            "completed": bool(completed),
+        }
 
 
 class UnifiedSearch:
-    """Neural MCTS with uncertainty-sized budget and Alpha-Beta verification."""
+    """Neural MCTS with mate-only tactical guard."""
 
     def __init__(self, model: Optional[torch.nn.Module], options=None, device=None):
         self.model = model
@@ -729,7 +670,6 @@ class UnifiedSearch:
         comparison_policy,
         root_node: Optional[MCTSNode],
         incumbent,
-        verifier_scores: Optional[Dict[chess.Move, float]] = None,
     ):
         if (
             not bool(self.options.q_tiebreak)
@@ -755,8 +695,6 @@ class UnifiedSearch:
         p_ratio = max(0.0, float(self.options.q_tiebreak_p_ratio))
         visit_ratio = max(0.0, float(self.options.q_tiebreak_visit_ratio))
         margin = max(0.0, float(self.options.q_tiebreak_margin))
-        verifier_scores = verifier_scores or {}
-        incumbent_verifier_score = verifier_scores.get(incumbent)
         effective_min_visits = self._q_tiebreak_effective_min_visits(
             configured_min_visits=min_visits,
             incumbent_visits=incumbent_visits,
@@ -774,13 +712,6 @@ class UnifiedSearch:
             child = root_node.children.get(candidate)
             if child is None:
                 continue
-
-            candidate_verifier_score = verifier_scores.get(candidate)
-            if incumbent_verifier_score is not None:
-                if candidate_verifier_score is None:
-                    continue
-                if candidate_verifier_score + 1e-6 < incumbent_verifier_score:
-                    continue
 
             visits = int(child.visit_count)
             if visits < effective_min_visits:
@@ -836,16 +767,6 @@ class UnifiedSearch:
                     "to_final_p": float(final_policy[candidate_index]),
                     "from_visits": incumbent_visits,
                     "to_visits": visits,
-                    "from_alpha_beta_value": (
-                        float(incumbent_verifier_score)
-                        if incumbent_verifier_score is not None
-                        else None
-                    ),
-                    "to_alpha_beta_value": (
-                        float(candidate_verifier_score)
-                        if candidate_verifier_score is not None
-                        else None
-                    ),
                     "min_visits": min_visits,
                     "effective_min_visits": effective_min_visits,
                     "from_q": incumbent_q,
@@ -869,7 +790,12 @@ class UnifiedSearch:
         if self.options.time_limit is not None and float(self.options.time_limit) > 0:
             total = float(self.options.time_limit)
             final_deadline = start + total
-            reserve = max(0.0, min(0.9, float(self.options.alpha_beta_time_fraction)))
+            reserve = 0.0
+            if int(self.options.mate_guard_plies) > 0:
+                reserve = max(
+                    0.0,
+                    min(0.5, float(self.options.mate_guard_time_fraction)),
+                )
             mcts_deadline = start + total * (1.0 - reserve)
 
         root_node = None
@@ -884,7 +810,6 @@ class UnifiedSearch:
                 "timeout": False,
                 "root_node": None,
             }
-            evaluator = None
         else:
             mcts = MCTS(
                 self.model,
@@ -896,107 +821,53 @@ class UnifiedSearch:
                 deadline=mcts_deadline,
             )
             root_node = stats.get("root_node")
-            evaluator = mcts.evaluator
 
         legal = list(root_board.legal_moves)
         mcts_move = self._select_top_move(root_board, mcts_policy)
         final_policy = mcts_policy.copy()
-        verifier_scores: Dict[chess.Move, float] = {}
-        verifier_completed = True
-        verifier_nodes = 0
-        overridden = False
-        alpha_beta_decisive = False
-        selected_by_verifier = None
+        mate_guard_forced = None
+        mate_guard_banned = set()
+        mate_guard_reasons: Dict[str, str] = {}
+        mate_guard_nodes = 0
+        mate_guard_completed = True
 
-        if (
-            self.model is not None
-            and evaluator is not None
-            and int(self.options.alpha_beta_depth) > 0
-            and root_node is not None
-            and legal
-        ):
-            uncertainty = float(stats.get("uncertainty", 0.0))
-            maximum_topk = max(2, int(self.options.alpha_beta_topk))
-            requested_topk = 2 + int(
-                round(uncertainty * max(0, maximum_topk - 2))
-            )
-            requested_topk = min(maximum_topk, max(2, requested_topk), len(legal))
-
+        if legal and int(self.options.mate_guard_plies) > 0:
+            guard_topk = max(1, int(self.options.mate_guard_topk))
             ranked = sorted(
                 legal,
                 key=lambda move: (
+                    float(mcts_policy[move_to_index(move)]),
                     root_node.children.get(move).visit_count
-                    if move in root_node.children
+                    if root_node is not None and move in root_node.children
                     else 0,
                     root_node.children.get(move).prior
-                    if move in root_node.children
-                    else float(mcts_policy[move_to_index(move)]),
+                    if root_node is not None and move in root_node.children
+                    else 0.0,
                     move.uci(),
                 ),
                 reverse=True,
             )
-            candidates = ranked[:requested_topk]
+            candidates = ranked[: min(guard_topk, len(ranked))]
             if mcts_move is not None and mcts_move not in candidates:
                 candidates[-1] = mcts_move
 
-            verifier = AlphaBetaVerifier(
-                evaluator=evaluator,
-                options=self.options,
-                deadline=final_deadline,
-            )
-            verifier_scores, verifier_completed = verifier.verify(
-                root_board,
-                candidates,
-            )
-            verifier_nodes = verifier.nodes
+            guard = MateGuard(self.options, deadline=final_deadline)
+            guard_info = guard.analyze(root_board, candidates)
+            mate_guard_forced = guard_info["forced_move"]
+            mate_guard_banned = set(guard_info["banned_moves"])
+            mate_guard_reasons = dict(guard_info["reasons"])
+            mate_guard_nodes = int(guard_info["nodes"])
+            mate_guard_completed = bool(guard_info["completed"])
 
-            if verifier_scores:
-                selected_by_verifier = max(
-                    verifier_scores,
-                    key=lambda move: (verifier_scores[move], move.uci()),
-                )
-                mcts_score = verifier_scores.get(mcts_move)
-                best_score = verifier_scores[selected_by_verifier]
-                decisive = (
-                    best_score >= 0.999
-                    or (
-                        mcts_score is not None
-                        and mcts_score <= -0.999
-                    )
-                )
-                alpha_beta_decisive = bool(decisive)
-                if (
-                    mcts_score is None
-                    or best_score - mcts_score
-                    >= float(self.options.alpha_beta_margin)
-                ):
-                    overridden = selected_by_verifier != mcts_move
-                    if overridden:
-                        one_hot = np.zeros(NUM_ACTIONS, dtype=np.float32)
-                        one_hot[move_to_index(selected_by_verifier)] = 1.0
-                        if decisive:
-                            final_policy = one_hot
-                        else:
-                            gap = best_score - (
-                                mcts_score if mcts_score is not None else -1.0
-                            )
-                            base_weight = max(
-                                0.05,
-                                min(
-                                    float(self.options.alpha_beta_policy_weight),
-                                    gap
-                                    / max(
-                                        1e-6,
-                                        4.0 * float(self.options.alpha_beta_margin),
-                                    )
-                                    * float(self.options.alpha_beta_policy_weight),
-                                ),
-                            )
-                            final_policy = normalize_policy(
-                                (1.0 - base_weight) * final_policy
-                                + base_weight * one_hot,
-                                root_board,
-                            )
+            if mate_guard_forced is not None and mate_guard_forced in legal:
+                final_policy = np.zeros(NUM_ACTIONS, dtype=np.float32)
+                final_policy[move_to_index(mate_guard_forced)] = 1.0
+            elif mate_guard_banned:
+                guarded_policy = final_policy.copy()
+                for banned in mate_guard_banned:
+                    guarded_policy[move_to_index(banned)] = 0.0
+                if float(guarded_policy.sum()) > 0.0:
+                    final_policy = normalize_policy(guarded_policy, root_board)
 
         move = self._select_top_move(root_board, final_policy)
         if move is None or move not in legal:
@@ -1011,23 +882,25 @@ class UnifiedSearch:
             )
 
         q_tiebreak = None
-        if not alpha_beta_decisive:
+        if mate_guard_forced is None:
             selected, q_tiebreak = self._q_tiebreak_move(
                 root_board,
                 final_policy,
                 mcts_policy,
                 root_node,
                 move,
-                verifier_scores,
             )
-            if q_tiebreak is not None and selected in legal:
-                final_policy = self._promote_policy(
-                    final_policy,
-                    root_board,
-                    selected,
-                    move,
-                )
-                move = selected
+            if q_tiebreak is not None:
+                if selected in legal and selected not in mate_guard_banned:
+                    final_policy = self._promote_policy(
+                        final_policy,
+                        root_board,
+                        selected,
+                        move,
+                    )
+                    move = selected
+                else:
+                    q_tiebreak = None
 
         root_lines = []
         for candidate in legal:
@@ -1046,11 +919,7 @@ class UnifiedSearch:
                 "visits": int(child.visit_count) if child is not None else 0,
                 "prior": float(child.prior) if child is not None else float(mcts_policy[index]),
                 "q": float(-child.q) if child is not None else 0.0,
-                "alpha_beta_value": (
-                    float(verifier_scores[candidate])
-                    if candidate in verifier_scores
-                    else None
-                ),
+                "mate_guard": mate_guard_reasons.get(candidate.uci()),
             })
         root_lines.sort(
             key=lambda row: (
@@ -1065,7 +934,7 @@ class UnifiedSearch:
 
         elapsed_ms = (time.monotonic() - start) * 1000.0
         info = {
-            "search_type": "uncertainty_mcts_alpha_beta",
+            "search_type": "mcts_mate_guard",
             "value": float(value),
             "mcts_soft_cap": int(self.options.mcts_sims),
             "mcts_dynamic_target": int(stats.get("dynamic_target", 0)),
@@ -1073,11 +942,17 @@ class UnifiedSearch:
             "uncertainty": float(stats.get("uncertainty", 0.0)),
             "nodes": int(stats.get("expanded_nodes", 0)),
             "nn_batches": int(stats.get("nn_batches", 0)),
-            "alpha_beta_depth": int(self.options.alpha_beta_depth),
-            "alpha_beta_nodes": int(verifier_nodes),
-            "alpha_beta_completed": bool(verifier_completed),
-            "alpha_beta_overrode_mcts": bool(overridden),
-            "alpha_beta_decisive": bool(alpha_beta_decisive),
+            "mate_guard_plies": int(self.options.mate_guard_plies),
+            "mate_guard_topk": int(self.options.mate_guard_topk),
+            "mate_guard_nodes": int(mate_guard_nodes),
+            "mate_guard_completed": bool(mate_guard_completed),
+            "mate_guard_forced_move": (
+                mate_guard_forced.uci() if mate_guard_forced is not None else None
+            ),
+            "mate_guard_banned_moves": sorted(
+                move.uci() for move in mate_guard_banned
+            ),
+            "mate_guard_reasons": dict(mate_guard_reasons),
             "q_tiebreak_enabled": bool(self.options.q_tiebreak),
             "q_tiebreak_overrode": q_tiebreak is not None,
             "q_tiebreak": q_tiebreak,
@@ -1085,11 +960,6 @@ class UnifiedSearch:
                 q_tiebreak["to"] if q_tiebreak is not None else None
             ),
             "mcts_move": mcts_move.uci() if mcts_move else None,
-            "verifier_move": (
-                selected_by_verifier.uci()
-                if selected_by_verifier is not None
-                else None
-            ),
             "piece_count": count_pieces(root_board),
             "best_move": move.uci(),
             "best_san": safe_san(root_board, move),
@@ -1128,7 +998,7 @@ def get_suggestions(board, model, options=None, topn=5, device=None) -> List[Dic
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="ChessAI uncertainty MCTS with Alpha-Beta verification"
+        description="ChessAI MCTS search with mate guard"
     )
     parser.add_argument("--model", default=MODEL_PATH)
     parser.add_argument("--fen", default="startpos")
@@ -1138,13 +1008,10 @@ def parse_args():
     parser.add_argument("--mcts-batch-size", type=int, default=32)
     parser.add_argument("--movetime-ms", type=int, default=5000)
     parser.add_argument("--c-puct", type=float, default=CPUCT)
-    parser.add_argument("--alpha-beta-depth", type=int, default=4)
-    parser.add_argument("--alpha-beta-topk", type=int, default=4)
-    parser.add_argument("--alpha-beta-nodes", type=int, default=20000)
-    parser.add_argument("--alpha-beta-quiescence", type=int, default=3)
-    parser.add_argument("--alpha-beta-margin", type=float, default=0.10)
-    parser.add_argument("--alpha-beta-time-fraction", type=float, default=0.25)
     parser.add_argument("--mate-guard-plies", type=int, default=3)
+    parser.add_argument("--mate-guard-topk", type=int, default=8)
+    parser.add_argument("--mate-guard-nodes", type=int, default=20000)
+    parser.add_argument("--mate-guard-time-fraction", type=float, default=0.10)
     parser.add_argument("--q-tiebreak", action="store_true", default=True)
     parser.add_argument("--no-q-tiebreak", dest="q_tiebreak", action="store_false")
     parser.add_argument("--q-tiebreak-min-visits", type=int, default=32)
@@ -1168,13 +1035,10 @@ def main():
         mcts_batch_size=args.mcts_batch_size,
         time_limit=(args.movetime_ms / 1000.0) if args.movetime_ms > 0 else None,
         c_puct=args.c_puct,
-        alpha_beta_depth=args.alpha_beta_depth,
-        alpha_beta_topk=args.alpha_beta_topk,
-        alpha_beta_nodes=args.alpha_beta_nodes,
-        alpha_beta_quiescence=args.alpha_beta_quiescence,
-        alpha_beta_margin=args.alpha_beta_margin,
-        alpha_beta_time_fraction=args.alpha_beta_time_fraction,
         mate_guard_plies=args.mate_guard_plies,
+        mate_guard_topk=args.mate_guard_topk,
+        mate_guard_nodes=args.mate_guard_nodes,
+        mate_guard_time_fraction=args.mate_guard_time_fraction,
         q_tiebreak=args.q_tiebreak,
         q_tiebreak_min_visits=args.q_tiebreak_min_visits,
         q_tiebreak_p_ratio=args.q_tiebreak_p_ratio,
@@ -1195,8 +1059,10 @@ def main():
         result.info["mcts_soft_cap"],
     )
     print("uncertainty:", result.info["uncertainty"])
-    print("alpha_beta_nodes:", result.info["alpha_beta_nodes"])
-    print("alpha_beta_overrode_mcts:", result.info["alpha_beta_overrode_mcts"])
+    print("mate_guard_nodes:", result.info["mate_guard_nodes"])
+    print("mate_guard_completed:", result.info["mate_guard_completed"])
+    print("mate_guard_forced_move:", result.info["mate_guard_forced_move"])
+    print("mate_guard_banned_moves:", result.info["mate_guard_banned_moves"])
     print("q_tiebreak_overrode:", result.info["q_tiebreak_overrode"])
     print("q_tiebreak:", result.info["q_tiebreak"])
     print("elapsed_ms:", result.info["elapsed_ms"])
@@ -1207,7 +1073,7 @@ def main():
             f"{marker}{index:2d}. {row['san']:8s} {row['move']:5s} "
             f"p={row['p']:.5f} mcts={row['mcts_p']:.5f} "
             f"visits={row['visits']:4d} q={row['q']:+.4f} "
-            f"ab={row['alpha_beta_value']}"
+            f"guard={row['mate_guard']}"
         )
 
 

@@ -64,14 +64,22 @@ def trace_search_info(info: Dict, root_topn: int) -> Dict:
         "best_move",
         "best_san",
         "value",
+        "sims_completed",
         "mcts_completed",
         "mcts_dynamic_target",
         "mcts_soft_cap",
         "uncertainty",
+        "nodes",
         "expanded_nodes",
         "nn_batches",
-        "alpha_beta_nodes",
-        "alpha_beta_overrode_mcts",
+        "mcts_move",
+        "mate_guard_plies",
+        "mate_guard_topk",
+        "mate_guard_nodes",
+        "mate_guard_completed",
+        "mate_guard_forced_move",
+        "mate_guard_banned_moves",
+        "mate_guard_reasons",
         "q_tiebreak_enabled",
         "q_tiebreak_overrode",
         "q_tiebreak_move",
@@ -91,10 +99,15 @@ def pgn_search_comment(owner: str, info: Dict) -> str:
     ]
     if "mcts_completed" in info and "mcts_soft_cap" in info:
         parts.append(f"sims={info.get('mcts_completed')}/{info.get('mcts_soft_cap')}")
+    elif "sims_completed" in info and "mcts_soft_cap" in info:
+        parts.append(f"sims={info.get('sims_completed')}/{info.get('mcts_soft_cap')}")
     if "value" in info:
         parts.append(f"value={float(info.get('value')):+.3f}")
-    if "alpha_beta_overrode_mcts" in info:
-        parts.append(f"ab_override={bool(info.get('alpha_beta_overrode_mcts'))}")
+    if info.get("mate_guard_forced_move"):
+        parts.append(f"mate_forced={info.get('mate_guard_forced_move')}")
+    banned = info.get("mate_guard_banned_moves") or []
+    if banned:
+        parts.append(f"mate_banned={','.join(str(move) for move in banned)}")
     if "q_tiebreak_overrode" in info:
         parts.append(f"q_tiebreak={bool(info.get('q_tiebreak_overrode'))}")
     root = []
@@ -232,19 +245,17 @@ def _worker(job):
         candidate_path,
         baseline_path,
         specs,
+        game_id_offset,
         sims,
         device,
         max_plies,
         mcts_batch_size,
         movetime_ms,
         c_puct,
-        alpha_beta_depth,
-        alpha_beta_topk,
-        alpha_beta_nodes,
-        alpha_beta_quiescence,
-        alpha_beta_margin,
-        alpha_beta_time_fraction,
         mate_guard_plies,
+        mate_guard_topk,
+        mate_guard_nodes,
+        mate_guard_time_fraction,
         q_tiebreak,
         q_tiebreak_min_visits,
         q_tiebreak_p_ratio,
@@ -266,13 +277,10 @@ def _worker(job):
         mcts_batch_size=mcts_batch_size,
         time_limit=(movetime_ms / 1000.0) if movetime_ms > 0 else None,
         c_puct=c_puct,
-        alpha_beta_depth=alpha_beta_depth,
-        alpha_beta_topk=alpha_beta_topk,
-        alpha_beta_nodes=alpha_beta_nodes,
-        alpha_beta_quiescence=alpha_beta_quiescence,
-        alpha_beta_margin=alpha_beta_margin,
-        alpha_beta_time_fraction=alpha_beta_time_fraction,
         mate_guard_plies=mate_guard_plies,
+        mate_guard_topk=mate_guard_topk,
+        mate_guard_nodes=mate_guard_nodes,
+        mate_guard_time_fraction=mate_guard_time_fraction,
         q_tiebreak=q_tiebreak,
         q_tiebreak_min_visits=q_tiebreak_min_visits,
         q_tiebreak_p_ratio=q_tiebreak_p_ratio,
@@ -290,14 +298,15 @@ def _worker(job):
     pgns = []
 
     total_specs = len(specs)
-    for game_index, (fen, candidate_color) in enumerate(specs, 1):
+    for local_index, (fen, candidate_color) in enumerate(specs, 1):
+        game_id = int(game_id_offset) + local_index
         result, score, plies, trace, pgn = play_arena_game(
             candidate_searcher,
             baseline_searcher,
             candidate_color,
             max_plies,
             fen,
-            game_index,
+            game_id,
             pgn_comments,
             trace_root_topn,
         )
@@ -309,7 +318,8 @@ def _worker(job):
         pgns.append(pgn)
         progress_print(
             progress,
-            f"arena worker {worker_index}: game {game_index}/{total_specs} "
+            f"arena worker {worker_index}: game {local_index}/{total_specs} "
+            f"global_game={game_id} "
             f"candidate_color={'white' if candidate_color == chess.WHITE else 'black'} "
             f"result={result} candidate_score={score:.1f} plies={plies}",
         )
@@ -475,13 +485,10 @@ def evaluate_models(
     mcts_batch_size=32,
     movetime_ms=5000,
     c_puct=1.5,
-    alpha_beta_depth=4,
-    alpha_beta_topk=4,
-    alpha_beta_nodes=20000,
-    alpha_beta_quiescence=3,
-    alpha_beta_margin=0.10,
-    alpha_beta_time_fraction=0.25,
     mate_guard_plies=3,
+    mate_guard_topk=8,
+    mate_guard_nodes=20000,
+    mate_guard_time_fraction=0.10,
     q_tiebreak=True,
     q_tiebreak_min_visits=32,
     q_tiebreak_p_ratio=0.90,
@@ -542,6 +549,7 @@ def evaluate_models(
     for count in splits:
         if count <= 0:
             continue
+        game_id_offset = offset
         subset = specs[offset:offset + count]
         offset += count
         jobs.append((
@@ -549,19 +557,17 @@ def evaluate_models(
             candidate_path,
             baseline_path,
             subset,
+            game_id_offset,
             sims,
             device,
             max_plies,
             mcts_batch_size,
             movetime_ms,
             c_puct,
-            alpha_beta_depth,
-            alpha_beta_topk,
-            alpha_beta_nodes,
-            alpha_beta_quiescence,
-            alpha_beta_margin,
-            alpha_beta_time_fraction,
             mate_guard_plies,
+            mate_guard_topk,
+            mate_guard_nodes,
+            mate_guard_time_fraction,
             q_tiebreak,
             q_tiebreak_min_visits,
             q_tiebreak_p_ratio,
@@ -668,11 +674,14 @@ def evaluate_models(
         **game_summary,
         "quality": quality,
         "quality_loss_cap_cp": int(quality_loss_cap_cp),
-        "search_type": "uncertainty_mcts_alpha_beta",
+        "search_type": "mcts_mate_guard",
         "sims_soft_cap": int(sims),
         "mcts_batch_size": int(mcts_batch_size),
         "movetime_ms": int(movetime_ms),
         "mate_guard_plies": int(mate_guard_plies),
+        "mate_guard_topk": int(mate_guard_topk),
+        "mate_guard_nodes": int(mate_guard_nodes),
+        "mate_guard_time_fraction": float(mate_guard_time_fraction),
         "q_tiebreak": bool(q_tiebreak),
         "q_tiebreak_min_visits": int(q_tiebreak_min_visits),
         "q_tiebreak_p_ratio": float(q_tiebreak_p_ratio),
@@ -704,13 +713,10 @@ def parse_args():
     parser.add_argument("--mcts-batch-size", type=int, default=32)
     parser.add_argument("--movetime-ms", type=int, default=5000)
     parser.add_argument("--c-puct", type=float, default=1.5)
-    parser.add_argument("--alpha-beta-depth", type=int, default=4)
-    parser.add_argument("--alpha-beta-topk", type=int, default=4)
-    parser.add_argument("--alpha-beta-nodes", type=int, default=20000)
-    parser.add_argument("--alpha-beta-quiescence", type=int, default=3)
-    parser.add_argument("--alpha-beta-margin", type=float, default=0.10)
-    parser.add_argument("--alpha-beta-time-fraction", type=float, default=0.25)
     parser.add_argument("--mate-guard-plies", type=int, default=3)
+    parser.add_argument("--mate-guard-topk", type=int, default=8)
+    parser.add_argument("--mate-guard-nodes", type=int, default=20000)
+    parser.add_argument("--mate-guard-time-fraction", type=float, default=0.10)
     parser.add_argument("--q-tiebreak", action="store_true", default=True)
     parser.add_argument("--no-q-tiebreak", dest="q_tiebreak", action="store_false")
     parser.add_argument("--q-tiebreak-min-visits", type=int, default=32)
@@ -751,13 +757,10 @@ def main():
         mcts_batch_size=args.mcts_batch_size,
         movetime_ms=args.movetime_ms,
         c_puct=args.c_puct,
-        alpha_beta_depth=args.alpha_beta_depth,
-        alpha_beta_topk=args.alpha_beta_topk,
-        alpha_beta_nodes=args.alpha_beta_nodes,
-        alpha_beta_quiescence=args.alpha_beta_quiescence,
-        alpha_beta_margin=args.alpha_beta_margin,
-        alpha_beta_time_fraction=args.alpha_beta_time_fraction,
         mate_guard_plies=args.mate_guard_plies,
+        mate_guard_topk=args.mate_guard_topk,
+        mate_guard_nodes=args.mate_guard_nodes,
+        mate_guard_time_fraction=args.mate_guard_time_fraction,
         q_tiebreak=args.q_tiebreak,
         q_tiebreak_min_visits=args.q_tiebreak_min_visits,
         q_tiebreak_p_ratio=args.q_tiebreak_p_ratio,

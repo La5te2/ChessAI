@@ -339,13 +339,14 @@ def search_options_from_args(args, evaluation=False):
         mcts_batch_size=batch,
         time_limit=(movetime_ms / 1000.0) if movetime_ms > 0 else None,
         c_puct=search_arg(args, "c_puct", evaluation),
-        alpha_beta_depth=search_arg(args, "alpha_beta_depth", evaluation),
-        alpha_beta_topk=search_arg(args, "alpha_beta_topk", evaluation),
-        alpha_beta_nodes=search_arg(args, "alpha_beta_nodes", evaluation),
-        alpha_beta_quiescence=search_arg(args, "alpha_beta_quiescence", evaluation),
-        alpha_beta_margin=search_arg(args, "alpha_beta_margin", evaluation),
-        alpha_beta_time_fraction=search_arg(args, "alpha_beta_time_fraction", evaluation),
         mate_guard_plies=search_arg(args, "mate_guard_plies", evaluation),
+        mate_guard_topk=search_arg(args, "mate_guard_topk", evaluation),
+        mate_guard_nodes=search_arg(args, "mate_guard_nodes", evaluation),
+        mate_guard_time_fraction=search_arg(
+            args,
+            "mate_guard_time_fraction",
+            evaluation,
+        ),
         q_tiebreak=search_arg(args, "q_tiebreak", evaluation),
         q_tiebreak_min_visits=search_arg(args, "q_tiebreak_min_visits", evaluation),
         q_tiebreak_p_ratio=search_arg(args, "q_tiebreak_p_ratio", evaluation),
@@ -701,11 +702,14 @@ def generate_selflearn_data(args, model_path, output_path, iteration):
         "teacher_label_topk": int(args.teacher_label_topk),
         "teacher_label_min_weight": float(args.teacher_label_min_weight),
         "truncate_adjudication_cp": int(args.truncate_adjudication_cp),
-        "search_type": "uncertainty_mcts_alpha_beta",
+        "search_type": "mcts_mate_guard",
         "move_selection": "top1",
         "target_policy_base": "top1_teacher_labeled_topk",
         "sims_soft_cap": int(args.sims),
         "mate_guard_plies": int(args.mate_guard_plies),
+        "mate_guard_topk": int(args.mate_guard_topk),
+        "mate_guard_nodes": int(args.mate_guard_nodes),
+        "mate_guard_time_fraction": float(args.mate_guard_time_fraction),
         "q_tiebreak": bool(args.q_tiebreak),
         "q_tiebreak_min_visits": int(args.q_tiebreak_min_visits),
         "q_tiebreak_p_ratio": float(args.q_tiebreak_p_ratio),
@@ -1049,21 +1053,14 @@ def regression_validation(model, cases, args, label="model"):
             else None
         ),
         c_puct=search_arg(args, "c_puct", evaluation=True),
-        alpha_beta_depth=search_arg(args, "alpha_beta_depth", evaluation=True),
-        alpha_beta_topk=search_arg(args, "alpha_beta_topk", evaluation=True),
-        alpha_beta_nodes=search_arg(args, "alpha_beta_nodes", evaluation=True),
-        alpha_beta_quiescence=search_arg(
-            args,
-            "alpha_beta_quiescence",
-            evaluation=True,
-        ),
-        alpha_beta_margin=search_arg(args, "alpha_beta_margin", evaluation=True),
-        alpha_beta_time_fraction=search_arg(
-            args,
-            "alpha_beta_time_fraction",
-            evaluation=True,
-        ),
         mate_guard_plies=search_arg(args, "mate_guard_plies", evaluation=True),
+        mate_guard_topk=search_arg(args, "mate_guard_topk", evaluation=True),
+        mate_guard_nodes=search_arg(args, "mate_guard_nodes", evaluation=True),
+        mate_guard_time_fraction=search_arg(
+            args,
+            "mate_guard_time_fraction",
+            evaluation=True,
+        ),
         q_tiebreak=search_arg(args, "q_tiebreak", evaluation=True),
         q_tiebreak_min_visits=search_arg(
             args,
@@ -1252,21 +1249,14 @@ def validate_candidate(
         mcts_batch_size=args.eval_mcts_batch_size,
         movetime_ms=args.eval_movetime_ms,
         c_puct=search_arg(args, "c_puct", evaluation=True),
-        alpha_beta_depth=search_arg(args, "alpha_beta_depth", evaluation=True),
-        alpha_beta_topk=search_arg(args, "alpha_beta_topk", evaluation=True),
-        alpha_beta_nodes=search_arg(args, "alpha_beta_nodes", evaluation=True),
-        alpha_beta_quiescence=search_arg(
-            args,
-            "alpha_beta_quiescence",
-            evaluation=True,
-        ),
-        alpha_beta_margin=search_arg(args, "alpha_beta_margin", evaluation=True),
-        alpha_beta_time_fraction=search_arg(
-            args,
-            "alpha_beta_time_fraction",
-            evaluation=True,
-        ),
         mate_guard_plies=search_arg(args, "mate_guard_plies", evaluation=True),
+        mate_guard_topk=search_arg(args, "mate_guard_topk", evaluation=True),
+        mate_guard_nodes=search_arg(args, "mate_guard_nodes", evaluation=True),
+        mate_guard_time_fraction=search_arg(
+            args,
+            "mate_guard_time_fraction",
+            evaluation=True,
+        ),
         q_tiebreak=search_arg(args, "q_tiebreak", evaluation=True),
         q_tiebreak_min_visits=search_arg(
             args,
@@ -1446,13 +1436,10 @@ def parse_args():
     parser.add_argument("--movetime-ms", type=int, default=5000)
     parser.add_argument("--c-puct", type=float, default=1.5)
 
-    parser.add_argument("--alpha-beta-depth", type=int, default=4)
-    parser.add_argument("--alpha-beta-topk", type=int, default=4)
-    parser.add_argument("--alpha-beta-nodes", type=int, default=20000)
-    parser.add_argument("--alpha-beta-quiescence", type=int, default=3)
-    parser.add_argument("--alpha-beta-margin", type=float, default=0.10)
-    parser.add_argument("--alpha-beta-time-fraction", type=float, default=0.25)
     parser.add_argument("--mate-guard-plies", type=int, default=3)
+    parser.add_argument("--mate-guard-topk", type=int, default=8)
+    parser.add_argument("--mate-guard-nodes", type=int, default=20000)
+    parser.add_argument("--mate-guard-time-fraction", type=float, default=0.10)
     parser.add_argument("--q-tiebreak", action="store_true", default=True)
     parser.add_argument("--no-q-tiebreak", dest="q_tiebreak", action="store_false")
     parser.add_argument("--q-tiebreak-min-visits", type=int, default=32)
@@ -1571,17 +1558,10 @@ def parse_args():
     parser.add_argument("--eval-mcts-batch-size", type=int, default=32)
     parser.add_argument("--eval-movetime-ms", type=int, default=5000)
     parser.add_argument("--eval-c-puct", type=float, default=None)
-    parser.add_argument("--eval-alpha-beta-depth", type=int, default=None)
-    parser.add_argument("--eval-alpha-beta-topk", type=int, default=None)
-    parser.add_argument("--eval-alpha-beta-nodes", type=int, default=None)
-    parser.add_argument("--eval-alpha-beta-quiescence", type=int, default=None)
-    parser.add_argument("--eval-alpha-beta-margin", type=float, default=None)
-    parser.add_argument(
-        "--eval-alpha-beta-time-fraction",
-        type=float,
-        default=None,
-    )
     parser.add_argument("--eval-mate-guard-plies", type=int, default=None)
+    parser.add_argument("--eval-mate-guard-topk", type=int, default=None)
+    parser.add_argument("--eval-mate-guard-nodes", type=int, default=None)
+    parser.add_argument("--eval-mate-guard-time-fraction", type=float, default=None)
     parser.add_argument(
         "--eval-q-tiebreak",
         dest="eval_q_tiebreak",

@@ -41,13 +41,10 @@ class EngineConfig:
     mcts_batch_size: int = 32
     movetime_ms: int = 3000
     c_puct: float = 1.5
-    alpha_beta_depth: int = 4
-    alpha_beta_topk: int = 4
-    alpha_beta_nodes: int = 20000
-    alpha_beta_quiescence: int = 3
-    alpha_beta_margin: float = 0.10
-    alpha_beta_time_fraction: float = 0.25
     mate_guard_plies: int = 3
+    mate_guard_topk: int = 8
+    mate_guard_nodes: int = 20000
+    mate_guard_time_fraction: float = 0.10
     q_tiebreak: bool = True
     q_tiebreak_min_visits: int = 32
     q_tiebreak_p_ratio: float = 0.90
@@ -74,13 +71,10 @@ SEARCH_PARAMETER_TYPES = {
     "mcts_batch_size": int,
     "movetime_ms": int,
     "c_puct": float,
-    "alpha_beta_depth": int,
-    "alpha_beta_topk": int,
-    "alpha_beta_nodes": int,
-    "alpha_beta_quiescence": int,
-    "alpha_beta_margin": float,
-    "alpha_beta_time_fraction": float,
     "mate_guard_plies": int,
+    "mate_guard_topk": int,
+    "mate_guard_nodes": int,
+    "mate_guard_time_fraction": float,
     "q_tiebreak": bool_from_text,
     "q_tiebreak_min_visits": int,
     "q_tiebreak_p_ratio": float,
@@ -183,13 +177,10 @@ class ChessEngine:
                 else None
             ),
             c_puct=self.config.c_puct,
-            alpha_beta_depth=self.config.alpha_beta_depth,
-            alpha_beta_topk=self.config.alpha_beta_topk,
-            alpha_beta_nodes=self.config.alpha_beta_nodes,
-            alpha_beta_quiescence=self.config.alpha_beta_quiescence,
-            alpha_beta_margin=self.config.alpha_beta_margin,
-            alpha_beta_time_fraction=self.config.alpha_beta_time_fraction,
             mate_guard_plies=self.config.mate_guard_plies,
+            mate_guard_topk=self.config.mate_guard_topk,
+            mate_guard_nodes=self.config.mate_guard_nodes,
+            mate_guard_time_fraction=self.config.mate_guard_time_fraction,
             q_tiebreak=self.config.q_tiebreak,
             q_tiebreak_min_visits=self.config.q_tiebreak_min_visits,
             q_tiebreak_p_ratio=self.config.q_tiebreak_p_ratio,
@@ -236,11 +227,9 @@ class ChessEngine:
                     "mcts_min_sims",
                     "mcts_batch_size",
                     "movetime_ms",
-                    "alpha_beta_depth",
-                    "alpha_beta_topk",
-                    "alpha_beta_nodes",
-                    "alpha_beta_quiescence",
                     "mate_guard_plies",
+                    "mate_guard_topk",
+                    "mate_guard_nodes",
                     "q_tiebreak_min_visits",
                     "root_topn",
                 } and value < 0:
@@ -260,11 +249,11 @@ class ChessEngine:
                 if name == "q_tiebreak_margin" and value < 0.0:
                     raise ValueError("q_tiebreak_margin must be non-negative")
                 if (
-                    name == "alpha_beta_time_fraction"
-                    and not 0.0 <= value <= 0.9
+                    name == "mate_guard_time_fraction"
+                    and not 0.0 <= value <= 0.5
                 ):
                     raise ValueError(
-                        "alpha_beta_time_fraction must be between 0 and 0.9"
+                        "mate_guard_time_fraction must be between 0 and 0.5"
                     )
                 setattr(self.config, name, value)
 
@@ -653,13 +642,10 @@ class ModelSettingsDialog(tk.Toplevel):
             "mcts_batch_size": "MCTS batch size",
             "movetime_ms": "Movetime (ms)",
             "c_puct": "C-PUCT",
-            "alpha_beta_depth": "Alpha-Beta depth",
-            "alpha_beta_topk": "Alpha-Beta root candidates",
-            "alpha_beta_nodes": "Alpha-Beta node cap",
-            "alpha_beta_quiescence": "Quiescence depth",
-            "alpha_beta_margin": "Alpha-Beta override margin",
-            "alpha_beta_time_fraction": "Alpha-Beta time fraction",
             "mate_guard_plies": "Mate guard plies",
+            "mate_guard_topk": "Mate guard root candidates",
+            "mate_guard_nodes": "Mate guard node cap",
+            "mate_guard_time_fraction": "Mate guard time fraction",
             "q_tiebreak": "Q tiebreak",
             "q_tiebreak_min_visits": "Q tiebreak min visits",
             "q_tiebreak_p_ratio": "Q tiebreak p ratio",
@@ -1082,9 +1068,10 @@ class ChessBoardApp:
             f"Value: {info.get('value')}\n"
             f"Expanded nodes: {info.get('nodes')}\n"
             f"NN batches: {info.get('nn_batches')}\n"
-            f"Alpha-Beta nodes: {info.get('alpha_beta_nodes')}\n"
-            f"Alpha-Beta override: "
-            f"{info.get('alpha_beta_overrode_mcts')}\n"
+            f"Mate guard nodes: {info.get('mate_guard_nodes')}\n"
+            f"Mate guard completed: {info.get('mate_guard_completed')}\n"
+            f"Mate guard forced: {info.get('mate_guard_forced_move')}\n"
+            f"Mate guard banned: {info.get('mate_guard_banned_moves')}\n"
             f"Q tiebreak: {info.get('q_tiebreak_overrode')} "
             f"{info.get('q_tiebreak_move')}\n"
             f"Elapsed: {info.get('elapsed_ms')} ms\n"
@@ -1859,17 +1846,10 @@ def parse_args():
     parser.add_argument("--mcts-batch-size", type=int, default=32)
     parser.add_argument("--movetime-ms", type=int, default=3000)
     parser.add_argument("--c-puct", type=float, default=1.5)
-    parser.add_argument("--alpha-beta-depth", type=int, default=4)
-    parser.add_argument("--alpha-beta-topk", type=int, default=4)
-    parser.add_argument("--alpha-beta-nodes", type=int, default=20000)
-    parser.add_argument("--alpha-beta-quiescence", type=int, default=3)
-    parser.add_argument("--alpha-beta-margin", type=float, default=0.10)
-    parser.add_argument(
-        "--alpha-beta-time-fraction",
-        type=float,
-        default=0.25,
-    )
     parser.add_argument("--mate-guard-plies", type=int, default=3)
+    parser.add_argument("--mate-guard-topk", type=int, default=8)
+    parser.add_argument("--mate-guard-nodes", type=int, default=20000)
+    parser.add_argument("--mate-guard-time-fraction", type=float, default=0.10)
     parser.add_argument("--q-tiebreak", action="store_true", default=True)
     parser.add_argument("--no-q-tiebreak", dest="q_tiebreak", action="store_false")
     parser.add_argument("--q-tiebreak-min-visits", type=int, default=32)
@@ -1891,13 +1871,10 @@ def main():
         mcts_batch_size=args.mcts_batch_size,
         movetime_ms=args.movetime_ms,
         c_puct=args.c_puct,
-        alpha_beta_depth=args.alpha_beta_depth,
-        alpha_beta_topk=args.alpha_beta_topk,
-        alpha_beta_nodes=args.alpha_beta_nodes,
-        alpha_beta_quiescence=args.alpha_beta_quiescence,
-        alpha_beta_margin=args.alpha_beta_margin,
-        alpha_beta_time_fraction=args.alpha_beta_time_fraction,
         mate_guard_plies=args.mate_guard_plies,
+        mate_guard_topk=args.mate_guard_topk,
+        mate_guard_nodes=args.mate_guard_nodes,
+        mate_guard_time_fraction=args.mate_guard_time_fraction,
         q_tiebreak=args.q_tiebreak,
         q_tiebreak_min_visits=args.q_tiebreak_min_visits,
         q_tiebreak_p_ratio=args.q_tiebreak_p_ratio,

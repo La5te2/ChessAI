@@ -55,13 +55,10 @@ SIMS=64
 MCTS_BATCH_SIZE=64
 MOVETIME_MS=1000
 C_PUCT=0.5
-ALPHA_BETA_DEPTH=3
-ALPHA_BETA_TOPK=4
-ALPHA_BETA_NODES=20000
-ALPHA_BETA_QUIESCENCE=2
-ALPHA_BETA_MARGIN=0.02
-ALPHA_BETA_TIME_FRACTION=0.20
 MATE_GUARD_PLIES=3
+MATE_GUARD_TOPK=8
+MATE_GUARD_NODES=20000
+MATE_GUARD_TIME_FRACTION=0.10
 Q_TIEBREAK_MIN_VISITS=32
 Q_TIEBREAK_P_RATIO=0.9
 Q_TIEBREAK_VISIT_RATIO=0.9
@@ -114,7 +111,7 @@ echo "selflearn start"
 echo "selflearn model: ${MODEL}"
 echo "selflearn data: games_per_iter=${GAMES_PER_ITER} iterations=${ITERATIONS} opening_book=${OPENING_BOOK} max_book_positions=${MAX_BOOK_POSITIONS}"
 echo "selflearn workers: parallel=${PARALLEL} train_workers=${TRAIN_WORKERS} device=${DEVICE}"
-echo "selflearn search: sims=${SIMS} movetime_ms=${MOVETIME_MS} c_puct=${C_PUCT} alpha_beta=${ALPHA_BETA_DEPTH}/${ALPHA_BETA_TOPK}/${ALPHA_BETA_NODES}/${ALPHA_BETA_QUIESCENCE} ab_time_fraction=${ALPHA_BETA_TIME_FRACTION} mate_guard_plies=${MATE_GUARD_PLIES}"
+echo "selflearn search: sims=${SIMS} movetime_ms=${MOVETIME_MS} c_puct=${C_PUCT} mate_guard=${MATE_GUARD_PLIES}/${MATE_GUARD_TOPK}/${MATE_GUARD_NODES} mate_guard_time_fraction=${MATE_GUARD_TIME_FRACTION}"
 echo "selflearn move selection: deterministic top1"
 echo "selflearn teacher: uci_depth=${UCI_DEPTH} uci_multipv=${UCI_MULTIPV} uci_threads=${UCI_THREADS} label_topk=${TEACHER_LABEL_TOPK} label_min_weight=${TEACHER_LABEL_MIN_WEIGHT} veto_regret_cp=${TEACHER_VETO_REGRET_CP} veto_min_weight=${TEACHER_VETO_MIN_WEIGHT}"
 echo "selflearn train: epochs_per_iter=${EPOCHS_PER_ITER} train_max_steps=${TRAIN_MAX_STEPS} batch_size=${BATCH_SIZE} replay_window=${REPLAY_WINDOW} lr=${LR} supervised_weight=${SUPERVISED_WEIGHT} kl_weight=${KL_WEIGHT}"
@@ -138,13 +135,10 @@ exec python src/selflearn.py \
   --mcts-batch-size "${MCTS_BATCH_SIZE}" \
   --movetime-ms "${MOVETIME_MS}" \
   --c-puct "${C_PUCT}" \
-  --alpha-beta-depth "${ALPHA_BETA_DEPTH}" \
-  --alpha-beta-topk "${ALPHA_BETA_TOPK}" \
-  --alpha-beta-nodes "${ALPHA_BETA_NODES}" \
-  --alpha-beta-quiescence "${ALPHA_BETA_QUIESCENCE}" \
-  --alpha-beta-margin "${ALPHA_BETA_MARGIN}" \
-  --alpha-beta-time-fraction "${ALPHA_BETA_TIME_FRACTION}" \
   --mate-guard-plies "${MATE_GUARD_PLIES}" \
+  --mate-guard-topk "${MATE_GUARD_TOPK}" \
+  --mate-guard-nodes "${MATE_GUARD_NODES}" \
+  --mate-guard-time-fraction "${MATE_GUARD_TIME_FRACTION}" \
   --q-tiebreak-min-visits "${Q_TIEBREAK_MIN_VISITS}" \
   --q-tiebreak-p-ratio "${Q_TIEBREAK_P_RATIO}" \
   --q-tiebreak-visit-ratio "${Q_TIEBREAK_VISIT_RATIO}" \
@@ -180,13 +174,10 @@ exec python src/selflearn.py \
   --eval-mcts-batch-size "${EVAL_MCTS_BATCH_SIZE}" \
   --eval-movetime-ms "${EVAL_MOVETIME_MS}" \
   --eval-c-puct "${EVAL_C_PUCT}" \
-  --eval-alpha-beta-depth "${ALPHA_BETA_DEPTH}" \
-  --eval-alpha-beta-topk "${ALPHA_BETA_TOPK}" \
-  --eval-alpha-beta-nodes "${ALPHA_BETA_NODES}" \
-  --eval-alpha-beta-quiescence "${ALPHA_BETA_QUIESCENCE}" \
-  --eval-alpha-beta-margin "${ALPHA_BETA_MARGIN}" \
-  --eval-alpha-beta-time-fraction "${ALPHA_BETA_TIME_FRACTION}" \
   --eval-mate-guard-plies "${MATE_GUARD_PLIES}" \
+  --eval-mate-guard-topk "${MATE_GUARD_TOPK}" \
+  --eval-mate-guard-nodes "${MATE_GUARD_NODES}" \
+  --eval-mate-guard-time-fraction "${MATE_GUARD_TIME_FRACTION}" \
   --eval-q-tiebreak-min-visits "${Q_TIEBREAK_MIN_VISITS}" \
   --eval-q-tiebreak-p-ratio "${Q_TIEBREAK_P_RATIO}" \
   --eval-q-tiebreak-visit-ratio "${Q_TIEBREAK_VISIT_RATIO}" \
