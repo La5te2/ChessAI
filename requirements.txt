@@ -1,0 +1,6 @@
+torch
+torchvision
+python-chess
+h5py
+tqdm
+numpy
