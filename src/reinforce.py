@@ -221,14 +221,21 @@ def step_feedback(args: Dict, result: Dict) -> Dict:
     regret_cp = int(max(0, result.get("regret_cp", best_cp - played_cp)))
     best_value = cp_to_value(best_cp)
     played_value = cp_to_value(played_cp)
+
+    regret_scale = max(1.0, float(args["regret_scale_cp"]))
     regret_norm = min(
         1.0,
-        regret_cp / max(1.0, float(args["regret_scale_cp"])),
+        regret_cp / regret_scale,
     )
-    reward = (
-        float(args["delta_weight"]) * (played_value - best_value)
-        - float(args["regret_weight"]) * regret_norm
+    accuracy = float(np.exp(-float(regret_cp) / regret_scale))
+    quality_reward = float(args["regret_weight"]) * (2.0 * accuracy - 1.0)
+    value_delta = float(args["delta_weight"]) * (played_value - best_value)
+    blunder_norm = min(
+        1.0,
+        max(0.0, float(regret_cp) - float(args["blunder_cp"])) / regret_scale,
     )
+    blunder_penalty = float(args["blunder_weight"]) * blunder_norm
+    reward = quality_reward + value_delta - blunder_penalty
     reward = max(
         -float(args["reward_clip"]),
         min(float(args["reward_clip"]), float(reward)),
@@ -238,6 +245,8 @@ def step_feedback(args: Dict, result: Dict) -> Dict:
         "best_value": float(best_value),
         "played_value": float(played_value),
         "regret_cp": float(regret_cp),
+        "accuracy": float(accuracy),
+        "regret_norm": float(regret_norm),
         "reward": float(reward),
     }
 
@@ -483,11 +492,16 @@ def merge_rollout_outputs(outputs: List[Dict]) -> Tuple[Dict, Dict]:
             results[result] = results.get(result, 0) + int(count)
 
     positions = len(rows["actions"])
+    regret_array = np.asarray(rows["regret_cp"], dtype=np.float32)
     summary = {
         "games": int(sum(item["games"] for item in summaries)),
         "positions": int(positions),
         "results": results,
-        "mean_regret_cp": float(np.mean(rows["regret_cp"])) if positions else 0.0,
+        "mean_regret_cp": float(np.mean(regret_array)) if positions else 0.0,
+        "excellent_rate": float(np.mean(regret_array <= 30.0)) if positions else 0.0,
+        "inaccuracy_rate": float(np.mean(regret_array > 50.0)) if positions else 0.0,
+        "mistake_rate": float(np.mean(regret_array > 150.0)) if positions else 0.0,
+        "blunder_rate": float(np.mean(regret_array > 300.0)) if positions else 0.0,
         "mean_reward": float(np.mean(rows["rewards"])) if positions else 0.0,
         "mean_advantage": float(np.mean(rows["advantages"])) if positions else 0.0,
         "std_advantage": float(np.std(rows["advantages"])) if positions else 0.0,
@@ -1082,19 +1096,21 @@ def build_parser():
     parser.add_argument("--reuse-rollout", action="store_true", default=True)
     parser.add_argument("--no-reuse-rollout", dest="reuse_rollout", action="store_false")
 
-    parser.add_argument("--sample-temperature", type=float, default=0.8)
+    parser.add_argument("--sample-temperature", type=float, default=0.5)
     parser.add_argument("--sample-topk", type=int, default=8)
     parser.add_argument("--sharp-check", action="store_true", default=True)
     parser.add_argument("--no-sharp-check", dest="sharp_check", action="store_false")
     parser.add_argument("--sharp-gap-cp", type=int, default=180)
-    parser.add_argument("--sharp-temperature", type=float, default=0.25)
+    parser.add_argument("--sharp-temperature", type=float, default=0.15)
     parser.add_argument("--sharp-topk", type=int, default=1)
 
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--gae-lambda", type=float, default=0.95)
-    parser.add_argument("--delta-weight", type=float, default=1.0)
-    parser.add_argument("--regret-weight", type=float, default=1.0)
-    parser.add_argument("--regret-scale-cp", type=float, default=300.0)
+    parser.add_argument("--delta-weight", type=float, default=0.35)
+    parser.add_argument("--regret-weight", type=float, default=0.70)
+    parser.add_argument("--regret-scale-cp", type=float, default=250.0)
+    parser.add_argument("--blunder-cp", type=float, default=300.0)
+    parser.add_argument("--blunder-weight", type=float, default=0.60)
     parser.add_argument("--terminal-weight", type=float, default=1.0)
     parser.add_argument("--reward-clip", type=float, default=2.0)
     parser.add_argument("--value-clip", type=float, default=2.0)

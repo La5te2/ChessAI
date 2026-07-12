@@ -32,11 +32,18 @@ OPENING_BOOK=""
 BOOK_PLIES=8
 MAX_BOOK_POSITIONS=50000
 
-SAMPLE_TEMPERATURE=0.8
-SAMPLE_TOPK=8
+SAMPLE_TEMPERATURE=0.5
+SAMPLE_TOPK=4
 SHARP_GAP_CP=100
-SHARP_TEMPERATURE=0.25
+SHARP_TEMPERATURE=0.15
 SHARP_TOPK=1
+
+DELTA_WEIGHT=0.35
+REGRET_WEIGHT=0.70
+REGRET_SCALE_CP=250
+BLUNDER_CP=300
+BLUNDER_WEIGHT=0.60
+REWARD_CLIP=2.0
 
 UCI_DEPTH=12
 UCI_MOVETIME_MS=0
@@ -72,6 +79,7 @@ echo "run_id=${RUN_ID}"
 echo "model=${MODEL}"
 echo "rollout: games_per_iter=${GAMES_PER_ITER} parallel=${PARALLEL} max_plies=${MAX_PLIES} opening=startpos"
 echo "sampling: temperature=${SAMPLE_TEMPERATURE} topk=${SAMPLE_TOPK} sharp_gap_cp=${SHARP_GAP_CP}"
+echo "reward: delta_weight=${DELTA_WEIGHT} regret_weight=${REGRET_WEIGHT} regret_scale_cp=${REGRET_SCALE_CP} blunder_cp=${BLUNDER_CP} blunder_weight=${BLUNDER_WEIGHT}"
 echo "teacher: uci=${UCI} depth=${UCI_DEPTH} multipv=${UCI_MULTIPV} threads=${UCI_THREADS}"
 echo "train: ppo_epochs=${PPO_EPOCHS} train_max_steps=${TRAIN_MAX_STEPS} batch_size=${BATCH_SIZE} critic_target=${CRITIC_TARGET}"
 echo "eval: games=${EVAL_GAMES} sims=${EVAL_SIMS} movetime_ms=${EVAL_MOVETIME_MS} opening_book=${EVAL_OPENING_BOOK}"
@@ -94,6 +102,12 @@ exec python src/reinforce.py \
   --sharp-gap-cp "${SHARP_GAP_CP}" \
   --sharp-temperature "${SHARP_TEMPERATURE}" \
   --sharp-topk "${SHARP_TOPK}" \
+  --delta-weight "${DELTA_WEIGHT}" \
+  --regret-weight "${REGRET_WEIGHT}" \
+  --regret-scale-cp "${REGRET_SCALE_CP}" \
+  --blunder-cp "${BLUNDER_CP}" \
+  --blunder-weight "${BLUNDER_WEIGHT}" \
+  --reward-clip "${REWARD_CLIP}" \
   --uci-depth "${UCI_DEPTH}" \
   --uci-movetime-ms "${UCI_MOVETIME_MS}" \
   --uci-multipv "${UCI_MULTIPV}" \
