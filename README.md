@@ -55,6 +55,7 @@ ChessAI/
 │   ├── regression.py
 │   ├── selflearn.py
 │   ├── reinforce.py
+│   ├── analyze.py
 │   └── board.py
 ├── run_selflearn.sh
 ├── run_reinforce.sh
@@ -185,6 +186,10 @@ FEN
 
 `Reset FEN` 输入框接收完整 FEN。空输入恢复 `startpos`。
 
+### 1.9 PGN 棋谱分析
+
+`analyze.py` 使用 Stockfish 按 PGN 主线逐手分析，输出同目录同名 `.cmt` 报告。报告包含 Summary、Main Reading、Critical Moves、Full Move Table 和关键行候选走法。`--critical-threshold-cp` 默认 50，贴合 `?!` 起点；mate 编码行会在摘要中单独说明。
+
 ---
 
 ## 2. 安装依赖
@@ -223,17 +228,18 @@ python src/opening_book.py \
   --book-plies 8 \
   --min-fens 50000 \
   --uci-depth 12 \
+  --uci-movetime-ms 0 \
   --uci-threads 4 \
   --uci-hash-mb 512 \
   --log-every 1000
 ```
 
-`--verify` 使用 Stockfish 评估 Polyglot book 的可达开局。`abs(white_cp) <= --max-abs-cp` 的路径会写入输出 book。`--book-plies` 控制开局深度，`--min-fens` 控制输出 `.bin` 按同一开局深度可展开出的 selflearn unique opening state 下限。
+`--verify` 使用 Stockfish 评估 Polyglot book 的可达开局。`abs(white_cp) <= --max-abs-cp` 的路径会写入输出 book。`--book-plies` 控制开局深度，`--min-fens` 控制输出 `.bin` 按同一开局深度可展开出的 unique opening state 下限；selflearn 和 arena 读取 book 时使用同一类 state 去分配起始局面。
 
 Windows 本地 Stockfish 示例：
 
 ```powershell
-python src/opening_book.py --verify data/openings.bin --uci models/stockfish/stockfish.exe --output data/openings.bal.local.bin --min-fens 200 --uci-depth 8 --log-every 20
+python src/opening_book.py --verify data/openings.bin --uci models/stockfish/stockfish.exe --output data/openings.bal.local.bin --min-fens 200 --uci-depth 8 --uci-movetime-ms 0 --log-every 20
 ```
 
 `--in-place` 会备份原 book 并写回原路径。
@@ -249,18 +255,23 @@ python src/opening_book.py \
   --book-plies 8 \
   --min-fens 50000 \
   --uci-depth 10 \
+  --uci-movetime-ms 0 \
   --uci-threads 4 \
   --uci-hash-mb 512 \
   --log-every 1000
 ```
 
-`--pgn` 从 PGN 主线开局中筛选均势路径，并写入到达 endpoint FEN 的 Polyglot entry。省略 `--output` 时写入 `data/openings.gen.bin`。
+`--pgn` 从 PGN 主线开局中筛选均势路径，并写入到达 endpoint FEN 的 Polyglot entry。默认输出路径为 `data/openings.gen.bin`。`--uci-depth`、`--uci-movetime-ms`、`--uci-threads` 和 `--uci-hash-mb` 传给 UCI 引擎；当前脚本按 Stockfish 常用选项配置。
 
 脚本入口：
 
 ```bash
 bash run_opening.sh data/games.pgn 50000 data/openings.gen.bin
 ```
+
+`run_opening.sh` 也读取环境变量：`PGN`、`MIN_FENS`、`OUTPUT`、`UCI`、`MAX_ABS_CP`、`BOOK_PLIES`、`UCI_DEPTH`、`UCI_MOVETIME_MS`、`UCI_THREADS`、`UCI_HASH_MB` 和 `LOG_EVERY`。
+
+Opening book 生成和验证会打印 `accepted_fens`、`readable_fens`、`unique_entries` 和拒绝统计。写出 `.bin` 后会重新展开校验，`readable_fens` 达到 `--min-fens` 后完成。`--opening-book ""` 在 selflearn、reinforce eval 和 arena 中表示从标准初始局面开始。
 
 ### 2.2 控制台输出
 
@@ -319,7 +330,7 @@ python src/preprocess.py \
 
 ---
 
-## 4. HDF5 检查
+## 4. 数据检查与 PGN 分析
 
 监督训练数据：
 
@@ -342,6 +353,25 @@ Actor-critic rollout 数据：
 python src/inspection.py \
   data/runs/<run-id>/rollout_iter_001.h5
 ```
+
+PGN 主线逐手分析：
+
+```bash
+python src/analyze.py \
+  --input data/user-pgn/1.pgn \
+  --uci models/stockfish/stockfish \
+  --uci-depth 14 \
+  --uci-multipv 5 \
+  --uci-threads 4
+```
+
+Windows 本地 Stockfish 示例：
+
+```powershell
+python src/analyze.py --input data/user-pgn/1.pgn --uci models/stockfish/stockfish.exe --uci-depth 14 --uci-multipv 5 --uci-threads 4
+```
+
+输出文件使用输入文件同路径同名 `.cmt`，例如 `data/user-pgn/1.cmt`。报告包含开局信息、全局摘要、关键问题手、完整逐手表格和关键行候选走法。`--critical-threshold-cp` 控制进入 Critical Moves 的 regret 下限，默认 50；`--top-moves` 控制每个关键行展示的 Stockfish 候选数量，默认 3。
 
 ---
 
@@ -484,10 +514,13 @@ python src/arena.py \
   --uci-multipv 8 \
   --uci-threads 4 \
   --uci-hash-mb 512 \
+  --teacher-cache data/runs/arena_teacher_cache.sqlite \
+  --quality-loss-cap-cp 1000 \
+  --pgn-output data/runs/chessnet2_vs_chessnet1.pgn \
   --log-every 1000
 ```
 
-命令输出配对对局结果和双方走法质量指标。
+arena 使用 paired openings：同一个起始局面会交换双方颜色各下一局；`--games 100` 会消耗 50 个 unique start positions。`--opening-book ""` 使用标准初始局面并轮换 candidate 执白/执黑。`--workers` 同时作用于模型对局和 Stockfish move-quality 分析；每个 worker 使用独立的 teacher cache 分片。`--pgn-output` 保存 arena 对局棋谱。命令输出配对对局结果、双方 ACPL / accuracy / blunder 质量指标，以及 `accepted` 所需的验收字段。
 
 ---
 
@@ -660,31 +693,37 @@ python src/reinforce.py \
   --supervised-data data/games.h5 \
   --uci models/stockfish/stockfish \
   --device cuda \
-  --iterations 1 \
+  --iterations 10 \
   --games-per-iter 500 \
   --parallel 10 \
   --max-plies 150 \
   --opening-book "" \
   --book-plies 8 \
   --max-book-positions 50000 \
-  --sample-temperature 0.8 \
-  --sample-topk 8 \
-  --sharp-gap-cp 180 \
-  --sharp-temperature 0.25 \
+  --sample-temperature 0.25 \
+  --sample-topk 4 \
+  --sharp-gap-cp 60 \
+  --sharp-temperature 0.10 \
   --sharp-topk 1 \
-  --uci-depth 8 \
+  --delta-weight 0.20 \
+  --regret-weight 0.70 \
+  --regret-scale-cp 100 \
+  --blunder-cp 150 \
+  --blunder-weight 0.70 \
+  --reward-clip 2.0 \
+  --uci-depth 12 \
   --uci-movetime-ms 0 \
-  --uci-multipv 6 \
+  --uci-multipv 4 \
   --uci-threads 1 \
   --uci-hash-mb 512 \
-  --ppo-epochs 4 \
-  --train-max-steps 2000 \
+  --ppo-epochs 25 \
+  --train-max-steps 2500 \
   --batch-size 256 \
   --train-workers 4 \
-  --lr 0.00001 \
+  --lr 0.00005 \
   --supervised-weight 0.35 \
   --kl-weight 0.10 \
-  --entropy-weight 0.01 \
+  --entropy-weight 0.005 \
   --critic-target teacher \
   --eval-games 100 \
   --eval-sims 64 \
@@ -699,7 +738,9 @@ python src/reinforce.py \
   --seed 2026
 ```
 
-Actor-critic 采样由模型自身 policy 决定：`--opening-book ""` 表示 rollout 从 startpos 开始；`--sample-temperature` 控制探索温度，`--sample-topk` 控制采样候选范围。`--sharp-check` 会让 Stockfish 先评估当前局面；当最佳与次佳分差达到 `--sharp-gap-cp`，采样温度切到 `--sharp-temperature`，采样范围切到 `--sharp-topk`。教师评价实际落子后生成 regret、played value、teacher value 和 shaped reward。训练阶段使用 PPO clipped policy loss、critic value loss、entropy bonus、KL reference 和监督辅助项。`--critic-target teacher` 使用教师 value 训练 value head。验收对局通过 `--eval-opening-book` 使用开局书，并由 arena 调用 search 参数完成对战。
+Actor-critic 采样由模型自身 policy 决定：`--opening-book ""` 表示 rollout 从 startpos 开始；rollout 阶段直接按 policy 温度采样落子，并记录 behavior mask、behavior temperature、old log probability 和 old value。`--sample-temperature` 控制探索温度，`--sample-topk` 控制采样候选范围。`--sharp-check` 会让 Stockfish 先评估当前局面；当最佳与次佳分差达到 `--sharp-gap-cp`，采样温度切到 `--sharp-temperature`，采样范围切到 `--sharp-topk`。教师评价实际落子后生成 regret、played value、teacher value 和 shaped reward；教师机负责评价和裁定，rollout 落子仍来自模型。当前 reward 使用连续 `regret_cp`：`--regret-scale-cp 100` 让约 70cp 的亏损进入负反馈区间，`--blunder-cp 150` 让明显错误进入额外惩罚区间，`--delta-weight 0.20` 控制 played value 与 best value 的差值权重。达到 `--max-plies` 的 rollout 对局由 Stockfish 按当前局面 value 裁定结果。训练阶段使用 PPO clipped policy loss、critic value loss、entropy bonus、KL reference 和监督辅助项。`--critic-target teacher` 使用教师 value 训练 value head。验收对局通过 `--eval-opening-book` 使用开局书，并由 arena 调用 search 参数完成对战。
+
+reinforce 的 arena gate 使用当前 run 的 `current.pth` 作为 baseline，`candidate_iter_*.pth` 作为 candidate。`result_ok` 要求 `net_wins >= --eval-min-net-wins`；`quality_ok` 要求 candidate 的 ACPL 低于 baseline 且 accuracy 高于 baseline，阈值由 `--eval-min-acpl-improvement` 和 `--eval-min-accuracy-improvement` 控制，脚本当前使用默认 `0.0`。通过 gate 后，candidate 写回本次 run 的 `models/runs/<run-id>/current.pth`。
 
 同一 run-id 下已有 `rollout_iter_*.h5` 时，脚本默认复用该 rollout 并从训练阶段继续执行；传入 `--no-reuse-rollout` 会重新生成 rollout。
 

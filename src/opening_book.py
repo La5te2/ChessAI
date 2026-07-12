@@ -783,8 +783,7 @@ def parse_args():
     parser.add_argument("--output", default=None)
     parser.add_argument("--in-place", action="store_true", default=False)
     parser.add_argument("--max-abs-cp", type=int, default=80)
-    parser.add_argument("--min-fens", type=int, default=None)
-    parser.add_argument("--max-fens", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--min-fens", type=int, default=DEFAULT_MIN_FENS)
     parser.add_argument("--book-plies", type=int, default=8)
     parser.add_argument("--min-weight", type=int, default=1)
     parser.add_argument("--uci-depth", type=int, default=12)
@@ -793,8 +792,6 @@ def parse_args():
     parser.add_argument("--uci-hash-mb", type=int, default=512)
     parser.add_argument("--log-every", type=int, default=100)
     args = parser.parse_args()
-    if args.min_fens is None:
-        args.min_fens = args.max_fens if args.max_fens is not None else DEFAULT_MIN_FENS
     return args
 
 
