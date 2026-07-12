@@ -252,6 +252,13 @@ def make_arena_specs(
     if games <= 0:
         return []
 
+    if not opening_book:
+        start_fen = chess.Board().fen()
+        specs: List[Tuple[str, chess.Color]] = []
+        for index in range(games):
+            specs.append((start_fen, chess.WHITE if index % 2 == 0 else chess.BLACK))
+        return specs
+
     book = OpeningBook(
         path=opening_book,
         book_plies=book_plies,

@@ -11,6 +11,7 @@ import os
 from typing import Dict, List
 
 import chess
+import chess.pgn
 import numpy as np
 
 from config import CONFIDENCE_Z, DEVICE, STOCKFISH_PATH
@@ -82,8 +83,19 @@ def play_arena_game(
     candidate_color,
     max_plies,
     start_fen,
+    game_id=None,
 ):
     board = chess.Board(start_fen)
+    game = chess.pgn.Game()
+    game.headers["Event"] = "ChessAI Arena"
+    if game_id is not None:
+        game.headers["Round"] = str(game_id)
+    game.headers["White"] = "candidate" if candidate_color == chess.WHITE else "baseline"
+    game.headers["Black"] = "baseline" if candidate_color == chess.WHITE else "candidate"
+    if start_fen != chess.Board().fen():
+        game.headers["SetUp"] = "1"
+        game.headers["FEN"] = start_fen
+    node = game
     trace = []
     ply = 0
 
@@ -103,17 +115,20 @@ def play_arena_game(
             "move": move.uci(),
             "owner": "candidate" if candidate_turn else "baseline",
         })
+        node = node.add_variation(move)
         board.push(move)
         ply += 1
 
     result_string = board.result(claim_draw=True)
     if result_string == "*":
         result_string = "1/2-1/2"
+    game.headers["Result"] = result_string
     return (
         result_string,
         score_from_result(result_string, candidate_color),
         ply,
         trace,
+        str(game),
     )
 
 
@@ -176,21 +191,24 @@ def _worker(job):
     raw_results = {}
     plies_total = 0
     traces = []
+    pgns = []
 
     total_specs = len(specs)
     for game_index, (fen, candidate_color) in enumerate(specs, 1):
-        result, score, plies, trace = play_arena_game(
+        result, score, plies, trace, pgn = play_arena_game(
             candidate_searcher,
             baseline_searcher,
             candidate_color,
             max_plies,
             fen,
+            game_index,
         )
         scores.append(score)
         counts[outcome_from_score(score)] += 1
         raw_results[result] = raw_results.get(result, 0) + 1
         plies_total += plies
         traces.extend(trace)
+        pgns.append(pgn)
         progress_print(
             progress,
             f"arena worker {worker_index}: game {game_index}/{total_specs} "
@@ -204,6 +222,7 @@ def _worker(job):
         "raw_results": raw_results,
         "plies_total": plies_total,
         "traces": traces,
+        "pgns": pgns,
     }
 
 
@@ -378,6 +397,7 @@ def evaluate_models(
     uci_multipv=4,
     teacher_cache="data/selflearn/teacher_cache.sqlite",
     quality_loss_cap_cp=1000,
+    pgn_output=None,
     log_every=1000,
     progress=True,
 ):
@@ -456,10 +476,12 @@ def evaluate_models(
     raw_results = {}
     plies_total = 0
     traces = []
+    pgns = []
     for output in outputs:
         scores.extend(output["scores"])
         plies_total += int(output["plies_total"])
         traces.extend(output["traces"])
+        pgns.extend(output.get("pgns", []))
         for key, value in output["counts"].items():
             counts[key] += int(value)
         for key, value in output["raw_results"].items():
@@ -519,6 +541,12 @@ def evaluate_models(
         f"score={score:.3f}",
         f"elo_diff={elo_from_score(score):+.1f}",
     )
+    if pgn_output:
+        os.makedirs(os.path.dirname(pgn_output) or ".", exist_ok=True)
+        with open(pgn_output, "w", encoding="utf-8") as handle:
+            handle.write("\n\n".join(pgns))
+            handle.write("\n")
+        progress_print(progress, f"arena PGN saved: {pgn_output}")
     return {
         "candidate": candidate_path,
         "baseline": baseline_path,
@@ -582,6 +610,7 @@ def parse_args():
     parser.add_argument("--uci-multipv", type=int, default=4)
     parser.add_argument("--teacher-cache", default="data/selflearn/teacher_cache.sqlite")
     parser.add_argument("--quality-loss-cap-cp", type=int, default=1000)
+    parser.add_argument("--pgn-output", default=None)
     parser.add_argument("--log-every", type=int, default=1000)
     return parser.parse_args()
 
@@ -623,6 +652,7 @@ def main():
         uci_multipv=args.uci_multipv,
         teacher_cache=args.teacher_cache,
         quality_loss_cap_cp=args.quality_loss_cap_cp,
+        pgn_output=args.pgn_output,
         log_every=args.log_every,
         progress=True,
     )
