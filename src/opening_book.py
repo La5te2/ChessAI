@@ -59,7 +59,8 @@ def load_polyglot_positions(
         while queue and len(positions) < target:
             board, plies = queue.popleft()
             fen = board.fen()
-            visit_key = (fen, int(plies))
+            state_key = opening_state_key(fen)
+            visit_key = (state_key, int(plies))
             if visit_key in visited:
                 continue
             visited.add(visit_key)
@@ -74,9 +75,12 @@ def load_polyglot_positions(
                 rng.shuffle(entries)
 
             if plies > 0 and (plies >= max_plies or not entries):
-                if fen not in seen_positions and not board.is_game_over(claim_draw=True):
+                if (
+                    state_key not in seen_positions
+                    and not board.is_game_over(claim_draw=True)
+                ):
                     positions.append(fen)
-                    seen_positions.add(fen)
+                    seen_positions.add(state_key)
                 continue
 
             for entry in entries:
@@ -137,7 +141,8 @@ def expanded_position_count_from_moves(
     while queue and len(positions) < target:
         board, plies = queue.popleft()
         fen = board.fen()
-        visit_key = (fen, int(plies))
+        state_key = opening_state_key(fen)
+        visit_key = (state_key, int(plies))
         if visit_key in visited:
             continue
         visited.add(visit_key)
@@ -152,9 +157,12 @@ def expanded_position_count_from_moves(
             ]
 
         if plies > 0 and (plies >= max_plies or not moves):
-            if fen not in seen_positions and not board.is_game_over(claim_draw=True):
+            if (
+                state_key not in seen_positions
+                and not board.is_game_over(claim_draw=True)
+            ):
                 positions.append(fen)
-                seen_positions.add(fen)
+                seen_positions.add(state_key)
             continue
 
         for move in moves:

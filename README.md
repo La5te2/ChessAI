@@ -211,7 +211,7 @@ python src/opening_book.py \
   --log-every 1000
 ```
 
-`--verify` 使用 Stockfish 评估 Polyglot book 的可达开局。`abs(white_cp) <= --max-abs-cp` 的路径会写入输出 book。`--book-plies` 控制开局深度，`--min-fens` 控制输出 `.bin` 按同一开局深度可展开出的起始局面下限。
+`--verify` 使用 Stockfish 评估 Polyglot book 的可达开局。`abs(white_cp) <= --max-abs-cp` 的路径会写入输出 book。`--book-plies` 控制开局深度，`--min-fens` 控制输出 `.bin` 按同一开局深度可展开出的 selflearn unique opening state 下限。
 
 Windows 本地 Stockfish 示例：
 
