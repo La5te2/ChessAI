@@ -20,7 +20,7 @@ else
   else
     RUN_SUFFIX="${RANDOM}${RANDOM}"
   fi
-  SELFLEARN_RUN_ID="${RUN_ID:-run_$(date +%Y%m%d_%H%M%S)_$$_${RUN_SUFFIX}}"
+  SELFLEARN_RUN_ID="${RUN_ID:-selflearn_$(date +%Y%m%d_%H%M%S)_$$_${RUN_SUFFIX}}"
   LOG_DIR="data/runs/${SELFLEARN_RUN_ID}"
   LOG_PATH="${LOG_DIR}/info.log"
   PID_PATH="${LOG_DIR}/pid"

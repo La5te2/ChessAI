@@ -127,7 +127,7 @@ def worker_cache_path(cache_path, worker_index, worker_count):
 
 def create_run_id():
     stamp = time.strftime("%Y%m%d_%H%M%S")
-    return f"run_{stamp}_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+    return f"selflearn_{stamp}_{os.getpid()}_{uuid.uuid4().hex[:8]}"
 
 
 def normalize_run_id(run_id):

@@ -11,17 +11,28 @@ ChessAI/
 │   ├── selflearn/
 │   │   └── regression.json
 │   └── runs/
-│       └── run_YYYYMMDD_HHMMSS_pid_xxxxxxxx/
-│           ├── selflearn_iter_*.h5
-│           ├── regression.json
-│           ├── teacher_cache.sqlite
-│           └── teacher_cache.worker*.sqlite
+│       ├── selflearn_YYYYMMDD_HHMMSS_pid_suffix/
+│       │   ├── info.log
+│       │   ├── pid
+│       │   ├── selflearn_iter_*.h5
+│       │   ├── regression.json
+│       │   ├── teacher_cache.sqlite
+│       │   └── teacher_cache.worker*.sqlite
+│       └── reinforce_YYYYMMDD_HHMMSS_pid/
+│           ├── info.log
+│           ├── pid
+│           ├── rollout_iter_*.h5
+│           ├── summary_iter_*.json
+│           └── summary.json
 ├── models/
 │   ├── chessnet.pth
 │   ├── runs/
-│   │   └── run_YYYYMMDD_HHMMSS_pid_xxxxxxxx/
+│   │   ├── selflearn_YYYYMMDD_HHMMSS_pid_suffix/
+│   │   │   ├── current.pth
+│   │   │   └── selflearn_candidate_iter_*.pth
+│   │   └── reinforce_YYYYMMDD_HHMMSS_pid/
 │   │       ├── current.pth
-│   │       └── selflearn_candidate_iter_*.pth
+│   │       └── candidate_iter_*.pth
 │   └── stockfish/
 │       ├── stockfish      # Linux / 云端
 │       └── stockfish.exe  # Windows / 本地
@@ -43,12 +54,14 @@ ChessAI/
 │   ├── teacher.py
 │   ├── regression.py
 │   ├── selflearn.py
+│   ├── reinforce.py
 │   └── board.py
 ├── run_selflearn.sh
+├── run_reinforce.sh
 └── requirements.txt
 ```
 
-项目数据由监督训练 HDF5、自学习 run 目录、动态回归集、教师缓存和模型 checkpoint 组成。
+项目数据由监督训练 HDF5、自学习 run 目录、actor-critic run 目录、动态回归集、教师缓存和模型 checkpoint 组成。
 
 ---
 
@@ -149,7 +162,11 @@ FEN
 
 可接受走法由 Stockfish MultiPV 分值与容差共同确定。candidate 通过完整验收后，当前轮样例进入长期回归集。
 
-### 1.7 棋盘模拟器
+### 1.7 Teacher-Shaped Actor-Critic
+
+`reinforce.py` 是独立的 actor-critic / PPO 实验入口。模型按温度与 top-k 从自身 policy 中采样落子；Stockfish 评价当前局面的候选和实际落子，输出 regret、teacher value、played value 和 shaped reward。训练阶段使用 PPO clipped policy loss、critic value loss、entropy、KL reference 和监督辅助项。候选模型通过 arena 验收后写回本次 run 的 `current.pth`。
+
+### 1.8 棋盘模拟器
 
 `board.py` 启动后进入 `Simulator` 模式，双方按照当前行棋方轮流走子。
 
@@ -247,13 +264,14 @@ bash run_opening.sh data/games.pgn 50000 data/openings.gen.bin
 
 ### 2.2 控制台输出
 
-训练、预处理、自学习和 arena 的进度信息直接打印到控制台。
+训练、预处理、自学习、actor-critic 和 arena 的进度信息直接打印到控制台。
 
 `--log-every` 控制 step / move / preprocess game 进度行：
 
 ```text
 train step: ...
 selflearn train step: ...
+reinforce train step: ...
 regression validation: ...
 arena quality: ...
 arena quality worker ...:
@@ -262,10 +280,11 @@ preprocess progress: ...
 
 `--log-every 0` 关闭这类进度行。
 
-自学习和 arena 每局结束打印一行：
+自学习、actor-critic 和 arena 每局结束打印一行：
 
 ```text
 selflearn worker ... game ...
+reinforce game ...
 arena worker ... game ...
 ```
 
@@ -274,6 +293,8 @@ arena worker ... game ...
 ```text
 preprocess summary:
 selflearn games summary:
+reinforce rollout summary:
+reinforce arena summary:
 arena game summary:
 arena: finished 后输出最终 metrics JSON
 resume validation metrics
@@ -313,6 +334,13 @@ python src/inspection.py \
 python src/inspection.py \
   data/runs/<run-id>/selflearn_iter_1.h5 \
   --check-probabilities
+```
+
+Actor-critic rollout 数据：
+
+```bash
+python src/inspection.py \
+  data/runs/<run-id>/rollout_iter_001.h5
 ```
 
 ---
@@ -471,13 +499,10 @@ python src/arena.py \
 bash run_selflearn.sh
 ```
 
-保留控制台输出并写入日志：
+脚本默认后台运行，并把输出写入本次 run 的日志：
 
 ```bash
-mkdir -p logs
-LOG="logs/selflearn_$(date +%Y%m%d_%H%M%S).log"
-set -o pipefail
-bash run_selflearn.sh 2>&1 | tee -a "$LOG"
+tail -f data/runs/<run-id>/info.log
 ```
 
 实验参数直接写在 `run_selflearn.sh` 里。调整采样、教师、训练或验收配置时，编辑脚本中的对应数字。脚本启动时会打印本次模型、数据、worker、search、teacher、train 和 eval 摘要。
@@ -490,14 +515,15 @@ python src/selflearn.py \
   --supervised-data data/games.h5 \
   --uci models/stockfish/stockfish \
   --device cuda \
-  --iterations 1 \
-  --games-per-iter 1000 \
+  --run-id <selflearn-run-id> \
+  --iterations 5 \
+  --games-per-iter 200 \
   --parallel 10 \
   --max-plies 150 \
   --opening-book data/openings.gen.bin \
   --book-plies 8 \
-  --max-book-positions 1000 \
-  --sims 32 \
+  --max-book-positions 200 \
+  --sims 64 \
   --mcts-batch-size 64 \
   --movetime-ms 1000 \
   --c-puct 0.5 \
@@ -509,21 +535,21 @@ python src/selflearn.py \
   --alpha-beta-time-fraction 0.20 \
   --mate-guard-plies 3 \
   --q-tiebreak-min-visits 32 \
-  --q-tiebreak-p-ratio 0.85 \
-  --q-tiebreak-visit-ratio 0.85 \
+  --q-tiebreak-p-ratio 0.9 \
+  --q-tiebreak-visit-ratio 0.9 \
   --q-tiebreak-margin 0.03 \
   --uci-depth 12 \
-  --uci-multipv 6 \
-  --uci-threads 2 \
+  --uci-multipv 4 \
+  --uci-threads 1 \
   --uci-hash-mb 512 \
   --teacher-start-ply 0 \
   --teacher-every 1 \
   --teacher-sample-rate 1 \
   --teacher-label-topk 4 \
   --teacher-label-min-weight 0.20 \
-  --teacher-veto-regret-cp 200 \
-  --teacher-veto-min-weight 0.70 \
-  --epochs-per-iter 64 \
+  --teacher-veto-regret-cp 100 \
+  --teacher-veto-min-weight 0.05 \
+  --epochs-per-iter 60 \
   --train-max-steps 2500 \
   --batch-size 256 \
   --train-workers 4 \
@@ -538,8 +564,8 @@ python src/selflearn.py \
   --min-regression-accuracy 0.0 \
   --max-regression-drop 0 \
   --eval-games 100 \
-  --eval-sims 32 \
-  --eval-max-plies 180 \
+  --eval-sims 64 \
+  --eval-max-plies 150 \
   --eval-mcts-batch-size 64 \
   --eval-movetime-ms 1000 \
   --eval-c-puct 0.5 \
@@ -551,8 +577,8 @@ python src/selflearn.py \
   --eval-alpha-beta-time-fraction 0.20 \
   --eval-mate-guard-plies 3 \
   --eval-q-tiebreak-min-visits 32 \
-  --eval-q-tiebreak-p-ratio 0.85 \
-  --eval-q-tiebreak-visit-ratio 0.85 \
+  --eval-q-tiebreak-p-ratio 0.9 \
+  --eval-q-tiebreak-visit-ratio 0.9 \
   --eval-q-tiebreak-margin 0.03 \
   --eval-opening-book data/openings.gen.bin \
   --eval-book-plies 8 \
@@ -560,8 +586,8 @@ python src/selflearn.py \
   --eval-min-net-wins 0 \
   --eval-min-acpl-improvement 0.0 \
   --eval-min-accuracy-improvement 0.0 \
-  --eval-uci-depth 12 \
-  --eval-uci-multipv 6 \
+  --eval-uci-depth 16 \
+  --eval-uci-multipv 4 \
   --log-every 50
 ```
 
@@ -572,22 +598,22 @@ python src/selflearn.py \
 每次自学习运行都会生成配对的独立 run 目录：
 
 ```text
-data/runs/run_YYYYMMDD_HHMMSS_pid_xxxxxxxx/
-models/runs/run_YYYYMMDD_HHMMSS_pid_xxxxxxxx/
+data/runs/selflearn_YYYYMMDD_HHMMSS_pid_suffix/
+models/runs/selflearn_YYYYMMDD_HHMMSS_pid_suffix/
 ```
 
 run-id 默认由程序自动生成，格式为：
 
 ```text
-run_YYYYMMDD_HHMMSS_pid_xxxxxxxx
+selflearn_YYYYMMDD_HHMMSS_pid_suffix
 ```
 
-其中 `pid` 来自当前 Python 进程，末尾 8 位来自随机 UUID。相同 run-id 同时用于 `data/runs/<run-id>/` 和 `models/runs/<run-id>/`。
+其中 `pid` 来自启动进程，`suffix` 来自脚本随机值或程序 UUID。相同 run-id 同时用于 `data/runs/<run-id>/` 和 `models/runs/<run-id>/`。
 
-固定 run-id 时，在 `run_selflearn.sh` 的 `python src/selflearn.py` 参数中加入：
+固定 run-id 时：
 
 ```bash
-  --run-id experiment_001 \
+RUN_ID=selflearn_experiment_001 bash run_selflearn.sh
 ```
 
 `--model` 指定初始模型。运行开始后会复制为本次 run 的：
@@ -600,6 +626,8 @@ models/runs/<run-id>/current.pth
 
 ```text
 data/runs/<run-id>/selflearn_iter_*.h5
+data/runs/<run-id>/info.log
+data/runs/<run-id>/pid
 data/runs/<run-id>/teacher_cache.sqlite
 data/runs/<run-id>/teacher_cache.worker*.sqlite
 data/runs/<run-id>/regression.json
@@ -609,7 +637,102 @@ models/runs/<run-id>/selflearn_candidate_iter_*.pth
 
 ---
 
-## 11. GUI 棋盘模拟器
+## 11. Teacher-Shaped Actor-Critic 实验
+
+推荐使用脚本启动：
+
+```bash
+bash run_reinforce.sh
+```
+
+脚本默认后台运行，并把输出写入本次 run 的日志：
+
+```bash
+tail -f data/runs/<run-id>/info.log
+```
+
+`run_reinforce.sh` 当前展开命令：
+
+```bash
+python src/reinforce.py \
+  --run-id <reinforce-run-id> \
+  --model models/chessnet.pth \
+  --supervised-data data/games.h5 \
+  --uci models/stockfish/stockfish \
+  --device cuda \
+  --iterations 1 \
+  --games-per-iter 500 \
+  --parallel 10 \
+  --max-plies 150 \
+  --opening-book "" \
+  --book-plies 8 \
+  --max-book-positions 50000 \
+  --sample-temperature 0.8 \
+  --sample-topk 8 \
+  --sharp-gap-cp 180 \
+  --sharp-temperature 0.25 \
+  --sharp-topk 1 \
+  --uci-depth 8 \
+  --uci-movetime-ms 0 \
+  --uci-multipv 6 \
+  --uci-threads 1 \
+  --uci-hash-mb 512 \
+  --ppo-epochs 4 \
+  --train-max-steps 2000 \
+  --batch-size 256 \
+  --train-workers 4 \
+  --lr 0.00001 \
+  --supervised-weight 0.35 \
+  --kl-weight 0.10 \
+  --entropy-weight 0.01 \
+  --critic-target teacher \
+  --eval-games 100 \
+  --eval-sims 64 \
+  --eval-workers 10 \
+  --eval-max-plies 150 \
+  --eval-opening-book data/openings.gen.bin \
+  --eval-movetime-ms 1000 \
+  --eval-uci-depth 12 \
+  --eval-uci-multipv 6 \
+  --eval-min-net-wins 5 \
+  --log-every 50 \
+  --seed 2026
+```
+
+Actor-critic 采样由模型自身 policy 决定：`--opening-book ""` 表示 rollout 从 startpos 开始；`--sample-temperature` 控制探索温度，`--sample-topk` 控制采样候选范围。`--sharp-check` 会让 Stockfish 先评估当前局面；当最佳与次佳分差达到 `--sharp-gap-cp`，采样温度切到 `--sharp-temperature`，采样范围切到 `--sharp-topk`。教师评价实际落子后生成 regret、played value、teacher value 和 shaped reward。训练阶段使用 PPO clipped policy loss、critic value loss、entropy bonus、KL reference 和监督辅助项。`--critic-target teacher` 使用教师 value 训练 value head。验收对局通过 `--eval-opening-book` 使用开局书，并由 arena 调用 search 参数完成对战。
+
+同一 run-id 下已有 `rollout_iter_*.h5` 时，脚本默认复用该 rollout 并从训练阶段继续执行；传入 `--no-reuse-rollout` 会重新生成 rollout。
+
+每次 actor-critic 运行都会生成配对的独立 run 目录：
+
+```text
+data/runs/reinforce_YYYYMMDD_HHMMSS_pid/
+models/runs/reinforce_YYYYMMDD_HHMMSS_pid/
+```
+
+固定 run-id 时：
+
+```bash
+RUN_ID=reinforce_experiment_001 bash run_reinforce.sh
+```
+
+主要输出：
+
+```text
+data/runs/<run-id>/info.log
+data/runs/<run-id>/pid
+data/runs/<run-id>/rollout_iter_*.h5
+data/runs/<run-id>/summary_iter_*.json
+data/runs/<run-id>/summary.json
+models/runs/<run-id>/current.pth
+models/runs/<run-id>/candidate_iter_*.pth
+```
+
+候选通过 arena 验收后写回本次 run 的 `current.pth`。
+
+---
+
+## 12. GUI 棋盘模拟器
 
 ```bash
 python src/board.py \
@@ -680,7 +803,7 @@ python src/board.py \
 
 ---
 
-## 12. CLI 棋盘模拟器
+## 13. CLI 棋盘模拟器
 
 ```bash
 python src/board.py \
@@ -741,7 +864,7 @@ CLI 自动候选同样受 `movetime` 约束。`movetime=0` 表示时间上限关
 
 ---
 
-## 13. 空间维护
+## 14. 空间维护
 
 查看主要文件：
 
@@ -756,11 +879,13 @@ find . -type d -name "__pycache__" -prune -exec rm -rf {} +
 find . -type f -name "*.pyc" -delete
 ```
 
-清理自学习 run 目录：
+清理 run 目录：
 
 ```bash
-rm -rf data/runs/run_*
-rm -rf models/runs/run_*
+rm -rf data/runs/selflearn_*
+rm -rf data/runs/reinforce_*
+rm -rf models/runs/selflearn_*
+rm -rf models/runs/reinforce_*
 ```
 
 清理临时候选模型：
