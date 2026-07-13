@@ -199,6 +199,92 @@ def load_fens(args, iteration: int) -> List[str]:
     )
 
 
+def arena_trace_path(data_run_dir: str, iteration: int) -> str:
+    return os.path.join(data_run_dir, f"arena_trace_iter_{int(iteration):03d}.jsonl")
+
+
+def arena_fens_path(data_run_dir: str, iteration: int) -> str:
+    return os.path.join(data_run_dir, f"arena_fens_iter_{int(iteration):03d}.txt")
+
+
+def dedupe_fens(fens: Iterable[str]) -> List[str]:
+    seen = set()
+    output = []
+    for fen in fens:
+        value = str(fen).strip()
+        if not value or value in seen:
+            continue
+        try:
+            chess.Board(value)
+        except Exception:
+            continue
+        seen.add(value)
+        output.append(value)
+    return output
+
+
+def write_arena_fens_from_trace(trace_path: str, output_path: str) -> Dict:
+    total = 0
+    invalid = 0
+    fens = []
+    if trace_path and os.path.exists(trace_path):
+        with open(trace_path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                total += 1
+                try:
+                    row = json.loads(line)
+                    fen = str(row.get("fen") or "").strip()
+                    chess.Board(fen)
+                except Exception:
+                    invalid += 1
+                    continue
+                fens.append(fen)
+
+    unique = dedupe_fens(fens)
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as handle:
+        for fen in unique:
+            handle.write(fen + "\n")
+    return {
+        "trace_path": trace_path,
+        "path": output_path,
+        "trace_rows": int(total),
+        "positions": int(len(unique)),
+        "duplicates": int(max(0, len(fens) - len(unique))),
+        "invalid": int(invalid),
+    }
+
+
+def load_arena_replay_fens(args, data_run_dir: str, iteration: int) -> Tuple[List[str], List[str]]:
+    limit = int(args.arena_replay_positions)
+    if limit == 0 or int(iteration) <= 1:
+        return [], []
+
+    window = max(1, int(args.arena_replay_window))
+    first_iteration = max(1, int(iteration) - window)
+    paths = [
+        arena_fens_path(data_run_dir, replay_iteration)
+        for replay_iteration in range(int(iteration) - 1, first_iteration - 1, -1)
+    ]
+
+    fens = []
+    used_paths = []
+    for path in paths:
+        if not os.path.exists(path):
+            continue
+        used_paths.append(path)
+        with open(path, "r", encoding="utf-8") as handle:
+            fens.extend(line.strip() for line in handle if line.strip())
+
+    unique = dedupe_fens(fens)
+    if limit > 0:
+        unique = unique[:limit]
+    return unique, used_paths
+
+
 def load_validation_fens(args) -> List[str]:
     if int(args.validation_positions) <= 0:
         return []
@@ -472,23 +558,28 @@ def write_offline_h5(path: str, rows: List[Dict], summary: Dict):
         h5.attrs["generator"] = "offline_actor_critic"
 
 
-def read_offline_summary(path: str) -> Dict:
-    with h5py.File(path, "r") as h5:
-        raw = h5.attrs.get("summary_json")
-        if isinstance(raw, bytes):
-            raw = raw.decode("utf-8")
-        if raw:
-            return json.loads(str(raw))
-        return {"positions": int(h5["states"].shape[0])}
-
-
-def generate_offline_data(args, model_path: str, output_path: str, iteration: int) -> Dict:
-    fens = load_fens(args, iteration=iteration)
+def generate_offline_data(
+    args,
+    model_path: str,
+    output_path: str,
+    iteration: int,
+    data_run_dir: str,
+) -> Dict:
+    source_fens = load_fens(args, iteration=iteration)
+    replay_fens, replay_paths = load_arena_replay_fens(
+        args,
+        data_run_dir=data_run_dir,
+        iteration=iteration,
+    )
+    fens = dedupe_fens([*source_fens, *replay_fens])
+    replay_used = max(0, len(fens) - len(dedupe_fens(source_fens)))
     print(
         "offline reinforce labeling start:",
         f"iteration={iteration}",
         f"model={model_path}",
         f"source={args.fen_source or PGN_PATH}",
+        f"source_positions={len(source_fens)}",
+        f"arena_replay_positions={replay_used}",
         f"positions={len(fens)}",
         f"sample_topk={args.sample_topk}",
         f"device={args.label_device or args.device}",
@@ -532,6 +623,11 @@ def generate_offline_data(args, model_path: str, output_path: str, iteration: in
         "iteration": int(iteration),
         "path": output_path,
         "positions": int(len(rows)),
+        "source_positions": int(len(source_fens)),
+        "arena_replay_positions": int(replay_used),
+        "arena_replay_paths": list(replay_paths),
+        "arena_replay_window": int(args.arena_replay_window),
+        "arena_replay_limit": int(args.arena_replay_positions),
         "source": str(args.fen_source or PGN_PATH),
         "source_offset": int(args.source_offset) + max(0, int(iteration) - 1) * int(args.positions_per_iter),
         "sample_topk": int(args.sample_topk),
@@ -755,12 +851,14 @@ def teacher_validation_worker(job):
     top1_regrets = []
     max_regrets = []
     action_counts = []
+    model_values = []
+    teacher_values = []
     teacher_best_topk_hits = 0
     teacher_best_action_hits = 0
     with StockfishTeacher(teacher_config) as teacher:
         for global_index, fen in specs:
             board = chess.Board(fen)
-            candidates, model_policy, _model_value = legal_policy_candidates(
+            candidates, model_policy, model_value = legal_policy_candidates(
                 model,
                 board,
                 device=device,
@@ -770,6 +868,7 @@ def teacher_validation_worker(job):
                 continue
 
             root_result = teacher.analyse(board)
+            teacher_value = float(root_result.get("value", 0.0))
             teacher_best = str(root_result.get("best_move"))
             model_topk_uci = {move.uci() for move in candidates}
             if teacher_best in model_topk_uci:
@@ -804,11 +903,17 @@ def teacher_validation_worker(job):
             top1_regrets.append(float(model_top1_regret))
             max_regrets.append(float(max_regret))
             action_counts.append(float(action_count))
+            model_values.append(float(model_value))
+            teacher_values.append(float(teacher_value))
 
             if bool(args_dict["progress"]):
                 log_every = max(0, int(args_dict["log_every"]))
                 labeled = len(top1_regrets)
                 if log_every > 0 and (labeled == 1 or labeled % log_every == 0):
+                    value_errors = np.asarray(model_values, dtype=np.float32) - np.asarray(
+                        teacher_values,
+                        dtype=np.float32,
+                    )
                     print(
                         "teacher validation:",
                         f"model={label}",
@@ -816,6 +921,7 @@ def teacher_validation_worker(job):
                         f"labeled={labeled}",
                         f"global_index={global_index}",
                         f"mean_top1_regret_cp={np.mean(top1_regrets):.1f}",
+                        f"value_mae={np.mean(np.abs(value_errors)):.4f}",
                         f"teacher_best_topk_rate={teacher_best_topk_hits / max(1, labeled):.3f}",
                         flush=True,
                     )
@@ -824,6 +930,8 @@ def teacher_validation_worker(job):
         "top1_regrets": top1_regrets,
         "max_regrets": max_regrets,
         "action_counts": action_counts,
+        "model_values": model_values,
+        "teacher_values": teacher_values,
         "teacher_best_topk_hits": int(teacher_best_topk_hits),
         "teacher_best_action_hits": int(teacher_best_action_hits),
     }
@@ -842,11 +950,27 @@ def summarize_teacher_validation(label: str, outputs: List[Dict]) -> Dict:
         [value for output in outputs for value in output["action_counts"]],
         dtype=np.float32,
     )
+    model_values = np.asarray(
+        [value for output in outputs for value in output["model_values"]],
+        dtype=np.float32,
+    )
+    teacher_values = np.asarray(
+        [value for output in outputs for value in output["teacher_values"]],
+        dtype=np.float32,
+    )
     positions = int(top1_regrets.shape[0])
     teacher_best_topk_hits = sum(int(output["teacher_best_topk_hits"]) for output in outputs)
     teacher_best_action_hits = sum(int(output["teacher_best_action_hits"]) for output in outputs)
     if positions <= 0:
         return {"model": label, "positions": 0}
+
+    value_errors = model_values - teacher_values
+    model_signs = np.where(model_values > 0.05, 1, np.where(model_values < -0.05, -1, 0))
+    teacher_signs = np.where(teacher_values > 0.05, 1, np.where(teacher_values < -0.05, -1, 0))
+    value_corr = 0.0
+    if float(np.std(model_values)) > 1e-8 and float(np.std(teacher_values)) > 1e-8:
+        value_corr = float(np.corrcoef(model_values, teacher_values)[0, 1])
+
     return {
         "model": label,
         "positions": positions,
@@ -858,6 +982,13 @@ def summarize_teacher_validation(label: str, outputs: List[Dict]) -> Dict:
         "mean_actions": float(np.mean(action_counts)),
         "teacher_best_topk_rate": float(teacher_best_topk_hits / max(1, positions)),
         "teacher_best_action_rate": float(teacher_best_action_hits / max(1, positions)),
+        "value_mae": float(np.mean(np.abs(value_errors))),
+        "value_rmse": float(np.sqrt(np.mean(value_errors ** 2))),
+        "value_corr": float(value_corr),
+        "value_sign_acc": float(np.mean(model_signs == teacher_signs)),
+        "value_bias": float(np.mean(value_errors)),
+        "model_value_mean": float(np.mean(model_values)),
+        "teacher_value_mean": float(np.mean(teacher_values)),
     }
 
 
@@ -917,15 +1048,46 @@ def evaluate_teacher_validation(args, candidate_path: str, baseline_path: str) -
             float(candidate.get("teacher_best_topk_rate", 0.0))
             - float(baseline.get("teacher_best_topk_rate", 0.0))
         ),
+        "delta_value_mae": (
+            float(candidate.get("value_mae", 0.0))
+            - float(baseline.get("value_mae", 0.0))
+        ),
+        "delta_value_rmse": (
+            float(candidate.get("value_rmse", 0.0))
+            - float(baseline.get("value_rmse", 0.0))
+        ),
+        "delta_value_corr": (
+            float(candidate.get("value_corr", 0.0))
+            - float(baseline.get("value_corr", 0.0))
+        ),
+        "delta_value_sign_acc": (
+            float(candidate.get("value_sign_acc", 0.0))
+            - float(baseline.get("value_sign_acc", 0.0))
+        ),
+        "delta_value_bias": (
+            float(candidate.get("value_bias", 0.0))
+            - float(baseline.get("value_bias", 0.0))
+        ),
     }
     print("offline reinforce teacher validation summary:", flush=True)
     print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
     return result
 
 
-def evaluate_candidate(args, candidate_path: str, baseline_path: str) -> Dict:
+def evaluate_candidate(
+    args,
+    candidate_path: str,
+    baseline_path: str,
+    data_run_dir: str,
+    iteration: int,
+) -> Dict:
     if int(args.eval_games) <= 0:
         return {"accepted": False, "skipped": True, "games": 0}
+
+    trace_output = None
+    if int(args.arena_replay_positions) != 0:
+        trace_output = arena_trace_path(data_run_dir, iteration)
+
     metrics = evaluate_models(
         candidate_path=candidate_path,
         baseline_path=baseline_path,
@@ -956,9 +1118,20 @@ def evaluate_candidate(args, candidate_path: str, baseline_path: str) -> Dict:
         uci_hash_mb=args.uci_hash_mb,
         quality_loss_cap_cp=args.eval_quality_loss_cap_cp,
         teacher_cache=args.teacher_cache,
+        trace_output=trace_output,
+        trace_root_topn=0,
         log_every=args.log_every,
         progress=True,
     )
+    if trace_output is not None:
+        replay_summary = write_arena_fens_from_trace(
+            trace_output,
+            arena_fens_path(data_run_dir, iteration),
+        )
+        metrics["arena_replay"] = replay_summary
+        print("offline reinforce arena replay fens:", flush=True)
+        print(json.dumps(replay_summary, ensure_ascii=False, indent=2), flush=True)
+
     metrics = attach_arena_acceptance(
         metrics,
         min_net_wins=args.eval_min_net_wins,
@@ -976,11 +1149,8 @@ def run(args):
 
     paths = prepare_run_paths(args)
     current_model = paths["current_model"]
-    if os.path.exists(current_model):
-        print("offline reinforce current model reuse:", current_model, flush=True)
-    else:
-        shutil.copy2(args.model, current_model)
-        print("offline reinforce current model initialized:", current_model, flush=True)
+    shutil.copy2(args.model, current_model)
+    print("offline reinforce current model initialized:", current_model, flush=True)
     print("offline reinforce run id:", paths["run_id"], flush=True)
     print("offline reinforce data run directory:", paths["data_run_dir"], flush=True)
     print("offline reinforce model run directory:", paths["model_run_dir"], flush=True)
@@ -1003,18 +1173,13 @@ def run(args):
             f"candidate_iter_{iteration:03d}.pth",
         )
 
-        if args.reuse_labels and os.path.exists(data_path):
-            label_summary = read_offline_summary(data_path)
-            label_summary["path"] = data_path
-            print("reusing offline labels:", data_path, flush=True)
-            print(json.dumps(label_summary, ensure_ascii=False, indent=2), flush=True)
-        else:
-            label_summary = generate_offline_data(
-                args,
-                model_path=current_model,
-                output_path=data_path,
-                iteration=iteration,
-            )
+        label_summary = generate_offline_data(
+            args,
+            model_path=current_model,
+            output_path=data_path,
+            iteration=iteration,
+            data_run_dir=paths["data_run_dir"],
+        )
 
         train_summary = train_offline_actor_critic(
             args,
@@ -1027,7 +1192,13 @@ def run(args):
             candidate_path=candidate_path,
             baseline_path=current_model,
         )
-        eval_summary = evaluate_candidate(args, candidate_path, current_model)
+        eval_summary = evaluate_candidate(
+            args,
+            candidate_path,
+            current_model,
+            data_run_dir=paths["data_run_dir"],
+            iteration=iteration,
+        )
         accepted = bool(eval_summary.get("accepted"))
         if accepted and args.promote_if_accepted:
             atomic_copy(candidate_path, current_model, make_backup=not args.no_backup)
@@ -1090,8 +1261,13 @@ def build_parser():
     parser.add_argument("--source-min-ply", type=int, default=0)
     parser.add_argument("--source-max-ply", type=int, default=160)
     parser.add_argument("--source-max-games", type=int, default=None)
-    parser.add_argument("--reuse-labels", action="store_true", default=True)
-    parser.add_argument("--no-reuse-labels", dest="reuse_labels", action="store_false")
+    parser.add_argument("--arena-replay-window", type=int, default=1)
+    parser.add_argument(
+        "--arena-replay-positions",
+        type=int,
+        default=0,
+        help="Maximum arena FENs to add to the next offline labeling pass; 0 disables, negative means all.",
+    )
 
     parser.add_argument("--sample-topk", type=int, default=8)
     parser.add_argument("--include-teacher-best", action="store_true", default=True)

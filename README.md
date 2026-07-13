@@ -31,6 +31,7 @@ ChessAI/
 │   ├── model.py
 │   ├── evaluator.py
 │   ├── search.py
+│   ├── uci_engine.py
 │   ├── opening_book.py
 │   ├── checkpoint_io.py
 │   ├── preprocess.py
@@ -43,6 +44,9 @@ ChessAI/
 │   ├── analyze.py
 │   └── board.py
 ├── run_reinforce.sh
+├── setup_lichess_bot.sh
+├── run_lichess_bot.sh
+├── stop_lichess_bot.sh
 └── requirements.txt
 ```
 
@@ -106,7 +110,7 @@ candidate 的对局结果与走法质量共同构成验收条件。
 
 ### 1.5 Offline Actor-Critic
 
-`reinforce.py` 是独立的 offline actor-critic 实验入口。脚本从 PGN 或带 `fens` dataset 的 HDF5 中按顺序抽取局面，模型用 sim=0 policy top-k 提出候选走法，Stockfish 为各 action 生成连续 reward。critic 学习当前候选策略的期望 reward，actor 使用 action reward 与 critic value 形成 advantage 并执行策略梯度更新。训练使用 entropy 与 KL reference；teacher validation 使用 Stockfish 在人类棋谱局面上验证 baseline 与 candidate。候选模型通过 arena 验收后写回本次 run 的 `current.pth`。
+`reinforce.py` 是独立的 offline actor-critic 实验入口。脚本从 PGN 或带 `fens` dataset 的 HDF5 中按顺序抽取局面，模型用 sim=0 policy top-k 提出候选走法，Stockfish 为各 action 生成连续 reward。critic 学习当前候选策略的期望 reward，actor 使用 action reward 与 critic value 形成 advantage 并执行策略梯度更新。训练使用 entropy 与 KL reference；teacher validation 使用 Stockfish 在人类棋谱局面上验证 baseline 与 candidate 的 policy regret 与 value 误差。候选模型通过 arena 验收后写回本次 run 的 `current.pth`。
 
 归档文件 `data/selflearn.py.bak_20260713_134805` 与 `data/regression.py.bak_20260713_134805` 保存此前的教师约束自学习和动态回归实现。
 
@@ -132,6 +136,10 @@ candidate 的对局结果与走法质量共同构成验收条件。
 ### 1.7 PGN 棋谱分析
 
 `analyze.py` 使用 Stockfish 按 PGN 主线逐手分析，输出同目录同名 `.cmt` 报告。报告包含 Summary、Main Reading、Critical Moves、Full Move Table 和关键行候选走法。`--critical-threshold-cp` 默认 50，贴合 `?!` 起点；mate 编码行会在摘要中单独说明。
+
+### 1.8 UCI 引擎
+
+`uci_engine.py` 是 ChessAI checkpoint 的 UCI 协议外壳。进程通过 stdin/stdout 接收 `uci`、`isready`、`setoption`、`position`、`go` 和 `quit`，加载指定 `.pth` 后调用当前 `search.py` 逻辑输出 `bestmove`。模型文件保持 `.pth` checkpoint 格式。
 
 ---
 
@@ -402,6 +410,129 @@ python src/search.py \
 
 `--mcts-sims` 表示 MCTS 软上限。`--movetime-ms` 表示完整 Search 的时间上限。动态探索常数为 `c_puct + c_puct_factor * log((parent_visits + c_puct_base + 1) / c_puct_base)`。`--fpu-reduction` 控制未访问节点相对父节点 Q 的初始折减。`--virtual-loss` 控制 batched MCTS 同一批次内已选路径的额外临时扣分，默认 `0.0`，保留 virtual visits 的轻度占位效果。`--mcts-time-fraction` 分配完整 Search 时间中供 MCTS 使用的比例，剩余时间由 mate guard 使用。`--mate-guard-*` 控制短深度强制将杀检查的 ply、候选数与节点数。
 
+### 8.1 UCI 引擎入口
+
+```bash
+python src/uci_engine.py \
+  --model models/champion.pth \
+  --device cuda \
+  --mcts-sims 100 \
+  --mcts-batch-size 64 \
+  --movetime-ms 1000 \
+  --c-puct 0.5 \
+  --c-puct-base 19652 \
+  --c-puct-factor 1.0 \
+  --fpu-reduction 0.15 \
+  --mcts-time-fraction 1.0 \
+  --mate-guard-plies 0 \
+  --mate-guard-topk 0 \
+  --mate-guard-nodes 0
+```
+
+最小协议手测：
+
+```text
+uci
+isready
+position startpos moves e2e4 e7e5
+go movetime 1000
+quit
+```
+
+常用 UCI option：
+
+```text
+ModelPath
+Device
+MCTSSims
+MCTSBatchSize
+MoveTimeMS
+CPuct
+CPuctBase
+CPuctFactor
+FPUReduction
+MCTSTimeFraction
+MateGuardPlies
+MateGuardTopK
+MateGuardNodes
+LogSearch
+```
+
+外部 GUI 或 lichess-bot 可通过 `setoption name ModelPath value models/champion.pth` 和 `go wtime ... btime ... winc ... binc ...` 控制模型与时钟预算。
+
+### 8.2 Lichess Bot
+
+`setup_lichess_bot.sh` 和 `run_lichess_bot.sh` 面向云端 Linux 使用。`data/lichess/` 存放官方 lichess-bot 仓库、虚拟环境、生成配置、日志、PID 和 PGN。
+
+安装或更新 lichess-bot：
+
+```bash
+bash setup_lichess_bot.sh
+```
+
+准备 Lichess OAuth token 后导入环境变量：
+
+```bash
+export LICHESS_TOKEN=lip_xxxxxxxxxxxxxxxxxxxx
+```
+
+首次把 Lichess 账号升级为 BOT 账号：
+
+```bash
+UPGRADE_BOT=1 bash run_lichess_bot.sh
+```
+
+启动 bot：
+
+```bash
+export LICHESS_TOKEN=lip_xxxxxxxxxxxxxxxxxxxx
+
+MODEL=models/champion.pth \
+DEVICE=cuda \
+MCTS_SIMS=0 \
+MOVETIME_MS=1000 \
+MAX_MOVETIME_MS=5000 \
+CHALLENGE_ONLY_BOT=true \
+ALLOW_MATCHMAKING=false \
+bash run_lichess_bot.sh
+```
+
+脚本会生成：
+
+```text
+data/lichess/lichess-bot/
+data/lichess/runs/<run-id>/config.yml
+data/lichess/runs/<run-id>/chessai_uci.sh
+data/lichess/runs/<run-id>/info.log
+data/lichess/runs/<run-id>/pid
+data/lichess/runs/<run-id>/pgn/
+```
+
+默认挑战策略为 standard / casual / bot-only / 并发 1。常用覆盖参数：
+
+```bash
+CHALLENGE_CONCURRENCY=1
+CHALLENGE_VARIANTS=standard
+CHALLENGE_TIME_CONTROLS=blitz,rapid,classical
+CHALLENGE_MODES=casual
+CHALLENGE_ONLY_BOT=true
+ALLOW_MATCHMAKING=false
+```
+
+查看日志：
+
+```bash
+tail -f data/lichess/runs/<run-id>/info.log
+```
+
+停止 bot：
+
+```bash
+bash stop_lichess_bot.sh <run-id>
+```
+
+本地 Windows 只用于代码修改和 UCI 烟测；持续在线的 Lichess bot 进程放在云端运行。
+
 
 ---
 
@@ -442,6 +573,14 @@ python src/arena.py \
 
 arena 使用 paired openings：同一个起始局面会交换双方颜色各下一局；`--games 100` 会消耗 50 个 unique start positions。`--opening-book ""` 使用标准初始局面并轮换 candidate 执白/执黑。`--workers` 同时作用于模型对局和 Stockfish move-quality 分析；每个 worker 使用独立的 teacher cache 分片。`--pgn-output` 保存 arena 对局棋谱。命令输出配对对局结果、双方 ACPL / accuracy / blunder 质量指标，以及 `accepted` 所需的验收字段。
 
+Windows:
+
+```bash
+python src/arena.py   --candidate models/candidate.pth   --baseline models/champion.pth   --device cpu   --games 1   --workers 1   --max-plies 240   --opening-book ""   --sims 10   --mcts-batch-size 32   --movetime-ms 0   --c-puct 0.8   --c-puct-base 19652   --c-puct-factor 1.0   --fpu-reduction 0.15   --mcts-time-fraction 1   --mate-guard-plies 0   --mate-guard-topk 0   --mate-guard-nodes 0   --uci models/stockfish/stockfish.exe   --uci-depth 16   --uci-multipv 8   --uci-threads 1   --uci-hash-mb 256   --teacher-cache data/user-pgn/test4_cache.sqlite   --pgn-output data/user-pgn/test5.pgn   --log-every 1
+```
+
+
+
 ---
 
 ## 10. Offline Actor-Critic 实验
@@ -467,12 +606,14 @@ python src/reinforce.py \
   --fen-source data/games.pgn \
   --uci models/stockfish/stockfish \
   --device cuda \
-  --iterations 1 \
-  --positions-per-iter 50000 \
+  --iterations 5 \
+  --positions-per-iter 20000 \
   --parallel 10 \
   --source-min-ply 0 \
   --source-max-ply 160 \
-  --sample-topk 8 \
+  --arena-replay-window 1 \
+  --arena-replay-positions -1 \
+  --sample-topk 4 \
   --reward-scale-cp 300 \
   --actor-exploration-mix 0.05 \
   --advantage-clip 1.0 \
@@ -481,8 +622,8 @@ python src/reinforce.py \
   --uci-multipv 1 \
   --uci-threads 1 \
   --uci-hash-mb 512 \
-  --epochs 20 \
-  --train-max-steps 3000 \
+  --epochs 30 \
+  --train-max-steps 2000 \
   --batch-size 256 \
   --train-workers 4 \
   --lr 0.00003 \
@@ -492,8 +633,8 @@ python src/reinforce.py \
   --kl-weight 0.10 \
   --validation-source data/games.pgn \
   --validation-positions 1000 \
-  --validation-offset 50000 \
-  --validation-min-ply 8 \
+  --validation-offset 100000 \
+  --validation-min-ply 0 \
   --validation-max-ply 160 \
   --validation-topk 4 \
   --validation-workers 10 \
@@ -502,20 +643,20 @@ python src/reinforce.py \
   --validation-uci-multipv 1 \
   --validation-uci-threads 1 \
   --validation-uci-hash-mb 512 \
-  --eval-games 100 \
-  --eval-sims 0 \
+  --eval-games 200 \
+  --eval-sims 100 \
   --eval-workers 10 \
-  --eval-max-plies 150 \
+  --eval-max-plies 160 \
   --eval-opening-book data/openings.gen.bin \
   --eval-movetime-ms 0 \
   --eval-c-puct 0.5 \
   --eval-c-puct-base 19652 \
   --eval-c-puct-factor 1.0 \
   --eval-fpu-reduction 0.15 \
-  --eval-mcts-time-fraction 0.50 \
-  --eval-mate-guard-plies 1 \
-  --eval-mate-guard-topk 8 \
-  --eval-mate-guard-nodes 1000 \
+  --eval-mcts-time-fraction 1.0 \
+  --eval-mate-guard-plies 0 \
+  --eval-mate-guard-topk 0 \
+  --eval-mate-guard-nodes 0 \
   --eval-uci-depth 16 \
   --eval-uci-multipv 1 \
   --eval-min-net-wins 4 \
@@ -525,13 +666,13 @@ python src/reinforce.py \
   --seed 2026
 ```
 
-Offline reinforce 的状态由 `--fen-source` 提供：PGN 或带 `fens` dataset 的 HDF5。`--positions-per-iter` 表示每轮按顺序抽取的 FEN 数量，`--source-min-ply` 与 `--source-max-ply` 控制 PGN 局面范围。模型用 sim=0 policy top-k 提出 action，`--sample-topk` 控制候选数量，`--include-teacher-best` 把 Stockfish 最佳招加入 action 集合。教师机为每个 action 生成 `tanh(score_cp / reward_scale_cp)` 连续 reward。critic 学习候选行为策略的期望 reward；actor 使用 `reward - value` advantage 执行策略梯度。`--actor-exploration-mix` 为已评价 action 分配均匀探索权重，`--advantage-clip` 控制 advantage 范围。训练使用 entropy 与 KL reference。`--validation-*` 从人类棋谱局面抽取验证集，并由 Stockfish 统计 baseline 与 candidate 的 top1 regret、max regret 和 teacher-best top-k 命中率。验收对局通过 `--eval-opening-book` 使用开局书，并由 arena 调用 search 参数完成对战。
+Offline reinforce 的状态由 `--fen-source` 提供：PGN 或带 `fens` dataset 的 HDF5。`--positions-per-iter` 表示每轮按顺序抽取的 FEN 数量，`--source-min-ply` 与 `--source-max-ply` 控制 PGN 局面范围。模型用 sim=0 policy top-k 提出 action，`--sample-topk` 控制候选数量，`--include-teacher-best` 把 Stockfish 最佳招加入 action 集合。教师机为每个 action 生成 `tanh(score_cp / reward_scale_cp)` 连续 reward。critic 学习候选行为策略的期望 reward；actor 使用 `reward - value` advantage 执行策略梯度。`--actor-exploration-mix` 为已评价 action 分配均匀探索权重，`--advantage-clip` 控制 advantage 范围。训练使用 entropy 与 KL reference。`--arena-replay-window` 与 `--arena-replay-positions` 把最近 arena 对局产生的 FEN 混入下一轮离线标注；`-1` 表示读取窗口内全部 arena FEN。`--validation-*` 从人类棋谱局面抽取验证集，并由 Stockfish 统计 baseline 与 candidate 的 top1 regret、max regret、teacher-best top-k 命中率、value MAE/RMSE/correlation/sign accuracy。验收对局通过 `--eval-opening-book` 使用开局书，并由 arena 调用 search 参数完成对战。
 
 `--seed` 控制 offline RL DataLoader 的 batch shuffle 与 arena opening book 洗牌。FEN 标注保持源文件顺序，固定 seed 便于复现实验的数据顺序和验收开局。
 
-reinforce 的 arena gate 使用当前 run 的 `current.pth` 作为 baseline，`candidate_iter_*.pth` 作为 candidate。`result_ok` 要求 `net_wins >= --eval-min-net-wins`；`quality_ok` 要求 candidate 的 ACPL 低于 baseline 且 accuracy 高于 baseline，阈值由 `--eval-min-acpl-improvement` 和 `--eval-min-accuracy-improvement` 控制，脚本当前使用默认 `0.0`。通过 gate 后，candidate 写回本次 run 的 `models/runs/<run-id>/current.pth`。
+reinforce 的 arena gate 使用当前 run 的 `current.pth` 作为 baseline，`candidate_iter_*.pth` 作为 candidate。`result_ok` 要求 `net_wins >= --eval-min-net-wins`；`quality_ok` 要求 candidate 的 ACPL 低于 baseline 且 accuracy 高于 baseline，阈值由 `--eval-min-acpl-improvement` 和 `--eval-min-accuracy-improvement` 控制，脚本当前使用默认 `0.0`。arena trace 会写入 `data/runs/<run-id>/arena_trace_iter_*.jsonl`，去重后的 FEN 写入 `data/runs/<run-id>/arena_fens_iter_*.txt`。通过 gate 后，candidate 写回本次 run 的 `models/runs/<run-id>/current.pth`。
 
-同一 run-id 下已有 `offline_iter_*.h5` 时，脚本默认复用该标注数据并从训练阶段继续执行；传入 `--no-reuse-labels` 会重新生成离线标注。
+offline reinforce 每次运行都会按当前参数生成本次 run 的 `offline_iter_*.h5`；中断后的 run 目录保留为历史产物。
 
 每次 offline reinforce 运行都会生成配对的独立 run 目录：
 
@@ -610,6 +751,18 @@ pkill -KILL -f "models/stockfish/stockfish"
 ```
 
 同一台云端机器同时跑多个实验时，先用 `ps -ef` 确认命令行里的 `--run-id` 和路径，再结束对应 PID。`tail -f` 只是在查看日志，按 `Ctrl+C` 只会退出日志查看。
+
+查看 Lichess bot 进程：
+
+```bash
+ps -ef | grep -E "lichess-bot.py|uci_engine.py" | grep -v grep
+```
+
+停止 Lichess bot：
+
+```bash
+bash stop_lichess_bot.sh <run-id>
+```
 
 ---
 

@@ -1,3 +1,8 @@
 /data/
 /models/
 __pycache__/
+backup/
+*.token
+.env
+/lichess*.yml
+/lichess*.yaml

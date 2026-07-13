@@ -23,14 +23,16 @@ FEN_SOURCE="data/games.pgn"
 UCI="models/stockfish/stockfish"
 DEVICE="cuda"
 
-ITERATIONS=5
-POSITIONS_PER_ITER=20000
+ITERATIONS=2
+POSITIONS_PER_ITER=50000
 PARALLEL=10
 SOURCE_MIN_PLY=0
 SOURCE_MAX_PLY=160
+ARENA_REPLAY_WINDOW=1
+ARENA_REPLAY_POSITIONS=-1
 
-SAMPLE_TOPK=4
-REWARD_SCALE_CP=300
+SAMPLE_TOPK=8
+REWARD_SCALE_CP=600
 ACTOR_EXPLORATION_MIX=0.05
 ADVANTAGE_CLIP=1.0
 
@@ -64,7 +66,7 @@ VALIDATION_UCI_THREADS=1
 VALIDATION_UCI_HASH_MB=512
 
 EVAL_GAMES=200
-EVAL_SIMS=100
+EVAL_SIMS=0
 EVAL_WORKERS=10
 EVAL_MAX_PLIES=160
 EVAL_OPENING_BOOK="data/openings.gen.bin"
@@ -91,6 +93,7 @@ echo "run_id=${RUN_ID}"
 echo "model=${MODEL}"
 echo "seed=${SEED}"
 echo "offline labels: fen_source=${FEN_SOURCE} positions_per_iter=${POSITIONS_PER_ITER} parallel=${PARALLEL} source_ply=${SOURCE_MIN_PLY}-${SOURCE_MAX_PLY}"
+echo "arena replay: window=${ARENA_REPLAY_WINDOW} positions=${ARENA_REPLAY_POSITIONS}"
 echo "actor actions: topk=${SAMPLE_TOPK} include_teacher_best=true exploration_mix=${ACTOR_EXPLORATION_MIX}"
 echo "reward: continuous_tanh_cp scale_cp=${REWARD_SCALE_CP} advantage_clip=${ADVANTAGE_CLIP}"
 echo "teacher: uci=${UCI} depth=${UCI_DEPTH} multipv=${UCI_MULTIPV} threads=${UCI_THREADS}"
@@ -109,6 +112,8 @@ exec python src/reinforce.py \
   --parallel "${PARALLEL}" \
   --source-min-ply "${SOURCE_MIN_PLY}" \
   --source-max-ply "${SOURCE_MAX_PLY}" \
+  --arena-replay-window "${ARENA_REPLAY_WINDOW}" \
+  --arena-replay-positions "${ARENA_REPLAY_POSITIONS}" \
   --sample-topk "${SAMPLE_TOPK}" \
   --reward-scale-cp "${REWARD_SCALE_CP}" \
   --actor-exploration-mix "${ACTOR_EXPLORATION_MIX}" \

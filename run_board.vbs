@@ -8,7 +8,7 @@ cmd = "pythonw.exe src\board.py" & _
   " --gui 1" & _
   " --model models\candidate.pth" & _
   " --device cpu" & _
-  " --mcts-sims 1000" & _
+  " --mcts-sims 100" & _
   " --mcts-min-sims 0" & _
   " --mcts-batch-size 32" & _
   " --movetime-ms 0" & _
