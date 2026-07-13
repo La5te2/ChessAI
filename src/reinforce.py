@@ -37,7 +37,6 @@ from checkpoint_io import atomic_copy_with_backup
 from chess_env import board_to_packed, packed_to_tensor
 from config import (
     DEVICE,
-    H5_PATH,
     MODEL_DIR,
     MODEL_PATH,
     NUM_ACTIONS,
@@ -45,7 +44,6 @@ from config import (
     STOCKFISH_PATH,
     WEIGHT_DECAY,
 )
-from data import H5ChessDataset
 from model import load_model, save_model
 from move_encoder import move_to_index
 from teacher import MATE_SCORE_CP, StockfishTeacher, TeacherConfig
@@ -149,18 +147,21 @@ def iter_pgn_fens(
                 board.push(move)
 
 
-def load_fens(args, iteration: int) -> List[str]:
-    source = str(args.fen_source or "").strip()
-    if not source:
-        source = PGN_PATH
-    offset = int(args.source_offset) + max(0, int(iteration) - 1) * int(args.positions_per_iter)
-    limit = int(args.positions_per_iter)
-
+def load_fens_from_source(
+    source: str,
+    offset: int,
+    limit: int,
+    min_ply: int,
+    max_ply: int,
+    max_games: Optional[int],
+) -> List[str]:
+    source = str(source or "").strip() or PGN_PATH
     if source.lower() == "startpos":
         return [chess.Board().fen() for _ in range(limit)]
     if not os.path.exists(source):
         raise FileNotFoundError(
-            f"fen source not found: {source}. Pass --fen-source <games.pgn|fens.h5>."
+            f"fen source not found: {source}. Pass a PGN path or an HDF5 file "
+            "with a 'fens' dataset."
         )
 
     lower = source.lower()
@@ -172,9 +173,9 @@ def load_fens(args, iteration: int) -> List[str]:
                 source,
                 offset=offset,
                 limit=limit,
-                min_ply=args.source_min_ply,
-                max_ply=args.source_max_ply,
-                max_games=args.source_max_games,
+                min_ply=min_ply,
+                max_ply=max_ply,
+                max_games=max_games,
             )
         )
 
@@ -184,6 +185,34 @@ def load_fens(args, iteration: int) -> List[str]:
             f"source={source}, offset={offset}"
         )
     return fens
+
+
+def load_fens(args, iteration: int) -> List[str]:
+    offset = int(args.source_offset) + max(0, int(iteration) - 1) * int(args.positions_per_iter)
+    return load_fens_from_source(
+        source=args.fen_source or PGN_PATH,
+        offset=offset,
+        limit=int(args.positions_per_iter),
+        min_ply=int(args.source_min_ply),
+        max_ply=int(args.source_max_ply),
+        max_games=args.source_max_games,
+    )
+
+
+def load_validation_fens(args) -> List[str]:
+    if int(args.validation_positions) <= 0:
+        return []
+    source = str(args.validation_source or "").strip()
+    if not source:
+        source = str(args.fen_source or PGN_PATH)
+    return load_fens_from_source(
+        source=source,
+        offset=int(args.validation_offset),
+        limit=int(args.validation_positions),
+        min_ply=int(args.validation_min_ply),
+        max_ply=int(args.validation_max_ply),
+        max_games=args.validation_source_max_games,
+    )
 
 
 def legal_policy_candidates(
@@ -279,6 +308,20 @@ def rl_targets_from_scores(
     return candidate_mask, action_rewards, max_regret, model_top1_regret
 
 
+def add_teacher_best_candidate(
+    board: chess.Board,
+    candidates: List[chess.Move],
+    teacher_result: Dict,
+) -> List[chess.Move]:
+    try:
+        teacher_move = chess.Move.from_uci(str(teacher_result.get("best_move")))
+    except Exception:
+        return candidates
+    if teacher_move in board.legal_moves and teacher_move not in candidates:
+        return [*candidates, teacher_move]
+    return candidates
+
+
 def label_worker(job):
     args_dict, worker_index, worker_count, model_path, specs = job
     device = args_dict.get("label_device") or args_dict.get("device") or "cpu"
@@ -302,6 +345,7 @@ def label_worker(job):
     rows = []
     total_regret = 0.0
     total_top1_regret = 0.0
+    total_actions = 0
     labeled = 0
     with StockfishTeacher(teacher_config) as teacher:
         for global_index, fen in specs:
@@ -315,15 +359,10 @@ def label_worker(job):
             if not candidates:
                 continue
 
-            teacher_result = teacher.analyse_candidates(board, candidates)
             if bool(args_dict["include_teacher_best"]):
-                try:
-                    teacher_move = chess.Move.from_uci(str(teacher_result.get("best_move")))
-                    if teacher_move in board.legal_moves and teacher_move not in candidates:
-                        candidates.append(teacher_move)
-                        teacher_result = teacher.analyse_candidates(board, candidates)
-                except Exception:
-                    pass
+                root_result = teacher.analyse(board)
+                candidates = add_teacher_best_candidate(board, candidates, root_result)
+            teacher_result = teacher.analyse_candidates(board, candidates)
 
             move_scores = {
                 str(move): int(score)
@@ -344,6 +383,7 @@ def label_worker(job):
             if int(candidate_mask.sum()) <= 0:
                 continue
 
+            action_count = int(candidate_mask.sum())
             best_score = int(teacher_result.get("best_score_cp", 0))
             rows.append({
                 "state": board_to_packed(board),
@@ -363,6 +403,7 @@ def label_worker(job):
             })
             total_regret += float(max_regret)
             total_top1_regret += float(model_top1_regret)
+            total_actions += action_count
             labeled += 1
 
             if bool(args_dict["progress"]):
@@ -374,6 +415,8 @@ def label_worker(job):
                         f"labeled={labeled}",
                         f"global_index={global_index}",
                         f"mean_top1_regret_cp={total_top1_regret / max(1, labeled):.1f}",
+                        f"mean_max_regret_cp={total_regret / max(1, labeled):.1f}",
+                        f"mean_actions={total_actions / max(1, labeled):.2f}",
                         flush=True,
                     )
 
@@ -386,6 +429,7 @@ def label_worker(job):
             "mean_top1_regret_cp": float(
                 total_top1_regret / max(1, labeled)
             ),
+            "mean_actions": float(total_actions / max(1, labeled)),
         },
     }
 
@@ -523,12 +567,6 @@ class OfflineDataset(Dataset):
         )
 
 
-def cycle(loader):
-    while True:
-        for batch in loader:
-            yield batch
-
-
 def actor_critic_losses(logits, values, candidate_mask, action_rewards, args):
     masked_logits = logits.masked_fill(~candidate_mask, torch.finfo(logits.dtype).min)
     raw_policy = F.softmax(masked_logits, dim=1)
@@ -557,20 +595,6 @@ def actor_critic_losses(logits, values, candidate_mask, action_rewards, args):
     return actor_loss, critic_loss, entropy, critic_target.mean()
 
 
-def supervised_loss_from_batch(model, batch, args):
-    states, target, values = batch
-    states = states.to(args.device, non_blocking=True)
-    target = target.to(args.device, non_blocking=True)
-    values = values.to(args.device, non_blocking=True)
-    logits, predicted_values = model(states)
-    if target.ndim == 2:
-        policy_loss = -(target * F.log_softmax(logits, dim=1)).sum(dim=1).mean()
-    else:
-        policy_loss = F.cross_entropy(logits, target.long())
-    value_loss = F.mse_loss(predicted_values.squeeze(1), values)
-    return policy_loss + float(args.supervised_value_weight) * value_loss
-
-
 def train_offline_actor_critic(args, source_model: str, data_path: str, candidate_path: str) -> Dict:
     random.seed(int(args.seed))
     np.random.seed(int(args.seed) % (2 ** 32 - 1))
@@ -593,20 +617,6 @@ def train_offline_actor_critic(args, source_model: str, data_path: str, candidat
         persistent_workers=args.train_workers > 0,
         generator=train_generator,
     )
-
-    supervised_iter = None
-    if args.supervised_data and os.path.exists(args.supervised_data) and args.supervised_weight > 0:
-        supervised_generator = torch.Generator().manual_seed(int(args.seed) + 1)
-        supervised_loader = DataLoader(
-            H5ChessDataset(args.supervised_data),
-            batch_size=args.batch_size,
-            shuffle=True,
-            num_workers=args.train_workers,
-            pin_memory=pin_memory,
-            persistent_workers=args.train_workers > 0,
-            generator=supervised_generator,
-        )
-        supervised_iter = cycle(supervised_loader)
 
     student = load_model(source_model, device=args.device)
     student.train()
@@ -656,20 +666,11 @@ def train_offline_actor_critic(args, source_model: str, data_path: str, candidat
                     reference_p * (reference_logp - student_logp)
                 ).sum(dim=1).mean() * (max(1e-6, float(args.kl_temperature)) ** 2)
 
-                supervised_loss = torch.zeros((), device=args.device)
-                if supervised_iter is not None:
-                    supervised_loss = supervised_loss_from_batch(
-                        student,
-                        next(supervised_iter),
-                        args,
-                    )
-
                 loss = (
                     float(args.actor_weight) * actor_loss
                     + float(args.critic_weight) * critic_loss
                     - float(args.entropy_weight) * entropy
                     + float(args.kl_weight) * kl_loss
-                    + float(args.supervised_weight) * supervised_loss
                 )
 
             scaler.scale(loss).backward()
@@ -688,7 +689,6 @@ def train_offline_actor_critic(args, source_model: str, data_path: str, candidat
                 "reward": float(mean_reward.item()),
                 "entropy": float(entropy.item()),
                 "kl": float(kl_loss.item()),
-                "supervised": float(supervised_loss.item()),
                 "loss": float(loss.item()),
             }
             if args.log_every > 0 and (step == 1 or step % int(args.log_every) == 0):
@@ -701,7 +701,6 @@ def train_offline_actor_critic(args, source_model: str, data_path: str, candidat
                     f"reward={last_metrics['reward']:+.4f}",
                     f"entropy={last_metrics['entropy']:.4f}",
                     f"kl={last_metrics['kl']:.4f}",
-                    f"supervised={last_metrics['supervised']:.4f}",
                     f"loss={last_metrics['loss']:.4f}",
                     flush=True,
                 )
@@ -731,6 +730,197 @@ def train_offline_actor_critic(args, source_model: str, data_path: str, candidat
         flush=True,
     )
     return {"steps": int(step), "candidate": candidate_path, "last_metrics": last_metrics}
+
+
+def teacher_validation_worker(job):
+    args_dict, worker_index, worker_count, model_path, specs, label = job
+    device = args_dict.get("validation_device") or args_dict.get("label_device") or args_dict.get("device") or "cpu"
+    model = load_model(model_path, device=device)
+    model.eval()
+
+    teacher_config = TeacherConfig(
+        uci=args_dict["uci"],
+        depth=int(args_dict["validation_uci_depth"]),
+        movetime_ms=int(args_dict["validation_uci_movetime_ms"]),
+        multipv=int(args_dict["validation_uci_multipv"]),
+        threads=int(args_dict["validation_uci_threads"]),
+        hash_mb=int(args_dict["validation_uci_hash_mb"]),
+        cache_path=worker_cache_path(
+            args_dict.get("teacher_cache"),
+            worker_index,
+            worker_count,
+        ),
+    )
+
+    top1_regrets = []
+    max_regrets = []
+    action_counts = []
+    teacher_best_topk_hits = 0
+    teacher_best_action_hits = 0
+    with StockfishTeacher(teacher_config) as teacher:
+        for global_index, fen in specs:
+            board = chess.Board(fen)
+            candidates, model_policy, _model_value = legal_policy_candidates(
+                model,
+                board,
+                device=device,
+                topk=int(args_dict["validation_topk"]),
+            )
+            if not candidates:
+                continue
+
+            root_result = teacher.analyse(board)
+            teacher_best = str(root_result.get("best_move"))
+            model_topk_uci = {move.uci() for move in candidates}
+            if teacher_best in model_topk_uci:
+                teacher_best_topk_hits += 1
+
+            candidates = add_teacher_best_candidate(board, candidates, root_result)
+            action_uci = {move.uci() for move in candidates}
+            if teacher_best in action_uci:
+                teacher_best_action_hits += 1
+
+            teacher_result = teacher.analyse_candidates(board, candidates)
+            move_scores = {
+                str(move): int(score)
+                for move, score in (teacher_result.get("move_scores_cp") or {}).items()
+            }
+            (
+                candidate_mask,
+                _action_rewards,
+                max_regret,
+                model_top1_regret,
+            ) = rl_targets_from_scores(
+                board,
+                move_scores,
+                candidates,
+                model_policy=model_policy,
+                reward_scale_cp=float(args_dict["reward_scale_cp"]),
+            )
+            action_count = int(candidate_mask.sum())
+            if action_count <= 0:
+                continue
+
+            top1_regrets.append(float(model_top1_regret))
+            max_regrets.append(float(max_regret))
+            action_counts.append(float(action_count))
+
+            if bool(args_dict["progress"]):
+                log_every = max(0, int(args_dict["log_every"]))
+                labeled = len(top1_regrets)
+                if log_every > 0 and (labeled == 1 or labeled % log_every == 0):
+                    print(
+                        "teacher validation:",
+                        f"model={label}",
+                        f"worker={worker_index}",
+                        f"labeled={labeled}",
+                        f"global_index={global_index}",
+                        f"mean_top1_regret_cp={np.mean(top1_regrets):.1f}",
+                        f"teacher_best_topk_rate={teacher_best_topk_hits / max(1, labeled):.3f}",
+                        flush=True,
+                    )
+
+    return {
+        "top1_regrets": top1_regrets,
+        "max_regrets": max_regrets,
+        "action_counts": action_counts,
+        "teacher_best_topk_hits": int(teacher_best_topk_hits),
+        "teacher_best_action_hits": int(teacher_best_action_hits),
+    }
+
+
+def summarize_teacher_validation(label: str, outputs: List[Dict]) -> Dict:
+    top1_regrets = np.asarray(
+        [value for output in outputs for value in output["top1_regrets"]],
+        dtype=np.float32,
+    )
+    max_regrets = np.asarray(
+        [value for output in outputs for value in output["max_regrets"]],
+        dtype=np.float32,
+    )
+    action_counts = np.asarray(
+        [value for output in outputs for value in output["action_counts"]],
+        dtype=np.float32,
+    )
+    positions = int(top1_regrets.shape[0])
+    teacher_best_topk_hits = sum(int(output["teacher_best_topk_hits"]) for output in outputs)
+    teacher_best_action_hits = sum(int(output["teacher_best_action_hits"]) for output in outputs)
+    if positions <= 0:
+        return {"model": label, "positions": 0}
+    return {
+        "model": label,
+        "positions": positions,
+        "mean_top1_regret_cp": float(np.mean(top1_regrets)),
+        "p50_top1_regret_cp": float(np.percentile(top1_regrets, 50)),
+        "p90_top1_regret_cp": float(np.percentile(top1_regrets, 90)),
+        "mean_max_regret_cp": float(np.mean(max_regrets)),
+        "p90_max_regret_cp": float(np.percentile(max_regrets, 90)),
+        "mean_actions": float(np.mean(action_counts)),
+        "teacher_best_topk_rate": float(teacher_best_topk_hits / max(1, positions)),
+        "teacher_best_action_rate": float(teacher_best_action_hits / max(1, positions)),
+    }
+
+
+def run_teacher_validation_for_model(args, fens: List[str], model_path: str, label: str) -> Dict:
+    workers = max(1, min(int(args.validation_workers or args.parallel), len(fens)))
+    splits = [[] for _ in range(workers)]
+    for index, fen in enumerate(fens):
+        splits[index % workers].append((index + 1, fen))
+
+    args_dict = vars(args).copy()
+    args_dict["progress"] = True
+    jobs = [
+        (args_dict, worker_index + 1, workers, model_path, chunk, label)
+        for worker_index, chunk in enumerate(splits)
+        if chunk
+    ]
+    if len(jobs) == 1:
+        outputs = [teacher_validation_worker(jobs[0])]
+    else:
+        with mp.get_context("spawn").Pool(processes=len(jobs)) as pool:
+            outputs = pool.map(teacher_validation_worker, jobs)
+    return summarize_teacher_validation(label, outputs)
+
+
+def evaluate_teacher_validation(args, candidate_path: str, baseline_path: str) -> Dict:
+    if int(args.validation_positions) <= 0:
+        return {"skipped": True, "positions": 0}
+
+    fens = load_validation_fens(args)
+    print(
+        "offline reinforce teacher validation start:",
+        f"source={args.validation_source or args.fen_source or PGN_PATH}",
+        f"positions={len(fens)}",
+        f"topk={args.validation_topk}",
+        f"device={args.validation_device or args.label_device or args.device}",
+        flush=True,
+    )
+    baseline = run_teacher_validation_for_model(args, fens, baseline_path, "baseline")
+    candidate = run_teacher_validation_for_model(args, fens, candidate_path, "candidate")
+    result = {
+        "skipped": False,
+        "source": str(args.validation_source or args.fen_source or PGN_PATH),
+        "source_offset": int(args.validation_offset),
+        "positions": int(len(fens)),
+        "topk": int(args.validation_topk),
+        "baseline": baseline,
+        "candidate": candidate,
+        "delta_mean_top1_regret_cp": (
+            float(candidate.get("mean_top1_regret_cp", 0.0))
+            - float(baseline.get("mean_top1_regret_cp", 0.0))
+        ),
+        "delta_p90_top1_regret_cp": (
+            float(candidate.get("p90_top1_regret_cp", 0.0))
+            - float(baseline.get("p90_top1_regret_cp", 0.0))
+        ),
+        "delta_teacher_best_topk_rate": (
+            float(candidate.get("teacher_best_topk_rate", 0.0))
+            - float(baseline.get("teacher_best_topk_rate", 0.0))
+        ),
+    }
+    print("offline reinforce teacher validation summary:", flush=True)
+    print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
+    return result
 
 
 def evaluate_candidate(args, candidate_path: str, baseline_path: str) -> Dict:
@@ -832,6 +1022,11 @@ def run(args):
             data_path=data_path,
             candidate_path=candidate_path,
         )
+        teacher_validation = evaluate_teacher_validation(
+            args,
+            candidate_path=candidate_path,
+            baseline_path=current_model,
+        )
         eval_summary = evaluate_candidate(args, candidate_path, current_model)
         accepted = bool(eval_summary.get("accepted"))
         if accepted and args.promote_if_accepted:
@@ -850,6 +1045,7 @@ def run(args):
             "iteration": int(iteration),
             "data": label_summary,
             "train": train_summary,
+            "teacher_validation": teacher_validation,
             "eval": eval_summary,
             "accepted": accepted,
             "current_model": current_model,
@@ -878,11 +1074,11 @@ def build_parser():
         description="Offline Stockfish-rewarded actor-critic training for ChessAI."
     )
     parser.add_argument("--model", default=MODEL_PATH)
-    parser.add_argument("--supervised-data", default=H5_PATH)
     parser.add_argument("--fen-source", default=PGN_PATH)
     parser.add_argument("--uci", default=STOCKFISH_PATH)
     parser.add_argument("--device", default=DEVICE)
     parser.add_argument("--label-device", default=None)
+    parser.add_argument("--validation-device", default=None)
     parser.add_argument("--data-runs-dir", default=DEFAULT_DATA_RUNS_DIR)
     parser.add_argument("--model-runs-dir", default=DEFAULT_MODEL_RUNS_DIR)
     parser.add_argument("--run-id", default=None)
@@ -929,8 +1125,20 @@ def build_parser():
     parser.add_argument("--entropy-weight", type=float, default=0.01)
     parser.add_argument("--kl-weight", type=float, default=0.10)
     parser.add_argument("--kl-temperature", type=float, default=1.5)
-    parser.add_argument("--supervised-weight", type=float, default=0.35)
-    parser.add_argument("--supervised-value-weight", type=float, default=0.25)
+
+    parser.add_argument("--validation-source", default="")
+    parser.add_argument("--validation-positions", type=int, default=0)
+    parser.add_argument("--validation-offset", type=int, default=0)
+    parser.add_argument("--validation-min-ply", type=int, default=8)
+    parser.add_argument("--validation-max-ply", type=int, default=160)
+    parser.add_argument("--validation-source-max-games", type=int, default=None)
+    parser.add_argument("--validation-topk", type=int, default=4)
+    parser.add_argument("--validation-workers", type=int, default=None)
+    parser.add_argument("--validation-uci-depth", type=int, default=12)
+    parser.add_argument("--validation-uci-movetime-ms", type=int, default=0)
+    parser.add_argument("--validation-uci-multipv", type=int, default=1)
+    parser.add_argument("--validation-uci-threads", type=int, default=1)
+    parser.add_argument("--validation-uci-hash-mb", type=int, default=512)
 
     parser.add_argument("--eval-games", type=int, default=100)
     parser.add_argument("--eval-sims", type=int, default=0)

@@ -106,7 +106,7 @@ candidate 的对局结果与走法质量共同构成验收条件。
 
 ### 1.5 Offline Actor-Critic
 
-`reinforce.py` 是独立的 offline actor-critic 实验入口。脚本从 PGN 或带 `fens` dataset 的 HDF5 中按顺序抽取局面，模型用 sim=0 policy top-k 提出候选走法，Stockfish 为各 action 生成连续 reward。critic 学习当前候选策略的期望 reward，actor 使用 action reward 与 critic value 形成 advantage 并执行策略梯度更新。训练同时使用 entropy、KL reference 和监督辅助项。候选模型通过 arena 验收后写回本次 run 的 `current.pth`。
+`reinforce.py` 是独立的 offline actor-critic 实验入口。脚本从 PGN 或带 `fens` dataset 的 HDF5 中按顺序抽取局面，模型用 sim=0 policy top-k 提出候选走法，Stockfish 为各 action 生成连续 reward。critic 学习当前候选策略的期望 reward，actor 使用 action reward 与 critic value 形成 advantage 并执行策略梯度更新。训练使用 entropy 与 KL reference；teacher validation 使用 Stockfish 在人类棋谱局面上验证 baseline 与 candidate。候选模型通过 arena 验收后写回本次 run 的 `current.pth`。
 
 归档文件 `data/selflearn.py.bak_20260713_134805` 与 `data/regression.py.bak_20260713_134805` 保存此前的教师约束自学习和动态回归实现。
 
@@ -464,50 +464,60 @@ tail -f data/runs/<run-id>/info.log
 python src/reinforce.py \
   --run-id <reinforce-run-id> \
   --model models/chessnet.pth \
-  --supervised-data data/games.h5 \
   --fen-source data/games.pgn \
   --uci models/stockfish/stockfish \
   --device cuda \
   --iterations 1 \
-  --positions-per-iter 500 \
+  --positions-per-iter 50000 \
   --parallel 10 \
   --source-min-ply 0 \
   --source-max-ply 160 \
   --sample-topk 8 \
-  --reward-scale-cp 600 \
+  --reward-scale-cp 300 \
   --actor-exploration-mix 0.05 \
   --advantage-clip 1.0 \
   --uci-depth 16 \
   --uci-movetime-ms 0 \
-  --uci-multipv 4 \
+  --uci-multipv 1 \
   --uci-threads 1 \
   --uci-hash-mb 512 \
-  --epochs 25 \
-  --train-max-steps 2500 \
+  --epochs 20 \
+  --train-max-steps 3000 \
   --batch-size 256 \
   --train-workers 4 \
   --lr 0.00003 \
   --actor-weight 1.0 \
   --critic-weight 0.50 \
   --entropy-weight 0.01 \
-  --supervised-weight 0.35 \
   --kl-weight 0.10 \
+  --validation-source data/games.pgn \
+  --validation-positions 1000 \
+  --validation-offset 50000 \
+  --validation-min-ply 8 \
+  --validation-max-ply 160 \
+  --validation-topk 4 \
+  --validation-workers 10 \
+  --validation-uci-depth 16 \
+  --validation-uci-movetime-ms 0 \
+  --validation-uci-multipv 1 \
+  --validation-uci-threads 1 \
+  --validation-uci-hash-mb 512 \
   --eval-games 100 \
   --eval-sims 0 \
   --eval-workers 10 \
   --eval-max-plies 150 \
   --eval-opening-book data/openings.gen.bin \
-  --eval-movetime-ms 1500 \
+  --eval-movetime-ms 0 \
   --eval-c-puct 0.5 \
   --eval-c-puct-base 19652 \
   --eval-c-puct-factor 1.0 \
   --eval-fpu-reduction 0.15 \
-  --eval-mcts-time-fraction 0.90 \
-  --eval-mate-guard-plies 3 \
+  --eval-mcts-time-fraction 0.50 \
+  --eval-mate-guard-plies 1 \
   --eval-mate-guard-topk 8 \
-  --eval-mate-guard-nodes 20000 \
+  --eval-mate-guard-nodes 1000 \
   --eval-uci-depth 16 \
-  --eval-uci-multipv 4 \
+  --eval-uci-multipv 1 \
   --eval-min-net-wins 4 \
   --eval-min-acpl-improvement 0.0 \
   --eval-min-accuracy-improvement 0.0 \
@@ -515,7 +525,7 @@ python src/reinforce.py \
   --seed 2026
 ```
 
-Offline reinforce 的状态由 `--fen-source` 提供：PGN 或带 `fens` dataset 的 HDF5。`--positions-per-iter` 表示每轮按顺序抽取的 FEN 数量，`--source-min-ply` 与 `--source-max-ply` 控制 PGN 局面范围。模型用 sim=0 policy top-k 提出 action，`--sample-topk` 控制候选数量，`--include-teacher-best` 把 Stockfish 最佳招加入 action 集合。教师机为每个 action 生成 `tanh(score_cp / reward_scale_cp)` 连续 reward。critic 学习候选行为策略的期望 reward；actor 使用 `reward - value` advantage 执行策略梯度。`--actor-exploration-mix` 为已评价 action 分配均匀探索权重，`--advantage-clip` 控制 advantage 范围。训练同时使用 entropy、KL reference 和监督辅助项。验收对局通过 `--eval-opening-book` 使用开局书，并由 arena 调用 search 参数完成对战。
+Offline reinforce 的状态由 `--fen-source` 提供：PGN 或带 `fens` dataset 的 HDF5。`--positions-per-iter` 表示每轮按顺序抽取的 FEN 数量，`--source-min-ply` 与 `--source-max-ply` 控制 PGN 局面范围。模型用 sim=0 policy top-k 提出 action，`--sample-topk` 控制候选数量，`--include-teacher-best` 把 Stockfish 最佳招加入 action 集合。教师机为每个 action 生成 `tanh(score_cp / reward_scale_cp)` 连续 reward。critic 学习候选行为策略的期望 reward；actor 使用 `reward - value` advantage 执行策略梯度。`--actor-exploration-mix` 为已评价 action 分配均匀探索权重，`--advantage-clip` 控制 advantage 范围。训练使用 entropy 与 KL reference。`--validation-*` 从人类棋谱局面抽取验证集，并由 Stockfish 统计 baseline 与 candidate 的 top1 regret、max regret 和 teacher-best top-k 命中率。验收对局通过 `--eval-opening-book` 使用开局书，并由 arena 调用 search 参数完成对战。
 
 `--seed` 控制 offline RL DataLoader 的 batch shuffle 与 arena opening book 洗牌。FEN 标注保持源文件顺序，固定 seed 便于复现实验的数据顺序和验收开局。
 
@@ -551,7 +561,59 @@ models/runs/<run-id>/candidate_iter_*.pth
 
 ---
 
-## 11. GUI 棋盘模拟器
+## 11. 后台进程管理
+
+`run_reinforce.sh` 默认使用 `nohup` 后台运行，并把主进程 PID 写入：
+
+```text
+data/runs/<run-id>/pid
+```
+
+查看日志：
+
+```bash
+RUN_DIR=data/runs/<run-id>
+tail -f "$RUN_DIR/info.log"
+```
+
+查看主进程：
+
+```bash
+RUN_DIR=data/runs/<run-id>
+PID="$(cat "$RUN_DIR/pid")"
+ps -fp "$PID"
+```
+
+停止当前 run：
+
+```bash
+RUN_DIR=data/runs/<run-id>
+PID="$(cat "$RUN_DIR/pid")"
+kill -TERM "$PID"
+sleep 5
+ps -fp "$PID"
+```
+
+查看仍在运行的 reinforce / Stockfish 进程：
+
+```bash
+ps -ef | grep -E "reinforce.py|stockfish" | grep -v grep
+```
+
+清理该 run 的残留子进程时，优先按 `ps` 输出中的 PID 精确结束：
+
+```bash
+kill -TERM <pid>
+sleep 3
+kill -KILL <pid>
+pkill -KILL -f "models/stockfish/stockfish"
+```
+
+同一台云端机器同时跑多个实验时，先用 `ps -ef` 确认命令行里的 `--run-id` 和路径，再结束对应 PID。`tail -f` 只是在查看日志，按 `Ctrl+C` 只会退出日志查看。
+
+---
+
+## 12. GUI 棋盘模拟器
 
 ```bash
 python src/board.py \
@@ -617,7 +679,7 @@ python src/board.py \
 
 ---
 
-## 12. CLI 棋盘模拟器
+## 13. CLI 棋盘模拟器
 
 ```bash
 python src/board.py \
@@ -674,7 +736,7 @@ CLI 自动候选同样受 `movetime` 约束。`movetime=0` 表示时间上限关
 
 ---
 
-## 13. 空间维护
+## 14. 空间维护
 
 查看主要文件：
 

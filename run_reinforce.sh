@@ -19,55 +19,66 @@ fi
 RUN_ID="${2:?missing run id}"
 
 MODEL="models/chessnet.pth"
-SUPERVISED_DATA="data/games.h5"
 FEN_SOURCE="data/games.pgn"
 UCI="models/stockfish/stockfish"
 DEVICE="cuda"
 
-ITERATIONS=1
-POSITIONS_PER_ITER=500
+ITERATIONS=5
+POSITIONS_PER_ITER=20000
 PARALLEL=10
 SOURCE_MIN_PLY=0
 SOURCE_MAX_PLY=160
 
 SAMPLE_TOPK=8
-REWARD_SCALE_CP=600
+REWARD_SCALE_CP=300
 ACTOR_EXPLORATION_MIX=0.05
 ADVANTAGE_CLIP=1.0
 
 UCI_DEPTH=16
 UCI_MOVETIME_MS=0
-UCI_MULTIPV=4
+UCI_MULTIPV=1
 UCI_THREADS=1
 UCI_HASH_MB=512
 
-EPOCHS=25
-TRAIN_MAX_STEPS=2500
+EPOCHS=40
+TRAIN_MAX_STEPS=3000
 BATCH_SIZE=256
 TRAIN_WORKERS=4
 LR=0.00003
 ACTOR_WEIGHT=1.0
 CRITIC_WEIGHT=0.50
 ENTROPY_WEIGHT=0.01
-SUPERVISED_WEIGHT=0.35
 KL_WEIGHT=0.10
 
-EVAL_GAMES=100
-EVAL_SIMS=0
+VALIDATION_SOURCE="data/games.pgn"
+VALIDATION_POSITIONS=1000
+VALIDATION_OFFSET="${POSITIONS_PER_ITER}"
+VALIDATION_MIN_PLY=0
+VALIDATION_MAX_PLY=160
+VALIDATION_TOPK=4
+VALIDATION_WORKERS=10
+VALIDATION_UCI_DEPTH=16
+VALIDATION_UCI_MOVETIME_MS=0
+VALIDATION_UCI_MULTIPV=1
+VALIDATION_UCI_THREADS=1
+VALIDATION_UCI_HASH_MB=512
+
+EVAL_GAMES=200
+EVAL_SIMS=100
 EVAL_WORKERS=10
-EVAL_MAX_PLIES=150
+EVAL_MAX_PLIES=160
 EVAL_OPENING_BOOK="data/openings.gen.bin"
-EVAL_MOVETIME_MS=1500
+EVAL_MOVETIME_MS=0
 EVAL_C_PUCT=0.5
 EVAL_C_PUCT_BASE=19652
 EVAL_C_PUCT_FACTOR=1.0
 EVAL_FPU_REDUCTION=0.15
-EVAL_MCTS_TIME_FRACTION=0.90
-EVAL_MATE_GUARD_PLIES=3
-EVAL_MATE_GUARD_TOPK=8
-EVAL_MATE_GUARD_NODES=20000
+EVAL_MCTS_TIME_FRACTION=1.0
+EVAL_MATE_GUARD_PLIES=0
+EVAL_MATE_GUARD_TOPK=0
+EVAL_MATE_GUARD_NODES=0
 EVAL_UCI_DEPTH=16
-EVAL_UCI_MULTIPV=4
+EVAL_UCI_MULTIPV=1
 EVAL_MIN_NET_WINS=4
 EVAL_MIN_ACPL_IMPROVEMENT=0.0
 EVAL_MIN_ACCURACY_IMPROVEMENT=0.0
@@ -84,12 +95,12 @@ echo "actor actions: topk=${SAMPLE_TOPK} include_teacher_best=true exploration_m
 echo "reward: continuous_tanh_cp scale_cp=${REWARD_SCALE_CP} advantage_clip=${ADVANTAGE_CLIP}"
 echo "teacher: uci=${UCI} depth=${UCI_DEPTH} multipv=${UCI_MULTIPV} threads=${UCI_THREADS}"
 echo "train: epochs=${EPOCHS} train_max_steps=${TRAIN_MAX_STEPS} batch_size=${BATCH_SIZE} actor_weight=${ACTOR_WEIGHT} critic_weight=${CRITIC_WEIGHT} entropy_weight=${ENTROPY_WEIGHT}"
+echo "teacher validation: source=${VALIDATION_SOURCE} positions=${VALIDATION_POSITIONS} offset=${VALIDATION_OFFSET} topk=${VALIDATION_TOPK} uci_depth=${VALIDATION_UCI_DEPTH} uci_multipv=${VALIDATION_UCI_MULTIPV}"
 echo "eval: games=${EVAL_GAMES} sims=${EVAL_SIMS} movetime_ms=${EVAL_MOVETIME_MS} c_puct=${EVAL_C_PUCT} fpu_reduction=${EVAL_FPU_REDUCTION} mcts_time_fraction=${EVAL_MCTS_TIME_FRACTION} mate_guard=${EVAL_MATE_GUARD_PLIES}/${EVAL_MATE_GUARD_TOPK}/${EVAL_MATE_GUARD_NODES} min_net_wins=${EVAL_MIN_NET_WINS} min_acpl_improvement=${EVAL_MIN_ACPL_IMPROVEMENT} min_accuracy_improvement=${EVAL_MIN_ACCURACY_IMPROVEMENT} opening_book=${EVAL_OPENING_BOOK}"
 
 exec python src/reinforce.py \
   --run-id "${RUN_ID}" \
   --model "${MODEL}" \
-  --supervised-data "${SUPERVISED_DATA}" \
   --fen-source "${FEN_SOURCE}" \
   --uci "${UCI}" \
   --device "${DEVICE}" \
@@ -115,8 +126,19 @@ exec python src/reinforce.py \
   --actor-weight "${ACTOR_WEIGHT}" \
   --critic-weight "${CRITIC_WEIGHT}" \
   --entropy-weight "${ENTROPY_WEIGHT}" \
-  --supervised-weight "${SUPERVISED_WEIGHT}" \
   --kl-weight "${KL_WEIGHT}" \
+  --validation-source "${VALIDATION_SOURCE}" \
+  --validation-positions "${VALIDATION_POSITIONS}" \
+  --validation-offset "${VALIDATION_OFFSET}" \
+  --validation-min-ply "${VALIDATION_MIN_PLY}" \
+  --validation-max-ply "${VALIDATION_MAX_PLY}" \
+  --validation-topk "${VALIDATION_TOPK}" \
+  --validation-workers "${VALIDATION_WORKERS}" \
+  --validation-uci-depth "${VALIDATION_UCI_DEPTH}" \
+  --validation-uci-movetime-ms "${VALIDATION_UCI_MOVETIME_MS}" \
+  --validation-uci-multipv "${VALIDATION_UCI_MULTIPV}" \
+  --validation-uci-threads "${VALIDATION_UCI_THREADS}" \
+  --validation-uci-hash-mb "${VALIDATION_UCI_HASH_MB}" \
   --eval-games "${EVAL_GAMES}" \
   --eval-sims "${EVAL_SIMS}" \
   --eval-workers "${EVAL_WORKERS}" \
