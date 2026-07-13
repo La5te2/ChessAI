@@ -322,9 +322,31 @@ def parse_args():
         default=None,
         help="Output .cmt path. Defaults to the input path with .cmt suffix.",
     )
-    parser.add_argument("--all-games", action="store_true", default=False)
-    parser.add_argument("--game-index", type=int, default=1)
-    parser.add_argument("--max-games", type=int, default=0)
+    parser.add_argument(
+        "--all-games",
+        dest="all_games",
+        action="store_true",
+        default=True,
+        help="Analyse every game in the PGN. This is the default.",
+    )
+    parser.add_argument(
+        "--single-game",
+        dest="all_games",
+        action="store_false",
+        help="Analyse one game selected by --game-index.",
+    )
+    parser.add_argument(
+        "--game-index",
+        type=int,
+        default=1,
+        help="1-based game index used with --single-game.",
+    )
+    parser.add_argument(
+        "--max-games",
+        type=int,
+        default=0,
+        help="Maximum number of games to analyse when analysing all games.",
+    )
     parser.add_argument("--critical-threshold-cp", type=int, default=50)
     parser.add_argument("--top-moves", type=int, default=3)
 

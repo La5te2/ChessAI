@@ -89,19 +89,17 @@ class SearchOptions:
     mcts_min_sims: int = 0
     mcts_batch_size: int = 32
     c_puct: float = CPUCT
+    c_puct_base: float = 19652.0
+    c_puct_factor: float = 1.0
+    fpu_reduction: float = 0.15
     time_limit: Optional[float] = None
+    mcts_time_fraction: float = 0.90
     root_topn: int = 10
-    virtual_loss: float = 1.0
+    virtual_loss: float = 0.0
 
     mate_guard_plies: int = 3
     mate_guard_topk: int = 8
     mate_guard_nodes: int = 20000
-    mate_guard_time_fraction: float = 0.10
-
-    q_tiebreak: bool = True
-    q_tiebreak_p_ratio: float = 0.90
-    q_tiebreak_visit_ratio: float = 0.80
-    q_tiebreak_margin: float = 0.25
 
 
 class MCTSNode:
@@ -178,11 +176,31 @@ class MCTS:
         self.expanded_nodes = 0
         self.nn_batches = 0
 
+    def _scheduled_c_puct(self, parent: MCTSNode) -> float:
+        visits = max(0.0, float(parent.visit_count + parent.virtual_visits))
+        base = max(1.0, float(self.options.c_puct_base))
+        growth = max(0.0, float(self.options.c_puct_factor)) * math.log(
+            (visits + base + 1.0) / base
+        )
+        return max(0.0, float(self.options.c_puct) + growth)
+
+    def _fpu_value(self, parent: MCTSNode) -> float:
+        visited_policy_mass = sum(
+            max(0.0, float(child.prior))
+            for child in parent.children.values()
+            if child.visit_count > 0
+        )
+        parent_q = float(parent.q) if parent.visit_count > 0 else 0.0
+        reduction = max(0.0, float(self.options.fpu_reduction))
+        return float(
+            max(-1.0, min(1.0, parent_q - reduction * math.sqrt(visited_policy_mass)))
+        )
+
     def _ucb_score(self, parent: MCTSNode, child: MCTSNode):
-        q_from_parent = -child.q
+        q_from_parent = -child.q if child.visit_count > 0 else self._fpu_value(parent)
         visits = child.visit_count + child.virtual_visits
         exploration = (
-            float(self.options.c_puct)
+            self._scheduled_c_puct(parent)
             * child.prior
             * np.sqrt(parent.visit_count + parent.virtual_visits + 1.0)
             / (1.0 + visits)
@@ -248,6 +266,8 @@ class MCTS:
                 "nn_batches": 0,
                 "timeout": False,
                 "root_node": root,
+                "root_c_puct": self._scheduled_c_puct(root),
+                "root_fpu": self._fpu_value(root),
             }
 
         root_policy, root_value = self.evaluator.evaluate_one(board)
@@ -266,6 +286,8 @@ class MCTS:
                 "nn_batches": self.nn_batches,
                 "timeout": False,
                 "root_node": root,
+                "root_c_puct": self._scheduled_c_puct(root),
+                "root_fpu": self._fpu_value(root),
             }
 
         configured_minimum = int(self.options.mcts_min_sims)
@@ -340,7 +362,12 @@ class MCTS:
 
         policy = np.zeros(NUM_ACTIONS, dtype=np.float32)
         for move, child in root.children.items():
-            policy[move_to_index(move)] = float(child.visit_count)
+            # Preserve the network prior as the root tie-breaker. With small
+            # search budgets many legal moves can finish with identical visit
+            # counts; using visits alone then falls through to UCI ordering.
+            policy[move_to_index(move)] = (
+                float(child.visit_count) + max(0.0, float(child.prior))
+            )
         if float(policy.sum()) <= 0:
             for move, child in root.children.items():
                 policy[move_to_index(move)] = float(child.prior)
@@ -354,6 +381,8 @@ class MCTS:
             "nn_batches": int(self.nn_batches),
             "timeout": bool(deadline is not None and time.monotonic() >= deadline),
             "root_node": root,
+            "root_c_puct": float(self._scheduled_c_puct(root)),
+            "root_fpu": float(self._fpu_value(root)),
         }
 
 
@@ -590,185 +619,6 @@ class UnifiedSearch:
             ),
         )
 
-    @staticmethod
-    def _promote_policy(policy, board: chess.Board, selected, incumbent):
-        if selected is None or incumbent is None or selected == incumbent:
-            return policy
-        promoted = policy.copy()
-        selected_index = move_to_index(selected)
-        incumbent_index = move_to_index(incumbent)
-        selected_value = float(promoted[selected_index])
-        incumbent_value = float(promoted[incumbent_index])
-        if selected_value <= incumbent_value:
-            promoted[selected_index] = incumbent_value + max(
-                1e-6,
-                abs(incumbent_value) * 1e-6,
-            )
-        return normalize_policy(promoted, board)
-
-    @staticmethod
-    def _q_tiebreak_required_gain(
-        margin: float,
-        p_ratio_actual: float,
-        visit_ratio_actual: float,
-        p_ratio_floor: float,
-        visit_ratio_floor: float,
-    ) -> Tuple[float, Dict[str, float]]:
-        margin = max(0.0, float(margin))
-
-        def deficit(actual: float, floor: float) -> float:
-            actual = max(0.0, float(actual))
-            floor = max(0.0, float(floor))
-            if actual >= 1.0:
-                return 0.0
-            if floor >= 1.0:
-                return 1.0
-            floor = min(floor, 1.0 - 1e-9)
-            if actual <= floor:
-                return 1.0
-            return (1.0 - actual) / max(1e-9, 1.0 - floor)
-
-        p_deficit = deficit(p_ratio_actual, p_ratio_floor)
-        visit_deficit = deficit(visit_ratio_actual, visit_ratio_floor)
-        closeness_penalty = max(p_deficit, visit_deficit)
-        dynamic_gain = margin * closeness_penalty
-
-        # If policy and visits are effectively tied, require only a small Q edge
-        # so deterministic tie cases can be ordered by value without amplifying
-        # pure floating-point noise.
-        min_gain = 1e-6 if margin <= 0.0 else min(0.01, margin * 0.10)
-        required = max(min_gain, dynamic_gain)
-        return required, {
-            "p_ratio_actual": float(p_ratio_actual),
-            "visit_ratio_actual": float(visit_ratio_actual),
-            "p_deficit": float(p_deficit),
-            "visit_deficit": float(visit_deficit),
-            "closeness_penalty": float(closeness_penalty),
-        }
-
-    @staticmethod
-    def _q_tiebreak_effective_min_visits(
-        incumbent_visits: int,
-        visit_ratio: float,
-    ) -> int:
-        incumbent = max(0, int(incumbent_visits))
-        if incumbent <= 0:
-            return 0
-        return max(0, int(math.ceil(incumbent * max(0.0, float(visit_ratio)))))
-
-    def _q_tiebreak_move(
-        self,
-        board: chess.Board,
-        final_policy,
-        comparison_policy,
-        root_node: Optional[MCTSNode],
-        incumbent,
-    ):
-        if (
-            not bool(self.options.q_tiebreak)
-            or root_node is None
-            or incumbent is None
-        ):
-            return incumbent, None
-
-        legal = list(board.legal_moves)
-        if incumbent not in legal:
-            return incumbent, None
-
-        incumbent_child = root_node.children.get(incumbent)
-        if incumbent_child is None:
-            return incumbent, None
-
-        incumbent_visits = int(incumbent_child.visit_count)
-        incumbent_index = move_to_index(incumbent)
-        incumbent_p = float(comparison_policy[incumbent_index])
-        incumbent_final_p = float(final_policy[incumbent_index])
-        incumbent_q = float(-incumbent_child.q)
-        p_ratio = max(0.0, float(self.options.q_tiebreak_p_ratio))
-        visit_ratio = max(0.0, float(self.options.q_tiebreak_visit_ratio))
-        margin = max(0.0, float(self.options.q_tiebreak_margin))
-        effective_min_visits = self._q_tiebreak_effective_min_visits(
-            incumbent_visits=incumbent_visits,
-            visit_ratio=visit_ratio,
-        )
-        if incumbent_visits < effective_min_visits:
-            return incumbent, None
-
-        best_move = None
-        best_info = None
-        best_key = None
-        for candidate in legal:
-            if candidate == incumbent:
-                continue
-            child = root_node.children.get(candidate)
-            if child is None:
-                continue
-
-            visits = int(child.visit_count)
-            if visits < effective_min_visits:
-                continue
-            visit_ratio_actual = (
-                visits / max(1.0, float(incumbent_visits))
-                if incumbent_visits > 0
-                else 1.0
-            )
-            if incumbent_visits > 0 and visit_ratio_actual < visit_ratio:
-                continue
-
-            candidate_index = move_to_index(candidate)
-            candidate_p = float(comparison_policy[candidate_index])
-            p_ratio_actual = (
-                candidate_p / max(1e-12, incumbent_p)
-                if incumbent_p > 0.0
-                else 1.0
-            )
-            if incumbent_p > 0.0 and p_ratio_actual < p_ratio:
-                continue
-
-            candidate_q = float(-child.q)
-            q_gain = candidate_q - incumbent_q
-            required_gain, dynamic_info = self._q_tiebreak_required_gain(
-                margin=margin,
-                p_ratio_actual=p_ratio_actual,
-                visit_ratio_actual=visit_ratio_actual,
-                p_ratio_floor=p_ratio,
-                visit_ratio_floor=visit_ratio,
-            )
-            q_surplus = q_gain - required_gain
-            if q_surplus < 0.0:
-                continue
-
-            key = (
-                q_surplus,
-                candidate_q,
-                q_gain,
-                candidate_p,
-                visits,
-                candidate.uci(),
-            )
-            if best_key is None or key > best_key:
-                best_move = candidate
-                best_key = key
-                best_info = {
-                    "from": incumbent.uci(),
-                    "to": candidate.uci(),
-                    "from_p": incumbent_p,
-                    "to_p": candidate_p,
-                    "from_final_p": incumbent_final_p,
-                    "to_final_p": float(final_policy[candidate_index]),
-                    "from_visits": incumbent_visits,
-                    "to_visits": visits,
-                    "effective_min_visits": effective_min_visits,
-                    "from_q": incumbent_q,
-                    "to_q": candidate_q,
-                    "q_gain": q_gain,
-                    "required_q_gain": required_gain,
-                    "q_surplus": q_surplus,
-                    **dynamic_info,
-                }
-
-        return (best_move, best_info) if best_move is not None else (incumbent, None)
-
     def search(self, board: chess.Board) -> SearchResult:
         if board.is_game_over(claim_draw=True):
             raise RuntimeError("game is already over")
@@ -780,13 +630,13 @@ class UnifiedSearch:
         if self.options.time_limit is not None and float(self.options.time_limit) > 0:
             total = float(self.options.time_limit)
             final_deadline = start + total
-            reserve = 0.0
-            if int(self.options.mate_guard_plies) > 0:
-                reserve = max(
-                    0.0,
-                    min(0.5, float(self.options.mate_guard_time_fraction)),
-                )
-            mcts_deadline = start + total * (1.0 - reserve)
+            mcts_fraction = max(
+                0.0,
+                min(1.0, float(self.options.mcts_time_fraction)),
+            )
+            if int(self.options.mate_guard_plies) <= 0:
+                mcts_fraction = 1.0
+            mcts_deadline = start + total * mcts_fraction
 
         root_node = None
         if self.model is None or int(self.options.mcts_sims) <= 0:
@@ -871,27 +721,6 @@ class UnifiedSearch:
                 ),
             )
 
-        q_tiebreak = None
-        if mate_guard_forced is None:
-            selected, q_tiebreak = self._q_tiebreak_move(
-                root_board,
-                final_policy,
-                mcts_policy,
-                root_node,
-                move,
-            )
-            if q_tiebreak is not None:
-                if selected in legal and selected not in mate_guard_banned:
-                    final_policy = self._promote_policy(
-                        final_policy,
-                        root_board,
-                        selected,
-                        move,
-                    )
-                    move = selected
-                else:
-                    q_tiebreak = None
-
         root_lines = []
         for candidate in legal:
             index = move_to_index(candidate)
@@ -932,6 +761,14 @@ class UnifiedSearch:
             "uncertainty": float(stats.get("uncertainty", 0.0)),
             "nodes": int(stats.get("expanded_nodes", 0)),
             "nn_batches": int(stats.get("nn_batches", 0)),
+            "c_puct_initial": float(self.options.c_puct),
+            "c_puct_base": float(self.options.c_puct_base),
+            "c_puct_factor": float(self.options.c_puct_factor),
+            "c_puct_root": float(stats.get("root_c_puct", self.options.c_puct)),
+            "fpu_reduction": float(self.options.fpu_reduction),
+            "fpu_root": float(stats.get("root_fpu", 0.0)),
+            "virtual_loss": float(self.options.virtual_loss),
+            "mcts_time_fraction": float(self.options.mcts_time_fraction),
             "mate_guard_plies": int(self.options.mate_guard_plies),
             "mate_guard_topk": int(self.options.mate_guard_topk),
             "mate_guard_nodes": int(mate_guard_nodes),
@@ -943,12 +780,6 @@ class UnifiedSearch:
                 move.uci() for move in mate_guard_banned
             ),
             "mate_guard_reasons": dict(mate_guard_reasons),
-            "q_tiebreak_enabled": bool(self.options.q_tiebreak),
-            "q_tiebreak_overrode": q_tiebreak is not None,
-            "q_tiebreak": q_tiebreak,
-            "q_tiebreak_move": (
-                q_tiebreak["to"] if q_tiebreak is not None else None
-            ),
             "mcts_move": mcts_move.uci() if mcts_move else None,
             "piece_count": count_pieces(root_board),
             "best_move": move.uci(),
@@ -998,15 +829,14 @@ def parse_args():
     parser.add_argument("--mcts-batch-size", type=int, default=32)
     parser.add_argument("--movetime-ms", type=int, default=5000)
     parser.add_argument("--c-puct", type=float, default=CPUCT)
+    parser.add_argument("--c-puct-base", type=float, default=19652.0)
+    parser.add_argument("--c-puct-factor", type=float, default=1.0)
+    parser.add_argument("--fpu-reduction", type=float, default=0.15)
+    parser.add_argument("--virtual-loss", type=float, default=0.0)
+    parser.add_argument("--mcts-time-fraction", type=float, default=0.90)
     parser.add_argument("--mate-guard-plies", type=int, default=3)
     parser.add_argument("--mate-guard-topk", type=int, default=8)
     parser.add_argument("--mate-guard-nodes", type=int, default=20000)
-    parser.add_argument("--mate-guard-time-fraction", type=float, default=0.10)
-    parser.add_argument("--q-tiebreak", action="store_true", default=True)
-    parser.add_argument("--no-q-tiebreak", dest="q_tiebreak", action="store_false")
-    parser.add_argument("--q-tiebreak-p-ratio", type=float, default=0.90)
-    parser.add_argument("--q-tiebreak-visit-ratio", type=float, default=0.80)
-    parser.add_argument("--q-tiebreak-margin", type=float, default=0.25)
     parser.add_argument("--root-topn", type=int, default=10)
     return parser.parse_args()
 
@@ -1024,14 +854,14 @@ def main():
         mcts_batch_size=args.mcts_batch_size,
         time_limit=(args.movetime_ms / 1000.0) if args.movetime_ms > 0 else None,
         c_puct=args.c_puct,
+        c_puct_base=args.c_puct_base,
+        c_puct_factor=args.c_puct_factor,
+        fpu_reduction=args.fpu_reduction,
+        virtual_loss=args.virtual_loss,
+        mcts_time_fraction=args.mcts_time_fraction,
         mate_guard_plies=args.mate_guard_plies,
         mate_guard_topk=args.mate_guard_topk,
         mate_guard_nodes=args.mate_guard_nodes,
-        mate_guard_time_fraction=args.mate_guard_time_fraction,
-        q_tiebreak=args.q_tiebreak,
-        q_tiebreak_p_ratio=args.q_tiebreak_p_ratio,
-        q_tiebreak_visit_ratio=args.q_tiebreak_visit_ratio,
-        q_tiebreak_margin=args.q_tiebreak_margin,
         root_topn=args.root_topn,
     )
     result = UnifiedSearch(model, options, device=args.device).search(board)
@@ -1047,12 +877,13 @@ def main():
         result.info["mcts_soft_cap"],
     )
     print("uncertainty:", result.info["uncertainty"])
+    print("c_puct_root:", result.info["c_puct_root"])
+    print("fpu_root:", result.info["fpu_root"])
+    print("virtual_loss:", result.info["virtual_loss"])
     print("mate_guard_nodes:", result.info["mate_guard_nodes"])
     print("mate_guard_completed:", result.info["mate_guard_completed"])
     print("mate_guard_forced_move:", result.info["mate_guard_forced_move"])
     print("mate_guard_banned_moves:", result.info["mate_guard_banned_moves"])
-    print("q_tiebreak_overrode:", result.info["q_tiebreak_overrode"])
-    print("q_tiebreak:", result.info["q_tiebreak"])
     print("elapsed_ms:", result.info["elapsed_ms"])
     print("root:")
     for index, row in enumerate(result.info.get("root", []), 1):

@@ -75,14 +75,13 @@ def _run_resume_validation(args, candidate_path):
         mcts_batch_size=args.eval_mcts_batch_size,
         movetime_ms=args.eval_movetime_ms,
         c_puct=args.eval_c_puct,
+        c_puct_base=args.eval_c_puct_base,
+        c_puct_factor=args.eval_c_puct_factor,
+        fpu_reduction=args.eval_fpu_reduction,
+        mcts_time_fraction=args.eval_mcts_time_fraction,
         mate_guard_plies=args.eval_mate_guard_plies,
         mate_guard_topk=args.eval_mate_guard_topk,
         mate_guard_nodes=args.eval_mate_guard_nodes,
-        mate_guard_time_fraction=args.eval_mate_guard_time_fraction,
-        q_tiebreak=args.eval_q_tiebreak,
-        q_tiebreak_p_ratio=args.eval_q_tiebreak_p_ratio,
-        q_tiebreak_visit_ratio=args.eval_q_tiebreak_visit_ratio,
-        q_tiebreak_margin=args.eval_q_tiebreak_margin,
         uci=args.uci,
         uci_depth=args.eval_uci_depth,
         uci_movetime_ms=args.eval_uci_movetime_ms,
@@ -307,23 +306,13 @@ def parse_args():
     parser.add_argument("--eval-mcts-batch-size", type=int, default=32)
     parser.add_argument("--eval-movetime-ms", type=int, default=5000)
     parser.add_argument("--eval-c-puct", type=float, default=1.5)
+    parser.add_argument("--eval-c-puct-base", type=float, default=19652.0)
+    parser.add_argument("--eval-c-puct-factor", type=float, default=1.0)
+    parser.add_argument("--eval-fpu-reduction", type=float, default=0.15)
+    parser.add_argument("--eval-mcts-time-fraction", type=float, default=0.90)
     parser.add_argument("--eval-mate-guard-plies", type=int, default=3)
     parser.add_argument("--eval-mate-guard-topk", type=int, default=8)
     parser.add_argument("--eval-mate-guard-nodes", type=int, default=20000)
-    parser.add_argument("--eval-mate-guard-time-fraction", type=float, default=0.10)
-    parser.add_argument("--eval-q-tiebreak", action="store_true", default=True)
-    parser.add_argument(
-        "--no-eval-q-tiebreak",
-        dest="eval_q_tiebreak",
-        action="store_false",
-    )
-    parser.add_argument("--eval-q-tiebreak-p-ratio", type=float, default=0.90)
-    parser.add_argument(
-        "--eval-q-tiebreak-visit-ratio",
-        type=float,
-        default=0.80,
-    )
-    parser.add_argument("--eval-q-tiebreak-margin", type=float, default=0.25)
 
     parser.add_argument("--uci", default=STOCKFISH_PATH)
     parser.add_argument("--eval-uci-depth", type=int, default=8)

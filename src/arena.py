@@ -9,6 +9,8 @@ import json
 import math
 import multiprocessing as mp
 import os
+import re
+import textwrap
 from typing import Dict, List
 
 import chess
@@ -69,6 +71,14 @@ def trace_search_info(info: Dict, root_topn: int) -> Dict:
         "mcts_dynamic_target",
         "mcts_soft_cap",
         "uncertainty",
+        "c_puct_initial",
+        "c_puct_root",
+        "c_puct_base",
+        "c_puct_factor",
+        "fpu_reduction",
+        "fpu_root",
+        "virtual_loss",
+        "mcts_time_fraction",
         "nodes",
         "expanded_nodes",
         "nn_batches",
@@ -80,10 +90,6 @@ def trace_search_info(info: Dict, root_topn: int) -> Dict:
         "mate_guard_forced_move",
         "mate_guard_banned_moves",
         "mate_guard_reasons",
-        "q_tiebreak_enabled",
-        "q_tiebreak_overrode",
-        "q_tiebreak_move",
-        "q_tiebreak",
         "elapsed_ms",
     )
     payload = {key: info.get(key) for key in keys if key in info}
@@ -107,9 +113,7 @@ def pgn_search_comment(owner: str, info: Dict) -> str:
         parts.append(f"mate_forced={info.get('mate_guard_forced_move')}")
     banned = info.get("mate_guard_banned_moves") or []
     if banned:
-        parts.append(f"mate_banned={','.join(str(move) for move in banned)}")
-    if "q_tiebreak_overrode" in info:
-        parts.append(f"q_tiebreak={bool(info.get('q_tiebreak_overrode'))}")
+        parts.append(f"mate_banned={', '.join(str(move) for move in banned)}")
     root = []
     for row in list(info.get("root") or [])[:3]:
         root.append(
@@ -118,8 +122,73 @@ def pgn_search_comment(owner: str, info: Dict) -> str:
             f"q{float(row.get('q', 0.0)):+.3f}"
         )
     if root:
-        parts.append("root=" + ",".join(root))
+        parts.append("root=" + ", ".join(root))
     return " ".join(parts).replace("{", "(").replace("}", ")")
+
+
+def pgn_result_and_termination(
+    board: chess.Board,
+    ply: int,
+    max_plies: int,
+    claim_draws: bool,
+):
+    outcome = board.outcome(claim_draw=claim_draws)
+    result = board.result(claim_draw=claim_draws)
+    if result == "*":
+        result = "1/2-1/2"
+
+    if outcome is None:
+        if int(max_plies) > 0 and int(ply) >= int(max_plies):
+            return result, "max plies"
+        return result, "unfinished"
+
+    termination = outcome.termination.name.lower().replace("_", " ")
+    if outcome.termination == chess.Termination.THREEFOLD_REPETITION and claim_draws:
+        termination = "claimed threefold repetition"
+    elif outcome.termination == chess.Termination.FIFTY_MOVES and claim_draws:
+        termination = "claimed fifty-move rule"
+    return result, termination
+
+
+def render_pgn(game: chess.pgn.Game, columns: int = 88) -> str:
+    exporter = chess.pgn.StringExporter(
+        headers=True,
+        variations=False,
+        comments=True,
+        columns=None if int(columns) <= 0 else int(columns),
+    )
+    text = game.accept(exporter)
+    if int(columns) <= 0:
+        return text
+    return wrap_pgn_comments(text, columns=int(columns))
+
+
+def wrap_pgn_comments(text: str, columns: int) -> str:
+    wrapped_lines = []
+    width = max(40, int(columns) - 4)
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not (stripped.startswith("{") and stripped.endswith("}")):
+            wrapped_lines.append(line)
+            continue
+
+        content = stripped[1:-1].strip()
+        content = re.sub(r",(?=\S)", ", ", content)
+        parts = textwrap.wrap(
+            content,
+            width=width,
+            break_long_words=True,
+            break_on_hyphens=False,
+        )
+        if len(parts) <= 1:
+            wrapped_lines.append("{ " + content + " }")
+            continue
+
+        wrapped_lines.append("{ " + parts[0])
+        for part in parts[1:-1]:
+            wrapped_lines.append("  " + part)
+        wrapped_lines.append("  " + parts[-1] + " }")
+    return "\n".join(wrapped_lines)
 
 
 def worker_cache_path(cache_path, worker_index, worker_count):
@@ -177,6 +246,8 @@ def play_arena_game(
     start_fen,
     game_id=None,
     pgn_comments=False,
+    pgn_columns=88,
+    claim_draws=False,
     trace_root_topn=12,
 ):
     board = chess.Board(start_fen)
@@ -193,7 +264,7 @@ def play_arena_game(
     trace = []
     ply = 0
 
-    while not board.is_game_over(claim_draw=True) and ply < int(max_plies):
+    while not board.is_game_over(claim_draw=bool(claim_draws)) and ply < int(max_plies):
         candidate_turn = board.turn == candidate_color
         owner = "candidate" if candidate_turn else "baseline"
         searcher = candidate_searcher if candidate_turn else baseline_searcher
@@ -226,16 +297,20 @@ def play_arena_game(
         board.push(move)
         ply += 1
 
-    result_string = board.result(claim_draw=True)
-    if result_string == "*":
-        result_string = "1/2-1/2"
+    result_string, termination = pgn_result_and_termination(
+        board,
+        ply=ply,
+        max_plies=max_plies,
+        claim_draws=bool(claim_draws),
+    )
     game.headers["Result"] = result_string
+    game.headers["Termination"] = termination
     return (
         result_string,
         score_from_result(result_string, candidate_color),
         ply,
         trace,
-        str(game),
+        render_pgn(game, columns=pgn_columns),
     )
 
 
@@ -252,15 +327,16 @@ def _worker(job):
         mcts_batch_size,
         movetime_ms,
         c_puct,
+        c_puct_base,
+        c_puct_factor,
+        fpu_reduction,
+        mcts_time_fraction,
         mate_guard_plies,
         mate_guard_topk,
         mate_guard_nodes,
-        mate_guard_time_fraction,
-        q_tiebreak,
-        q_tiebreak_p_ratio,
-        q_tiebreak_visit_ratio,
-        q_tiebreak_margin,
         pgn_comments,
+        pgn_columns,
+        claim_draws,
         trace_root_topn,
         progress,
     ) = job
@@ -276,14 +352,13 @@ def _worker(job):
         mcts_batch_size=mcts_batch_size,
         time_limit=(movetime_ms / 1000.0) if movetime_ms > 0 else None,
         c_puct=c_puct,
+        c_puct_base=c_puct_base,
+        c_puct_factor=c_puct_factor,
+        fpu_reduction=fpu_reduction,
+        mcts_time_fraction=mcts_time_fraction,
         mate_guard_plies=mate_guard_plies,
         mate_guard_topk=mate_guard_topk,
         mate_guard_nodes=mate_guard_nodes,
-        mate_guard_time_fraction=mate_guard_time_fraction,
-        q_tiebreak=q_tiebreak,
-        q_tiebreak_p_ratio=q_tiebreak_p_ratio,
-        q_tiebreak_visit_ratio=q_tiebreak_visit_ratio,
-        q_tiebreak_margin=q_tiebreak_margin,
     )
     candidate_searcher = UnifiedSearch(candidate, options, device=device)
     baseline_searcher = UnifiedSearch(baseline, options, device=device)
@@ -305,8 +380,10 @@ def _worker(job):
             max_plies,
             fen,
             game_id,
-            pgn_comments,
-            trace_root_topn,
+            pgn_comments=pgn_comments,
+            pgn_columns=pgn_columns,
+            claim_draws=claim_draws,
+            trace_root_topn=trace_root_topn,
         )
         scores.append(score)
         counts[outcome_from_score(score)] += 1
@@ -483,14 +560,13 @@ def evaluate_models(
     mcts_batch_size=32,
     movetime_ms=5000,
     c_puct=1.5,
+    c_puct_base=19652.0,
+    c_puct_factor=1.0,
+    fpu_reduction=0.15,
+    mcts_time_fraction=0.90,
     mate_guard_plies=3,
     mate_guard_topk=8,
     mate_guard_nodes=20000,
-    mate_guard_time_fraction=0.10,
-    q_tiebreak=True,
-    q_tiebreak_p_ratio=0.90,
-    q_tiebreak_visit_ratio=0.80,
-    q_tiebreak_margin=0.25,
     uci=STOCKFISH_PATH,
     uci_depth=8,
     uci_movetime_ms=0,
@@ -502,6 +578,8 @@ def evaluate_models(
     pgn_output=None,
     trace_output=None,
     pgn_comments=False,
+    pgn_columns=88,
+    claim_draws=False,
     trace_root_topn=12,
     log_every=1000,
     progress=True,
@@ -561,15 +639,16 @@ def evaluate_models(
             mcts_batch_size,
             movetime_ms,
             c_puct,
+            c_puct_base,
+            c_puct_factor,
+            fpu_reduction,
+            mcts_time_fraction,
             mate_guard_plies,
             mate_guard_topk,
             mate_guard_nodes,
-            mate_guard_time_fraction,
-            q_tiebreak,
-            q_tiebreak_p_ratio,
-            q_tiebreak_visit_ratio,
-            q_tiebreak_margin,
             pgn_comments,
+            pgn_columns,
+            claim_draws,
             trace_root_topn,
             progress,
         ))
@@ -677,11 +756,12 @@ def evaluate_models(
         "mate_guard_plies": int(mate_guard_plies),
         "mate_guard_topk": int(mate_guard_topk),
         "mate_guard_nodes": int(mate_guard_nodes),
-        "mate_guard_time_fraction": float(mate_guard_time_fraction),
-        "q_tiebreak": bool(q_tiebreak),
-        "q_tiebreak_p_ratio": float(q_tiebreak_p_ratio),
-        "q_tiebreak_visit_ratio": float(q_tiebreak_visit_ratio),
-        "q_tiebreak_margin": float(q_tiebreak_margin),
+        "c_puct_initial": float(c_puct),
+        "c_puct_base": float(c_puct_base),
+        "c_puct_factor": float(c_puct_factor),
+        "fpu_reduction": float(fpu_reduction),
+        "mcts_time_fraction": float(mcts_time_fraction),
+        "claim_draws": bool(claim_draws),
         "opening_book": opening_book,
         "book_plies": int(book_plies),
         "paired_openings": True,
@@ -708,15 +788,13 @@ def parse_args():
     parser.add_argument("--mcts-batch-size", type=int, default=32)
     parser.add_argument("--movetime-ms", type=int, default=5000)
     parser.add_argument("--c-puct", type=float, default=1.5)
+    parser.add_argument("--c-puct-base", type=float, default=19652.0)
+    parser.add_argument("--c-puct-factor", type=float, default=1.0)
+    parser.add_argument("--fpu-reduction", type=float, default=0.15)
+    parser.add_argument("--mcts-time-fraction", type=float, default=0.90)
     parser.add_argument("--mate-guard-plies", type=int, default=3)
     parser.add_argument("--mate-guard-topk", type=int, default=8)
     parser.add_argument("--mate-guard-nodes", type=int, default=20000)
-    parser.add_argument("--mate-guard-time-fraction", type=float, default=0.10)
-    parser.add_argument("--q-tiebreak", action="store_true", default=True)
-    parser.add_argument("--no-q-tiebreak", dest="q_tiebreak", action="store_false")
-    parser.add_argument("--q-tiebreak-p-ratio", type=float, default=0.90)
-    parser.add_argument("--q-tiebreak-visit-ratio", type=float, default=0.80)
-    parser.add_argument("--q-tiebreak-margin", type=float, default=0.25)
 
     parser.add_argument("--uci", default=STOCKFISH_PATH)
     parser.add_argument("--uci-depth", type=int, default=8)
@@ -729,6 +807,8 @@ def parse_args():
     parser.add_argument("--pgn-output", default=None)
     parser.add_argument("--trace-output", default=None)
     parser.add_argument("--pgn-comments", action="store_true", default=False)
+    parser.add_argument("--pgn-columns", type=int, default=88)
+    parser.add_argument("--claim-draws", action="store_true", default=False)
     parser.add_argument("--trace-root-topn", type=int, default=12)
     parser.add_argument("--log-every", type=int, default=1000)
     return parser.parse_args()
@@ -751,14 +831,13 @@ def main():
         mcts_batch_size=args.mcts_batch_size,
         movetime_ms=args.movetime_ms,
         c_puct=args.c_puct,
+        c_puct_base=args.c_puct_base,
+        c_puct_factor=args.c_puct_factor,
+        fpu_reduction=args.fpu_reduction,
+        mcts_time_fraction=args.mcts_time_fraction,
         mate_guard_plies=args.mate_guard_plies,
         mate_guard_topk=args.mate_guard_topk,
         mate_guard_nodes=args.mate_guard_nodes,
-        mate_guard_time_fraction=args.mate_guard_time_fraction,
-        q_tiebreak=args.q_tiebreak,
-        q_tiebreak_p_ratio=args.q_tiebreak_p_ratio,
-        q_tiebreak_visit_ratio=args.q_tiebreak_visit_ratio,
-        q_tiebreak_margin=args.q_tiebreak_margin,
         uci=args.uci,
         uci_depth=args.uci_depth,
         uci_movetime_ms=args.uci_movetime_ms,
@@ -770,6 +849,8 @@ def main():
         pgn_output=args.pgn_output,
         trace_output=args.trace_output,
         pgn_comments=args.pgn_comments,
+        pgn_columns=args.pgn_columns,
+        claim_draws=args.claim_draws,
         trace_root_topn=args.trace_root_topn,
         log_every=args.log_every,
         progress=True,

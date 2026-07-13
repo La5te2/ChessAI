@@ -41,14 +41,13 @@ class EngineConfig:
     mcts_batch_size: int = 32
     movetime_ms: int = 3000
     c_puct: float = 1.5
+    c_puct_base: float = 19652.0
+    c_puct_factor: float = 1.0
+    fpu_reduction: float = 0.15
+    mcts_time_fraction: float = 0.90
     mate_guard_plies: int = 3
     mate_guard_topk: int = 8
     mate_guard_nodes: int = 20000
-    mate_guard_time_fraction: float = 0.10
-    q_tiebreak: bool = True
-    q_tiebreak_p_ratio: float = 0.90
-    q_tiebreak_visit_ratio: float = 0.80
-    q_tiebreak_margin: float = 0.25
     root_topn: int = 8
 
 
@@ -70,14 +69,13 @@ SEARCH_PARAMETER_TYPES = {
     "mcts_batch_size": int,
     "movetime_ms": int,
     "c_puct": float,
+    "c_puct_base": float,
+    "c_puct_factor": float,
+    "fpu_reduction": float,
+    "mcts_time_fraction": float,
     "mate_guard_plies": int,
     "mate_guard_topk": int,
     "mate_guard_nodes": int,
-    "mate_guard_time_fraction": float,
-    "q_tiebreak": bool_from_text,
-    "q_tiebreak_p_ratio": float,
-    "q_tiebreak_visit_ratio": float,
-    "q_tiebreak_margin": float,
     "root_topn": int,
 }
 
@@ -175,14 +173,13 @@ class ChessEngine:
                 else None
             ),
             c_puct=self.config.c_puct,
+            c_puct_base=self.config.c_puct_base,
+            c_puct_factor=self.config.c_puct_factor,
+            fpu_reduction=self.config.fpu_reduction,
+            mcts_time_fraction=self.config.mcts_time_fraction,
             mate_guard_plies=self.config.mate_guard_plies,
             mate_guard_topk=self.config.mate_guard_topk,
             mate_guard_nodes=self.config.mate_guard_nodes,
-            mate_guard_time_fraction=self.config.mate_guard_time_fraction,
-            q_tiebreak=self.config.q_tiebreak,
-            q_tiebreak_p_ratio=self.config.q_tiebreak_p_ratio,
-            q_tiebreak_visit_ratio=self.config.q_tiebreak_visit_ratio,
-            q_tiebreak_margin=self.config.q_tiebreak_margin,
             root_topn=self.config.root_topn,
         )
 
@@ -230,26 +227,22 @@ class ChessEngine:
                     "root_topn",
                 } and value < 0:
                     raise ValueError(f"{name} must be non-negative")
+                if name in {
+                    "c_puct",
+                    "c_puct_base",
+                    "c_puct_factor",
+                    "fpu_reduction",
+                } and value < 0:
+                    raise ValueError(f"{name} must be non-negative")
+                if name == "c_puct_base" and value < 1:
+                    raise ValueError("c_puct_base must be at least 1")
                 if name == "mcts_batch_size" and value < 1:
                     raise ValueError("mcts_batch_size must be at least 1")
                 if name == "root_topn" and value < 1:
                     raise ValueError("root_topn must be at least 1")
-                if (
-                    name in {
-                        "q_tiebreak_p_ratio",
-                        "q_tiebreak_visit_ratio",
-                    }
-                    and not 0.0 <= value <= 1.0
-                ):
-                    raise ValueError(f"{name} must be between 0 and 1")
-                if name == "q_tiebreak_margin" and value < 0.0:
-                    raise ValueError("q_tiebreak_margin must be non-negative")
-                if (
-                    name == "mate_guard_time_fraction"
-                    and not 0.0 <= value <= 0.5
-                ):
+                if name == "mcts_time_fraction" and not 0.0 <= value <= 1.0:
                     raise ValueError(
-                        "mate_guard_time_fraction must be between 0 and 0.5"
+                        "mcts_time_fraction must be between 0 and 1"
                     )
                 setattr(self.config, name, value)
 
@@ -637,15 +630,14 @@ class ModelSettingsDialog(tk.Toplevel):
             "mcts_min_sims": "MCTS minimum sims",
             "mcts_batch_size": "MCTS batch size",
             "movetime_ms": "Movetime (ms)",
-            "c_puct": "C-PUCT",
+            "c_puct": "C-PUCT initial",
+            "c_puct_base": "C-PUCT schedule base",
+            "c_puct_factor": "C-PUCT schedule factor",
+            "fpu_reduction": "FPU reduction",
+            "mcts_time_fraction": "MCTS time fraction",
             "mate_guard_plies": "Mate guard plies",
             "mate_guard_topk": "Mate guard root candidates",
             "mate_guard_nodes": "Mate guard node cap",
-            "mate_guard_time_fraction": "Mate guard time fraction",
-            "q_tiebreak": "Q tiebreak",
-            "q_tiebreak_p_ratio": "Q tiebreak p ratio",
-            "q_tiebreak_visit_ratio": "Q tiebreak visit ratio",
-            "q_tiebreak_margin": "Q tiebreak margin",
             "root_topn": "Suggestion count",
         }
         current = engine.parameter_dict()
@@ -1061,14 +1053,15 @@ class ChessBoardApp:
             f"{info.get('mcts_soft_cap')}\n"
             f"Uncertainty: {info.get('uncertainty')}\n"
             f"Value: {info.get('value')}\n"
+            f"C-PUCT root: {info.get('c_puct_root')}\n"
+            f"FPU root: {info.get('fpu_root')}\n"
+            f"MCTS time fraction: {info.get('mcts_time_fraction')}\n"
             f"Expanded nodes: {info.get('nodes')}\n"
             f"NN batches: {info.get('nn_batches')}\n"
             f"Mate guard nodes: {info.get('mate_guard_nodes')}\n"
             f"Mate guard completed: {info.get('mate_guard_completed')}\n"
             f"Mate guard forced: {info.get('mate_guard_forced_move')}\n"
             f"Mate guard banned: {info.get('mate_guard_banned_moves')}\n"
-            f"Q tiebreak: {info.get('q_tiebreak_overrode')} "
-            f"{info.get('q_tiebreak_move')}\n"
             f"Elapsed: {info.get('elapsed_ms')} ms\n"
         )
         self.info_text.insert(tk.END, text)
@@ -1602,7 +1595,6 @@ def print_search_info(info: Dict):
         ),
         "uncertainty=", info.get("uncertainty"),
         "value=", info.get("value"),
-        "q_tiebreak=", info.get("q_tiebreak_move"),
     )
 
 
@@ -1841,15 +1833,13 @@ def parse_args():
     parser.add_argument("--mcts-batch-size", type=int, default=32)
     parser.add_argument("--movetime-ms", type=int, default=3000)
     parser.add_argument("--c-puct", type=float, default=1.5)
+    parser.add_argument("--c-puct-base", type=float, default=19652.0)
+    parser.add_argument("--c-puct-factor", type=float, default=1.0)
+    parser.add_argument("--fpu-reduction", type=float, default=0.15)
+    parser.add_argument("--mcts-time-fraction", type=float, default=0.90)
     parser.add_argument("--mate-guard-plies", type=int, default=3)
     parser.add_argument("--mate-guard-topk", type=int, default=8)
     parser.add_argument("--mate-guard-nodes", type=int, default=20000)
-    parser.add_argument("--mate-guard-time-fraction", type=float, default=0.10)
-    parser.add_argument("--q-tiebreak", action="store_true", default=True)
-    parser.add_argument("--no-q-tiebreak", dest="q_tiebreak", action="store_false")
-    parser.add_argument("--q-tiebreak-p-ratio", type=float, default=0.90)
-    parser.add_argument("--q-tiebreak-visit-ratio", type=float, default=0.80)
-    parser.add_argument("--q-tiebreak-margin", type=float, default=0.25)
     parser.add_argument("--root-topn", type=int, default=8)
     return parser.parse_args()
 
@@ -1865,14 +1855,13 @@ def main():
         mcts_batch_size=args.mcts_batch_size,
         movetime_ms=args.movetime_ms,
         c_puct=args.c_puct,
+        c_puct_base=args.c_puct_base,
+        c_puct_factor=args.c_puct_factor,
+        fpu_reduction=args.fpu_reduction,
+        mcts_time_fraction=args.mcts_time_fraction,
         mate_guard_plies=args.mate_guard_plies,
         mate_guard_topk=args.mate_guard_topk,
         mate_guard_nodes=args.mate_guard_nodes,
-        mate_guard_time_fraction=args.mate_guard_time_fraction,
-        q_tiebreak=args.q_tiebreak,
-        q_tiebreak_p_ratio=args.q_tiebreak_p_ratio,
-        q_tiebreak_visit_ratio=args.q_tiebreak_visit_ratio,
-        q_tiebreak_margin=args.q_tiebreak_margin,
         root_topn=args.root_topn,
     )
     engine = ChessEngine(
