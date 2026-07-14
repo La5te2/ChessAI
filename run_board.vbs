@@ -6,7 +6,7 @@ shell.CurrentDirectory = baseDir
 
 cmd = "pythonw.exe src\board.py" & _
   " --gui 1" & _
-  " --model models\candidate.pth" & _
+  " --model models\candidate1.pth" & _
   " --device cpu" & _
   " --search-type only-mcts" & _
   " --mcts-sims 100" & _
@@ -19,8 +19,8 @@ cmd = "pythonw.exe src\board.py" & _
   " --fpu-reduction 0.15" & _
   " --mcts-time-fraction 1.0" & _
   " --mate-plies 0" & _
-  " --mate-topk 4" & _
-  " --mate-nodes 20000" & _
+  " --mate-topk 0" & _
+  " --mate-nodes 0" & _
   " --mate-hash-mb 16" & _
   " --root-topn 8"
 
