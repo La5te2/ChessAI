@@ -464,37 +464,78 @@ LogSearch
 
 `setup_lichess_bot.sh` 和 `run_lichess_bot.sh` 面向云端 Linux 使用。`data/lichess/` 存放官方 lichess-bot 仓库、虚拟环境、生成配置、日志、PID 和 PGN。
 
+云端需要走本地代理时，先在本地保持反向隧道：
+
+```bash
+ssh -N -R 127.0.0.1:10090:127.0.0.1:10090 MS
+```
+
+然后在云端 shell 导入代理：
+
+```bash
+export http_proxy=http://127.0.0.1:10090
+export https_proxy=http://127.0.0.1:10090
+export HTTP_PROXY=http://127.0.0.1:10090
+export HTTPS_PROXY=http://127.0.0.1:10090
+export no_proxy=localhost,127.0.0.1,::1
+```
+
+创建并激活项目 Python 环境，供 `src/uci_engine.py` 加载 `.pth` 模型：
+
+```bash
+apt update
+apt install -y python3.10-venv python3-pip git
+
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
+python -m pip install python-chess numpy h5py tqdm
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+```
+
 安装或更新 lichess-bot：
 
 ```bash
 bash setup_lichess_bot.sh
 ```
 
-准备 Lichess OAuth token 后导入环境变量：
+准备 Lichess OAuth token 后导入环境变量。输入提示出现后粘贴完整的 `lip_...`，再回车：
 
 ```bash
-export LICHESS_TOKEN=lip_xxxxxxxxxxxxxxxxxxxx
+read -rsp "LICHESS_TOKEN: " LICHESS_TOKEN
+echo
+export LICHESS_TOKEN
+test -n "$LICHESS_TOKEN" && echo token_ok
 ```
 
 首次把 Lichess 账号升级为 BOT 账号：
 
 ```bash
-UPGRADE_BOT=1 bash run_lichess_bot.sh
+UPGRADE_BOT=1 \
+MODEL=models/candidate.pth \
+DEVICE=cpu \
+MCTS_SIMS=0 \
+bash run_lichess_bot.sh
 ```
 
-启动 bot：
+常驻云服务器 CPU 启动 bot：
 
 ```bash
-export LICHESS_TOKEN=lip_xxxxxxxxxxxxxxxxxxxx
-
-MODEL=models/champion.pth \
-DEVICE=cuda \
+MODEL=models/candidate.pth \
+DEVICE=cpu \
 MCTS_SIMS=0 \
 MOVETIME_MS=1000 \
-MAX_MOVETIME_MS=5000 \
+MAX_MOVETIME_MS=3000 \
 CHALLENGE_ONLY_BOT=true \
 ALLOW_MATCHMAKING=false \
 bash run_lichess_bot.sh
+```
+
+允许人类账号挑战：
+
+```bash
+MODEL=models/candidate.pth DEVICE=cpu MCTS_SIMS=100 MOVETIME_MS=0 MAX_MOVETIME_MS=5000 CHALLENGE_ONLY_BOT=false bash run_lichess_bot.sh
 ```
 
 脚本会生成：

@@ -27,4 +27,6 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 
 echo "lichess-bot setup done"
-echo "next: export LICHESS_TOKEN=... && bash $ROOT_DIR/run_lichess_bot.sh"
+echo "next: source $ROOT_DIR/.venv/bin/activate"
+echo "next: read -rsp \"LICHESS_TOKEN: \" LICHESS_TOKEN && echo && export LICHESS_TOKEN"
+echo "next: bash $ROOT_DIR/run_lichess_bot.sh"

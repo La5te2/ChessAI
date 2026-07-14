@@ -203,12 +203,12 @@ class UCIEngine:
         ):
             return self.model
 
-        uci_print(f"info string loading model {path} on {device}")
+        print(f"loading model {path} on {device}", file=sys.stderr, flush=True)
         with contextlib.redirect_stdout(sys.stderr):
             self.model = load_model(path, device=device)
         self.loaded_model_path = path
         self.loaded_device = device
-        uci_print("info string model ready")
+        print("model ready", file=sys.stderr, flush=True)
         return self.model
 
     def set_position(self, line: str):
