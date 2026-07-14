@@ -607,14 +607,17 @@ python src/reinforce.py \
   --uci models/stockfish/stockfish \
   --device cuda \
   --iterations 5 \
-  --positions-per-iter 20000 \
+  --positions-per-iter 10000 \
   --parallel 10 \
   --source-min-ply 0 \
   --source-max-ply 160 \
   --arena-replay-window 1 \
   --arena-replay-positions -1 \
-  --sample-topk 4 \
-  --reward-scale-cp 300 \
+  --arena-replay-positions-per-iter 10000 \
+  --sample-topk 6 \
+  --reward-scale-cp 600 \
+  --teacher-policy-weight 0.10 \
+  --teacher-policy-temp-cp 150 \
   --actor-exploration-mix 0.05 \
   --advantage-clip 1.0 \
   --uci-depth 16 \
@@ -629,8 +632,8 @@ python src/reinforce.py \
   --lr 0.00003 \
   --actor-weight 1.0 \
   --critic-weight 0.50 \
-  --entropy-weight 0.01 \
-  --kl-weight 0.10 \
+  --entropy-weight 0.003 \
+  --kl-weight 0.05 \
   --validation-source data/games.pgn \
   --validation-positions 1000 \
   --validation-offset 100000 \
@@ -644,7 +647,7 @@ python src/reinforce.py \
   --validation-uci-threads 1 \
   --validation-uci-hash-mb 512 \
   --eval-games 200 \
-  --eval-sims 100 \
+  --eval-sims 0 \
   --eval-workers 10 \
   --eval-max-plies 160 \
   --eval-opening-book data/openings.gen.bin \
@@ -659,14 +662,22 @@ python src/reinforce.py \
   --eval-mate-guard-nodes 0 \
   --eval-uci-depth 16 \
   --eval-uci-multipv 1 \
-  --eval-min-net-wins 4 \
+  --eval-min-net-wins 0 \
   --eval-min-acpl-improvement 0.0 \
   --eval-min-accuracy-improvement 0.0 \
   --log-every 50 \
   --seed 2026
 ```
 
-Offline reinforce 的状态由 `--fen-source` 提供：PGN 或带 `fens` dataset 的 HDF5。`--positions-per-iter` 表示每轮按顺序抽取的 FEN 数量，`--source-min-ply` 与 `--source-max-ply` 控制 PGN 局面范围。模型用 sim=0 policy top-k 提出 action，`--sample-topk` 控制候选数量，`--include-teacher-best` 把 Stockfish 最佳招加入 action 集合。教师机为每个 action 生成 `tanh(score_cp / reward_scale_cp)` 连续 reward。critic 学习候选行为策略的期望 reward；actor 使用 `reward - value` advantage 执行策略梯度。`--actor-exploration-mix` 为已评价 action 分配均匀探索权重，`--advantage-clip` 控制 advantage 范围。训练使用 entropy 与 KL reference。`--arena-replay-window` 与 `--arena-replay-positions` 把最近 arena 对局产生的 FEN 混入下一轮离线标注；`-1` 表示读取窗口内全部 arena FEN。`--validation-*` 从人类棋谱局面抽取验证集，并由 Stockfish 统计 baseline 与 candidate 的 top1 regret、max regret、teacher-best top-k 命中率、value MAE/RMSE/correlation/sign accuracy。验收对局通过 `--eval-opening-book` 使用开局书，并由 arena 调用 search 参数完成对战。
+Offline reinforce 的状态由 `--fen-source` 提供：PGN 或带 `fens` dataset 的 HDF5。`--positions-per-iter` 表示每轮按顺序抽取的 FEN 数量，`--source-min-ply` 与 `--source-max-ply` 控制 PGN 局面范围。模型用 sim=0 policy top-k 提出 action，`--sample-topk` 控制候选数量，`--include-teacher-best` 把 Stockfish 最佳招加入 action 集合。教师机为每个 action 生成 `tanh(score_cp / reward_scale_cp)` 连续 reward。`--teacher-policy-temp-cp` 将候选 action 的 Stockfish score 转换为 softmax teacher policy；`--teacher-policy-weight` 控制该 soft policy 交叉熵对 policy head 的辅助牵引。critic 学习候选行为策略的期望 reward；actor 使用 `reward - value` advantage 执行策略梯度。`--actor-exploration-mix` 为已评价 action 分配均匀探索权重，`--advantage-clip` 控制 advantage 范围。训练使用 entropy 与 KL reference。`--arena-replay-window` 控制读取最近几轮 arena FEN，`--arena-replay-positions` 是窗口内总量上限，`--arena-replay-positions-per-iter` 是每个历史 iter 的读取上限；`-1` 表示总量不截断。`--validation-*` 从人类棋谱局面抽取验证集，并由 Stockfish 统计 baseline 与 candidate 的 top1 regret、max regret、teacher-best top-k 命中率、value MAE/RMSE/correlation/sign accuracy。验收对局通过 `--eval-opening-book` 使用开局书，并由 arena 调用 search 参数完成对战。
+
+例如 iter5 使用前四轮各最多 10000 个 replay FEN：
+
+```bash
+ARENA_REPLAY_WINDOW=4
+ARENA_REPLAY_POSITIONS=-1
+ARENA_REPLAY_POSITIONS_PER_ITER=10000
+```
 
 `--seed` 控制 offline RL DataLoader 的 batch shuffle 与 arena opening book 洗牌。FEN 标注保持源文件顺序，固定 seed 便于复现实验的数据顺序和验收开局。
 

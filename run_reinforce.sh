@@ -23,16 +23,19 @@ FEN_SOURCE="data/games.pgn"
 UCI="models/stockfish/stockfish"
 DEVICE="cuda"
 
-ITERATIONS=2
-POSITIONS_PER_ITER=50000
+ITERATIONS=5
+POSITIONS_PER_ITER=10000
 PARALLEL=10
 SOURCE_MIN_PLY=0
 SOURCE_MAX_PLY=160
-ARENA_REPLAY_WINDOW=1
+ARENA_REPLAY_WINDOW=4
 ARENA_REPLAY_POSITIONS=-1
+ARENA_REPLAY_POSITIONS_PER_ITER=10000
 
-SAMPLE_TOPK=8
+SAMPLE_TOPK=6
 REWARD_SCALE_CP=600
+TEACHER_POLICY_WEIGHT=0.10
+TEACHER_POLICY_TEMP_CP=150
 ACTOR_EXPLORATION_MIX=0.05
 ADVANTAGE_CLIP=1.0
 
@@ -49,8 +52,8 @@ TRAIN_WORKERS=4
 LR=0.00003
 ACTOR_WEIGHT=1.0
 CRITIC_WEIGHT=0.50
-ENTROPY_WEIGHT=0.01
-KL_WEIGHT=0.10
+ENTROPY_WEIGHT=0.003
+KL_WEIGHT=0.05
 
 VALIDATION_SOURCE="data/games.pgn"
 VALIDATION_POSITIONS=1000
@@ -81,7 +84,7 @@ EVAL_MATE_GUARD_TOPK=0
 EVAL_MATE_GUARD_NODES=0
 EVAL_UCI_DEPTH=16
 EVAL_UCI_MULTIPV=1
-EVAL_MIN_NET_WINS=4
+EVAL_MIN_NET_WINS=0
 EVAL_MIN_ACPL_IMPROVEMENT=0.0
 EVAL_MIN_ACCURACY_IMPROVEMENT=0.0
 
@@ -93,9 +96,10 @@ echo "run_id=${RUN_ID}"
 echo "model=${MODEL}"
 echo "seed=${SEED}"
 echo "offline labels: fen_source=${FEN_SOURCE} positions_per_iter=${POSITIONS_PER_ITER} parallel=${PARALLEL} source_ply=${SOURCE_MIN_PLY}-${SOURCE_MAX_PLY}"
-echo "arena replay: window=${ARENA_REPLAY_WINDOW} positions=${ARENA_REPLAY_POSITIONS}"
+echo "arena replay: window=${ARENA_REPLAY_WINDOW} positions=${ARENA_REPLAY_POSITIONS} positions_per_iter=${ARENA_REPLAY_POSITIONS_PER_ITER}"
 echo "actor actions: topk=${SAMPLE_TOPK} include_teacher_best=true exploration_mix=${ACTOR_EXPLORATION_MIX}"
 echo "reward: continuous_tanh_cp scale_cp=${REWARD_SCALE_CP} advantage_clip=${ADVANTAGE_CLIP}"
+echo "teacher policy: weight=${TEACHER_POLICY_WEIGHT} temp_cp=${TEACHER_POLICY_TEMP_CP}"
 echo "teacher: uci=${UCI} depth=${UCI_DEPTH} multipv=${UCI_MULTIPV} threads=${UCI_THREADS}"
 echo "train: epochs=${EPOCHS} train_max_steps=${TRAIN_MAX_STEPS} batch_size=${BATCH_SIZE} actor_weight=${ACTOR_WEIGHT} critic_weight=${CRITIC_WEIGHT} entropy_weight=${ENTROPY_WEIGHT}"
 echo "teacher validation: source=${VALIDATION_SOURCE} positions=${VALIDATION_POSITIONS} offset=${VALIDATION_OFFSET} topk=${VALIDATION_TOPK} uci_depth=${VALIDATION_UCI_DEPTH} uci_multipv=${VALIDATION_UCI_MULTIPV}"
@@ -114,8 +118,11 @@ exec python src/reinforce.py \
   --source-max-ply "${SOURCE_MAX_PLY}" \
   --arena-replay-window "${ARENA_REPLAY_WINDOW}" \
   --arena-replay-positions "${ARENA_REPLAY_POSITIONS}" \
+  --arena-replay-positions-per-iter "${ARENA_REPLAY_POSITIONS_PER_ITER}" \
   --sample-topk "${SAMPLE_TOPK}" \
   --reward-scale-cp "${REWARD_SCALE_CP}" \
+  --teacher-policy-weight "${TEACHER_POLICY_WEIGHT}" \
+  --teacher-policy-temp-cp "${TEACHER_POLICY_TEMP_CP}" \
   --actor-exploration-mix "${ACTOR_EXPLORATION_MIX}" \
   --advantage-clip "${ADVANTAGE_CLIP}" \
   --uci-depth "${UCI_DEPTH}" \

@@ -260,24 +260,26 @@ def write_arena_fens_from_trace(trace_path: str, output_path: str) -> Dict:
 
 def load_arena_replay_fens(args, data_run_dir: str, iteration: int) -> Tuple[List[str], List[str]]:
     limit = int(args.arena_replay_positions)
-    if limit == 0 or int(iteration) <= 1:
+    per_iter_limit = int(getattr(args, "arena_replay_positions_per_iter", 0) or 0)
+    if (limit == 0 and per_iter_limit == 0) or int(iteration) <= 1:
         return [], []
 
     window = max(1, int(args.arena_replay_window))
     first_iteration = max(1, int(iteration) - window)
-    paths = [
-        arena_fens_path(data_run_dir, replay_iteration)
-        for replay_iteration in range(int(iteration) - 1, first_iteration - 1, -1)
-    ]
 
     fens = []
     used_paths = []
-    for path in paths:
+    for replay_iteration in range(int(iteration) - 1, first_iteration - 1, -1):
+        path = arena_fens_path(data_run_dir, replay_iteration)
         if not os.path.exists(path):
             continue
         used_paths.append(path)
         with open(path, "r", encoding="utf-8") as handle:
-            fens.extend(line.strip() for line in handle if line.strip())
+            path_fens = [line.strip() for line in handle if line.strip()]
+        path_fens = dedupe_fens(path_fens)
+        if per_iter_limit > 0:
+            path_fens = path_fens[:per_iter_limit]
+        fens.extend(path_fens)
 
     unique = dedupe_fens(fens)
     if limit > 0:
@@ -349,9 +351,11 @@ def rl_targets_from_scores(
     candidate_moves: Sequence[chess.Move],
     model_policy: np.ndarray,
     reward_scale_cp: float,
-) -> Tuple[np.ndarray, np.ndarray, float, float]:
+    teacher_policy_temp_cp: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, float]:
     candidate_mask = np.zeros(NUM_ACTIONS, dtype=np.uint8)
     action_rewards = np.zeros(NUM_ACTIONS, dtype=np.float32)
+    teacher_policy = np.zeros(NUM_ACTIONS, dtype=np.float32)
     rows = []
     legal = set(board.legal_moves)
     usable = []
@@ -364,21 +368,31 @@ def rl_targets_from_scores(
         usable.append((move, int(move_scores[uci])))
 
     if not usable:
-        return candidate_mask, action_rewards, 0.0, 0.0
+        return candidate_mask, action_rewards, teacher_policy, 0.0, 0.0
 
     best_score = max(score for _move, score in usable)
-    for move, score in usable:
+    temp = max(1.0, float(teacher_policy_temp_cp))
+    teacher_logits = np.asarray(
+        [(float(score) - float(best_score)) / temp for _move, score in usable],
+        dtype=np.float32,
+    )
+    teacher_logits -= float(np.max(teacher_logits))
+    teacher_weights = np.exp(teacher_logits).astype(np.float32)
+    teacher_weights /= max(1e-12, float(teacher_weights.sum()))
+    for (move, score), weight in zip(usable, teacher_weights):
         regret = max(0, int(best_score - score))
         reward = reward_from_cp(score, reward_scale_cp)
         index = move_to_index(move)
         candidate_mask[index] = 1
         action_rewards[index] = float(reward)
+        teacher_policy[index] = float(weight)
         rows.append({
             "move": move.uci(),
             "score_cp": int(score),
             "regret_cp": int(regret),
             "reward": float(reward),
             "model_probability": float(model_policy[index]),
+            "teacher_probability": float(teacher_policy[index]),
         })
 
     model_top1 = candidate_moves[0].uci() if candidate_moves else None
@@ -391,7 +405,7 @@ def rl_targets_from_scores(
         0.0,
     )
     max_regret = float(max(row["regret_cp"] for row in rows) if rows else 0.0)
-    return candidate_mask, action_rewards, max_regret, model_top1_regret
+    return candidate_mask, action_rewards, teacher_policy, max_regret, model_top1_regret
 
 
 def add_teacher_best_candidate(
@@ -457,6 +471,7 @@ def label_worker(job):
             (
                 candidate_mask,
                 action_rewards,
+                teacher_policy,
                 max_regret,
                 model_top1_regret,
             ) = rl_targets_from_scores(
@@ -465,6 +480,7 @@ def label_worker(job):
                 candidates,
                 model_policy=model_policy,
                 reward_scale_cp=float(args_dict["reward_scale_cp"]),
+                teacher_policy_temp_cp=float(args_dict["teacher_policy_temp_cp"]),
             )
             if int(candidate_mask.sum()) <= 0:
                 continue
@@ -475,6 +491,7 @@ def label_worker(job):
                 "state": board_to_packed(board),
                 "candidate_mask": candidate_mask,
                 "action_rewards": action_rewards,
+                "teacher_policy": teacher_policy,
                 "model_policy": model_policy,
                 "teacher_value": float(
                     teacher_result.get(
@@ -531,7 +548,7 @@ def write_offline_h5(path: str, rows: List[Dict], summary: Dict):
             chunks=True,
             compression="lzf",
         )
-        for key in ("action_rewards", "model_policy"):
+        for key in ("action_rewards", "teacher_policy", "model_policy"):
             h5.create_dataset(
                 key,
                 data=np.asarray([row[key] for row in rows], dtype=np.float16),
@@ -628,10 +645,12 @@ def generate_offline_data(
         "arena_replay_paths": list(replay_paths),
         "arena_replay_window": int(args.arena_replay_window),
         "arena_replay_limit": int(args.arena_replay_positions),
+        "arena_replay_limit_per_iter": int(args.arena_replay_positions_per_iter),
         "source": str(args.fen_source or PGN_PATH),
         "source_offset": int(args.source_offset) + max(0, int(iteration) - 1) * int(args.positions_per_iter),
         "sample_topk": int(args.sample_topk),
         "include_teacher_best": bool(args.include_teacher_best),
+        "teacher_policy_temp_cp": float(args.teacher_policy_temp_cp),
         "mean_max_regret_cp": float(np.mean(regret_values)),
         "p90_max_regret_cp": float(np.percentile(regret_values, 90)),
         "mean_top1_regret_cp": float(np.mean(top1_regret_values)),
@@ -651,6 +670,7 @@ class OfflineDataset(Dataset):
             self.states = np.asarray(h5["states"], dtype=np.uint8)
             self.candidate_mask = np.asarray(h5["candidate_mask"], dtype=np.bool_)
             self.action_rewards = np.asarray(h5["action_rewards"], dtype=np.float32)
+            self.teacher_policy = np.asarray(h5["teacher_policy"], dtype=np.float32)
 
     def __len__(self):
         return int(self.states.shape[0])
@@ -660,12 +680,14 @@ class OfflineDataset(Dataset):
             torch.from_numpy(packed_to_tensor(self.states[index])),
             torch.from_numpy(self.candidate_mask[index]),
             torch.from_numpy(self.action_rewards[index]),
+            torch.from_numpy(self.teacher_policy[index]),
         )
 
 
-def actor_critic_losses(logits, values, candidate_mask, action_rewards, args):
+def actor_critic_losses(logits, values, candidate_mask, action_rewards, teacher_policy, args):
     masked_logits = logits.masked_fill(~candidate_mask, torch.finfo(logits.dtype).min)
     raw_policy = F.softmax(masked_logits, dim=1)
+    raw_log_policy = F.log_softmax(masked_logits, dim=1)
 
     exploration_mix = max(0.0, min(1.0, float(args.actor_exploration_mix)))
     candidate_count = candidate_mask.sum(dim=1, keepdim=True).clamp_min(1)
@@ -688,7 +710,9 @@ def actor_critic_losses(logits, values, candidate_mask, action_rewards, args):
     ).sum(dim=1).mean()
     critic_loss = F.smooth_l1_loss(values, critic_target.detach())
     entropy = -(policy * log_policy).sum(dim=1).mean()
-    return actor_loss, critic_loss, entropy, critic_target.mean()
+    teacher_target = teacher_policy / teacher_policy.sum(dim=1, keepdim=True).clamp_min(1e-12)
+    teacher_policy_loss = -(teacher_target.detach() * raw_log_policy).sum(dim=1).mean()
+    return actor_loss, critic_loss, entropy, teacher_policy_loss, critic_target.mean()
 
 
 def train_offline_actor_critic(args, source_model: str, data_path: str, candidate_path: str) -> Dict:
@@ -733,7 +757,7 @@ def train_offline_actor_critic(args, source_model: str, data_path: str, candidat
     stop = False
     last_metrics = {}
     for epoch in range(int(args.epochs)):
-        for states, candidate_mask, action_rewards in loader:
+        for states, candidate_mask, action_rewards, teacher_policy in loader:
             states = states.to(args.device, non_blocking=True)
             candidate_mask = candidate_mask.to(
                 args.device,
@@ -741,16 +765,24 @@ def train_offline_actor_critic(args, source_model: str, data_path: str, candidat
                 non_blocking=True,
             )
             action_rewards = action_rewards.to(args.device, non_blocking=True)
+            teacher_policy = teacher_policy.to(args.device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", enabled=amp_enabled):
                 logits, values = student(states)
                 values = values.squeeze(1)
-                actor_loss, critic_loss, entropy, mean_reward = actor_critic_losses(
+                (
+                    actor_loss,
+                    critic_loss,
+                    entropy,
+                    teacher_policy_loss,
+                    mean_reward,
+                ) = actor_critic_losses(
                     logits,
                     values,
                     candidate_mask,
                     action_rewards,
+                    teacher_policy,
                     args,
                 )
                 with torch.no_grad():
@@ -767,6 +799,7 @@ def train_offline_actor_critic(args, source_model: str, data_path: str, candidat
                     + float(args.critic_weight) * critic_loss
                     - float(args.entropy_weight) * entropy
                     + float(args.kl_weight) * kl_loss
+                    + float(args.teacher_policy_weight) * teacher_policy_loss
                 )
 
             scaler.scale(loss).backward()
@@ -784,6 +817,7 @@ def train_offline_actor_critic(args, source_model: str, data_path: str, candidat
                 "critic": float(critic_loss.item()),
                 "reward": float(mean_reward.item()),
                 "entropy": float(entropy.item()),
+                "teacher_policy": float(teacher_policy_loss.item()),
                 "kl": float(kl_loss.item()),
                 "loss": float(loss.item()),
             }
@@ -796,6 +830,7 @@ def train_offline_actor_critic(args, source_model: str, data_path: str, candidat
                     f"critic={last_metrics['critic']:.4f}",
                     f"reward={last_metrics['reward']:+.4f}",
                     f"entropy={last_metrics['entropy']:.4f}",
+                    f"teacher_policy={last_metrics['teacher_policy']:.4f}",
                     f"kl={last_metrics['kl']:.4f}",
                     f"loss={last_metrics['loss']:.4f}",
                     flush=True,
@@ -1266,7 +1301,13 @@ def build_parser():
         "--arena-replay-positions",
         type=int,
         default=0,
-        help="Maximum arena FENs to add to the next offline labeling pass; 0 disables, negative means all.",
+        help="Total maximum arena FENs to add to the next offline labeling pass; 0 disables unless --arena-replay-positions-per-iter is set, negative means all.",
+    )
+    parser.add_argument(
+        "--arena-replay-positions-per-iter",
+        type=int,
+        default=0,
+        help="Maximum arena FENs to read from each previous iteration in the replay window; 0 uses the total-limit behavior.",
     )
 
     parser.add_argument("--sample-topk", type=int, default=8)
@@ -1277,6 +1318,8 @@ def build_parser():
         action="store_false",
     )
     parser.add_argument("--reward-scale-cp", type=float, default=600.0)
+    parser.add_argument("--teacher-policy-weight", type=float, default=0.10)
+    parser.add_argument("--teacher-policy-temp-cp", type=float, default=150.0)
     parser.add_argument("--actor-exploration-mix", type=float, default=0.05)
     parser.add_argument("--advantage-clip", type=float, default=1.0)
 
