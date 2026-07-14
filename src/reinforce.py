@@ -922,6 +922,7 @@ def teacher_validation_worker(job):
             (
                 candidate_mask,
                 _action_rewards,
+                _teacher_policy,
                 max_regret,
                 model_top1_regret,
             ) = rl_targets_from_scores(
@@ -930,6 +931,7 @@ def teacher_validation_worker(job):
                 candidates,
                 model_policy=model_policy,
                 reward_scale_cp=float(args_dict["reward_scale_cp"]),
+                teacher_policy_temp_cp=float(args_dict["teacher_policy_temp_cp"]),
             )
             action_count = int(candidate_mask.sum())
             if action_count <= 0:
