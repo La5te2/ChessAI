@@ -563,13 +563,17 @@ ALLOW_MATCHMAKING=false
 查看日志：
 
 ```bash
-tail -f data/lichess/runs/<run-id>/info.log
+ls -lt data/lichess/runs
+RUN_ID="$(ls -td data/lichess/runs/lichess_* | head -1 | xargs basename)"
+echo "$RUN_ID"
+tail -f "data/lichess/runs/$RUN_ID/info.log"
 ```
 
 停止 bot：
 
 ```bash
-bash stop_lichess_bot.sh <run-id>
+ps -ef | grep -E "lichess-bot.py|uci_engine.py" | grep -v grep
+bash stop_lichess_bot.sh "$RUN_ID"
 ```
 
 本地 Windows 只用于代码修改和 UCI 烟测；持续在线的 Lichess bot 进程放在云端运行。
