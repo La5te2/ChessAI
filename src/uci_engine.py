@@ -110,7 +110,7 @@ class UCIEngine:
 
     def handle_uci(self):
         uci_print("id name Gadidae")
-        uci_print("id author ChessAI")
+        uci_print("id author La5te2")
         for line in self.option_lines():
             uci_print(line)
         uci_print("uciok")
