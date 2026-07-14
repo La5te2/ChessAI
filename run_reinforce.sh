@@ -74,14 +74,15 @@ EVAL_WORKERS=10
 EVAL_MAX_PLIES=160
 EVAL_OPENING_BOOK="data/openings.gen.bin"
 EVAL_MOVETIME_MS=0
+EVAL_SEARCH_TYPE=closed
 EVAL_C_PUCT=0.5
 EVAL_C_PUCT_BASE=19652
 EVAL_C_PUCT_FACTOR=1.0
 EVAL_FPU_REDUCTION=0.15
 EVAL_MCTS_TIME_FRACTION=1.0
-EVAL_MATE_GUARD_PLIES=0
-EVAL_MATE_GUARD_TOPK=0
-EVAL_MATE_GUARD_NODES=0
+EVAL_MATE_PLIES=0
+EVAL_MATE_TOPK=4
+EVAL_MATE_NODES=20000
 EVAL_UCI_DEPTH=16
 EVAL_UCI_MULTIPV=1
 EVAL_MIN_NET_WINS=0
@@ -103,7 +104,7 @@ echo "teacher policy: weight=${TEACHER_POLICY_WEIGHT} temp_cp=${TEACHER_POLICY_T
 echo "teacher: uci=${UCI} depth=${UCI_DEPTH} multipv=${UCI_MULTIPV} threads=${UCI_THREADS}"
 echo "train: epochs=${EPOCHS} train_max_steps=${TRAIN_MAX_STEPS} batch_size=${BATCH_SIZE} actor_weight=${ACTOR_WEIGHT} critic_weight=${CRITIC_WEIGHT} entropy_weight=${ENTROPY_WEIGHT}"
 echo "teacher validation: source=${VALIDATION_SOURCE} positions=${VALIDATION_POSITIONS} offset=${VALIDATION_OFFSET} topk=${VALIDATION_TOPK} uci_depth=${VALIDATION_UCI_DEPTH} uci_multipv=${VALIDATION_UCI_MULTIPV}"
-echo "eval: games=${EVAL_GAMES} sims=${EVAL_SIMS} movetime_ms=${EVAL_MOVETIME_MS} c_puct=${EVAL_C_PUCT} fpu_reduction=${EVAL_FPU_REDUCTION} mcts_time_fraction=${EVAL_MCTS_TIME_FRACTION} mate_guard=${EVAL_MATE_GUARD_PLIES}/${EVAL_MATE_GUARD_TOPK}/${EVAL_MATE_GUARD_NODES} min_net_wins=${EVAL_MIN_NET_WINS} min_acpl_improvement=${EVAL_MIN_ACPL_IMPROVEMENT} min_accuracy_improvement=${EVAL_MIN_ACCURACY_IMPROVEMENT} opening_book=${EVAL_OPENING_BOOK}"
+echo "eval: games=${EVAL_GAMES} search_type=${EVAL_SEARCH_TYPE} sims=${EVAL_SIMS} movetime_ms=${EVAL_MOVETIME_MS} c_puct=${EVAL_C_PUCT} fpu_reduction=${EVAL_FPU_REDUCTION} mcts_time_fraction=${EVAL_MCTS_TIME_FRACTION} mate=${EVAL_MATE_PLIES}/${EVAL_MATE_TOPK}/${EVAL_MATE_NODES} min_net_wins=${EVAL_MIN_NET_WINS} min_acpl_improvement=${EVAL_MIN_ACPL_IMPROVEMENT} min_accuracy_improvement=${EVAL_MIN_ACCURACY_IMPROVEMENT} opening_book=${EVAL_OPENING_BOOK}"
 
 exec python src/reinforce.py \
   --run-id "${RUN_ID}" \
@@ -157,14 +158,15 @@ exec python src/reinforce.py \
   --eval-max-plies "${EVAL_MAX_PLIES}" \
   --eval-opening-book "${EVAL_OPENING_BOOK}" \
   --eval-movetime-ms "${EVAL_MOVETIME_MS}" \
+  --eval-search-type "${EVAL_SEARCH_TYPE}" \
   --eval-c-puct "${EVAL_C_PUCT}" \
   --eval-c-puct-base "${EVAL_C_PUCT_BASE}" \
   --eval-c-puct-factor "${EVAL_C_PUCT_FACTOR}" \
   --eval-fpu-reduction "${EVAL_FPU_REDUCTION}" \
   --eval-mcts-time-fraction "${EVAL_MCTS_TIME_FRACTION}" \
-  --eval-mate-guard-plies "${EVAL_MATE_GUARD_PLIES}" \
-  --eval-mate-guard-topk "${EVAL_MATE_GUARD_TOPK}" \
-  --eval-mate-guard-nodes "${EVAL_MATE_GUARD_NODES}" \
+  --eval-mate-plies "${EVAL_MATE_PLIES}" \
+  --eval-mate-topk "${EVAL_MATE_TOPK}" \
+  --eval-mate-nodes "${EVAL_MATE_NODES}" \
   --eval-uci-depth "${EVAL_UCI_DEPTH}" \
   --eval-uci-multipv "${EVAL_UCI_MULTIPV}" \
   --eval-min-net-wins "${EVAL_MIN_NET_WINS}" \

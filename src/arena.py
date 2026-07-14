@@ -20,7 +20,7 @@ import numpy as np
 from config import CONFIDENCE_Z, DEVICE, STOCKFISH_PATH
 from model import load_model
 from opening_book import make_arena_specs
-from search import SearchOptions, UnifiedSearch
+from search import SearchOptions, UnifiedSearch, VALID_SEARCH_TYPES
 from teacher import (
     StockfishTeacher,
     TeacherConfig,
@@ -63,6 +63,7 @@ def json_safe(value):
 def trace_search_info(info: Dict, root_topn: int) -> Dict:
     root_topn = max(0, int(root_topn))
     keys = (
+        "search_type",
         "best_move",
         "best_san",
         "value",
@@ -83,13 +84,12 @@ def trace_search_info(info: Dict, root_topn: int) -> Dict:
         "expanded_nodes",
         "nn_batches",
         "mcts_move",
-        "mate_guard_plies",
-        "mate_guard_topk",
-        "mate_guard_nodes",
-        "mate_guard_completed",
-        "mate_guard_forced_move",
-        "mate_guard_banned_moves",
-        "mate_guard_reasons",
+        "mate_plies",
+        "mate_topk",
+        "mate_nodes",
+        "mate_completed",
+        "mate_forced_move",
+        "mate_reasons",
         "elapsed_ms",
     )
     payload = {key: info.get(key) for key in keys if key in info}
@@ -109,11 +109,8 @@ def pgn_search_comment(owner: str, info: Dict) -> str:
         parts.append(f"sims={info.get('sims_completed')}/{info.get('mcts_soft_cap')}")
     if "value" in info:
         parts.append(f"value={float(info.get('value')):+.3f}")
-    if info.get("mate_guard_forced_move"):
-        parts.append(f"mate_forced={info.get('mate_guard_forced_move')}")
-    banned = info.get("mate_guard_banned_moves") or []
-    if banned:
-        parts.append(f"mate_banned={', '.join(str(move) for move in banned)}")
+    if info.get("mate_forced_move"):
+        parts.append(f"mate_forced={info.get('mate_forced_move')}")
     root = []
     for row in list(info.get("root") or [])[:3]:
         root.append(
@@ -326,14 +323,15 @@ def _worker(job):
         max_plies,
         mcts_batch_size,
         movetime_ms,
+        search_type,
         c_puct,
         c_puct_base,
         c_puct_factor,
         fpu_reduction,
         mcts_time_fraction,
-        mate_guard_plies,
-        mate_guard_topk,
-        mate_guard_nodes,
+        mate_plies,
+        mate_topk,
+        mate_nodes,
         pgn_comments,
         pgn_columns,
         claim_draws,
@@ -348,6 +346,7 @@ def _worker(job):
     candidate = load_model(candidate_path, device=device)
     baseline = load_model(baseline_path, device=device)
     options = SearchOptions(
+        search_type=search_type,
         mcts_sims=sims,
         mcts_batch_size=mcts_batch_size,
         time_limit=(movetime_ms / 1000.0) if movetime_ms > 0 else None,
@@ -356,9 +355,9 @@ def _worker(job):
         c_puct_factor=c_puct_factor,
         fpu_reduction=fpu_reduction,
         mcts_time_fraction=mcts_time_fraction,
-        mate_guard_plies=mate_guard_plies,
-        mate_guard_topk=mate_guard_topk,
-        mate_guard_nodes=mate_guard_nodes,
+        mate_plies=mate_plies,
+        mate_topk=mate_topk,
+        mate_nodes=mate_nodes,
     )
     candidate_searcher = UnifiedSearch(candidate, options, device=device)
     baseline_searcher = UnifiedSearch(baseline, options, device=device)
@@ -559,14 +558,15 @@ def evaluate_models(
     max_book_positions=50000,
     mcts_batch_size=32,
     movetime_ms=5000,
+    search_type="closed",
     c_puct=1.5,
     c_puct_base=19652.0,
     c_puct_factor=1.0,
     fpu_reduction=0.15,
     mcts_time_fraction=0.90,
-    mate_guard_plies=3,
-    mate_guard_topk=8,
-    mate_guard_nodes=20000,
+    mate_plies=0,
+    mate_topk=4,
+    mate_nodes=20000,
     uci=STOCKFISH_PATH,
     uci_depth=8,
     uci_movetime_ms=0,
@@ -638,14 +638,15 @@ def evaluate_models(
             max_plies,
             mcts_batch_size,
             movetime_ms,
+            search_type,
             c_puct,
             c_puct_base,
             c_puct_factor,
             fpu_reduction,
             mcts_time_fraction,
-            mate_guard_plies,
-            mate_guard_topk,
-            mate_guard_nodes,
+            mate_plies,
+            mate_topk,
+            mate_nodes,
             pgn_comments,
             pgn_columns,
             claim_draws,
@@ -741,6 +742,10 @@ def evaluate_models(
             for row in traces:
                 handle.write(json.dumps(json_safe(row), ensure_ascii=False) + "\n")
         progress_print(progress, f"arena trace saved: {trace_output}")
+    effective_sims = 0 if str(search_type) == "closed" else int(sims)
+    effective_mate_plies = int(mate_plies) if str(search_type) == "mcts-mate" else 0
+    effective_mate_topk = int(mate_topk) if str(search_type) == "mcts-mate" else 0
+    effective_mate_nodes = int(mate_nodes) if str(search_type) == "mcts-mate" else 0
     return {
         "candidate": candidate_path,
         "candidate_sha256": candidate_hash,
@@ -749,13 +754,13 @@ def evaluate_models(
         **game_summary,
         "quality": quality,
         "quality_loss_cap_cp": int(quality_loss_cap_cp),
-        "search_type": "mcts_mate_guard",
-        "sims_soft_cap": int(sims),
+        "search_type": str(search_type),
+        "sims_soft_cap": int(effective_sims),
         "mcts_batch_size": int(mcts_batch_size),
         "movetime_ms": int(movetime_ms),
-        "mate_guard_plies": int(mate_guard_plies),
-        "mate_guard_topk": int(mate_guard_topk),
-        "mate_guard_nodes": int(mate_guard_nodes),
+        "mate_plies": int(effective_mate_plies),
+        "mate_topk": int(effective_mate_topk),
+        "mate_nodes": int(effective_mate_nodes),
         "c_puct_initial": float(c_puct),
         "c_puct_base": float(c_puct_base),
         "c_puct_factor": float(c_puct_factor),
@@ -787,14 +792,19 @@ def parse_args():
     parser.add_argument("--max-book-positions", type=int, default=50000)
     parser.add_argument("--mcts-batch-size", type=int, default=32)
     parser.add_argument("--movetime-ms", type=int, default=5000)
+    parser.add_argument(
+        "--search-type",
+        choices=sorted(VALID_SEARCH_TYPES),
+        default="closed",
+    )
     parser.add_argument("--c-puct", type=float, default=1.5)
     parser.add_argument("--c-puct-base", type=float, default=19652.0)
     parser.add_argument("--c-puct-factor", type=float, default=1.0)
     parser.add_argument("--fpu-reduction", type=float, default=0.15)
     parser.add_argument("--mcts-time-fraction", type=float, default=0.90)
-    parser.add_argument("--mate-guard-plies", type=int, default=3)
-    parser.add_argument("--mate-guard-topk", type=int, default=8)
-    parser.add_argument("--mate-guard-nodes", type=int, default=20000)
+    parser.add_argument("--mate-plies", type=int, default=0)
+    parser.add_argument("--mate-topk", type=int, default=4)
+    parser.add_argument("--mate-nodes", type=int, default=20000)
 
     parser.add_argument("--uci", default=STOCKFISH_PATH)
     parser.add_argument("--uci-depth", type=int, default=8)
@@ -830,14 +840,15 @@ def main():
         max_book_positions=args.max_book_positions,
         mcts_batch_size=args.mcts_batch_size,
         movetime_ms=args.movetime_ms,
+        search_type=args.search_type,
         c_puct=args.c_puct,
         c_puct_base=args.c_puct_base,
         c_puct_factor=args.c_puct_factor,
         fpu_reduction=args.fpu_reduction,
         mcts_time_fraction=args.mcts_time_fraction,
-        mate_guard_plies=args.mate_guard_plies,
-        mate_guard_topk=args.mate_guard_topk,
-        mate_guard_nodes=args.mate_guard_nodes,
+        mate_plies=args.mate_plies,
+        mate_topk=args.mate_topk,
+        mate_nodes=args.mate_nodes,
         uci=args.uci,
         uci_depth=args.uci_depth,
         uci_movetime_ms=args.uci_movetime_ms,

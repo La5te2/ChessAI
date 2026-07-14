@@ -25,6 +25,7 @@ except Exception:
 from model import load_model
 from search import (
     SearchOptions,
+    VALID_SEARCH_TYPES,
     count_pieces,
     safe_san,
     select_move,
@@ -36,6 +37,7 @@ class EngineConfig:
     model_path: Optional[str] = None
     device: str = DEVICE
 
+    search_type: str = "mcts-mate"
     mcts_sims: int = 100
     mcts_min_sims: int = 0
     mcts_batch_size: int = 32
@@ -45,9 +47,9 @@ class EngineConfig:
     c_puct_factor: float = 1.0
     fpu_reduction: float = 0.15
     mcts_time_fraction: float = 0.90
-    mate_guard_plies: int = 3
-    mate_guard_topk: int = 8
-    mate_guard_nodes: int = 20000
+    mate_plies: int = 3
+    mate_topk: int = 4
+    mate_nodes: int = 20000
     root_topn: int = 8
 
 
@@ -64,6 +66,7 @@ def bool_from_text(value) -> bool:
 
 SEARCH_PARAMETER_TYPES = {
     "device": str,
+    "search_type": str,
     "mcts_sims": int,
     "mcts_min_sims": int,
     "mcts_batch_size": int,
@@ -73,9 +76,9 @@ SEARCH_PARAMETER_TYPES = {
     "c_puct_factor": float,
     "fpu_reduction": float,
     "mcts_time_fraction": float,
-    "mate_guard_plies": int,
-    "mate_guard_topk": int,
-    "mate_guard_nodes": int,
+    "mate_plies": int,
+    "mate_topk": int,
+    "mate_nodes": int,
     "root_topn": int,
 }
 
@@ -164,6 +167,7 @@ class ChessEngine:
 
     def search_options(self) -> SearchOptions:
         return SearchOptions(
+            search_type=self.config.search_type,
             mcts_sims=self.config.mcts_sims,
             mcts_min_sims=self.config.mcts_min_sims,
             mcts_batch_size=self.config.mcts_batch_size,
@@ -177,9 +181,9 @@ class ChessEngine:
             c_puct_factor=self.config.c_puct_factor,
             fpu_reduction=self.config.fpu_reduction,
             mcts_time_fraction=self.config.mcts_time_fraction,
-            mate_guard_plies=self.config.mate_guard_plies,
-            mate_guard_topk=self.config.mate_guard_topk,
-            mate_guard_nodes=self.config.mate_guard_nodes,
+            mate_plies=self.config.mate_plies,
+            mate_topk=self.config.mate_topk,
+            mate_nodes=self.config.mate_nodes,
             root_topn=self.config.root_topn,
         )
 
@@ -221,12 +225,18 @@ class ChessEngine:
                     "mcts_min_sims",
                     "mcts_batch_size",
                     "movetime_ms",
-                    "mate_guard_plies",
-                    "mate_guard_topk",
-                    "mate_guard_nodes",
+                    "mate_plies",
+                    "mate_topk",
+                    "mate_nodes",
                     "root_topn",
                 } and value < 0:
                     raise ValueError(f"{name} must be non-negative")
+                if name == "search_type":
+                    value = str(value).strip().lower()
+                    if value not in VALID_SEARCH_TYPES:
+                        raise ValueError(
+                            f"search_type must be one of {sorted(VALID_SEARCH_TYPES)}"
+                        )
                 if name in {
                     "c_puct",
                     "c_puct_base",
@@ -626,6 +636,7 @@ class ModelSettingsDialog(tk.Toplevel):
 
         labels = {
             "device": "Device",
+            "search_type": "Search type",
             "mcts_sims": "MCTS sims soft cap",
             "mcts_min_sims": "MCTS minimum sims",
             "mcts_batch_size": "MCTS batch size",
@@ -635,9 +646,9 @@ class ModelSettingsDialog(tk.Toplevel):
             "c_puct_factor": "C-PUCT schedule factor",
             "fpu_reduction": "FPU reduction",
             "mcts_time_fraction": "MCTS time fraction",
-            "mate_guard_plies": "Mate guard plies",
-            "mate_guard_topk": "Mate guard root candidates",
-            "mate_guard_nodes": "Mate guard node cap",
+            "mate_plies": "Mate plies",
+            "mate_topk": "Mate top candidates",
+            "mate_nodes": "Mate node cap",
             "root_topn": "Suggestion count",
         }
         current = engine.parameter_dict()
@@ -1058,10 +1069,9 @@ class ChessBoardApp:
             f"MCTS time fraction: {info.get('mcts_time_fraction')}\n"
             f"Expanded nodes: {info.get('nodes')}\n"
             f"NN batches: {info.get('nn_batches')}\n"
-            f"Mate guard nodes: {info.get('mate_guard_nodes')}\n"
-            f"Mate guard completed: {info.get('mate_guard_completed')}\n"
-            f"Mate guard forced: {info.get('mate_guard_forced_move')}\n"
-            f"Mate guard banned: {info.get('mate_guard_banned_moves')}\n"
+            f"Mate nodes: {info.get('mate_nodes')}\n"
+            f"Mate completed: {info.get('mate_completed')}\n"
+            f"Mate forced: {info.get('mate_forced_move')}\n"
             f"Elapsed: {info.get('elapsed_ms')} ms\n"
         )
         self.info_text.insert(tk.END, text)
@@ -1828,6 +1838,11 @@ def parse_args():
         default=1,
     )
     parser.add_argument("--device", default=DEVICE)
+    parser.add_argument(
+        "--search-type",
+        choices=sorted(VALID_SEARCH_TYPES),
+        default="mcts-mate",
+    )
     parser.add_argument("--mcts-sims", type=int, default=100)
     parser.add_argument("--mcts-min-sims", type=int, default=0)
     parser.add_argument("--mcts-batch-size", type=int, default=32)
@@ -1837,9 +1852,9 @@ def parse_args():
     parser.add_argument("--c-puct-factor", type=float, default=1.0)
     parser.add_argument("--fpu-reduction", type=float, default=0.15)
     parser.add_argument("--mcts-time-fraction", type=float, default=0.90)
-    parser.add_argument("--mate-guard-plies", type=int, default=3)
-    parser.add_argument("--mate-guard-topk", type=int, default=8)
-    parser.add_argument("--mate-guard-nodes", type=int, default=20000)
+    parser.add_argument("--mate-plies", type=int, default=3)
+    parser.add_argument("--mate-topk", type=int, default=4)
+    parser.add_argument("--mate-nodes", type=int, default=20000)
     parser.add_argument("--root-topn", type=int, default=8)
     return parser.parse_args()
 
@@ -1850,6 +1865,7 @@ def main():
     config = EngineConfig(
         model_path=model_path,
         device=args.device,
+        search_type=args.search_type,
         mcts_sims=args.mcts_sims,
         mcts_min_sims=args.mcts_min_sims,
         mcts_batch_size=args.mcts_batch_size,
@@ -1859,9 +1875,9 @@ def main():
         c_puct_factor=args.c_puct_factor,
         fpu_reduction=args.fpu_reduction,
         mcts_time_fraction=args.mcts_time_fraction,
-        mate_guard_plies=args.mate_guard_plies,
-        mate_guard_topk=args.mate_guard_topk,
-        mate_guard_nodes=args.mate_guard_nodes,
+        mate_plies=args.mate_plies,
+        mate_topk=args.mate_topk,
+        mate_nodes=args.mate_nodes,
         root_topn=args.root_topn,
     )
     engine = ChessEngine(

@@ -9,6 +9,7 @@ RUN_DIR="$LICHESS_HOME/runs/$RUN_ID"
 
 MODEL="${MODEL:-models/champion.pth}"
 DEVICE="${DEVICE:-cuda}"
+SEARCH_TYPE="${SEARCH_TYPE:-only-mcts}"
 MCTS_SIMS="${MCTS_SIMS:-0}"
 MCTS_MIN_SIMS="${MCTS_MIN_SIMS:-0}"
 MCTS_BATCH_SIZE="${MCTS_BATCH_SIZE:-64}"
@@ -24,9 +25,9 @@ C_PUCT_FACTOR="${C_PUCT_FACTOR:-1.0}"
 FPU_REDUCTION="${FPU_REDUCTION:-0.15}"
 VIRTUAL_LOSS="${VIRTUAL_LOSS:-0.0}"
 MCTS_TIME_FRACTION="${MCTS_TIME_FRACTION:-1.0}"
-MATE_GUARD_PLIES="${MATE_GUARD_PLIES:-0}"
-MATE_GUARD_TOPK="${MATE_GUARD_TOPK:-0}"
-MATE_GUARD_NODES="${MATE_GUARD_NODES:-0}"
+MATE_PLIES="${MATE_PLIES:-0}"
+MATE_TOPK="${MATE_TOPK:-4}"
+MATE_NODES="${MATE_NODES:-20000}"
 ROOT_TOPN="${ROOT_TOPN:-5}"
 LOG_SEARCH="${LOG_SEARCH:-false}"
 
@@ -79,6 +80,7 @@ export ENGINE_NAME="$(basename "$ENGINE_WRAPPER")"
 export ENGINE_WORKING_DIR="$ROOT_DIR"
 export MODEL_ABS
 export DEVICE
+export SEARCH_TYPE
 export MCTS_SIMS
 export MCTS_MIN_SIMS
 export MCTS_BATCH_SIZE
@@ -94,9 +96,9 @@ export C_PUCT_FACTOR
 export FPU_REDUCTION
 export VIRTUAL_LOSS
 export MCTS_TIME_FRACTION
-export MATE_GUARD_PLIES
-export MATE_GUARD_TOPK
-export MATE_GUARD_NODES
+export MATE_PLIES
+export MATE_TOPK
+export MATE_NODES
 export ROOT_TOPN
 export LOG_SEARCH
 export CHALLENGE_CONCURRENCY
@@ -147,6 +149,7 @@ engine["silence_stderr"] = False
 engine["uci_options"] = {
     "ModelPath": os.environ["MODEL_ABS"],
     "Device": os.environ["DEVICE"],
+    "SearchType": os.environ["SEARCH_TYPE"],
     "MCTSSims": env_int("MCTS_SIMS"),
     "MCTSMinSims": env_int("MCTS_MIN_SIMS"),
     "MCTSBatchSize": env_int("MCTS_BATCH_SIZE"),
@@ -162,9 +165,9 @@ engine["uci_options"] = {
     "FPUReduction": env_float("FPU_REDUCTION"),
     "VirtualLoss": env_float("VIRTUAL_LOSS"),
     "MCTSTimeFraction": env_float("MCTS_TIME_FRACTION"),
-    "MateGuardPlies": env_int("MATE_GUARD_PLIES"),
-    "MateGuardTopK": env_int("MATE_GUARD_TOPK"),
-    "MateGuardNodes": env_int("MATE_GUARD_NODES"),
+    "MatePlies": env_int("MATE_PLIES"),
+    "MateTopK": env_int("MATE_TOPK"),
+    "MateNodes": env_int("MATE_NODES"),
     "RootTopN": env_int("ROOT_TOPN"),
     "LogSearch": env_bool("LOG_SEARCH"),
 }
@@ -202,6 +205,7 @@ echo "config: $CONFIG_PATH"
 echo "engine wrapper: $ENGINE_WRAPPER"
 echo "model: $MODEL_ABS"
 echo "device: $DEVICE"
+echo "search_type: $SEARCH_TYPE"
 echo "mcts_sims: $MCTS_SIMS"
 
 if [ "${UPGRADE_BOT:-0}" = "1" ]; then

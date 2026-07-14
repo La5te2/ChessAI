@@ -22,6 +22,7 @@ from config import (
 )
 from data import H5ChessDataset
 from model import ChessNet, make_model_from_checkpoint, save_model
+from search import VALID_SEARCH_TYPES
 
 
 def _load_resume_weights(path, device):
@@ -74,14 +75,15 @@ def _run_resume_validation(args, candidate_path):
         max_book_positions=args.eval_max_book_positions,
         mcts_batch_size=args.eval_mcts_batch_size,
         movetime_ms=args.eval_movetime_ms,
+        search_type=args.eval_search_type,
         c_puct=args.eval_c_puct,
         c_puct_base=args.eval_c_puct_base,
         c_puct_factor=args.eval_c_puct_factor,
         fpu_reduction=args.eval_fpu_reduction,
         mcts_time_fraction=args.eval_mcts_time_fraction,
-        mate_guard_plies=args.eval_mate_guard_plies,
-        mate_guard_topk=args.eval_mate_guard_topk,
-        mate_guard_nodes=args.eval_mate_guard_nodes,
+        mate_plies=args.eval_mate_plies,
+        mate_topk=args.eval_mate_topk,
+        mate_nodes=args.eval_mate_nodes,
         uci=args.uci,
         uci_depth=args.eval_uci_depth,
         uci_movetime_ms=args.eval_uci_movetime_ms,
@@ -305,14 +307,19 @@ def parse_args():
     )
     parser.add_argument("--eval-mcts-batch-size", type=int, default=32)
     parser.add_argument("--eval-movetime-ms", type=int, default=5000)
+    parser.add_argument(
+        "--eval-search-type",
+        choices=sorted(VALID_SEARCH_TYPES),
+        default="closed",
+    )
     parser.add_argument("--eval-c-puct", type=float, default=1.5)
     parser.add_argument("--eval-c-puct-base", type=float, default=19652.0)
     parser.add_argument("--eval-c-puct-factor", type=float, default=1.0)
     parser.add_argument("--eval-fpu-reduction", type=float, default=0.15)
     parser.add_argument("--eval-mcts-time-fraction", type=float, default=0.90)
-    parser.add_argument("--eval-mate-guard-plies", type=int, default=3)
-    parser.add_argument("--eval-mate-guard-topk", type=int, default=8)
-    parser.add_argument("--eval-mate-guard-nodes", type=int, default=20000)
+    parser.add_argument("--eval-mate-plies", type=int, default=0)
+    parser.add_argument("--eval-mate-topk", type=int, default=4)
+    parser.add_argument("--eval-mate-nodes", type=int, default=20000)
 
     parser.add_argument("--uci", default=STOCKFISH_PATH)
     parser.add_argument("--eval-uci-depth", type=int, default=8)

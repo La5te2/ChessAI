@@ -8,6 +8,7 @@ cmd = "pythonw.exe src\board.py" & _
   " --gui 1" & _
   " --model models\candidate.pth" & _
   " --device cpu" & _
+  " --search-type only-mcts" & _
   " --mcts-sims 100" & _
   " --mcts-min-sims 0" & _
   " --mcts-batch-size 32" & _
@@ -17,9 +18,9 @@ cmd = "pythonw.exe src\board.py" & _
   " --c-puct-factor 1.0" & _
   " --fpu-reduction 0.15" & _
   " --mcts-time-fraction 1.0" & _
-  " --mate-guard-plies 0" & _
-  " --mate-guard-topk 0" & _
-  " --mate-guard-nodes 0" & _
+  " --mate-plies 0" & _
+  " --mate-topk 4" & _
+  " --mate-nodes 20000" & _
   " --root-topn 8"
 
 shell.Run cmd, 0, False

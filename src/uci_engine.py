@@ -12,7 +12,7 @@ import chess
 from config import CPUCT, DEFAULT_SIMS, DEVICE
 from model import load_model
 from move_encoder import move_to_index
-from search import SearchOptions, UnifiedSearch
+from search import SearchOptions, UnifiedSearch, VALID_SEARCH_TYPES
 
 
 def uci_print(text: str):
@@ -50,6 +50,7 @@ def normalize_option_name(name: str) -> str:
 class EngineConfig:
     model_path: str = ""
     device: str = DEVICE
+    search_type: str = "only-mcts"
     mcts_sims: int = DEFAULT_SIMS
     mcts_min_sims: int = 0
     mcts_batch_size: int = 32
@@ -65,9 +66,9 @@ class EngineConfig:
     fpu_reduction: float = 0.15
     virtual_loss: float = 0.0
     mcts_time_fraction: float = 0.90
-    mate_guard_plies: int = 3
-    mate_guard_topk: int = 8
-    mate_guard_nodes: int = 20000
+    mate_plies: int = 0
+    mate_topk: int = 4
+    mate_nodes: int = 20000
     root_topn: int = 5
     log_search: bool = False
 
@@ -86,6 +87,7 @@ class UCIEngine:
         return [
             f"option name ModelPath type string default {cfg.model_path}",
             f"option name Device type string default {cfg.device}",
+            f"option name SearchType type combo default {cfg.search_type} var closed var only-mcts var mcts-mate",
             f"option name MCTSSims type spin default {cfg.mcts_sims} min 0 max 1000000",
             f"option name MCTSMinSims type spin default {cfg.mcts_min_sims} min 0 max 1000000",
             f"option name MCTSBatchSize type spin default {cfg.mcts_batch_size} min 1 max 4096",
@@ -101,9 +103,9 @@ class UCIEngine:
             f"option name FPUReduction type string default {cfg.fpu_reduction}",
             f"option name VirtualLoss type string default {cfg.virtual_loss}",
             f"option name MCTSTimeFraction type string default {cfg.mcts_time_fraction}",
-            f"option name MateGuardPlies type spin default {cfg.mate_guard_plies} min 0 max 64",
-            f"option name MateGuardTopK type spin default {cfg.mate_guard_topk} min 0 max 256",
-            f"option name MateGuardNodes type spin default {cfg.mate_guard_nodes} min 0 max 10000000",
+            f"option name MatePlies type spin default {cfg.mate_plies} min 0 max 64",
+            f"option name MateTopK type spin default {cfg.mate_topk} min 0 max 256",
+            f"option name MateNodes type spin default {cfg.mate_nodes} min 0 max 10000000",
             f"option name RootTopN type spin default {cfg.root_topn} min 1 max 256",
             f"option name LogSearch type check default {'true' if cfg.log_search else 'false'}",
         ]
@@ -128,6 +130,12 @@ class UCIEngine:
             cfg.model_path = str(value).strip()
         elif key == "device":
             cfg.device = str(value).strip() or DEVICE
+        elif key == "searchtype":
+            candidate = str(value).strip().lower()
+            if candidate in VALID_SEARCH_TYPES:
+                cfg.search_type = candidate
+            else:
+                uci_print(f"info string invalid SearchType: {value}")
         elif key == "mctssims":
             cfg.mcts_sims = max(0, as_int(value, cfg.mcts_sims))
         elif key == "mctsminsims":
@@ -158,12 +166,12 @@ class UCIEngine:
             cfg.virtual_loss = max(0.0, as_float(value, cfg.virtual_loss))
         elif key == "mctstimefraction":
             cfg.mcts_time_fraction = max(0.0, min(1.0, as_float(value, cfg.mcts_time_fraction)))
-        elif key == "mateguardplies":
-            cfg.mate_guard_plies = max(0, as_int(value, cfg.mate_guard_plies))
-        elif key == "mateguardtopk":
-            cfg.mate_guard_topk = max(0, as_int(value, cfg.mate_guard_topk))
-        elif key == "mateguardnodes":
-            cfg.mate_guard_nodes = max(0, as_int(value, cfg.mate_guard_nodes))
+        elif key == "mateplies":
+            cfg.mate_plies = max(0, as_int(value, cfg.mate_plies))
+        elif key == "matetopk":
+            cfg.mate_topk = max(0, as_int(value, cfg.mate_topk))
+        elif key == "matenodes":
+            cfg.mate_nodes = max(0, as_int(value, cfg.mate_nodes))
         elif key == "roottopn":
             cfg.root_topn = max(1, as_int(value, cfg.root_topn))
         elif key == "logsearch":
@@ -243,6 +251,7 @@ class UCIEngine:
         cfg = self.config
         sims = cfg.mcts_sims if sims_override is None else max(0, int(sims_override))
         return SearchOptions(
+            search_type=cfg.search_type,
             mcts_sims=sims,
             mcts_min_sims=cfg.mcts_min_sims,
             mcts_batch_size=cfg.mcts_batch_size,
@@ -253,9 +262,9 @@ class UCIEngine:
             fpu_reduction=cfg.fpu_reduction,
             virtual_loss=cfg.virtual_loss,
             mcts_time_fraction=cfg.mcts_time_fraction,
-            mate_guard_plies=cfg.mate_guard_plies,
-            mate_guard_topk=cfg.mate_guard_topk,
-            mate_guard_nodes=cfg.mate_guard_nodes,
+            mate_plies=cfg.mate_plies,
+            mate_topk=cfg.mate_topk,
+            mate_nodes=cfg.mate_nodes,
             root_topn=cfg.root_topn,
         )
 
@@ -388,7 +397,7 @@ class UCIEngine:
                         f"p={float(row.get('p', 0.0)):.5f} "
                         f"visits={int(row.get('visits', 0))} "
                         f"q={float(row.get('q', 0.0)):+.4f} "
-                        f"guard={row.get('mate_guard')}"
+                        f"mate={row.get('mate')}"
                     )
 
             uci_print(f"bestmove {move.uci() if move is not None else self.fallback_move(allowed)}")
@@ -435,6 +444,11 @@ def parse_args():
     parser = argparse.ArgumentParser(description="ChessAI UCI engine wrapper")
     parser.add_argument("--model", default="")
     parser.add_argument("--device", default=DEVICE)
+    parser.add_argument(
+        "--search-type",
+        choices=sorted(VALID_SEARCH_TYPES),
+        default="only-mcts",
+    )
     parser.add_argument("--mcts-sims", type=int, default=DEFAULT_SIMS)
     parser.add_argument("--mcts-min-sims", type=int, default=0)
     parser.add_argument("--mcts-batch-size", type=int, default=32)
@@ -450,9 +464,9 @@ def parse_args():
     parser.add_argument("--fpu-reduction", type=float, default=0.15)
     parser.add_argument("--virtual-loss", type=float, default=0.0)
     parser.add_argument("--mcts-time-fraction", type=float, default=0.90)
-    parser.add_argument("--mate-guard-plies", type=int, default=3)
-    parser.add_argument("--mate-guard-topk", type=int, default=8)
-    parser.add_argument("--mate-guard-nodes", type=int, default=20000)
+    parser.add_argument("--mate-plies", type=int, default=0)
+    parser.add_argument("--mate-topk", type=int, default=4)
+    parser.add_argument("--mate-nodes", type=int, default=20000)
     parser.add_argument("--root-topn", type=int, default=5)
     parser.add_argument("--log-search", action="store_true", default=False)
     return parser.parse_args()
@@ -462,6 +476,7 @@ def config_from_args(args) -> EngineConfig:
     return EngineConfig(
         model_path=str(args.model),
         device=str(args.device),
+        search_type=str(args.search_type),
         mcts_sims=int(args.mcts_sims),
         mcts_min_sims=int(args.mcts_min_sims),
         mcts_batch_size=int(args.mcts_batch_size),
@@ -477,9 +492,9 @@ def config_from_args(args) -> EngineConfig:
         fpu_reduction=float(args.fpu_reduction),
         virtual_loss=float(args.virtual_loss),
         mcts_time_fraction=float(args.mcts_time_fraction),
-        mate_guard_plies=int(args.mate_guard_plies),
-        mate_guard_topk=int(args.mate_guard_topk),
-        mate_guard_nodes=int(args.mate_guard_nodes),
+        mate_plies=int(args.mate_plies),
+        mate_topk=int(args.mate_topk),
+        mate_nodes=int(args.mate_nodes),
         root_topn=int(args.root_topn),
         log_search=bool(args.log_search),
     )

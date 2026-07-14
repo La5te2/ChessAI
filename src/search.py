@@ -84,6 +84,7 @@ def normalize_policy(policy: np.ndarray, board: chess.Board) -> np.ndarray:
 
 @dataclass
 class SearchOptions:
+    search_type: str = "mcts-mate"
     # mcts_sims is a soft upper budget. Confident positions may stop earlier.
     mcts_sims: int = DEFAULT_SIMS
     mcts_min_sims: int = 0
@@ -97,9 +98,21 @@ class SearchOptions:
     root_topn: int = 10
     virtual_loss: float = 0.0
 
-    mate_guard_plies: int = 3
-    mate_guard_topk: int = 8
-    mate_guard_nodes: int = 20000
+    mate_plies: int = 3
+    mate_topk: int = 4
+    mate_nodes: int = 20000
+
+
+VALID_SEARCH_TYPES = {"closed", "only-mcts", "mcts-mate"}
+
+
+def normalize_search_type(search_type: str) -> str:
+    value = str(search_type).strip().lower()
+    if value not in VALID_SEARCH_TYPES:
+        raise ValueError(
+            f"search_type must be one of {sorted(VALID_SEARCH_TYPES)}, got {search_type!r}"
+        )
+    return value
 
 
 class MCTSNode:
@@ -386,34 +399,46 @@ class MCTS:
         }
 
 
-class GuardLimit(Exception):
+class MateLimit(Exception):
     pass
 
 
-class MateGuard:
-    """Mate-only tactical guard for root candidates.
+class MateFinder:
+    """Bounded proof search for forcing mates by the side to move.
 
-    The guard is deliberately narrow: it may force a short mate for the side to
-    move or ban candidates that allow the opponent a short mate. It does not
-    score ordinary positions.
+    The finder is intentionally one-way: it may override the root move when it
+    proves a mate for the mover inside the configured attacker-move budget. It
+    does not ban ordinary moves or try to defend against opponent threats.
     """
 
     def __init__(
         self,
+        model: Optional[torch.nn.Module],
         options: SearchOptions,
         deadline: Optional[float],
+        device: str,
+        root_policy: Optional[np.ndarray] = None,
     ):
+        self.model = model
         self.options = options
         self.deadline = deadline
+        self.device = str(device)
+        self.root_policy = root_policy
         self.nodes = 0
+        self.evaluator = None
+        self.policy_cache: Dict[str, Tuple[np.ndarray, float]] = {}
+        if self.model is not None:
+            self.evaluator = BatchedEvaluator(
+                self.model,
+                device=self.device,
+                batch_size=max(1, int(options.mcts_batch_size)),
+            )
 
     def _check_limit(self):
         if self.deadline is not None and time.monotonic() >= self.deadline:
-            raise GuardLimit()
-        if self.options.mate_guard_nodes > 0 and self.nodes >= int(
-            self.options.mate_guard_nodes
-        ):
-            raise GuardLimit()
+            raise MateLimit()
+        if self.options.mate_nodes > 0 and self.nodes >= int(self.options.mate_nodes):
+            raise MateLimit()
 
     @staticmethod
     def _move_order_score(board: chess.Board, move: chess.Move, prior=0.0):
@@ -438,98 +463,132 @@ class MateGuard:
             pass
         return score
 
-    def _side_can_force_checkmate(self, board: chess.Board, plies: int) -> bool:
-        self._check_limit()
-        self.nodes += 1
+    def _policy_for(self, board: chess.Board) -> Tuple[np.ndarray, float]:
+        if self.root_policy is not None and not board.move_stack:
+            return normalize_policy(self.root_policy, board), 0.0
+        key = board.transposition_key() if hasattr(board, "transposition_key") else board.fen()
+        if key in self.policy_cache:
+            return self.policy_cache[key]
+        if self.evaluator is None:
+            policy = np.zeros(NUM_ACTIONS, dtype=np.float32)
+            legal = list(board.legal_moves)
+            if legal:
+                probability = 1.0 / len(legal)
+                for move in legal:
+                    policy[move_to_index(move)] = probability
+            value = 0.0
+        else:
+            raw_policy, value = self.evaluator.evaluate_one(board)
+            policy = normalize_policy(raw_policy, board)
+        payload = (policy, float(value))
+        self.policy_cache[key] = payload
+        return payload
 
-        terminal = terminal_value_side_to_move(board)
-        if terminal is not None:
-            return float(terminal) > 0.0
-        if plies <= 0:
-            return False
-
-        checking_moves = [
-            move
-            for move in self._ordered_moves(board)
-            if board.gives_check(move)
-        ]
-        for move in checking_moves:
-            board.push(move)
-            if board.is_checkmate():
-                board.pop()
-                return True
-
-            legal_replies = list(self._ordered_moves(board))
-            forced = bool(legal_replies)
-            for reply in legal_replies:
-                board.push(reply)
-                reply_allows_mate = self._side_can_force_checkmate(
-                    board,
-                    plies - 2,
-                )
-                board.pop()
-                if not reply_allows_mate:
-                    forced = False
-                    break
-
-            board.pop()
-            if forced:
-                return True
-        return False
-
-    def _ordered_moves(self, board: chess.Board, priors=None):
-        priors = priors or {}
+    def _ordered_moves(
+        self,
+        board: chess.Board,
+        *,
+        topk: Optional[int] = None,
+        root_policy: Optional[np.ndarray] = None,
+    ):
+        policy = root_policy
+        if policy is None:
+            policy, _value = self._policy_for(board)
         moves = list(board.legal_moves)
         moves.sort(
             key=lambda move: (
-                self._move_order_score(board, move, priors.get(move, 0.0)),
+                self._move_order_score(board, move, policy[move_to_index(move)]),
                 move.uci(),
             ),
             reverse=True,
         )
-        return moves
+        if topk is None or int(topk) <= 0:
+            return moves
+        return moves[: min(int(topk), len(moves))]
 
-    def _find_forcing_mate_move(self, board: chess.Board, plies: int):
-        for move in self._ordered_moves(board):
+    def _side_can_force_checkmate(
+        self,
+        board: chess.Board,
+        attacker: chess.Color,
+        attacker_moves_left: int,
+    ) -> bool:
+        self._check_limit()
+        self.nodes += 1
+
+        if board.is_checkmate():
+            return board.turn != attacker
+        if board.is_game_over(claim_draw=True):
+            return False
+
+        if board.turn == attacker:
+            if attacker_moves_left <= 0:
+                return False
+            for move in self._ordered_moves(
+                board,
+                topk=max(1, int(self.options.mate_topk)),
+            ):
+                board.push(move)
+                forced = self._side_can_force_checkmate(
+                    board,
+                    attacker,
+                    attacker_moves_left - 1,
+                )
+                board.pop()
+                if forced:
+                    return True
+            return False
+
+        replies = self._ordered_moves(board, topk=None)
+        if not replies:
+            return False
+        for reply in replies:
+            board.push(reply)
+            still_forced = self._side_can_force_checkmate(
+                board,
+                attacker,
+                attacker_moves_left,
+            )
+            board.pop()
+            if not still_forced:
+                return False
+        return True
+
+    def _find_forcing_mate_move(
+        self,
+        board: chess.Board,
+        attacker_moves: int,
+        root_candidates: List[chess.Move],
+    ):
+        attacker = board.turn
+        for move in root_candidates:
             self._check_limit()
             self.nodes += 1
-            if not board.gives_check(move):
+            if move not in board.legal_moves:
                 continue
 
             board.push(move)
             if board.is_checkmate():
                 board.pop()
                 return move, "mate_in_1"
-
-            legal_replies = list(self._ordered_moves(board))
-            forced = bool(legal_replies)
-            for reply in legal_replies:
-                board.push(reply)
-                reply_allows_mate = self._side_can_force_checkmate(
-                    board,
-                    plies - 2,
-                )
-                board.pop()
-                if not reply_allows_mate:
-                    forced = False
-                    break
-
+            forced = self._side_can_force_checkmate(
+                board,
+                attacker,
+                attacker_moves - 1,
+            )
             board.pop()
             if forced:
-                return move, f"forces_mate_within_{plies}_plies"
+                return move, f"forces_mate_within_{attacker_moves}_moves"
         return None, None
 
     def analyze(self, board: chess.Board, candidates: List[chess.Move]):
         forced_move = None
-        banned_moves = set()
         reasons: Dict[str, str] = {}
         completed = True
-        guard_plies = max(0, int(self.options.mate_guard_plies))
+        mate_plies = max(0, int(self.options.mate_plies))
 
-        if guard_plies <= 0:
+        if mate_plies <= 0:
             return {
                 "forced_move": None,
-                "banned_moves": set(),
                 "reasons": {},
                 "nodes": 0,
                 "completed": True,
@@ -538,34 +597,16 @@ class MateGuard:
         try:
             forced_move, reason = self._find_forcing_mate_move(
                 board,
-                guard_plies,
+                mate_plies,
+                candidates,
             )
             if forced_move is not None and reason is not None:
                 reasons[forced_move.uci()] = reason
-        except GuardLimit:
+        except MateLimit:
             completed = False
-
-        for move in candidates:
-            if forced_move is not None:
-                break
-            try:
-                if move not in board.legal_moves:
-                    continue
-                child = board.copy(stack=False)
-                child.push(move)
-                terminal = terminal_value_side_to_move(child)
-                if terminal is not None:
-                    continue
-                if self._side_can_force_checkmate(child, guard_plies):
-                    banned_moves.add(move)
-                    reasons[move.uci()] = f"allows_mate_within_{guard_plies}_plies"
-            except GuardLimit:
-                completed = False
-                break
 
         return {
             "forced_move": forced_move,
-            "banned_moves": banned_moves,
             "reasons": reasons,
             "nodes": int(self.nodes),
             "completed": bool(completed),
@@ -573,7 +614,7 @@ class MateGuard:
 
 
 class UnifiedSearch:
-    """Neural MCTS with mate-only tactical guard."""
+    """Neural policy, MCTS, and optional active mate search."""
 
     def __init__(self, model: Optional[torch.nn.Module], options=None, device=None):
         self.model = model
@@ -623,6 +664,7 @@ class UnifiedSearch:
         if board.is_game_over(claim_draw=True):
             raise RuntimeError("game is already over")
 
+        search_type = normalize_search_type(self.options.search_type)
         root_board = board.copy(stack=False)
         start = time.monotonic()
         final_deadline = None
@@ -634,12 +676,16 @@ class UnifiedSearch:
                 0.0,
                 min(1.0, float(self.options.mcts_time_fraction)),
             )
-            if int(self.options.mate_guard_plies) <= 0:
+            if search_type != "mcts-mate" or int(self.options.mate_plies) <= 0:
                 mcts_fraction = 1.0
             mcts_deadline = start + total * mcts_fraction
 
         root_node = None
-        if self.model is None or int(self.options.mcts_sims) <= 0:
+        if (
+            search_type == "closed"
+            or self.model is None
+            or int(self.options.mcts_sims) <= 0
+        ):
             mcts_policy, value = self._policy_only(root_board)
             stats = {
                 "sims_completed": 0,
@@ -665,14 +711,13 @@ class UnifiedSearch:
         legal = list(root_board.legal_moves)
         mcts_move = self._select_top_move(root_board, mcts_policy)
         final_policy = mcts_policy.copy()
-        mate_guard_forced = None
-        mate_guard_banned = set()
-        mate_guard_reasons: Dict[str, str] = {}
-        mate_guard_nodes = 0
-        mate_guard_completed = True
+        mate_forced = None
+        mate_reasons: Dict[str, str] = {}
+        mate_nodes = 0
+        mate_completed = True
 
-        if legal and int(self.options.mate_guard_plies) > 0:
-            guard_topk = max(1, int(self.options.mate_guard_topk))
+        if legal and search_type == "mcts-mate" and int(self.options.mate_plies) > 0:
+            mate_topk = max(1, int(self.options.mate_topk))
             ranked = sorted(
                 legal,
                 key=lambda move: (
@@ -687,27 +732,26 @@ class UnifiedSearch:
                 ),
                 reverse=True,
             )
-            candidates = ranked[: min(guard_topk, len(ranked))]
+            candidates = ranked[: min(mate_topk, len(ranked))]
             if mcts_move is not None and mcts_move not in candidates:
                 candidates[-1] = mcts_move
 
-            guard = MateGuard(self.options, deadline=final_deadline)
-            guard_info = guard.analyze(root_board, candidates)
-            mate_guard_forced = guard_info["forced_move"]
-            mate_guard_banned = set(guard_info["banned_moves"])
-            mate_guard_reasons = dict(guard_info["reasons"])
-            mate_guard_nodes = int(guard_info["nodes"])
-            mate_guard_completed = bool(guard_info["completed"])
+            mate = MateFinder(
+                self.model,
+                self.options,
+                deadline=final_deadline,
+                device=str(model_device(self.model)) if self.model is not None else self.device,
+                root_policy=mcts_policy,
+            )
+            mate_info = mate.analyze(root_board, candidates)
+            mate_forced = mate_info["forced_move"]
+            mate_reasons = dict(mate_info["reasons"])
+            mate_nodes = int(mate_info["nodes"])
+            mate_completed = bool(mate_info["completed"])
 
-            if mate_guard_forced is not None and mate_guard_forced in legal:
+            if mate_forced is not None and mate_forced in legal:
                 final_policy = np.zeros(NUM_ACTIONS, dtype=np.float32)
-                final_policy[move_to_index(mate_guard_forced)] = 1.0
-            elif mate_guard_banned:
-                guarded_policy = final_policy.copy()
-                for banned in mate_guard_banned:
-                    guarded_policy[move_to_index(banned)] = 0.0
-                if float(guarded_policy.sum()) > 0.0:
-                    final_policy = normalize_policy(guarded_policy, root_board)
+                final_policy[move_to_index(mate_forced)] = 1.0
 
         move = self._select_top_move(root_board, final_policy)
         if move is None or move not in legal:
@@ -738,7 +782,7 @@ class UnifiedSearch:
                 "visits": int(child.visit_count) if child is not None else 0,
                 "prior": float(child.prior) if child is not None else float(mcts_policy[index]),
                 "q": float(-child.q) if child is not None else 0.0,
-                "mate_guard": mate_guard_reasons.get(candidate.uci()),
+                "mate": mate_reasons.get(candidate.uci()),
             })
         root_lines.sort(
             key=lambda row: (
@@ -752,10 +796,17 @@ class UnifiedSearch:
         )
 
         elapsed_ms = (time.monotonic() - start) * 1000.0
+        effective_mcts_sims = 0 if search_type == "closed" else int(self.options.mcts_sims)
+        effective_mate_plies = (
+            int(self.options.mate_plies) if search_type == "mcts-mate" else 0
+        )
+        effective_mate_topk = (
+            int(self.options.mate_topk) if search_type == "mcts-mate" else 0
+        )
         info = {
-            "search_type": "mcts_mate_guard",
+            "search_type": search_type,
             "value": float(value),
-            "mcts_soft_cap": int(self.options.mcts_sims),
+            "mcts_soft_cap": int(effective_mcts_sims),
             "mcts_dynamic_target": int(stats.get("dynamic_target", 0)),
             "sims_completed": int(stats.get("sims_completed", 0)),
             "uncertainty": float(stats.get("uncertainty", 0.0)),
@@ -769,17 +820,12 @@ class UnifiedSearch:
             "fpu_root": float(stats.get("root_fpu", 0.0)),
             "virtual_loss": float(self.options.virtual_loss),
             "mcts_time_fraction": float(self.options.mcts_time_fraction),
-            "mate_guard_plies": int(self.options.mate_guard_plies),
-            "mate_guard_topk": int(self.options.mate_guard_topk),
-            "mate_guard_nodes": int(mate_guard_nodes),
-            "mate_guard_completed": bool(mate_guard_completed),
-            "mate_guard_forced_move": (
-                mate_guard_forced.uci() if mate_guard_forced is not None else None
-            ),
-            "mate_guard_banned_moves": sorted(
-                move.uci() for move in mate_guard_banned
-            ),
-            "mate_guard_reasons": dict(mate_guard_reasons),
+            "mate_plies": int(effective_mate_plies),
+            "mate_topk": int(effective_mate_topk),
+            "mate_nodes": int(mate_nodes),
+            "mate_completed": bool(mate_completed),
+            "mate_forced_move": mate_forced.uci() if mate_forced is not None else None,
+            "mate_reasons": dict(mate_reasons),
             "mcts_move": mcts_move.uci() if mcts_move else None,
             "piece_count": count_pieces(root_board),
             "best_move": move.uci(),
@@ -819,11 +865,16 @@ def get_suggestions(board, model, options=None, topn=5, device=None) -> List[Dic
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="ChessAI MCTS search with mate guard"
+        description="ChessAI policy/MCTS search with optional active mate search"
     )
     parser.add_argument("--model", default=MODEL_PATH)
     parser.add_argument("--fen", default="startpos")
     parser.add_argument("--device", default=DEVICE)
+    parser.add_argument(
+        "--search-type",
+        choices=sorted(VALID_SEARCH_TYPES),
+        default="mcts-mate",
+    )
     parser.add_argument("--mcts-sims", type=int, default=DEFAULT_SIMS)
     parser.add_argument("--mcts-min-sims", type=int, default=0)
     parser.add_argument("--mcts-batch-size", type=int, default=32)
@@ -834,9 +885,9 @@ def parse_args():
     parser.add_argument("--fpu-reduction", type=float, default=0.15)
     parser.add_argument("--virtual-loss", type=float, default=0.0)
     parser.add_argument("--mcts-time-fraction", type=float, default=0.90)
-    parser.add_argument("--mate-guard-plies", type=int, default=3)
-    parser.add_argument("--mate-guard-topk", type=int, default=8)
-    parser.add_argument("--mate-guard-nodes", type=int, default=20000)
+    parser.add_argument("--mate-plies", type=int, default=3)
+    parser.add_argument("--mate-topk", type=int, default=4)
+    parser.add_argument("--mate-nodes", type=int, default=20000)
     parser.add_argument("--root-topn", type=int, default=10)
     return parser.parse_args()
 
@@ -849,6 +900,7 @@ def main():
         device=args.device,
     )
     options = SearchOptions(
+        search_type=args.search_type,
         mcts_sims=args.mcts_sims,
         mcts_min_sims=args.mcts_min_sims,
         mcts_batch_size=args.mcts_batch_size,
@@ -859,9 +911,9 @@ def main():
         fpu_reduction=args.fpu_reduction,
         virtual_loss=args.virtual_loss,
         mcts_time_fraction=args.mcts_time_fraction,
-        mate_guard_plies=args.mate_guard_plies,
-        mate_guard_topk=args.mate_guard_topk,
-        mate_guard_nodes=args.mate_guard_nodes,
+        mate_plies=args.mate_plies,
+        mate_topk=args.mate_topk,
+        mate_nodes=args.mate_nodes,
         root_topn=args.root_topn,
     )
     result = UnifiedSearch(model, options, device=args.device).search(board)
@@ -880,10 +932,9 @@ def main():
     print("c_puct_root:", result.info["c_puct_root"])
     print("fpu_root:", result.info["fpu_root"])
     print("virtual_loss:", result.info["virtual_loss"])
-    print("mate_guard_nodes:", result.info["mate_guard_nodes"])
-    print("mate_guard_completed:", result.info["mate_guard_completed"])
-    print("mate_guard_forced_move:", result.info["mate_guard_forced_move"])
-    print("mate_guard_banned_moves:", result.info["mate_guard_banned_moves"])
+    print("mate_nodes:", result.info["mate_nodes"])
+    print("mate_completed:", result.info["mate_completed"])
+    print("mate_forced_move:", result.info["mate_forced_move"])
     print("elapsed_ms:", result.info["elapsed_ms"])
     print("root:")
     for index, row in enumerate(result.info.get("root", []), 1):
@@ -892,7 +943,7 @@ def main():
             f"{marker}{index:2d}. {row['san']:8s} {row['move']:5s} "
             f"p={row['p']:.5f} mcts={row['mcts_p']:.5f} "
             f"visits={row['visits']:4d} q={row['q']:+.4f} "
-            f"guard={row['mate_guard']}"
+            f"mate={row['mate']}"
         )
 
 
