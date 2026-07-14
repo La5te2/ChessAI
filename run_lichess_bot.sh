@@ -28,6 +28,7 @@ MCTS_TIME_FRACTION="${MCTS_TIME_FRACTION:-1.0}"
 MATE_PLIES="${MATE_PLIES:-0}"
 MATE_TOPK="${MATE_TOPK:-4}"
 MATE_NODES="${MATE_NODES:-20000}"
+MATE_HASH_MB="${MATE_HASH_MB:-16}"
 ROOT_TOPN="${ROOT_TOPN:-5}"
 LOG_SEARCH="${LOG_SEARCH:-false}"
 
@@ -99,6 +100,7 @@ export MCTS_TIME_FRACTION
 export MATE_PLIES
 export MATE_TOPK
 export MATE_NODES
+export MATE_HASH_MB
 export ROOT_TOPN
 export LOG_SEARCH
 export CHALLENGE_CONCURRENCY
@@ -168,6 +170,7 @@ engine["uci_options"] = {
     "MatePlies": env_int("MATE_PLIES"),
     "MateTopK": env_int("MATE_TOPK"),
     "MateNodes": env_int("MATE_NODES"),
+    "MateHashMB": env_int("MATE_HASH_MB"),
     "RootTopN": env_int("ROOT_TOPN"),
     "LogSearch": env_bool("LOG_SEARCH"),
 }
@@ -207,6 +210,7 @@ echo "model: $MODEL_ABS"
 echo "device: $DEVICE"
 echo "search_type: $SEARCH_TYPE"
 echo "mcts_sims: $MCTS_SIMS"
+echo "mate: ${MATE_PLIES}/${MATE_TOPK}/${MATE_NODES} hash_mb=${MATE_HASH_MB}"
 
 if [ "${UPGRADE_BOT:-0}" = "1" ]; then
   echo "upgrading lichess account to BOT account"

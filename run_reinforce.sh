@@ -28,7 +28,7 @@ POSITIONS_PER_ITER=10000
 PARALLEL=10
 SOURCE_MIN_PLY=0
 SOURCE_MAX_PLY=160
-ARENA_REPLAY_WINDOW=4
+ARENA_REPLAY_WINDOW=1
 ARENA_REPLAY_POSITIONS=-1
 ARENA_REPLAY_POSITIONS_PER_ITER=10000
 
@@ -83,6 +83,7 @@ EVAL_MCTS_TIME_FRACTION=1.0
 EVAL_MATE_PLIES=0
 EVAL_MATE_TOPK=4
 EVAL_MATE_NODES=20000
+EVAL_MATE_HASH_MB=16
 EVAL_UCI_DEPTH=16
 EVAL_UCI_MULTIPV=1
 EVAL_MIN_NET_WINS=0
@@ -104,7 +105,7 @@ echo "teacher policy: weight=${TEACHER_POLICY_WEIGHT} temp_cp=${TEACHER_POLICY_T
 echo "teacher: uci=${UCI} depth=${UCI_DEPTH} multipv=${UCI_MULTIPV} threads=${UCI_THREADS}"
 echo "train: epochs=${EPOCHS} train_max_steps=${TRAIN_MAX_STEPS} batch_size=${BATCH_SIZE} actor_weight=${ACTOR_WEIGHT} critic_weight=${CRITIC_WEIGHT} entropy_weight=${ENTROPY_WEIGHT}"
 echo "teacher validation: source=${VALIDATION_SOURCE} positions=${VALIDATION_POSITIONS} offset=${VALIDATION_OFFSET} topk=${VALIDATION_TOPK} uci_depth=${VALIDATION_UCI_DEPTH} uci_multipv=${VALIDATION_UCI_MULTIPV}"
-echo "eval: games=${EVAL_GAMES} search_type=${EVAL_SEARCH_TYPE} sims=${EVAL_SIMS} movetime_ms=${EVAL_MOVETIME_MS} c_puct=${EVAL_C_PUCT} fpu_reduction=${EVAL_FPU_REDUCTION} mcts_time_fraction=${EVAL_MCTS_TIME_FRACTION} mate=${EVAL_MATE_PLIES}/${EVAL_MATE_TOPK}/${EVAL_MATE_NODES} min_net_wins=${EVAL_MIN_NET_WINS} min_acpl_improvement=${EVAL_MIN_ACPL_IMPROVEMENT} min_accuracy_improvement=${EVAL_MIN_ACCURACY_IMPROVEMENT} opening_book=${EVAL_OPENING_BOOK}"
+echo "eval: games=${EVAL_GAMES} search_type=${EVAL_SEARCH_TYPE} sims=${EVAL_SIMS} movetime_ms=${EVAL_MOVETIME_MS} c_puct=${EVAL_C_PUCT} fpu_reduction=${EVAL_FPU_REDUCTION} mcts_time_fraction=${EVAL_MCTS_TIME_FRACTION} mate=${EVAL_MATE_PLIES}/${EVAL_MATE_TOPK}/${EVAL_MATE_NODES} mate_hash_mb=${EVAL_MATE_HASH_MB} min_net_wins=${EVAL_MIN_NET_WINS} min_acpl_improvement=${EVAL_MIN_ACPL_IMPROVEMENT} min_accuracy_improvement=${EVAL_MIN_ACCURACY_IMPROVEMENT} opening_book=${EVAL_OPENING_BOOK}"
 
 exec python src/reinforce.py \
   --run-id "${RUN_ID}" \
@@ -167,6 +168,7 @@ exec python src/reinforce.py \
   --eval-mate-plies "${EVAL_MATE_PLIES}" \
   --eval-mate-topk "${EVAL_MATE_TOPK}" \
   --eval-mate-nodes "${EVAL_MATE_NODES}" \
+  --eval-mate-hash-mb "${EVAL_MATE_HASH_MB}" \
   --eval-uci-depth "${EVAL_UCI_DEPTH}" \
   --eval-uci-multipv "${EVAL_UCI_MULTIPV}" \
   --eval-min-net-wins "${EVAL_MIN_NET_WINS}" \

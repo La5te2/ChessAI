@@ -69,6 +69,7 @@ class EngineConfig:
     mate_plies: int = 0
     mate_topk: int = 4
     mate_nodes: int = 20000
+    mate_hash_mb: int = 16
     root_topn: int = 5
     log_search: bool = False
 
@@ -106,6 +107,7 @@ class UCIEngine:
             f"option name MatePlies type spin default {cfg.mate_plies} min 0 max 64",
             f"option name MateTopK type spin default {cfg.mate_topk} min 0 max 256",
             f"option name MateNodes type spin default {cfg.mate_nodes} min 0 max 10000000",
+            f"option name MateHashMB type spin default {cfg.mate_hash_mb} min 0 max 4096",
             f"option name RootTopN type spin default {cfg.root_topn} min 1 max 256",
             f"option name LogSearch type check default {'true' if cfg.log_search else 'false'}",
         ]
@@ -172,6 +174,8 @@ class UCIEngine:
             cfg.mate_topk = max(0, as_int(value, cfg.mate_topk))
         elif key == "matenodes":
             cfg.mate_nodes = max(0, as_int(value, cfg.mate_nodes))
+        elif key == "matehashmb":
+            cfg.mate_hash_mb = max(0, as_int(value, cfg.mate_hash_mb))
         elif key == "roottopn":
             cfg.root_topn = max(1, as_int(value, cfg.root_topn))
         elif key == "logsearch":
@@ -265,6 +269,7 @@ class UCIEngine:
             mate_plies=cfg.mate_plies,
             mate_topk=cfg.mate_topk,
             mate_nodes=cfg.mate_nodes,
+            mate_hash_mb=cfg.mate_hash_mb,
             root_topn=cfg.root_topn,
         )
 
@@ -467,6 +472,7 @@ def parse_args():
     parser.add_argument("--mate-plies", type=int, default=0)
     parser.add_argument("--mate-topk", type=int, default=4)
     parser.add_argument("--mate-nodes", type=int, default=20000)
+    parser.add_argument("--mate-hash-mb", type=int, default=16)
     parser.add_argument("--root-topn", type=int, default=5)
     parser.add_argument("--log-search", action="store_true", default=False)
     return parser.parse_args()
@@ -495,6 +501,7 @@ def config_from_args(args) -> EngineConfig:
         mate_plies=int(args.mate_plies),
         mate_topk=int(args.mate_topk),
         mate_nodes=int(args.mate_nodes),
+        mate_hash_mb=int(args.mate_hash_mb),
         root_topn=int(args.root_topn),
         log_search=bool(args.log_search),
     )

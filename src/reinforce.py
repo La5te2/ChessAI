@@ -1149,6 +1149,7 @@ def evaluate_candidate(
         mate_plies=args.eval_mate_plies,
         mate_topk=args.eval_mate_topk,
         mate_nodes=args.eval_mate_nodes,
+        mate_hash_mb=args.eval_mate_hash_mb,
         uci=args.uci,
         uci_depth=args.eval_uci_depth,
         uci_movetime_ms=args.eval_uci_movetime_ms,
@@ -1385,6 +1386,7 @@ def build_parser():
     parser.add_argument("--eval-mate-plies", type=int, default=0)
     parser.add_argument("--eval-mate-topk", type=int, default=4)
     parser.add_argument("--eval-mate-nodes", type=int, default=20000)
+    parser.add_argument("--eval-mate-hash-mb", type=int, default=16)
     parser.add_argument("--eval-uci-depth", type=int, default=10)
     parser.add_argument("--eval-uci-movetime-ms", type=int, default=0)
     parser.add_argument("--eval-uci-multipv", type=int, default=6)

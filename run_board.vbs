@@ -21,6 +21,7 @@ cmd = "pythonw.exe src\board.py" & _
   " --mate-plies 0" & _
   " --mate-topk 4" & _
   " --mate-nodes 20000" & _
+  " --mate-hash-mb 16" & _
   " --root-topn 8"
 
 shell.Run cmd, 0, False

@@ -87,8 +87,12 @@ def trace_search_info(info: Dict, root_topn: int) -> Dict:
         "mate_plies",
         "mate_topk",
         "mate_nodes",
+        "mate_hash_mb",
         "mate_completed",
+        "mate_status",
         "mate_forced_move",
+        "mate_pv",
+        "mate_cache_entries",
         "mate_reasons",
         "elapsed_ms",
     )
@@ -111,6 +115,10 @@ def pgn_search_comment(owner: str, info: Dict) -> str:
         parts.append(f"value={float(info.get('value')):+.3f}")
     if info.get("mate_forced_move"):
         parts.append(f"mate_forced={info.get('mate_forced_move')}")
+    if info.get("mate_status"):
+        parts.append(f"mate_status={info.get('mate_status')}")
+    if info.get("mate_pv"):
+        parts.append("mate_pv=" + " ".join(str(move) for move in info.get("mate_pv")))
     root = []
     for row in list(info.get("root") or [])[:3]:
         root.append(
@@ -332,6 +340,7 @@ def _worker(job):
         mate_plies,
         mate_topk,
         mate_nodes,
+        mate_hash_mb,
         pgn_comments,
         pgn_columns,
         claim_draws,
@@ -358,6 +367,7 @@ def _worker(job):
         mate_plies=mate_plies,
         mate_topk=mate_topk,
         mate_nodes=mate_nodes,
+        mate_hash_mb=mate_hash_mb,
     )
     candidate_searcher = UnifiedSearch(candidate, options, device=device)
     baseline_searcher = UnifiedSearch(baseline, options, device=device)
@@ -567,6 +577,7 @@ def evaluate_models(
     mate_plies=0,
     mate_topk=4,
     mate_nodes=20000,
+    mate_hash_mb=16,
     uci=STOCKFISH_PATH,
     uci_depth=8,
     uci_movetime_ms=0,
@@ -647,6 +658,7 @@ def evaluate_models(
             mate_plies,
             mate_topk,
             mate_nodes,
+            mate_hash_mb,
             pgn_comments,
             pgn_columns,
             claim_draws,
@@ -746,6 +758,7 @@ def evaluate_models(
     effective_mate_plies = int(mate_plies) if str(search_type) == "mcts-mate" else 0
     effective_mate_topk = int(mate_topk) if str(search_type) == "mcts-mate" else 0
     effective_mate_nodes = int(mate_nodes) if str(search_type) == "mcts-mate" else 0
+    effective_mate_hash_mb = int(mate_hash_mb) if str(search_type) == "mcts-mate" else 0
     return {
         "candidate": candidate_path,
         "candidate_sha256": candidate_hash,
@@ -761,6 +774,7 @@ def evaluate_models(
         "mate_plies": int(effective_mate_plies),
         "mate_topk": int(effective_mate_topk),
         "mate_nodes": int(effective_mate_nodes),
+        "mate_hash_mb": int(effective_mate_hash_mb),
         "c_puct_initial": float(c_puct),
         "c_puct_base": float(c_puct_base),
         "c_puct_factor": float(c_puct_factor),
@@ -805,6 +819,7 @@ def parse_args():
     parser.add_argument("--mate-plies", type=int, default=0)
     parser.add_argument("--mate-topk", type=int, default=4)
     parser.add_argument("--mate-nodes", type=int, default=20000)
+    parser.add_argument("--mate-hash-mb", type=int, default=16)
 
     parser.add_argument("--uci", default=STOCKFISH_PATH)
     parser.add_argument("--uci-depth", type=int, default=8)
@@ -849,6 +864,7 @@ def main():
         mate_plies=args.mate_plies,
         mate_topk=args.mate_topk,
         mate_nodes=args.mate_nodes,
+        mate_hash_mb=args.mate_hash_mb,
         uci=args.uci,
         uci_depth=args.uci_depth,
         uci_movetime_ms=args.uci_movetime_ms,

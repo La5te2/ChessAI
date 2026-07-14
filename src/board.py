@@ -50,6 +50,7 @@ class EngineConfig:
     mate_plies: int = 3
     mate_topk: int = 4
     mate_nodes: int = 20000
+    mate_hash_mb: int = 16
     root_topn: int = 8
 
 
@@ -79,6 +80,7 @@ SEARCH_PARAMETER_TYPES = {
     "mate_plies": int,
     "mate_topk": int,
     "mate_nodes": int,
+    "mate_hash_mb": int,
     "root_topn": int,
 }
 
@@ -184,6 +186,7 @@ class ChessEngine:
             mate_plies=self.config.mate_plies,
             mate_topk=self.config.mate_topk,
             mate_nodes=self.config.mate_nodes,
+            mate_hash_mb=self.config.mate_hash_mb,
             root_topn=self.config.root_topn,
         )
 
@@ -228,6 +231,7 @@ class ChessEngine:
                     "mate_plies",
                     "mate_topk",
                     "mate_nodes",
+                    "mate_hash_mb",
                     "root_topn",
                 } and value < 0:
                     raise ValueError(f"{name} must be non-negative")
@@ -649,6 +653,7 @@ class ModelSettingsDialog(tk.Toplevel):
             "mate_plies": "Mate plies",
             "mate_topk": "Mate top candidates",
             "mate_nodes": "Mate node cap",
+            "mate_hash_mb": "Mate hash (MB)",
             "root_topn": "Suggestion count",
         }
         current = engine.parameter_dict()
@@ -1070,8 +1075,12 @@ class ChessBoardApp:
             f"Expanded nodes: {info.get('nodes')}\n"
             f"NN batches: {info.get('nn_batches')}\n"
             f"Mate nodes: {info.get('mate_nodes')}\n"
+            f"Mate hash MB: {info.get('mate_hash_mb')}\n"
             f"Mate completed: {info.get('mate_completed')}\n"
+            f"Mate status: {info.get('mate_status')}\n"
             f"Mate forced: {info.get('mate_forced_move')}\n"
+            f"Mate PV: {' '.join(info.get('mate_pv') or [])}\n"
+            f"Mate cache entries: {info.get('mate_cache_entries')}\n"
             f"Elapsed: {info.get('elapsed_ms')} ms\n"
         )
         self.info_text.insert(tk.END, text)
@@ -1855,6 +1864,7 @@ def parse_args():
     parser.add_argument("--mate-plies", type=int, default=3)
     parser.add_argument("--mate-topk", type=int, default=4)
     parser.add_argument("--mate-nodes", type=int, default=20000)
+    parser.add_argument("--mate-hash-mb", type=int, default=16)
     parser.add_argument("--root-topn", type=int, default=8)
     return parser.parse_args()
 
@@ -1878,6 +1888,7 @@ def main():
         mate_plies=args.mate_plies,
         mate_topk=args.mate_topk,
         mate_nodes=args.mate_nodes,
+        mate_hash_mb=args.mate_hash_mb,
         root_topn=args.root_topn,
     )
     engine = ChessEngine(
