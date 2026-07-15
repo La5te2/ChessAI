@@ -1,13 +1,9 @@
 import argparse
-import json
 import os
 
 import torch
 from torch.utils.data import DataLoader
 
-from acceptance import attach_arena_acceptance
-from arena import evaluate_models
-from checkpoint_io import atomic_copy_with_backup, tmp_candidate_path_from_resume
 from config import (
     BATCH_SIZE,
     DEVICE,
@@ -16,121 +12,22 @@ from config import (
     LR,
     MODEL_PATH,
     NUM_WORKERS,
-    STOCKFISH_PATH,
     VALUE_LOSS_WEIGHT,
     WEIGHT_DECAY,
 )
 from data import H5ChessDataset
-from model import ChessNet, make_model_from_checkpoint, save_model
-from search import VALID_SEARCH_TYPES
-
-
-def _load_resume_weights(path, device):
-    checkpoint = torch.load(path, map_location=device)
-    source_epoch = int(checkpoint.get("epoch", 0)) if isinstance(checkpoint, dict) else 0
-    source_step = int(checkpoint.get("global_step", 0)) if isinstance(checkpoint, dict) else 0
-    return (
-        make_model_from_checkpoint(checkpoint, device=device),
-        source_epoch,
-        source_step,
-    )
-
-
-def _resolve_output_path(args):
-    if not args.resume:
-        return args.out or MODEL_PATH
-    output = args.out or tmp_candidate_path_from_resume(args.resume)
-    if os.path.abspath(output) == os.path.abspath(args.resume):
-        raise ValueError("--out must differ from --resume")
-    return output
-
-
-def _run_resume_validation(args, candidate_path):
-    if not args.resume:
-        return None
-    if args.eval_games <= 0:
-        print("resume validation skipped: eval_games <= 0", flush=True)
-        return {"accepted": None, "reason": "eval_games <= 0"}
-
-    print(
-        "resume validation start:",
-        f"candidate={candidate_path}",
-        f"baseline={args.resume}",
-        f"games={args.eval_games}",
-        f"sims={args.eval_sims}",
-        f"device={args.device}",
-        flush=True,
-    )
-    metrics = evaluate_models(
-        candidate_path=candidate_path,
-        baseline_path=args.resume,
-        games=args.eval_games,
-        sims=args.eval_sims,
-        workers=args.eval_workers,
-        device=args.device,
-        max_plies=args.eval_max_plies,
-        seed=args.eval_seed,
-        opening_book=args.eval_opening_book,
-        book_plies=args.eval_book_plies,
-        max_book_positions=args.eval_max_book_positions,
-        mcts_batch_size=args.eval_mcts_batch_size,
-        movetime_ms=args.eval_movetime_ms,
-        search_type=args.eval_search_type,
-        c_puct=args.eval_c_puct,
-        c_puct_base=args.eval_c_puct_base,
-        c_puct_factor=args.eval_c_puct_factor,
-        fpu_reduction=args.eval_fpu_reduction,
-        mcts_time_fraction=args.eval_mcts_time_fraction,
-        mate_plies=args.eval_mate_plies,
-        mate_topk=args.eval_mate_topk,
-        mate_nodes=args.eval_mate_nodes,
-        mate_hash_mb=args.eval_mate_hash_mb,
-        uci=args.uci,
-        uci_depth=args.eval_uci_depth,
-        uci_movetime_ms=args.eval_uci_movetime_ms,
-        uci_threads=args.eval_uci_threads,
-        uci_hash_mb=args.eval_uci_hash_mb,
-        uci_multipv=args.eval_uci_multipv,
-        teacher_cache=args.teacher_cache,
-        progress=True,
-    )
-    metrics = attach_arena_acceptance(
-        metrics,
-        min_net_wins=args.eval_min_net_wins,
-        min_acpl_improvement=args.eval_min_acpl_improvement,
-        min_accuracy_improvement=args.eval_min_accuracy_improvement,
-    )
-    print(json.dumps(metrics, ensure_ascii=False, indent=2))
-    print(
-        "resume validation decision:",
-        f"result_ok={metrics.get('result_ok')}",
-        f"quality_ok={metrics.get('quality_ok')}",
-        f"accepted={metrics.get('accepted')}",
-        flush=True,
-    )
-
-    if metrics.get("accepted"):
-        atomic_copy_with_backup(
-            candidate_path,
-            args.resume,
-            make_backup=not args.no_backup,
-        )
-        print("resume model updated:", args.resume)
-    else:
-        print("candidate rejected:", candidate_path)
-    return metrics
+from model import ChessNet, save_model
 
 
 def train(args):
-    args.out = _resolve_output_path(args)
+    output_path = args.out or MODEL_PATH
     device = str(args.device)
-    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     pin_memory = device.startswith("cuda")
     print(
         "training start:",
         f"data={args.data}",
-        f"out={args.out}",
-        f"resume={args.resume}",
+        f"out={output_path}",
         f"device={device}",
         f"epochs={args.epochs}",
         f"batch_size={args.batch_size}",
@@ -147,27 +44,16 @@ def train(args):
         persistent_workers=args.workers > 0,
     )
 
-    source_step = 0
-    if args.resume:
-        model, source_epoch, source_step = _load_resume_weights(
-            args.resume,
-            device,
-        )
-        print(
-            f"loaded weights from {args.resume}: "
-            f"epoch={source_epoch}, global_step={source_step}"
-        )
-    else:
-        model = ChessNet(
-            channels=args.channels,
-            blocks=args.blocks,
-        ).to(device)
-        print(
-            "created model:",
-            f"channels={args.channels}",
-            f"blocks={args.blocks}",
-            flush=True,
-        )
+    model = ChessNet(
+        channels=args.channels,
+        blocks=args.blocks,
+    ).to(device)
+    print(
+        "created model:",
+        f"channels={args.channels}",
+        f"blocks={args.blocks}",
+        flush=True,
+    )
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -179,8 +65,7 @@ def train(args):
     amp_enabled = bool(args.amp and device.startswith("cuda"))
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
-    global_step = int(source_step)
-    run_step = 0
+    global_step = 0
     stop = False
     model.train()
 
@@ -209,21 +94,19 @@ def train(args):
             scaler.update()
 
             global_step += 1
-            run_step += 1
             batches += 1
             total_policy += float(policy_loss.item())
             total_value += float(value_loss.item())
             if (
                 args.log_every > 0
                 and (
-                    run_step == 1
-                    or run_step % args.log_every == 0
+                    global_step == 1
+                    or global_step % args.log_every == 0
                 )
             ):
                 print(
                     "train step:",
                     f"epoch={epoch}",
-                    f"run_step={run_step}",
                     f"global_step={global_step}",
                     f"policy={policy_loss.item():.4f}",
                     f"value={value_loss.item():.4f}",
@@ -233,7 +116,7 @@ def train(args):
 
             if args.save_every > 0 and global_step % args.save_every == 0:
                 save_model(
-                    args.out,
+                    output_path,
                     model,
                     epoch=epoch,
                     global_step=global_step,
@@ -241,17 +124,17 @@ def train(args):
                 )
                 print(
                     "checkpoint saved:",
-                    f"path={args.out}",
+                    f"path={output_path}",
                     f"global_step={global_step}",
                     flush=True,
                 )
 
-            if args.max_steps is not None and run_step >= args.max_steps:
+            if args.max_steps is not None and global_step >= args.max_steps:
                 stop = True
                 break
 
         save_model(
-            args.out,
+            output_path,
             model,
             epoch=epoch,
             global_step=global_step,
@@ -266,8 +149,7 @@ def train(args):
         if stop:
             break
 
-    print("training finished:", args.out)
-    _run_resume_validation(args, args.out)
+    print("training finished:", output_path)
 
 
 def parse_args():
@@ -288,66 +170,6 @@ def parse_args():
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--save-every", type=int, default=5000)
     parser.add_argument("--log-every", type=int, default=100)
-    parser.add_argument("--resume", default=None)
-
-    parser.add_argument("--eval-games", type=int, default=100)
-    parser.add_argument("--eval-sims", type=int, default=80)
-    parser.add_argument("--eval-workers", type=int, default=1)
-    parser.add_argument("--eval-max-plies", type=int, default=240)
-    parser.add_argument("--eval-seed", type=int, default=2026)
-    parser.add_argument("--eval-min-net-wins", type=int, default=3)
-    parser.add_argument(
-        "--eval-opening-book",
-        default="data/openings.bin",
-    )
-    parser.add_argument("--eval-book-plies", type=int, default=8)
-    parser.add_argument(
-        "--eval-max-book-positions",
-        type=int,
-        default=50000,
-    )
-    parser.add_argument("--eval-mcts-batch-size", type=int, default=32)
-    parser.add_argument("--eval-movetime-ms", type=int, default=5000)
-    parser.add_argument(
-        "--eval-search-type",
-        choices=sorted(VALID_SEARCH_TYPES),
-        default="closed",
-    )
-    parser.add_argument("--eval-c-puct", type=float, default=1.5)
-    parser.add_argument("--eval-c-puct-base", type=float, default=19652.0)
-    parser.add_argument("--eval-c-puct-factor", type=float, default=1.0)
-    parser.add_argument("--eval-fpu-reduction", type=float, default=0.15)
-    parser.add_argument("--eval-mcts-time-fraction", type=float, default=0.90)
-    parser.add_argument("--eval-mate-plies", type=int, default=0)
-    parser.add_argument("--eval-mate-topk", type=int, default=4)
-    parser.add_argument("--eval-mate-nodes", type=int, default=20000)
-    parser.add_argument("--eval-mate-hash-mb", type=int, default=16)
-
-    parser.add_argument("--uci", default=STOCKFISH_PATH)
-    parser.add_argument("--eval-uci-depth", type=int, default=8)
-    parser.add_argument(
-        "--eval-uci-movetime-ms",
-        type=int,
-        default=0,
-    )
-    parser.add_argument("--eval-uci-threads", type=int, default=4)
-    parser.add_argument("--eval-uci-hash-mb", type=int, default=512)
-    parser.add_argument("--eval-uci-multipv", type=int, default=4)
-    parser.add_argument(
-        "--teacher-cache",
-        default="data/selflearn/teacher_cache.sqlite",
-    )
-    parser.add_argument(
-        "--eval-min-acpl-improvement",
-        type=float,
-        default=0.0,
-    )
-    parser.add_argument(
-        "--eval-min-accuracy-improvement",
-        type=float,
-        default=0.0,
-    )
-    parser.add_argument("--no-backup", action="store_true", default=False)
     return parser.parse_args()
 
 

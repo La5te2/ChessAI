@@ -1,7 +1,6 @@
 import os
 import shutil
 import time
-from pathlib import Path
 
 
 def timestamp() -> str:
@@ -52,9 +51,3 @@ def atomic_copy_with_backup(src: str, dst: str, make_backup: bool = True):
                 os.remove(tmp_path)
             except OSError:
                 pass
-
-
-def tmp_candidate_path_from_resume(resume_path: str) -> str:
-    p = Path(resume_path)
-    name = p.name
-    return str(p.with_name(f"tmp-{name}"))

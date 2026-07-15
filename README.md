@@ -66,7 +66,7 @@ moves
 values
 ```
 
-`train.py` 完成 policy/value 监督训练，并支持从已有模型权重继续训练。续训时 `--max-steps` 表示本轮追加训练步数，保存的 `global_step` 会在原 checkpoint 的基础上累加。
+`train.py` 完成 policy/value 监督训练。每次运行都会创建新模型并从 `global_step=0` 开始训练，输出写入 `--out` 指定 checkpoint。
 
 ### 1.2 模型格式
 
@@ -254,7 +254,6 @@ offline reinforce label summary:
 offline reinforce arena summary:
 arena game summary:
 arena: finished 后输出最终 metrics JSON
-resume validation metrics
 ```
 
 ---
@@ -341,50 +340,22 @@ python src/train.py \
 
 ---
 
-## 7. 模型续训与自动验收
+## 7. 监督训练本地 Smoke Test
 
-```bash
+```powershell
 python src/train.py \
   --data data/games.h5 \
-  --resume models/chessnet.pth \
-  --device cuda \
-  --max-steps 20000 \
-  --batch-size 512 \
-  --workers 4 \
-  --save-every 5000 \
-  --eval-games 100 \
-  --eval-sims 200 \
-  --eval-workers 1 \
-  --eval-max-plies 240 \
-  --eval-min-net-wins 5 \
-  --eval-mcts-batch-size 64 \
-  --eval-movetime-ms 10000 \
-  --eval-search-type closed \
-  --eval-c-puct 0.5 \
-  --eval-c-puct-base 19652 \
-  --eval-c-puct-factor 1.0 \
-  --eval-fpu-reduction 0.15 \
-  --eval-mcts-time-fraction 0.90 \
-  --eval-mate-plies 0 \
-  --eval-mate-topk 4 \
-  --eval-mate-nodes 20000 \
-  --eval-mate-hash-mb 16 \
-  --eval-opening-book data/openings.bal.bin \
-  --eval-book-plies 8 \
-  --eval-max-book-positions 50000 \
-  --uci models/stockfish/stockfish \
-  --eval-uci-depth 10 \
-  --eval-uci-multipv 8 \
-  --eval-uci-threads 4 \
-  --eval-uci-hash-mb 512 \
-  --log-every 100
+  --out models/test-train.pth \
+  --device cpu \
+  --epochs 1 \
+  --batch-size 8 \
+  --workers 0 \
+  --max-steps 1 \
+  --save-every 0 \
+  --log-every 1
 ```
 
-续训生成临时候选模型。candidate 同时满足对局结果、ACPL 和 Accuracy 条件后写回 `--resume` 指定路径。
-
-`--max-steps` 表示本轮追加步数。例如 checkpoint 中 `global_step=80000`，续训传入 `--max-steps 100000`，候选模型保存时 `global_step=180000`。
-
-本地 CPU 入口 smoke test 示例：`--device cpu --workers 0 --max-steps 1 --eval-games 0`。`--eval-games 0` 跳过 resume 验收，候选模型保存在输出路径。
+训练命令只执行监督学习本体。模型验收使用 `arena.py` 或 offline reinforce 自带 gate。
 
 ---
 
@@ -649,14 +620,15 @@ bash run_reinforce.sh
 脚本默认后台运行，并把输出写入本次 run 的日志：
 
 ```bash
-tail -f data/runs/<run-id>/info.log
+ls -lt data/runs
+RUN_ID="$(ls -td data/runs/reinforce_* | head -1 | xargs basename)"
+tail -f "data/runs/$RUN_ID/info.log"
 ```
 
 `run_reinforce.sh` 当前展开命令：
 
 ```bash
 python src/reinforce.py \
-  --run-id <reinforce-run-id> \
   --model models/chessnet.pth \
   --fen-source data/games.pgn \
   --uci models/stockfish/stockfish \
@@ -726,7 +698,7 @@ python src/reinforce.py \
   --seed 2026
 ```
 
-Offline reinforce 的状态由 `--fen-source` 提供：PGN 或带 `fens` dataset 的 HDF5。`--positions-per-iter` 表示每轮按顺序抽取的 FEN 数量，`--source-min-ply` 与 `--source-max-ply` 控制 PGN 局面范围。模型用 sim=0 policy top-k 提出 action，`--sample-topk` 控制候选数量，`--include-teacher-best` 把 Stockfish 最佳招加入 action 集合。教师机为每个 action 生成 `tanh(score_cp / reward_scale_cp)` 连续 reward。`--teacher-policy-temp-cp` 将候选 action 的 Stockfish score 转换为 softmax teacher policy；`--teacher-policy-weight` 控制该 soft policy 交叉熵对 policy head 的辅助牵引。critic 学习候选行为策略的期望 reward；actor 使用 `reward - value` advantage 执行策略梯度。`--actor-exploration-mix` 为已评价 action 分配均匀探索权重，`--advantage-clip` 控制 advantage 范围。训练使用 entropy 与 KL reference。`--arena-replay-window` 控制读取最近几轮 arena FEN，`--arena-replay-positions` 是窗口内总量上限，`--arena-replay-positions-per-iter` 是每个历史 iter 的读取上限；`-1` 表示总量不截断。`--validation-*` 从人类棋谱局面抽取验证集，并由 Stockfish 统计 baseline 与 candidate 的 top1 regret、max regret、teacher-best top-k 命中率、value MAE/RMSE/correlation/sign accuracy。验收对局通过 `--eval-opening-book` 使用开局书，并由 arena 调用 search 参数完成对战。
+Offline reinforce 的状态由 `--fen-source` 提供：PGN 或带 `fens` dataset 的 HDF5。`--positions-per-iter` 表示每轮按顺序抽取的 FEN 数量，`--source-min-ply` 与 `--source-max-ply` 控制 PGN 局面范围。模型用 sim=0 policy top-k 提出 action，`--sample-topk` 控制候选数量，`--include-teacher-best` 把 Stockfish 最佳招加入 action 集合。教师机为每个 action 生成 `tanh(score_cp / reward_scale_cp)` 连续 reward。`--teacher-policy-temp-cp` 将候选 action 的 Stockfish score 转换为 softmax teacher policy；`--teacher-policy-weight` 控制该 soft policy 交叉熵对 policy head 的辅助牵引。critic 学习候选行为策略的期望 reward；actor 使用 `reward - value` advantage 执行策略梯度。`--actor-exploration-mix` 为已评价 action 分配均匀探索权重，`--advantage-clip` 控制 advantage 范围。训练使用 entropy 与 KL reference。`--arena-replay-window` 控制读取最近几轮 arena FEN，`--arena-replay-positions` 是窗口内总量上限，`--arena-replay-positions-per-iter` 是每个历史 iter 的读取上限；`-1` 表示总量不截断。`--validation-*` 从人类棋谱局面抽取验证集，并由 Stockfish 统计 baseline 与 candidate 的 top1 regret、综合 regret、teacher-best top-k 命中率、value MAE/RMSE/correlation/sign accuracy；综合 regret 按模型 top-k 排名倒序加权，数值越低表示排序越好。验收对局通过 `--eval-opening-book` 使用开局书，并由 arena 调用 search 参数完成对战。
 
 例如 iter5 使用前四轮各最多 10000 个 replay FEN：
 
@@ -738,21 +710,15 @@ ARENA_REPLAY_POSITIONS_PER_ITER=10000
 
 `--seed` 控制 offline RL DataLoader 的 batch shuffle 与 arena opening book 洗牌。FEN 标注保持源文件顺序，固定 seed 便于复现实验的数据顺序和验收开局。
 
-reinforce 的 arena gate 使用当前 run 的 `current.pth` 作为 baseline，`candidate_iter_*.pth` 作为 candidate。`result_ok` 要求 `net_wins >= --eval-min-net-wins`；`quality_ok` 要求 candidate 的 ACPL 低于 baseline 且 accuracy 高于 baseline，阈值由 `--eval-min-acpl-improvement` 和 `--eval-min-accuracy-improvement` 控制，脚本当前使用默认 `0.0`。arena trace 会写入 `data/runs/<run-id>/arena_trace_iter_*.jsonl`，去重后的 FEN 写入 `data/runs/<run-id>/arena_fens_iter_*.txt`。通过 gate 后，candidate 写回本次 run 的 `models/runs/<run-id>/current.pth`。
+reinforce 的 arena gate 使用当前 run 的 `current.pth` 作为 baseline，`candidate_iter_*.pth` 作为 candidate。`result_ok` 要求 `net_wins >= --eval-min-net-wins`；`quality_ok` 要求 candidate 的 ACPL 低于 baseline 且 accuracy 高于 baseline，阈值由 `--eval-min-acpl-improvement` 和 `--eval-min-accuracy-improvement` 控制，脚本当前使用默认 `0.0`。arena trace 会写入 `data/runs/<run-id>/arena_trace_iter_*.jsonl`，去重后的 FEN 写入 `data/runs/<run-id>/arena_fens_iter_*.txt`。通过 gate 后，candidate 覆写本次 run 的 `models/runs/<run-id>/current.pth`，供同一次运行的下一轮 iteration 使用。
 
-offline reinforce 每次运行都会按当前参数生成本次 run 的 `offline_iter_*.h5`；中断后的 run 目录保留为历史产物。
+offline reinforce 每次运行都会由脚本或 Python 创建新的 run id，并按当前参数生成本次 run 的 `offline_iter_*.h5`。run 根目录固定为 `data/runs` 和 `models/runs`。中断后的 run 目录保留为历史产物。默认 teacher cache 使用本次 run 的固定 `teacher_cache.sqlite`。
 
 每次 offline reinforce 运行都会生成配对的独立 run 目录：
 
 ```text
 data/runs/reinforce_YYYYMMDD_HHMMSS_pid/
 models/runs/reinforce_YYYYMMDD_HHMMSS_pid/
-```
-
-固定 run-id 时：
-
-```bash
-RUN_ID=reinforce_experiment_001 bash run_reinforce.sh
 ```
 
 主要输出：
@@ -766,7 +732,7 @@ models/runs/<run-id>/current.pth
 models/runs/<run-id>/candidate_iter_*.pth
 ```
 
-候选通过 arena 验收后写回本次 run 的 `current.pth`。
+候选通过 arena 验收后覆写本次 run 的 `current.pth`。
 
 ---
 
@@ -818,7 +784,7 @@ kill -KILL <pid>
 pkill -KILL -f "models/stockfish/stockfish"
 ```
 
-同一台云端机器同时跑多个实验时，先用 `ps -ef` 确认命令行里的 `--run-id` 和路径，再结束对应 PID。`tail -f` 只是在查看日志，按 `Ctrl+C` 只会退出日志查看。
+同一台云端机器同时跑多个实验时，先用 `ps -ef` 和 `data/runs/<run-id>/pid` 确认目标进程，再结束对应 PID。`tail -f` 只是在查看日志，按 `Ctrl+C` 只会退出日志查看。
 
 查看 Lichess bot 进程：
 
@@ -981,12 +947,6 @@ find . -type f -name "*.pyc" -delete
 ```bash
 rm -rf data/runs/reinforce_*
 rm -rf models/runs/reinforce_*
-```
-
-清理临时候选模型：
-
-```bash
-rm -f models/tmp-*.pth
 ```
 
 清理模型备份：

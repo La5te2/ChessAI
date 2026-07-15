@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ "${1:-}" != "--foreground" ]]; then
-  RUN_ID="${RUN_ID:-reinforce_$(date +%Y%m%d_%H%M%S)_$$}"
+  RUN_ID="reinforce_$(date +%Y%m%d_%H%M%S)_$$"
   DATA_RUN_DIR="data/runs/${RUN_ID}"
   mkdir -p "${DATA_RUN_DIR}"
   nohup bash "$0" --foreground "${RUN_ID}" > "${DATA_RUN_DIR}/info.log" 2>&1 < /dev/null &
@@ -17,6 +17,7 @@ if [[ "${1:-}" != "--foreground" ]]; then
 fi
 
 RUN_ID="${2:?missing run id}"
+export REINFORCE_RUN_ID="${RUN_ID}"
 
 MODEL="models/chessnet.pth"
 FEN_SOURCE="data/games.pgn"
@@ -108,7 +109,6 @@ echo "teacher validation: source=${VALIDATION_SOURCE} positions=${VALIDATION_POS
 echo "eval: games=${EVAL_GAMES} search_type=${EVAL_SEARCH_TYPE} sims=${EVAL_SIMS} movetime_ms=${EVAL_MOVETIME_MS} c_puct=${EVAL_C_PUCT} fpu_reduction=${EVAL_FPU_REDUCTION} mcts_time_fraction=${EVAL_MCTS_TIME_FRACTION} mate=${EVAL_MATE_PLIES}/${EVAL_MATE_TOPK}/${EVAL_MATE_NODES} mate_hash_mb=${EVAL_MATE_HASH_MB} min_net_wins=${EVAL_MIN_NET_WINS} min_acpl_improvement=${EVAL_MIN_ACPL_IMPROVEMENT} min_accuracy_improvement=${EVAL_MIN_ACCURACY_IMPROVEMENT} opening_book=${EVAL_OPENING_BOOK}"
 
 exec python src/reinforce.py \
-  --run-id "${RUN_ID}" \
   --model "${MODEL}" \
   --fen-source "${FEN_SOURCE}" \
   --uci "${UCI}" \

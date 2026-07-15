@@ -33,7 +33,6 @@ from torch.utils.data import DataLoader, Dataset
 
 from acceptance import attach_arena_acceptance
 from arena import evaluate_models, worker_cache_path
-from checkpoint_io import atomic_copy_with_backup
 from chess_env import board_to_packed, packed_to_tensor
 from config import (
     DEVICE,
@@ -58,27 +57,15 @@ def create_run_id() -> str:
     return time.strftime("reinforce_%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:4]
 
 
-def normalize_run_id(run_id: str) -> str:
-    cleaned = str(run_id).strip().replace("\\", "/").split("/")[-1]
-    if not cleaned:
-        raise ValueError("empty run id")
-    return cleaned
-
-
-def make_run_dirs(data_root: str, model_root: str, run_id: str) -> Tuple[str, str]:
-    data_dir = os.path.join(data_root, run_id)
-    model_dir = os.path.join(model_root, run_id)
+def prepare_run_paths(args):
+    run_id = os.environ.get("REINFORCE_RUN_ID") or create_run_id()
+    run_id = str(run_id).strip().replace("\\", "/").split("/")[-1]
+    if not run_id.startswith("reinforce_"):
+        raise ValueError("system run id must start with reinforce_")
+    data_dir = os.path.join(DEFAULT_DATA_RUNS_DIR, run_id)
+    model_dir = os.path.join(DEFAULT_MODEL_RUNS_DIR, run_id)
     os.makedirs(data_dir, exist_ok=True)
     os.makedirs(model_dir, exist_ok=True)
-    return data_dir, model_dir
-
-
-def prepare_run_paths(args):
-    if args.run_id:
-        run_id = normalize_run_id(args.run_id)
-    else:
-        run_id = create_run_id()
-    data_dir, model_dir = make_run_dirs(args.data_runs_dir, args.model_runs_dir, run_id)
     if args.teacher_cache is None:
         args.teacher_cache = os.path.join(data_dir, "teacher_cache.sqlite")
     return {
@@ -89,8 +76,21 @@ def prepare_run_paths(args):
     }
 
 
-def atomic_copy(src: str, dst: str, make_backup: bool = True):
-    return atomic_copy_with_backup(src, dst, make_backup=make_backup)
+def atomic_copy(src: str, dst: str):
+    os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+    tmp = os.path.join(
+        os.path.dirname(dst) or ".",
+        f".{os.path.basename(dst)}.tmp_{os.getpid()}",
+    )
+    try:
+        shutil.copy2(src, tmp)
+        os.replace(tmp, dst)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
 
 def decode_h5_string(value) -> str:
@@ -421,6 +421,43 @@ def add_teacher_best_candidate(
     if teacher_move in board.legal_moves and teacher_move not in candidates:
         return [*candidates, teacher_move]
     return candidates
+
+
+def composite_regret_cp(
+    board: chess.Board,
+    move_scores: Dict[str, int],
+    model_ranked_moves: Sequence[chess.Move],
+) -> float:
+    legal = set(board.legal_moves)
+    legal_scores = {}
+    for uci, score in move_scores.items():
+        try:
+            move = chess.Move.from_uci(str(uci))
+        except Exception:
+            continue
+        if move in legal:
+            legal_scores[str(uci)] = int(score)
+    if not legal_scores:
+        return 0.0
+
+    best_score = max(legal_scores.values())
+    regrets = []
+    seen = set()
+    for move in model_ranked_moves:
+        if move not in legal:
+            continue
+        uci = move.uci()
+        if uci in seen or uci not in legal_scores:
+            continue
+        seen.add(uci)
+        regrets.append(float(max(0, best_score - int(legal_scores[uci]))))
+
+    if not regrets:
+        return 0.0
+
+    weights = np.arange(len(regrets), 0, -1, dtype=np.float32)
+    values = np.asarray(regrets, dtype=np.float32)
+    return float(np.sum(values * weights) / max(1e-12, float(np.sum(weights))))
 
 
 def label_worker(job):
@@ -885,7 +922,7 @@ def teacher_validation_worker(job):
     )
 
     top1_regrets = []
-    max_regrets = []
+    composite_regrets = []
     action_counts = []
     model_values = []
     teacher_values = []
@@ -910,6 +947,7 @@ def teacher_validation_worker(job):
             if teacher_best in model_topk_uci:
                 teacher_best_topk_hits += 1
 
+            model_ranked_candidates = list(candidates)
             candidates = add_teacher_best_candidate(board, candidates, root_result)
             action_uci = {move.uci() for move in candidates}
             if teacher_best in action_uci:
@@ -924,7 +962,7 @@ def teacher_validation_worker(job):
                 candidate_mask,
                 _action_rewards,
                 _teacher_policy,
-                max_regret,
+                _max_regret,
                 model_top1_regret,
             ) = rl_targets_from_scores(
                 board,
@@ -938,8 +976,13 @@ def teacher_validation_worker(job):
             if action_count <= 0:
                 continue
 
+            composite_regret = composite_regret_cp(
+                board,
+                move_scores,
+                model_ranked_candidates,
+            )
             top1_regrets.append(float(model_top1_regret))
-            max_regrets.append(float(max_regret))
+            composite_regrets.append(float(composite_regret))
             action_counts.append(float(action_count))
             model_values.append(float(model_value))
             teacher_values.append(float(teacher_value))
@@ -959,6 +1002,7 @@ def teacher_validation_worker(job):
                         f"labeled={labeled}",
                         f"global_index={global_index}",
                         f"mean_top1_regret_cp={np.mean(top1_regrets):.1f}",
+                        f"mean_composite_regret_cp={np.mean(composite_regrets):.1f}",
                         f"value_mae={np.mean(np.abs(value_errors)):.4f}",
                         f"teacher_best_topk_rate={teacher_best_topk_hits / max(1, labeled):.3f}",
                         flush=True,
@@ -966,7 +1010,7 @@ def teacher_validation_worker(job):
 
     return {
         "top1_regrets": top1_regrets,
-        "max_regrets": max_regrets,
+        "composite_regrets": composite_regrets,
         "action_counts": action_counts,
         "model_values": model_values,
         "teacher_values": teacher_values,
@@ -980,8 +1024,8 @@ def summarize_teacher_validation(label: str, outputs: List[Dict]) -> Dict:
         [value for output in outputs for value in output["top1_regrets"]],
         dtype=np.float32,
     )
-    max_regrets = np.asarray(
-        [value for output in outputs for value in output["max_regrets"]],
+    composite_regrets = np.asarray(
+        [value for output in outputs for value in output["composite_regrets"]],
         dtype=np.float32,
     )
     action_counts = np.asarray(
@@ -1015,8 +1059,9 @@ def summarize_teacher_validation(label: str, outputs: List[Dict]) -> Dict:
         "mean_top1_regret_cp": float(np.mean(top1_regrets)),
         "p50_top1_regret_cp": float(np.percentile(top1_regrets, 50)),
         "p90_top1_regret_cp": float(np.percentile(top1_regrets, 90)),
-        "mean_max_regret_cp": float(np.mean(max_regrets)),
-        "p90_max_regret_cp": float(np.percentile(max_regrets, 90)),
+        "mean_composite_regret_cp": float(np.mean(composite_regrets)),
+        "p50_composite_regret_cp": float(np.percentile(composite_regrets, 50)),
+        "p90_composite_regret_cp": float(np.percentile(composite_regrets, 90)),
         "mean_actions": float(np.mean(action_counts)),
         "teacher_best_topk_rate": float(teacher_best_topk_hits / max(1, positions)),
         "teacher_best_action_rate": float(teacher_best_action_hits / max(1, positions)),
@@ -1081,6 +1126,14 @@ def evaluate_teacher_validation(args, candidate_path: str, baseline_path: str) -
         "delta_p90_top1_regret_cp": (
             float(candidate.get("p90_top1_regret_cp", 0.0))
             - float(baseline.get("p90_top1_regret_cp", 0.0))
+        ),
+        "delta_mean_composite_regret_cp": (
+            float(candidate.get("mean_composite_regret_cp", 0.0))
+            - float(baseline.get("mean_composite_regret_cp", 0.0))
+        ),
+        "delta_p90_composite_regret_cp": (
+            float(candidate.get("p90_composite_regret_cp", 0.0))
+            - float(baseline.get("p90_composite_regret_cp", 0.0))
         ),
         "delta_teacher_best_topk_rate": (
             float(candidate.get("teacher_best_topk_rate", 0.0))
@@ -1240,15 +1293,9 @@ def run(args):
             iteration=iteration,
         )
         accepted = bool(eval_summary.get("accepted"))
-        if accepted and args.promote_if_accepted:
-            atomic_copy(candidate_path, current_model, make_backup=not args.no_backup)
+        if accepted:
+            atomic_copy(candidate_path, current_model)
             print("offline reinforce promoted:", current_model, flush=True)
-        elif accepted:
-            print(
-                "offline reinforce candidate accepted but not promoted:",
-                candidate_path,
-                flush=True,
-            )
         else:
             print("offline reinforce candidate rejected:", candidate_path, flush=True)
 
@@ -1290,9 +1337,6 @@ def build_parser():
     parser.add_argument("--device", default=DEVICE)
     parser.add_argument("--label-device", default=None)
     parser.add_argument("--validation-device", default=None)
-    parser.add_argument("--data-runs-dir", default=DEFAULT_DATA_RUNS_DIR)
-    parser.add_argument("--model-runs-dir", default=DEFAULT_MODEL_RUNS_DIR)
-    parser.add_argument("--run-id", default=None)
 
     parser.add_argument("--iterations", type=int, default=1)
     parser.add_argument("--positions-per-iter", type=int, default=500)
@@ -1394,13 +1438,6 @@ def build_parser():
     parser.add_argument("--eval-min-net-wins", type=int, default=5)
     parser.add_argument("--eval-min-acpl-improvement", type=float, default=0.0)
     parser.add_argument("--eval-min-accuracy-improvement", type=float, default=0.0)
-    parser.add_argument("--promote-if-accepted", action="store_true", default=True)
-    parser.add_argument(
-        "--no-promote-if-accepted",
-        dest="promote_if_accepted",
-        action="store_false",
-    )
-    parser.add_argument("--no-backup", action="store_true", default=False)
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--seed", type=int, default=2026)
     return parser
