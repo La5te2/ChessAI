@@ -6,6 +6,7 @@ import argparse
 import dataclasses
 import io
 import os
+import queue
 import sys
 import threading
 import time
@@ -773,6 +774,8 @@ class ChessBoardApp:
         self.ai_generation = 0
         self.ai_cancel_event = None
         self.pending_ai_after_id = None
+        self.ui_queue = queue.Queue()
+        self.ui_poll_interval_ms = 100
         self.buttons: List[ttk.Button] = []
 
         self.light = "#EEEED2"
@@ -784,6 +787,7 @@ class ChessBoardApp:
         self._build_ui()
         self.draw_board()
         self.refresh_controls()
+        self.root.after(self.ui_poll_interval_ms, self.process_ui_events)
         self.schedule_ai_reply()
 
     def _add_button(self, parent, text, command, side=tk.LEFT):
@@ -961,6 +965,33 @@ class ChessBoardApp:
         if before_fen is not None and self.engine.board.fen() != before_fen:
             return False
         return True
+
+    def post_ui_event(self, kind: str, *payload):
+        self.ui_queue.put((kind, payload))
+
+    def process_ui_events(self):
+        latest_progress = None
+        events = []
+        while True:
+            try:
+                kind, payload = self.ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "progress":
+                latest_progress = payload
+            else:
+                events.append((kind, payload))
+
+        if latest_progress is not None:
+            self.apply_search_progress(*latest_progress)
+
+        for kind, payload in events:
+            if kind == "finish_ai_move":
+                self.finish_ai_move(payload[0])
+            elif kind == "finish_suggestions":
+                self.finish_suggestions(payload[0])
+
+        self.root.after(self.ui_poll_interval_ms, self.process_ui_events)
 
     def schedule_ai_reply(self):
         self.cancel_pending_ai(cancel_running=False)
@@ -1254,11 +1285,7 @@ class ChessBoardApp:
         self.draw_board()
 
         def progress(info):
-            self.root.after(
-                0,
-                lambda current=generation, fen=before_fen, payload=info:
-                    self.apply_search_progress(current, fen, payload),
-            )
+            self.post_ui_event("progress", generation, before_fen, info)
 
         def worker():
             payload = {
@@ -1284,10 +1311,7 @@ class ChessBoardApp:
                 payload["ok"] = True
             except Exception as exc:
                 payload["error"] = str(exc)
-            self.root.after(
-                0,
-                lambda result=payload: self.finish_ai_move(result),
-            )
+            self.post_ui_event("finish_ai_move", payload)
 
         self.ai_worker = threading.Thread(target=worker, daemon=True)
         self.ai_worker.start()
@@ -1377,11 +1401,7 @@ class ChessBoardApp:
         self.draw_board()
 
         def progress(info):
-            self.root.after(
-                0,
-                lambda current=generation, fen=before_fen, payload=info:
-                    self.apply_search_progress(current, fen, payload),
-            )
+            self.post_ui_event("progress", generation, before_fen, info)
 
         def worker():
             payload = {
@@ -1403,10 +1423,7 @@ class ChessBoardApp:
                 payload["ok"] = True
             except Exception as exc:
                 payload["error"] = str(exc)
-            self.root.after(
-                0,
-                lambda result=payload: self.finish_suggestions(result),
-            )
+            self.post_ui_event("finish_suggestions", payload)
 
         self.ai_worker = threading.Thread(target=worker, daemon=True)
         self.ai_worker.start()
