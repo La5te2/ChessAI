@@ -16,7 +16,7 @@ from config import (
     WEIGHT_DECAY,
 )
 from data import H5ChessDataset
-from model import ChessNet, save_model
+from model import DEFAULT_ARCH_TYPE, SUPPORTED_ARCH_TYPES, create_model, save_model
 
 
 def train(args):
@@ -44,12 +44,15 @@ def train(args):
         persistent_workers=args.workers > 0,
     )
 
-    model = ChessNet(
+    model = create_model(
+        arch_type=args.arch_type,
         channels=args.channels,
         blocks=args.blocks,
-    ).to(device)
+        device=device,
+    )
     print(
         "created model:",
+        f"arch_type={args.arch_type}",
         f"channels={args.channels}",
         f"blocks={args.blocks}",
         flush=True,
@@ -163,6 +166,11 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=LR)
     parser.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY)
     parser.add_argument("--value-weight", type=float, default=VALUE_LOSS_WEIGHT)
+    parser.add_argument(
+        "--arch-type",
+        choices=sorted(SUPPORTED_ARCH_TYPES),
+        default=DEFAULT_ARCH_TYPE,
+    )
     parser.add_argument("--channels", type=int, default=128)
     parser.add_argument("--blocks", type=int, default=10)
     parser.add_argument("--amp", action="store_true", default=True)

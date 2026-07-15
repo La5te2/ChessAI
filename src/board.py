@@ -5,10 +5,10 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import io
+import multiprocessing as mp
 import os
 import queue
 import sys
-import threading
 import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
@@ -76,6 +76,80 @@ SEARCH_PARAMETER_TYPES = {
     "progress_interval_ms": int,
     "root_topn": int,
 }
+
+
+def search_options_from_parameters(parameters: Dict, root_topn: Optional[int] = None) -> SearchOptions:
+    movetime_ms = int(parameters.get("movetime_ms", 0) or 0)
+    return SearchOptions(
+        search_type=str(parameters.get("search_type", "only-mcts")),
+        mcts_sims=int(parameters.get("mcts_sims", 0) or 0),
+        mcts_min_sims=int(parameters.get("mcts_min_sims", 0) or 0),
+        mcts_batch_size=max(1, int(parameters.get("mcts_batch_size", 32) or 32)),
+        time_limit=(movetime_ms / 1000.0) if movetime_ms > 0 else None,
+        c_puct=float(parameters.get("c_puct", 1.5) or 1.5),
+        c_puct_base=float(parameters.get("c_puct_base", 19652.0) or 19652.0),
+        c_puct_factor=float(parameters.get("c_puct_factor", 1.0) or 1.0),
+        fpu_reduction=float(parameters.get("fpu_reduction", 0.15) or 0.15),
+        progress_interval_sec=max(
+            0.0,
+            float(parameters.get("progress_interval_ms", 750) or 0) / 1000.0,
+        ),
+        root_topn=max(1, int(root_topn or parameters.get("root_topn", 8) or 8)),
+    )
+
+
+def board_search_process(job: Dict, output_queue, cancel_event):
+    try:
+        board = chess.Board(str(job["fen"]))
+        parameters = dict(job["parameters"])
+        model_path = str(job.get("model_path") or "").strip()
+        if not model_path:
+            raise RuntimeError("model path is empty")
+        model = load_model(model_path, device=str(parameters.get("device", DEVICE)))
+        options = search_options_from_parameters(
+            parameters,
+            root_topn=int(job.get("root_topn") or parameters.get("root_topn", 8) or 8),
+        )
+
+        def progress(info):
+            if cancel_event is not None and cancel_event.is_set():
+                return
+            output_queue.put((
+                "progress",
+                (int(job["generation"]), str(job["before_fen"]), info),
+            ))
+
+        move, info = select_move(
+            board,
+            model,
+            options,
+            device=str(parameters.get("device", DEVICE)),
+            cancel_event=cancel_event,
+            progress_callback=progress,
+        )
+        output_queue.put((
+            str(job["finish_kind"]),
+            ({
+                "ok": True,
+                "move": move.uci(),
+                "info": info,
+                "error": None,
+                "generation": int(job["generation"]),
+                "before_fen": str(job["before_fen"]),
+            },),
+        ))
+    except Exception as exc:
+        output_queue.put((
+            str(job.get("finish_kind") or "finish_suggestions"),
+            ({
+                "ok": False,
+                "move": None,
+                "info": None,
+                "error": str(exc),
+                "generation": int(job.get("generation", -1)),
+                "before_fen": str(job.get("before_fen", "")),
+            },),
+        ))
 
 
 def color_from_side(side: str) -> chess.Color:
@@ -761,6 +835,7 @@ class ChessBoardApp:
         self.engine = engine
 
         self.root.title("Chessboard Simulator")
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.square_size = 72
         self.board_size = self.square_size * 8
         self.flipped = False
@@ -769,12 +844,14 @@ class ChessBoardApp:
         self.last_move = self.engine.last_move()
 
         self.ai_thinking = False
-        self.ai_worker = None
+        self.ai_process = None
         self.ai_task: Optional[str] = None
+        self.ai_context: Optional[Dict] = None
         self.ai_generation = 0
         self.ai_cancel_event = None
         self.pending_ai_after_id = None
-        self.ui_queue = queue.Queue()
+        self.mp_context = mp.get_context("spawn" if os.name == "nt" else "fork")
+        self.ui_queue = self.mp_context.Queue()
         self.ui_poll_interval_ms = 100
         self.buttons: List[ttk.Button] = []
 
@@ -943,21 +1020,83 @@ class ChessBoardApp:
             self.ai_generation += 1
             if self.ai_cancel_event is not None:
                 self.ai_cancel_event.set()
+            self.stop_ai_process(terminate=True)
             self.ai_cancel_event = None
             self.ai_thinking = False
-            self.ai_worker = None
             self.ai_task = None
+            self.ai_context = None
             self.refresh_controls()
 
     def begin_ai_task(self, task: str):
         self.cancel_pending_ai()
         self.ai_generation += 1
-        cancel_event = threading.Event()
+        cancel_event = self.mp_context.Event()
         self.ai_cancel_event = cancel_event
         self.ai_thinking = True
         self.ai_task = task
         self.refresh_controls()
         return self.ai_generation, cancel_event
+
+    def stop_ai_process(self, terminate: bool = False):
+        process = self.ai_process
+        self.ai_process = None
+        if process is None:
+            return
+        try:
+            if terminate and process.is_alive():
+                process.terminate()
+            process.join(timeout=0.2)
+        except Exception:
+            pass
+        try:
+            process.close()
+        except Exception:
+            pass
+
+    def on_close(self):
+        self.cancel_pending_ai()
+        self.root.destroy()
+
+    def merge_ai_context(self, payload: Dict) -> Dict:
+        generation = int(payload.get("generation", -1))
+        context = (
+            self.ai_context
+            if self.ai_context is not None
+            and int(self.ai_context.get("generation", -2)) == generation
+            else {}
+        )
+        merged = dict(context)
+        merged.update(payload)
+        return merged
+
+    def start_search_process(
+        self,
+        task: str,
+        board: chess.Board,
+        generation: int,
+        cancel_event,
+        finish_kind: str,
+        context: Dict,
+        root_topn: Optional[int] = None,
+    ):
+        self.ai_context = dict(context)
+        job = {
+            "task": task,
+            "generation": int(generation),
+            "before_fen": str(context.get("before_fen") or board.fen()),
+            "fen": board.fen(),
+            "model_path": self.engine.model_path,
+            "parameters": self.engine.parameter_dict(),
+            "root_topn": int(root_topn or self.engine.config.root_topn),
+            "finish_kind": finish_kind,
+        }
+        process = self.mp_context.Process(
+            target=board_search_process,
+            args=(job, self.ui_queue, cancel_event),
+            daemon=True,
+        )
+        self.ai_process = process
+        process.start()
 
     def is_current_ai_task(self, generation: int, before_fen: Optional[str] = None) -> bool:
         if generation != self.ai_generation:
@@ -987,9 +1126,9 @@ class ChessBoardApp:
 
         for kind, payload in events:
             if kind == "finish_ai_move":
-                self.finish_ai_move(payload[0])
+                self.finish_ai_move(self.merge_ai_context(payload[0]))
             elif kind == "finish_suggestions":
-                self.finish_suggestions(payload[0])
+                self.finish_suggestions(self.merge_ai_context(payload[0]))
 
         self.root.after(self.ui_poll_interval_ms, self.process_ui_events)
 
@@ -1284,37 +1423,21 @@ class ChessBoardApp:
         self.clear_selection()
         self.draw_board()
 
-        def progress(info):
-            self.post_ui_event("progress", generation, before_fen, info)
-
-        def worker():
-            payload = {
-                "ok": False,
-                "move": None,
-                "info": None,
-                "error": None,
+        self.start_search_process(
+            task="move",
+            board=before_board,
+            generation=generation,
+            cancel_event=cancel_event,
+            finish_kind="finish_ai_move",
+            context={
                 "generation": generation,
                 "cancel_event": cancel_event,
                 "before_board": before_board,
                 "before_fen": before_fen,
                 "before_turn": before_turn,
                 "before_length": before_length,
-            }
-            try:
-                move, info = self.engine.choose_ai_move(
-                    cancel_event=cancel_event,
-                    progress_callback=progress,
-                    board_snapshot=before_board,
-                )
-                payload["move"] = move.uci()
-                payload["info"] = info
-                payload["ok"] = True
-            except Exception as exc:
-                payload["error"] = str(exc)
-            self.post_ui_event("finish_ai_move", payload)
-
-        self.ai_worker = threading.Thread(target=worker, daemon=True)
-        self.ai_worker.start()
+            },
+        )
 
     def apply_search_progress(self, generation: int, before_fen: str, info: Dict):
         if not self.is_current_ai_task(generation, before_fen):
@@ -1378,9 +1501,10 @@ class ChessBoardApp:
             generation = int(payload.get("generation", -1))
             if generation == self.ai_generation:
                 self.ai_thinking = False
-                self.ai_worker = None
                 self.ai_task = None
                 self.ai_cancel_event = None
+                self.ai_context = None
+                self.stop_ai_process(terminate=False)
                 self.draw_board()
                 self.schedule_ai_reply()
 
@@ -1400,33 +1524,19 @@ class ChessBoardApp:
         generation, cancel_event = self.begin_ai_task("suggestion")
         self.draw_board()
 
-        def progress(info):
-            self.post_ui_event("progress", generation, before_fen, info)
-
-        def worker():
-            payload = {
-                "ok": False,
-                "info": None,
-                "error": None,
+        self.start_search_process(
+            task="suggestion",
+            board=board_snapshot,
+            generation=generation,
+            cancel_event=cancel_event,
+            finish_kind="finish_suggestions",
+            context={
                 "generation": generation,
                 "cancel_event": cancel_event,
                 "before_fen": before_fen,
-            }
-            try:
-                _suggestions, info = self.engine.suggestions(
-                    topn=self.engine.config.root_topn,
-                    cancel_event=cancel_event,
-                    progress_callback=progress,
-                    board_snapshot=board_snapshot,
-                )
-                payload["info"] = info
-                payload["ok"] = True
-            except Exception as exc:
-                payload["error"] = str(exc)
-            self.post_ui_event("finish_suggestions", payload)
-
-        self.ai_worker = threading.Thread(target=worker, daemon=True)
-        self.ai_worker.start()
+            },
+            root_topn=self.engine.config.root_topn,
+        )
 
     def finish_suggestions(self, payload):
         error_message = None
@@ -1458,9 +1568,10 @@ class ChessBoardApp:
             generation = int(payload.get("generation", -1))
             if generation == self.ai_generation:
                 self.ai_thinking = False
-                self.ai_worker = None
                 self.ai_task = None
                 self.ai_cancel_event = None
+                self.ai_context = None
+                self.stop_ai_process(terminate=False)
                 self.draw_board()
                 if error_message:
                     self.update_analysis(None)
@@ -1662,6 +1773,7 @@ def parse_args():
 
 
 def main():
+    mp.freeze_support()
     args = parse_args()
     model_path = resolve_model_path(args.model)
     config = EngineConfig(
