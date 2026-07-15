@@ -440,9 +440,7 @@ final_score = mcts_score + tactic_weight * tactic_score
 - 把选择性将杀当成绝对将杀
 - 把 tactic 输出当成教师机真值
 
-## 未来替代 mate
-
-当前 `mate` 模块很窄，只搜索将杀。未来 `tactic` 可以吸收并替代它。
+## 关于将杀
 
 将杀只是 `tactic` 的一个目标：
 
@@ -466,19 +464,5 @@ target = space_gain
 model policy/value
   -> mcts 通用搜索
   -> tactic 目标导向搜索
-  -> 解释输出与可选软排序
+  -> 解释输出与软排序
 ```
-
-## 当前 mate 与未来 tactic 的差异
-
-当前 `mate` 基本只在根节点利用 MCTS 排序，进入搜索树内部后主要依赖模型 policy/value、规则排序和 proof cache。
-
-它不是完整的 MCTS-assisted tactic。
-
-未来 `tactic` 需要做到：
-
-- 根节点复用 MCTS。
-- 非根节点也尽量复用 MCTS tree 中已有的节点统计。
-- 找不到 MCTS 节点时再回退到模型与规则启发。
-- 输出解释性结论，而不是强制覆盖走法。
-- 把将杀、赢子、长将、空间优势等都作为统一目标处理。
