@@ -1,4 +1,4 @@
-"""GUI and CLI chessboard simulator with optional model-assisted play."""
+"""GUI chessboard simulator with optional model-assisted play."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import chess
 import chess.pgn
@@ -37,7 +37,7 @@ class EngineConfig:
     model_path: Optional[str] = None
     device: str = DEVICE
 
-    search_type: str = "mcts-mate"
+    search_type: str = "only-mcts"
     mcts_sims: int = 100
     mcts_min_sims: int = 0
     mcts_batch_size: int = 32
@@ -46,11 +46,7 @@ class EngineConfig:
     c_puct_base: float = 19652.0
     c_puct_factor: float = 1.0
     fpu_reduction: float = 0.15
-    mcts_time_fraction: float = 0.90
-    mate_plies: int = 3
-    mate_topk: int = 4
-    mate_nodes: int = 20000
-    mate_hash_mb: int = 16
+    progress_interval_ms: int = 750
     root_topn: int = 8
 
 
@@ -76,11 +72,7 @@ SEARCH_PARAMETER_TYPES = {
     "c_puct_base": float,
     "c_puct_factor": float,
     "fpu_reduction": float,
-    "mcts_time_fraction": float,
-    "mate_plies": int,
-    "mate_topk": int,
-    "mate_nodes": int,
-    "mate_hash_mb": int,
+    "progress_interval_ms": int,
     "root_topn": int,
 }
 
@@ -182,11 +174,7 @@ class ChessEngine:
             c_puct_base=self.config.c_puct_base,
             c_puct_factor=self.config.c_puct_factor,
             fpu_reduction=self.config.fpu_reduction,
-            mcts_time_fraction=self.config.mcts_time_fraction,
-            mate_plies=self.config.mate_plies,
-            mate_topk=self.config.mate_topk,
-            mate_nodes=self.config.mate_nodes,
-            mate_hash_mb=self.config.mate_hash_mb,
+            progress_interval_sec=max(0.0, self.config.progress_interval_ms / 1000.0),
             root_topn=self.config.root_topn,
         )
 
@@ -228,10 +216,7 @@ class ChessEngine:
                     "mcts_min_sims",
                     "mcts_batch_size",
                     "movetime_ms",
-                    "mate_plies",
-                    "mate_topk",
-                    "mate_nodes",
-                    "mate_hash_mb",
+                    "progress_interval_ms",
                     "root_topn",
                 } and value < 0:
                     raise ValueError(f"{name} must be non-negative")
@@ -254,10 +239,6 @@ class ChessEngine:
                     raise ValueError("mcts_batch_size must be at least 1")
                 if name == "root_topn" and value < 1:
                     raise ValueError("root_topn must be at least 1")
-                if name == "mcts_time_fraction" and not 0.0 <= value <= 1.0:
-                    raise ValueError(
-                        "mcts_time_fraction must be between 0 and 1"
-                    )
                 setattr(self.config, name, value)
 
             return self.load_model(model_path)
@@ -433,7 +414,12 @@ class ChessEngine:
             raise RuntimeError("the AI side is to move")
         return self.make_move(self.parse_move(move_text))
 
-    def choose_ai_move(self) -> Tuple[chess.Move, Dict]:
+    def choose_ai_move(
+        self,
+        cancel_event=None,
+        progress_callback: Optional[Callable[[Dict], None]] = None,
+        board_snapshot: Optional[chess.Board] = None,
+    ) -> Tuple[chess.Move, Dict]:
         if not self.model_loaded:
             raise RuntimeError("load a model and apply its parameters first")
         if not self.playing_with_ai:
@@ -443,13 +429,22 @@ class ChessEngine:
         if self.game_over():
             raise RuntimeError("game is already over")
 
-        live_fen = self.board.fen()
+        search_board = (
+            board_snapshot.copy(stack=True)
+            if board_snapshot is not None
+            else self.board.copy(stack=True)
+        )
+        live_fen = search_board.fen()
         move, info = select_move(
-            self.board.copy(stack=True),
+            search_board,
             self.model,
             self.search_options(),
             device=self.config.device,
+            cancel_event=cancel_event,
+            progress_callback=progress_callback,
         )
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("AI search cancelled")
         if self.board.fen() != live_fen:
             raise RuntimeError("board changed during AI search")
 
@@ -500,20 +495,37 @@ class ChessEngine:
             self.clear_analysis()
             raise
 
-    def suggestions(self, topn: int = 8) -> Tuple[List[Dict], Dict]:
+    def suggestions(
+        self,
+        topn: int = 8,
+        cancel_event=None,
+        progress_callback: Optional[Callable[[Dict], None]] = None,
+        board_snapshot: Optional[chess.Board] = None,
+    ) -> Tuple[List[Dict], Dict]:
         if not self.model_loaded:
             raise RuntimeError("load a model and apply its parameters first")
         options = dataclasses.replace(
             self.search_options(),
             root_topn=max(1, int(topn)),
         )
-        board_copy = self.board.copy(stack=True)
+        board_copy = (
+            board_snapshot.copy(stack=True)
+            if board_snapshot is not None
+            else self.board.copy(stack=True)
+        )
+        live_fen = board_copy.fen()
         move, info = select_move(
             board_copy,
             self.model,
             options,
             device=self.config.device,
+            cancel_event=cancel_event,
+            progress_callback=progress_callback,
         )
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("AI search cancelled")
+        if self.board.fen() != live_fen:
+            raise RuntimeError("board changed during AI search")
         suggestions = info.get("root", [])[: max(1, int(topn))]
         self.last_ai_info = info
         self.last_suggestions = suggestions
@@ -649,11 +661,7 @@ class ModelSettingsDialog(tk.Toplevel):
             "c_puct_base": "C-PUCT schedule base",
             "c_puct_factor": "C-PUCT schedule factor",
             "fpu_reduction": "FPU reduction",
-            "mcts_time_fraction": "MCTS time fraction",
-            "mate_plies": "Mate plies",
-            "mate_topk": "Mate top candidates",
-            "mate_nodes": "Mate node cap",
-            "mate_hash_mb": "Mate hash (MB)",
+            "progress_interval_ms": "Progress interval (ms)",
             "root_topn": "Suggestion count",
         }
         current = engine.parameter_dict()
@@ -762,6 +770,8 @@ class ChessBoardApp:
         self.ai_thinking = False
         self.ai_worker = None
         self.ai_task: Optional[str] = None
+        self.ai_generation = 0
+        self.ai_cancel_event = None
         self.pending_ai_after_id = None
         self.buttons: List[ttk.Button] = []
 
@@ -890,46 +900,70 @@ class ChessBoardApp:
         self._add_button(move_bar, "Save PGN", self.save_pgn)
 
     def refresh_controls(self):
-        base_state = tk.DISABLED if self.ai_thinking else tk.NORMAL
         for button in self.buttons:
             try:
-                button.configure(state=base_state)
+                button.configure(state=tk.NORMAL)
             except Exception:
                 pass
 
-        if not self.ai_thinking:
-            model_state = (
+        model_state = (
+            tk.NORMAL
+            if self.engine.model_loaded
+            else tk.DISABLED
+        )
+        self.play_ai_button.configure(state=model_state)
+        self.simulator_button.configure(
+            state=(
                 tk.NORMAL
-                if self.engine.model_loaded
+                if self.engine.playing_with_ai
                 else tk.DISABLED
             )
-            self.play_ai_button.configure(state=model_state)
-            self.simulator_button.configure(
-                state=(
-                    tk.NORMAL
-                    if self.engine.playing_with_ai
-                    else tk.DISABLED
-                )
-            )
+        )
 
         label = "Close" if self.engine.ai_suggest_open else "Open"
         state = (
             tk.NORMAL
-            if self.engine.mode == "simulator" and self.ai_task != "move"
+            if self.engine.mode == "simulator"
             else tk.DISABLED
         )
         self.ai_suggest_button.configure(text=label, state=state)
 
-    def cancel_pending_ai(self):
+    def cancel_pending_ai(self, cancel_running: bool = True):
         if self.pending_ai_after_id is not None:
             try:
                 self.root.after_cancel(self.pending_ai_after_id)
             except Exception:
                 pass
             self.pending_ai_after_id = None
+        if cancel_running and self.ai_thinking:
+            self.ai_generation += 1
+            if self.ai_cancel_event is not None:
+                self.ai_cancel_event.set()
+            self.ai_cancel_event = None
+            self.ai_thinking = False
+            self.ai_worker = None
+            self.ai_task = None
+            self.refresh_controls()
+
+    def begin_ai_task(self, task: str):
+        self.cancel_pending_ai()
+        self.ai_generation += 1
+        cancel_event = threading.Event()
+        self.ai_cancel_event = cancel_event
+        self.ai_thinking = True
+        self.ai_task = task
+        self.refresh_controls()
+        return self.ai_generation, cancel_event
+
+    def is_current_ai_task(self, generation: int, before_fen: Optional[str] = None) -> bool:
+        if generation != self.ai_generation:
+            return False
+        if before_fen is not None and self.engine.board.fen() != before_fen:
+            return False
+        return True
 
     def schedule_ai_reply(self):
-        self.cancel_pending_ai()
+        self.cancel_pending_ai(cancel_running=False)
         if (
             self.ai_thinking
             or self.engine.game_over()
@@ -1040,6 +1074,9 @@ class ChessBoardApp:
         turn = side_name(self.engine.board.turn)
         mode = "Play" if self.engine.playing_with_ai else "Simulator"
         status = f"Mode: {mode} | Turn: {turn}"
+        if self.ai_thinking:
+            label = "AI move" if self.ai_task == "move" else "Analysis"
+            status = f"{status} | {label} running"
 
         self.status_var.set(status)
         self.update_board_state()
@@ -1064,6 +1101,8 @@ class ChessBoardApp:
         text = (
             f"Best: {info.get('best_san')} ({info.get('best_move')})\n"
             f"Search: {info.get('search_type')}\n"
+            f"Partial: {info.get('partial')}\n"
+            f"Cancelled: {info.get('cancelled')}\n"
             f"MCTS sims: {info.get('sims_completed')}/"
             f"{info.get('mcts_dynamic_target')}/"
             f"{info.get('mcts_soft_cap')}\n"
@@ -1071,16 +1110,10 @@ class ChessBoardApp:
             f"Value: {info.get('value')}\n"
             f"C-PUCT root: {info.get('c_puct_root')}\n"
             f"FPU root: {info.get('fpu_root')}\n"
-            f"MCTS time fraction: {info.get('mcts_time_fraction')}\n"
             f"Expanded nodes: {info.get('nodes')}\n"
             f"NN batches: {info.get('nn_batches')}\n"
-            f"Mate nodes: {info.get('mate_nodes')}\n"
-            f"Mate hash MB: {info.get('mate_hash_mb')}\n"
-            f"Mate completed: {info.get('mate_completed')}\n"
-            f"Mate status: {info.get('mate_status')}\n"
-            f"Mate forced: {info.get('mate_forced_move')}\n"
-            f"Mate PV: {' '.join(info.get('mate_pv') or [])}\n"
-            f"Mate cache entries: {info.get('mate_cache_entries')}\n"
+            f"Leaf depth avg/max: "
+            f"{info.get('avg_leaf_depth')}/{info.get('max_leaf_depth')}\n"
             f"Elapsed: {info.get('elapsed_ms')} ms\n"
         )
         self.info_text.insert(tk.END, text)
@@ -1107,7 +1140,7 @@ class ChessBoardApp:
         return True
 
     def on_click(self, event):
-        if self.ai_thinking or self.engine.game_over():
+        if self.engine.game_over():
             return
         if not self.engine.is_human_turn():
             return
@@ -1196,8 +1229,6 @@ class ChessBoardApp:
             self.draw_board()
 
     def submit_entry_move(self):
-        if self.ai_thinking:
-            return
         text = self.move_entry.get().strip()
         if not text:
             return
@@ -1209,18 +1240,25 @@ class ChessBoardApp:
             messagebox.showerror("Move", str(exc), parent=self.root)
 
     def ai_move_once(self):
-        if self.ai_thinking or not self.engine.is_ai_turn():
+        if self.ai_thinking:
+            self.cancel_pending_ai()
+        if not self.engine.is_ai_turn():
             return
 
-        self.cancel_pending_ai()
         before_board = self.engine.board.copy(stack=True)
         before_fen = self.engine.board.fen()
         before_turn = self.engine.board.turn
         before_length = len(self.engine.board.move_stack)
-        self.ai_thinking = True
-        self.ai_task = "move"
+        generation, cancel_event = self.begin_ai_task("move")
         self.clear_selection()
         self.draw_board()
+
+        def progress(info):
+            self.root.after(
+                0,
+                lambda current=generation, fen=before_fen, payload=info:
+                    self.apply_search_progress(current, fen, payload),
+            )
 
         def worker():
             payload = {
@@ -1228,13 +1266,19 @@ class ChessBoardApp:
                 "move": None,
                 "info": None,
                 "error": None,
+                "generation": generation,
+                "cancel_event": cancel_event,
                 "before_board": before_board,
                 "before_fen": before_fen,
                 "before_turn": before_turn,
                 "before_length": before_length,
             }
             try:
-                move, info = self.engine.choose_ai_move()
+                move, info = self.engine.choose_ai_move(
+                    cancel_event=cancel_event,
+                    progress_callback=progress,
+                    board_snapshot=before_board,
+                )
                 payload["move"] = move.uci()
                 payload["info"] = info
                 payload["ok"] = True
@@ -1248,10 +1292,21 @@ class ChessBoardApp:
         self.ai_worker = threading.Thread(target=worker, daemon=True)
         self.ai_worker.start()
 
+    def apply_search_progress(self, generation: int, before_fen: str, info: Dict):
+        if not self.is_current_ai_task(generation, before_fen):
+            return
+        self.update_analysis(info)
+
     def finish_ai_move(self, payload):
         try:
+            generation = int(payload.get("generation", -1))
+            if not self.is_current_ai_task(generation, payload.get("before_fen")):
+                return
+            cancel_event = payload.get("cancel_event")
+            if cancel_event is not None and cancel_event.is_set():
+                return
             if self.engine.board.fen() != payload.get("before_fen"):
-                raise RuntimeError("board changed during AI search")
+                return
             if not payload.get("ok"):
                 raise RuntimeError(payload.get("error") or "AI search failed")
 
@@ -1282,6 +1337,9 @@ class ChessBoardApp:
             self.last_move = move
             self.update_analysis(payload["info"])
         except Exception as exc:
+            generation = int(payload.get("generation", -1))
+            if generation != self.ai_generation:
+                return
             before_board = payload.get("before_board")
             if before_board is not None:
                 self.engine.board = before_board
@@ -1293,15 +1351,18 @@ class ChessBoardApp:
                 parent=self.root,
             )
         finally:
-            self.ai_thinking = False
-            self.ai_worker = None
-            self.ai_task = None
-            self.draw_board()
-            self.schedule_ai_reply()
+            generation = int(payload.get("generation", -1))
+            if generation == self.ai_generation:
+                self.ai_thinking = False
+                self.ai_worker = None
+                self.ai_task = None
+                self.ai_cancel_event = None
+                self.draw_board()
+                self.schedule_ai_reply()
 
     def start_simulator_suggestion(self):
         if self.ai_thinking:
-            return
+            self.cancel_pending_ai()
         if (
             self.engine.mode != "simulator"
             or self.engine.game_over()
@@ -1310,22 +1371,33 @@ class ChessBoardApp:
         ):
             return
 
-        self.cancel_pending_ai()
         before_fen = self.engine.board.fen()
-        self.ai_thinking = True
-        self.ai_task = "suggestion"
+        board_snapshot = self.engine.board.copy(stack=True)
+        generation, cancel_event = self.begin_ai_task("suggestion")
         self.draw_board()
+
+        def progress(info):
+            self.root.after(
+                0,
+                lambda current=generation, fen=before_fen, payload=info:
+                    self.apply_search_progress(current, fen, payload),
+            )
 
         def worker():
             payload = {
                 "ok": False,
                 "info": None,
                 "error": None,
+                "generation": generation,
+                "cancel_event": cancel_event,
                 "before_fen": before_fen,
             }
             try:
                 _suggestions, info = self.engine.suggestions(
-                    topn=self.engine.config.root_topn
+                    topn=self.engine.config.root_topn,
+                    cancel_event=cancel_event,
+                    progress_callback=progress,
+                    board_snapshot=board_snapshot,
                 )
                 payload["info"] = info
                 payload["ok"] = True
@@ -1342,6 +1414,12 @@ class ChessBoardApp:
     def finish_suggestions(self, payload):
         error_message = None
         try:
+            generation = int(payload.get("generation", -1))
+            if not self.is_current_ai_task(generation, payload.get("before_fen")):
+                return
+            cancel_event = payload.get("cancel_event")
+            if cancel_event is not None and cancel_event.is_set():
+                return
             if self.engine.mode != "simulator":
                 return
             if self.engine.board.fen() != payload.get("before_fen"):
@@ -1355,15 +1433,21 @@ class ChessBoardApp:
                 )
             self.update_analysis(payload["info"])
         except Exception as exc:
+            generation = int(payload.get("generation", -1))
+            if generation != self.ai_generation:
+                return
             error_message = f"Model analysis error: {exc}"
         finally:
-            self.ai_thinking = False
-            self.ai_worker = None
-            self.ai_task = None
-            self.draw_board()
-            if error_message:
-                self.update_analysis(None)
-                self.info_text.insert(tk.END, error_message)
+            generation = int(payload.get("generation", -1))
+            if generation == self.ai_generation:
+                self.ai_thinking = False
+                self.ai_worker = None
+                self.ai_task = None
+                self.ai_cancel_event = None
+                self.draw_board()
+                if error_message:
+                    self.update_analysis(None)
+                    self.info_text.insert(tk.END, error_message)
 
     def toggle_ai_suggest(self):
         if self.engine.mode != "simulator" or self.ai_task == "move":
@@ -1383,8 +1467,6 @@ class ChessBoardApp:
         self.schedule_ai_reply()
 
     def open_model_settings(self):
-        if self.ai_thinking:
-            return
         self.cancel_pending_ai()
         ModelSettingsDialog(
             self.root,
@@ -1459,8 +1541,6 @@ class ChessBoardApp:
         self.schedule_ai_reply()
 
     def reset_board(self):
-        if self.ai_thinking:
-            return
         self.cancel_pending_ai()
         fen = strip_wrapping_quotes(self.reset_entry.get())
         try:
@@ -1479,8 +1559,6 @@ class ChessBoardApp:
             )
 
     def undo_move(self):
-        if self.ai_thinking:
-            return
         self.cancel_pending_ai()
         undone = self.engine.undo()
         self.clear_selection()
@@ -1490,8 +1568,6 @@ class ChessBoardApp:
         self.schedule_ai_reply()
 
     def import_pgn(self):
-        if self.ai_thinking:
-            return
         self.cancel_pending_ai()
         path = filedialog.askopenfilename(
             parent=self.root,
@@ -1544,313 +1620,16 @@ class ChessBoardApp:
             )
 
 
-def print_cli_help():
-    print(
-        """
-Commands:
-  <move>
-      Play the legal move for the side to move. UCI and SAN are accepted.
-
-  model <path>
-      Load or reload a model with the current search parameters.
-
-  unload
-      Unload the model and enter simulator mode.
-
-  params
-      Show the current model search parameters.
-
-  set <name> <value>
-      Update one search parameter and reload the current model.
-
-  play
-      Choose White or Black and choose current position or startpos.
-
-  simulator
-      Return to two-sided board simulation.
-
-  close
-      Close simulator AI suggest output.
-
-  open
-      Open simulator AI suggest output and analyze the current position.
-
-  reset [fen]
-      Restore the supplied FEN. Empty input restores startpos.
-
-  pgn <path>
-      Load the first PGN mainline and display its final position.
-
-  undo
-      Undo one simulator ply or the latest human/AI turn pair.
-
-  save <path>
-      Save the current board history as PGN.
-
-  state
-      Show mode, model, FEN, side to move, and result.
-
-  board
-      Show the ASCII board.
-
-  help
-      Show this command list.
-
-  quit
-      Exit.
-"""
-    )
-
-
-def print_search_info(info: Dict):
-    print(
-        "search=", info.get("search_type"),
-        "best=", info.get("best_san"),
-        info.get("best_move"),
-        "sims=", (
-            info.get("sims_completed"),
-            info.get("mcts_dynamic_target"),
-            info.get("mcts_soft_cap"),
-        ),
-        "uncertainty=", info.get("uncertainty"),
-        "value=", info.get("value"),
-    )
-
-
-def print_suggestions(suggestions: List[Dict]):
-    for index, row in enumerate(suggestions, 1):
-        print(
-            f"{index}. {row.get('san')} {row.get('move')} "
-            f"p={row.get('p', 0.0):.4f} "
-            f"visits={row.get('visits', 0)} "
-            f"q={row.get('q', 0.0):+.3f}"
-        )
-
-
-def cli_simulator_suggest(engine: ChessEngine):
-    if (
-        engine.mode != "simulator"
-        or not engine.model_loaded
-        or not engine.ai_suggest_open
-        or engine.game_over()
-    ):
-        return
-    try:
-        suggestions, info = engine.suggestions(
-            topn=engine.config.root_topn
-        )
-        print_search_info(info)
-        print_suggestions(suggestions)
-    except Exception as exc:
-        print("Suggestion error:", exc)
-
-
-def cli_ai_reply(engine: ChessEngine):
-    if not engine.is_ai_turn() or engine.game_over():
-        return
-    output = engine.make_ai_move()
-    move = output["move"]
-    print(f"AI: {move['san']} ({move['uci']})")
-    print_search_info(output["info"])
-
-
-def cli_after_position_change(engine: ChessEngine):
-    if engine.is_ai_turn():
-        cli_ai_reply(engine)
-    else:
-        cli_simulator_suggest(engine)
-
-
-def prompt_ai_setup(engine: ChessEngine):
-    if not engine.model_loaded:
-        print("Load a model and apply its parameters first.")
-        return
-
-    side = input("Your side [white/black]: ").strip().lower()
-    if side not in {"white", "w", "black", "b"}:
-        print("Expected white or black.")
-        return
-    user_side = "white" if side in {"white", "w"} else "black"
-
-    start = input(
-        "Starting position [current/startpos]: "
-    ).strip().lower()
-    if start not in {"current", "c", "startpos", "start", "s", ""}:
-        print("Expected current or startpos.")
-        return
-    from_current = start in {"current", "c"}
-
-    engine.start_ai_game(
-        user_side=user_side,
-        from_current_position=from_current,
-    )
-    print(
-        f"Play: human={side_name(engine.user_color)}, "
-        f"ai={side_name(engine.ai_color)}, "
-        f"start={'current' if from_current else 'startpos'}"
-    )
-    cli_ai_reply(engine)
-
-
-def run_cli_app(engine: ChessEngine):
-    print("Chessboard Simulator CLI")
-    print("Mode: simulator")
-    print("Type 'help' for commands.")
-    cli_simulator_suggest(engine)
-
-    while True:
-        if engine.game_over():
-            print(engine.outcome_text())
-
-        raw = input("board> ")
-        text = raw.strip()
-        if not text:
-            continue
-        lower = text.lower()
-
-        if lower in {"q", "quit", "exit"}:
-            break
-        if lower in {"help", "h", "?"}:
-            print_cli_help()
-            continue
-        if lower == "board":
-            print(engine.board)
-            continue
-        if lower == "state":
-            state = engine.state()
-            for key, value in state.items():
-                print(f"{key}: {value}")
-            continue
-        if lower == "params":
-            for key, value in engine.parameter_dict().items():
-                print(f"{key}: {value}")
-            continue
-        if lower in {"play", "playai", "ai game"}:
-            try:
-                prompt_ai_setup(engine)
-            except Exception as exc:
-                print("Play error:", exc)
-            continue
-        if lower in {"simulator", "simulate"}:
-            engine.enter_simulator()
-            print("Mode: simulator")
-            cli_simulator_suggest(engine)
-            continue
-        if lower == "close":
-            engine.close_ai_suggest()
-            print("AI suggest: closed")
-            continue
-        if lower == "open":
-            engine.open_ai_suggest()
-            print("AI suggest: open")
-            cli_simulator_suggest(engine)
-            continue
-        if lower == "unload":
-            engine.unload_model()
-            print("Model unloaded. Mode: simulator")
-            continue
-        if lower == "undo":
-            print(f"undone {engine.undo()} ply")
-            cli_after_position_change(engine)
-            continue
-        if lower == "reset":
-            try:
-                engine.reset("startpos")
-                print("FEN:", engine.board.fen())
-                cli_after_position_change(engine)
-            except Exception as exc:
-                print("Reset error:", exc)
-            continue
-        if lower.startswith("reset "):
-            try:
-                fen = strip_wrapping_quotes(text[6:].strip())
-                engine.reset(fen or "startpos")
-                print("FEN:", engine.board.fen())
-                cli_after_position_change(engine)
-            except Exception as exc:
-                print("Reset error:", exc)
-            continue
-        if lower.startswith("model "):
-            path = strip_wrapping_quotes(text[6:].strip())
-            try:
-                loaded = engine.load_model(path)
-                print("Model loaded:", loaded)
-                cli_simulator_suggest(engine)
-            except Exception as exc:
-                print("Model error:", exc)
-            continue
-        if lower.startswith("set "):
-            parts = text.split(maxsplit=2)
-            if len(parts) != 3:
-                print("usage: set <name> <value>")
-                continue
-            name, value = parts[1], parts[2]
-            if name not in SEARCH_PARAMETER_TYPES:
-                print(
-                    "Available parameters:",
-                    ", ".join(SEARCH_PARAMETER_TYPES),
-                )
-                continue
-            if not engine.model_loaded:
-                print("Load a model before applying parameters.")
-                continue
-            try:
-                converter = SEARCH_PARAMETER_TYPES[name]
-                converted = converter(value)
-                engine.configure_model(
-                    engine.model_path,
-                    {name: converted},
-                )
-                print(
-                    f"{name}={getattr(engine.config, name)}; "
-                    "model reloaded"
-                )
-                cli_simulator_suggest(engine)
-            except Exception as exc:
-                print("Parameter error:", exc)
-            continue
-        if lower.startswith("pgn "):
-            path = strip_wrapping_quotes(text[4:].strip())
-            try:
-                engine.load_pgn_file(path)
-                print("FEN:", engine.board.fen())
-                cli_after_position_change(engine)
-            except Exception as exc:
-                print("PGN error:", exc)
-            continue
-        if lower.startswith("save "):
-            path = strip_wrapping_quotes(text[5:].strip())
-            try:
-                engine.save_pgn(path)
-                print("saved:", path)
-            except Exception as exc:
-                print("Save error:", exc)
-            continue
-
-        try:
-            result = engine.make_human_move(text)
-            print(f"Move: {result['san']} ({result['uci']})")
-            cli_after_position_change(engine)
-        except Exception as exc:
-            print("Move error:", exc)
-
-
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Chessboard simulator with optional model assistance"
+        description="Chessboard GUI with optional model assistance"
     )
     parser.add_argument("--model", default="none")
-    parser.add_argument(
-        "--gui",
-        type=int,
-        choices=[0, 1],
-        default=1,
-    )
     parser.add_argument("--device", default=DEVICE)
     parser.add_argument(
         "--search-type",
         choices=sorted(VALID_SEARCH_TYPES),
-        default="mcts-mate",
+        default="only-mcts",
     )
     parser.add_argument("--mcts-sims", type=int, default=100)
     parser.add_argument("--mcts-min-sims", type=int, default=0)
@@ -1860,11 +1639,7 @@ def parse_args():
     parser.add_argument("--c-puct-base", type=float, default=19652.0)
     parser.add_argument("--c-puct-factor", type=float, default=1.0)
     parser.add_argument("--fpu-reduction", type=float, default=0.15)
-    parser.add_argument("--mcts-time-fraction", type=float, default=0.90)
-    parser.add_argument("--mate-plies", type=int, default=3)
-    parser.add_argument("--mate-topk", type=int, default=4)
-    parser.add_argument("--mate-nodes", type=int, default=20000)
-    parser.add_argument("--mate-hash-mb", type=int, default=16)
+    parser.add_argument("--progress-interval-ms", type=int, default=750)
     parser.add_argument("--root-topn", type=int, default=8)
     return parser.parse_args()
 
@@ -1884,21 +1659,13 @@ def main():
         c_puct_base=args.c_puct_base,
         c_puct_factor=args.c_puct_factor,
         fpu_reduction=args.fpu_reduction,
-        mcts_time_fraction=args.mcts_time_fraction,
-        mate_plies=args.mate_plies,
-        mate_topk=args.mate_topk,
-        mate_nodes=args.mate_nodes,
-        mate_hash_mb=args.mate_hash_mb,
+        progress_interval_ms=args.progress_interval_ms,
         root_topn=args.root_topn,
     )
     engine = ChessEngine(
         config,
         load_weights=bool(model_path),
     )
-
-    if args.gui == 0:
-        run_cli_app(engine)
-        return
 
     root = tk.Tk()
     ChessBoardApp(root, engine)

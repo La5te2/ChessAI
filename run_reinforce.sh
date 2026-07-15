@@ -36,6 +36,7 @@ ARENA_REPLAY_POSITIONS_PER_ITER=10000
 SAMPLE_TOPK=6
 REWARD_SCALE_CP=600
 TEACHER_POLICY_WEIGHT=0.10
+TEACHER_VALUE_WEIGHT=0.50
 TEACHER_POLICY_TEMP_CP=150
 ACTOR_EXPLORATION_MIX=0.05
 ADVANTAGE_CLIP=1.0
@@ -68,6 +69,12 @@ VALIDATION_UCI_MOVETIME_MS=0
 VALIDATION_UCI_MULTIPV=1
 VALIDATION_UCI_THREADS=1
 VALIDATION_UCI_HASH_MB=512
+VALIDATION_MAX_TOP1_REGRET_REGRESSION_CP=20
+VALIDATION_MAX_COMPOSITE_REGRET_REGRESSION_CP=20
+VALIDATION_MAX_VALUE_MAE_REGRESSION=0.02
+VALIDATION_MAX_VALUE_RMSE_REGRESSION=0.02
+VALIDATION_MIN_VALUE_SIGN_ACC_DELTA=-0.02
+VALIDATION_MIN_TEACHER_BEST_TOPK_DELTA=-0.02
 
 EVAL_GAMES=200
 EVAL_SIMS=0
@@ -80,11 +87,6 @@ EVAL_C_PUCT=0.5
 EVAL_C_PUCT_BASE=19652
 EVAL_C_PUCT_FACTOR=1.0
 EVAL_FPU_REDUCTION=0.15
-EVAL_MCTS_TIME_FRACTION=1.0
-EVAL_MATE_PLIES=0
-EVAL_MATE_TOPK=4
-EVAL_MATE_NODES=20000
-EVAL_MATE_HASH_MB=16
 EVAL_UCI_DEPTH=16
 EVAL_UCI_MULTIPV=1
 EVAL_MIN_NET_WINS=0
@@ -102,11 +104,11 @@ echo "offline labels: fen_source=${FEN_SOURCE} positions_per_iter=${POSITIONS_PE
 echo "arena replay: window=${ARENA_REPLAY_WINDOW} positions=${ARENA_REPLAY_POSITIONS} positions_per_iter=${ARENA_REPLAY_POSITIONS_PER_ITER}"
 echo "actor actions: topk=${SAMPLE_TOPK} include_teacher_best=true exploration_mix=${ACTOR_EXPLORATION_MIX}"
 echo "reward: continuous_tanh_cp scale_cp=${REWARD_SCALE_CP} advantage_clip=${ADVANTAGE_CLIP}"
-echo "teacher policy: weight=${TEACHER_POLICY_WEIGHT} temp_cp=${TEACHER_POLICY_TEMP_CP}"
+echo "teacher targets: policy_weight=${TEACHER_POLICY_WEIGHT} value_weight=${TEACHER_VALUE_WEIGHT} policy_temp_cp=${TEACHER_POLICY_TEMP_CP}"
 echo "teacher: uci=${UCI} depth=${UCI_DEPTH} multipv=${UCI_MULTIPV} threads=${UCI_THREADS}"
 echo "train: epochs=${EPOCHS} train_max_steps=${TRAIN_MAX_STEPS} batch_size=${BATCH_SIZE} actor_weight=${ACTOR_WEIGHT} critic_weight=${CRITIC_WEIGHT} entropy_weight=${ENTROPY_WEIGHT}"
-echo "teacher validation: source=${VALIDATION_SOURCE} positions=${VALIDATION_POSITIONS} offset=${VALIDATION_OFFSET} topk=${VALIDATION_TOPK} uci_depth=${VALIDATION_UCI_DEPTH} uci_multipv=${VALIDATION_UCI_MULTIPV}"
-echo "eval: games=${EVAL_GAMES} search_type=${EVAL_SEARCH_TYPE} sims=${EVAL_SIMS} movetime_ms=${EVAL_MOVETIME_MS} c_puct=${EVAL_C_PUCT} fpu_reduction=${EVAL_FPU_REDUCTION} mcts_time_fraction=${EVAL_MCTS_TIME_FRACTION} mate=${EVAL_MATE_PLIES}/${EVAL_MATE_TOPK}/${EVAL_MATE_NODES} mate_hash_mb=${EVAL_MATE_HASH_MB} min_net_wins=${EVAL_MIN_NET_WINS} min_acpl_improvement=${EVAL_MIN_ACPL_IMPROVEMENT} min_accuracy_improvement=${EVAL_MIN_ACCURACY_IMPROVEMENT} opening_book=${EVAL_OPENING_BOOK}"
+echo "teacher validation: source=${VALIDATION_SOURCE} positions=${VALIDATION_POSITIONS} offset=${VALIDATION_OFFSET} topk=${VALIDATION_TOPK} uci_depth=${VALIDATION_UCI_DEPTH} uci_multipv=${VALIDATION_UCI_MULTIPV} top1_tol_cp=${VALIDATION_MAX_TOP1_REGRET_REGRESSION_CP} composite_tol_cp=${VALIDATION_MAX_COMPOSITE_REGRET_REGRESSION_CP}"
+echo "eval: games=${EVAL_GAMES} search_type=${EVAL_SEARCH_TYPE} sims=${EVAL_SIMS} movetime_ms=${EVAL_MOVETIME_MS} c_puct=${EVAL_C_PUCT} fpu_reduction=${EVAL_FPU_REDUCTION} min_net_wins=${EVAL_MIN_NET_WINS} min_acpl_improvement=${EVAL_MIN_ACPL_IMPROVEMENT} min_accuracy_improvement=${EVAL_MIN_ACCURACY_IMPROVEMENT} opening_book=${EVAL_OPENING_BOOK}"
 
 exec python src/reinforce.py \
   --model "${MODEL}" \
@@ -124,6 +126,7 @@ exec python src/reinforce.py \
   --sample-topk "${SAMPLE_TOPK}" \
   --reward-scale-cp "${REWARD_SCALE_CP}" \
   --teacher-policy-weight "${TEACHER_POLICY_WEIGHT}" \
+  --teacher-value-weight "${TEACHER_VALUE_WEIGHT}" \
   --teacher-policy-temp-cp "${TEACHER_POLICY_TEMP_CP}" \
   --actor-exploration-mix "${ACTOR_EXPLORATION_MIX}" \
   --advantage-clip "${ADVANTAGE_CLIP}" \
@@ -153,6 +156,12 @@ exec python src/reinforce.py \
   --validation-uci-multipv "${VALIDATION_UCI_MULTIPV}" \
   --validation-uci-threads "${VALIDATION_UCI_THREADS}" \
   --validation-uci-hash-mb "${VALIDATION_UCI_HASH_MB}" \
+  --validation-max-top1-regret-regression-cp "${VALIDATION_MAX_TOP1_REGRET_REGRESSION_CP}" \
+  --validation-max-composite-regret-regression-cp "${VALIDATION_MAX_COMPOSITE_REGRET_REGRESSION_CP}" \
+  --validation-max-value-mae-regression "${VALIDATION_MAX_VALUE_MAE_REGRESSION}" \
+  --validation-max-value-rmse-regression "${VALIDATION_MAX_VALUE_RMSE_REGRESSION}" \
+  --validation-min-value-sign-acc-delta "${VALIDATION_MIN_VALUE_SIGN_ACC_DELTA}" \
+  --validation-min-teacher-best-topk-delta "${VALIDATION_MIN_TEACHER_BEST_TOPK_DELTA}" \
   --eval-games "${EVAL_GAMES}" \
   --eval-sims "${EVAL_SIMS}" \
   --eval-workers "${EVAL_WORKERS}" \
@@ -164,11 +173,6 @@ exec python src/reinforce.py \
   --eval-c-puct-base "${EVAL_C_PUCT_BASE}" \
   --eval-c-puct-factor "${EVAL_C_PUCT_FACTOR}" \
   --eval-fpu-reduction "${EVAL_FPU_REDUCTION}" \
-  --eval-mcts-time-fraction "${EVAL_MCTS_TIME_FRACTION}" \
-  --eval-mate-plies "${EVAL_MATE_PLIES}" \
-  --eval-mate-topk "${EVAL_MATE_TOPK}" \
-  --eval-mate-nodes "${EVAL_MATE_NODES}" \
-  --eval-mate-hash-mb "${EVAL_MATE_HASH_MB}" \
   --eval-uci-depth "${EVAL_UCI_DEPTH}" \
   --eval-uci-multipv "${EVAL_UCI_MULTIPV}" \
   --eval-min-net-wins "${EVAL_MIN_NET_WINS}" \

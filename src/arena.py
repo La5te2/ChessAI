@@ -79,21 +79,10 @@ def trace_search_info(info: Dict, root_topn: int) -> Dict:
         "fpu_reduction",
         "fpu_root",
         "virtual_loss",
-        "mcts_time_fraction",
         "nodes",
         "expanded_nodes",
         "nn_batches",
         "mcts_move",
-        "mate_plies",
-        "mate_topk",
-        "mate_nodes",
-        "mate_hash_mb",
-        "mate_completed",
-        "mate_status",
-        "mate_forced_move",
-        "mate_pv",
-        "mate_cache_entries",
-        "mate_reasons",
         "elapsed_ms",
     )
     payload = {key: info.get(key) for key in keys if key in info}
@@ -113,12 +102,6 @@ def pgn_search_comment(owner: str, info: Dict) -> str:
         parts.append(f"sims={info.get('sims_completed')}/{info.get('mcts_soft_cap')}")
     if "value" in info:
         parts.append(f"value={float(info.get('value')):+.3f}")
-    if info.get("mate_forced_move"):
-        parts.append(f"mate_forced={info.get('mate_forced_move')}")
-    if info.get("mate_status"):
-        parts.append(f"mate_status={info.get('mate_status')}")
-    if info.get("mate_pv"):
-        parts.append("mate_pv=" + " ".join(str(move) for move in info.get("mate_pv")))
     root = []
     for row in list(info.get("root") or [])[:3]:
         root.append(
@@ -336,11 +319,6 @@ def _worker(job):
         c_puct_base,
         c_puct_factor,
         fpu_reduction,
-        mcts_time_fraction,
-        mate_plies,
-        mate_topk,
-        mate_nodes,
-        mate_hash_mb,
         pgn_comments,
         pgn_columns,
         claim_draws,
@@ -363,11 +341,6 @@ def _worker(job):
         c_puct_base=c_puct_base,
         c_puct_factor=c_puct_factor,
         fpu_reduction=fpu_reduction,
-        mcts_time_fraction=mcts_time_fraction,
-        mate_plies=mate_plies,
-        mate_topk=mate_topk,
-        mate_nodes=mate_nodes,
-        mate_hash_mb=mate_hash_mb,
     )
     candidate_searcher = UnifiedSearch(candidate, options, device=device)
     baseline_searcher = UnifiedSearch(baseline, options, device=device)
@@ -573,11 +546,6 @@ def evaluate_models(
     c_puct_base=19652.0,
     c_puct_factor=1.0,
     fpu_reduction=0.15,
-    mcts_time_fraction=0.90,
-    mate_plies=0,
-    mate_topk=4,
-    mate_nodes=20000,
-    mate_hash_mb=16,
     uci=STOCKFISH_PATH,
     uci_depth=8,
     uci_movetime_ms=0,
@@ -654,11 +622,6 @@ def evaluate_models(
             c_puct_base,
             c_puct_factor,
             fpu_reduction,
-            mcts_time_fraction,
-            mate_plies,
-            mate_topk,
-            mate_nodes,
-            mate_hash_mb,
             pgn_comments,
             pgn_columns,
             claim_draws,
@@ -755,10 +718,6 @@ def evaluate_models(
                 handle.write(json.dumps(json_safe(row), ensure_ascii=False) + "\n")
         progress_print(progress, f"arena trace saved: {trace_output}")
     effective_sims = 0 if str(search_type) == "closed" else int(sims)
-    effective_mate_plies = int(mate_plies) if str(search_type) == "mcts-mate" else 0
-    effective_mate_topk = int(mate_topk) if str(search_type) == "mcts-mate" else 0
-    effective_mate_nodes = int(mate_nodes) if str(search_type) == "mcts-mate" else 0
-    effective_mate_hash_mb = int(mate_hash_mb) if str(search_type) == "mcts-mate" else 0
     return {
         "candidate": candidate_path,
         "candidate_sha256": candidate_hash,
@@ -771,15 +730,10 @@ def evaluate_models(
         "sims_soft_cap": int(effective_sims),
         "mcts_batch_size": int(mcts_batch_size),
         "movetime_ms": int(movetime_ms),
-        "mate_plies": int(effective_mate_plies),
-        "mate_topk": int(effective_mate_topk),
-        "mate_nodes": int(effective_mate_nodes),
-        "mate_hash_mb": int(effective_mate_hash_mb),
         "c_puct_initial": float(c_puct),
         "c_puct_base": float(c_puct_base),
         "c_puct_factor": float(c_puct_factor),
         "fpu_reduction": float(fpu_reduction),
-        "mcts_time_fraction": float(mcts_time_fraction),
         "claim_draws": bool(claim_draws),
         "opening_book": opening_book,
         "book_plies": int(book_plies),
@@ -815,11 +769,6 @@ def parse_args():
     parser.add_argument("--c-puct-base", type=float, default=19652.0)
     parser.add_argument("--c-puct-factor", type=float, default=1.0)
     parser.add_argument("--fpu-reduction", type=float, default=0.15)
-    parser.add_argument("--mcts-time-fraction", type=float, default=0.90)
-    parser.add_argument("--mate-plies", type=int, default=0)
-    parser.add_argument("--mate-topk", type=int, default=4)
-    parser.add_argument("--mate-nodes", type=int, default=20000)
-    parser.add_argument("--mate-hash-mb", type=int, default=16)
 
     parser.add_argument("--uci", default=STOCKFISH_PATH)
     parser.add_argument("--uci-depth", type=int, default=8)
@@ -860,11 +809,6 @@ def main():
         c_puct_base=args.c_puct_base,
         c_puct_factor=args.c_puct_factor,
         fpu_reduction=args.fpu_reduction,
-        mcts_time_fraction=args.mcts_time_fraction,
-        mate_plies=args.mate_plies,
-        mate_topk=args.mate_topk,
-        mate_nodes=args.mate_nodes,
-        mate_hash_mb=args.mate_hash_mb,
         uci=args.uci,
         uci_depth=args.uci_depth,
         uci_movetime_ms=args.uci_movetime_ms,

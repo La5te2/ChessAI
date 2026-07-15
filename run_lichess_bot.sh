@@ -24,12 +24,9 @@ C_PUCT_BASE="${C_PUCT_BASE:-19652}"
 C_PUCT_FACTOR="${C_PUCT_FACTOR:-1.0}"
 FPU_REDUCTION="${FPU_REDUCTION:-0.15}"
 VIRTUAL_LOSS="${VIRTUAL_LOSS:-0.0}"
-MCTS_TIME_FRACTION="${MCTS_TIME_FRACTION:-1.0}"
-MATE_PLIES="${MATE_PLIES:-0}"
-MATE_TOPK="${MATE_TOPK:-4}"
-MATE_NODES="${MATE_NODES:-20000}"
-MATE_HASH_MB="${MATE_HASH_MB:-16}"
+MULTIPV="${MULTIPV:-1}"
 ROOT_TOPN="${ROOT_TOPN:-5}"
+SCORE_SCALE="${SCORE_SCALE:-1000}"
 LOG_SEARCH="${LOG_SEARCH:-false}"
 
 CHALLENGE_CONCURRENCY="${CHALLENGE_CONCURRENCY:-1}"
@@ -96,12 +93,9 @@ export C_PUCT_BASE
 export C_PUCT_FACTOR
 export FPU_REDUCTION
 export VIRTUAL_LOSS
-export MCTS_TIME_FRACTION
-export MATE_PLIES
-export MATE_TOPK
-export MATE_NODES
-export MATE_HASH_MB
+export MULTIPV
 export ROOT_TOPN
+export SCORE_SCALE
 export LOG_SEARCH
 export CHALLENGE_CONCURRENCY
 export CHALLENGE_VARIANTS
@@ -166,12 +160,9 @@ engine["uci_options"] = {
     "CPuctFactor": env_float("C_PUCT_FACTOR"),
     "FPUReduction": env_float("FPU_REDUCTION"),
     "VirtualLoss": env_float("VIRTUAL_LOSS"),
-    "MCTSTimeFraction": env_float("MCTS_TIME_FRACTION"),
-    "MatePlies": env_int("MATE_PLIES"),
-    "MateTopK": env_int("MATE_TOPK"),
-    "MateNodes": env_int("MATE_NODES"),
-    "MateHashMB": env_int("MATE_HASH_MB"),
+    "MultiPV": env_int("MULTIPV"),
     "RootTopN": env_int("ROOT_TOPN"),
+    "ScoreScale": env_int("SCORE_SCALE"),
     "LogSearch": env_bool("LOG_SEARCH"),
 }
 
@@ -210,7 +201,7 @@ echo "model: $MODEL_ABS"
 echo "device: $DEVICE"
 echo "search_type: $SEARCH_TYPE"
 echo "mcts_sims: $MCTS_SIMS"
-echo "mate: ${MATE_PLIES}/${MATE_TOPK}/${MATE_NODES} hash_mb=${MATE_HASH_MB}"
+echo "uci info: multipv=${MULTIPV} score_scale=${SCORE_SCALE} log_search=${LOG_SEARCH}"
 
 if [ "${UPGRADE_BOT:-0}" = "1" ]; then
   echo "upgrading lichess account to BOT account"

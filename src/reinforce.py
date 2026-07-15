@@ -709,6 +709,7 @@ class OfflineDataset(Dataset):
             self.candidate_mask = np.asarray(h5["candidate_mask"], dtype=np.bool_)
             self.action_rewards = np.asarray(h5["action_rewards"], dtype=np.float32)
             self.teacher_policy = np.asarray(h5["teacher_policy"], dtype=np.float32)
+            self.teacher_values = np.asarray(h5["teacher_value"], dtype=np.float32)
 
     def __len__(self):
         return int(self.states.shape[0])
@@ -719,10 +720,19 @@ class OfflineDataset(Dataset):
             torch.from_numpy(self.candidate_mask[index]),
             torch.from_numpy(self.action_rewards[index]),
             torch.from_numpy(self.teacher_policy[index]),
+            torch.tensor(self.teacher_values[index], dtype=torch.float32),
         )
 
 
-def actor_critic_losses(logits, values, candidate_mask, action_rewards, teacher_policy, args):
+def actor_critic_losses(
+    logits,
+    values,
+    candidate_mask,
+    action_rewards,
+    teacher_policy,
+    teacher_values,
+    args,
+):
     masked_logits = logits.masked_fill(~candidate_mask, torch.finfo(logits.dtype).min)
     raw_policy = F.softmax(masked_logits, dim=1)
     raw_log_policy = F.log_softmax(masked_logits, dim=1)
@@ -747,10 +757,18 @@ def actor_critic_losses(logits, values, candidate_mask, action_rewards, teacher_
         policy.detach() * advantages.detach() * log_policy
     ).sum(dim=1).mean()
     critic_loss = F.smooth_l1_loss(values, critic_target.detach())
+    teacher_value_loss = F.smooth_l1_loss(values, teacher_values.detach())
     entropy = -(policy * log_policy).sum(dim=1).mean()
     teacher_target = teacher_policy / teacher_policy.sum(dim=1, keepdim=True).clamp_min(1e-12)
     teacher_policy_loss = -(teacher_target.detach() * raw_log_policy).sum(dim=1).mean()
-    return actor_loss, critic_loss, entropy, teacher_policy_loss, critic_target.mean()
+    return (
+        actor_loss,
+        critic_loss,
+        teacher_value_loss,
+        entropy,
+        teacher_policy_loss,
+        critic_target.mean(),
+    )
 
 
 def train_offline_actor_critic(args, source_model: str, data_path: str, candidate_path: str) -> Dict:
@@ -795,7 +813,7 @@ def train_offline_actor_critic(args, source_model: str, data_path: str, candidat
     stop = False
     last_metrics = {}
     for epoch in range(int(args.epochs)):
-        for states, candidate_mask, action_rewards, teacher_policy in loader:
+        for states, candidate_mask, action_rewards, teacher_policy, teacher_values in loader:
             states = states.to(args.device, non_blocking=True)
             candidate_mask = candidate_mask.to(
                 args.device,
@@ -804,6 +822,7 @@ def train_offline_actor_critic(args, source_model: str, data_path: str, candidat
             )
             action_rewards = action_rewards.to(args.device, non_blocking=True)
             teacher_policy = teacher_policy.to(args.device, non_blocking=True)
+            teacher_values = teacher_values.to(args.device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", enabled=amp_enabled):
@@ -812,6 +831,7 @@ def train_offline_actor_critic(args, source_model: str, data_path: str, candidat
                 (
                     actor_loss,
                     critic_loss,
+                    teacher_value_loss,
                     entropy,
                     teacher_policy_loss,
                     mean_reward,
@@ -821,6 +841,7 @@ def train_offline_actor_critic(args, source_model: str, data_path: str, candidat
                     candidate_mask,
                     action_rewards,
                     teacher_policy,
+                    teacher_values,
                     args,
                 )
                 with torch.no_grad():
@@ -835,6 +856,7 @@ def train_offline_actor_critic(args, source_model: str, data_path: str, candidat
                 loss = (
                     float(args.actor_weight) * actor_loss
                     + float(args.critic_weight) * critic_loss
+                    + float(args.teacher_value_weight) * teacher_value_loss
                     - float(args.entropy_weight) * entropy
                     + float(args.kl_weight) * kl_loss
                     + float(args.teacher_policy_weight) * teacher_policy_loss
@@ -853,6 +875,7 @@ def train_offline_actor_critic(args, source_model: str, data_path: str, candidat
                 "epoch": int(epoch),
                 "actor": float(actor_loss.item()),
                 "critic": float(critic_loss.item()),
+                "teacher_value": float(teacher_value_loss.item()),
                 "reward": float(mean_reward.item()),
                 "entropy": float(entropy.item()),
                 "teacher_policy": float(teacher_policy_loss.item()),
@@ -866,6 +889,7 @@ def train_offline_actor_critic(args, source_model: str, data_path: str, candidat
                     f"step={step}",
                     f"actor={last_metrics['actor']:.4f}",
                     f"critic={last_metrics['critic']:.4f}",
+                    f"teacher_value={last_metrics['teacher_value']:.4f}",
                     f"reward={last_metrics['reward']:+.4f}",
                     f"entropy={last_metrics['entropy']:.4f}",
                     f"teacher_policy={last_metrics['teacher_policy']:.4f}",
@@ -1096,9 +1120,67 @@ def run_teacher_validation_for_model(args, fens: List[str], model_path: str, lab
     return summarize_teacher_validation(label, outputs)
 
 
+def attach_teacher_validation_acceptance(args, result: Dict) -> Dict:
+    if result.get("skipped"):
+        result["accepted"] = True
+        result["gate_enabled"] = bool(args.validation_gate)
+        result["acceptance"] = {"skipped": True}
+        return result
+    if not bool(args.validation_gate):
+        result["accepted"] = True
+        result["gate_enabled"] = False
+        result["acceptance"] = {"disabled": True}
+        return result
+
+    checks = {
+        "mean_top1_regret": {
+            "delta": float(result.get("delta_mean_top1_regret_cp", 0.0)),
+            "limit": float(args.validation_max_top1_regret_regression_cp),
+            "direction": "lower_or_equal",
+        },
+        "mean_composite_regret": {
+            "delta": float(result.get("delta_mean_composite_regret_cp", 0.0)),
+            "limit": float(args.validation_max_composite_regret_regression_cp),
+            "direction": "lower_or_equal",
+        },
+        "value_mae": {
+            "delta": float(result.get("delta_value_mae", 0.0)),
+            "limit": float(args.validation_max_value_mae_regression),
+            "direction": "lower_or_equal",
+        },
+        "value_rmse": {
+            "delta": float(result.get("delta_value_rmse", 0.0)),
+            "limit": float(args.validation_max_value_rmse_regression),
+            "direction": "lower_or_equal",
+        },
+        "value_sign_acc": {
+            "delta": float(result.get("delta_value_sign_acc", 0.0)),
+            "limit": float(args.validation_min_value_sign_acc_delta),
+            "direction": "greater_or_equal",
+        },
+        "teacher_best_topk_rate": {
+            "delta": float(result.get("delta_teacher_best_topk_rate", 0.0)),
+            "limit": float(args.validation_min_teacher_best_topk_delta),
+            "direction": "greater_or_equal",
+        },
+    }
+    for check in checks.values():
+        if check["direction"] == "lower_or_equal":
+            check["ok"] = bool(check["delta"] <= check["limit"])
+        else:
+            check["ok"] = bool(check["delta"] >= check["limit"])
+    result["accepted"] = all(bool(check["ok"]) for check in checks.values())
+    result["gate_enabled"] = True
+    result["acceptance"] = checks
+    return result
+
+
 def evaluate_teacher_validation(args, candidate_path: str, baseline_path: str) -> Dict:
     if int(args.validation_positions) <= 0:
-        return {"skipped": True, "positions": 0}
+        return attach_teacher_validation_acceptance(
+            args,
+            {"skipped": True, "positions": 0},
+        )
 
     fens = load_validation_fens(args)
     print(
@@ -1160,6 +1242,7 @@ def evaluate_teacher_validation(args, candidate_path: str, baseline_path: str) -
             - float(baseline.get("value_bias", 0.0))
         ),
     }
+    result = attach_teacher_validation_acceptance(args, result)
     print("offline reinforce teacher validation summary:", flush=True)
     print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
     return result
@@ -1198,11 +1281,6 @@ def evaluate_candidate(
         c_puct_base=args.eval_c_puct_base,
         c_puct_factor=args.eval_c_puct_factor,
         fpu_reduction=args.eval_fpu_reduction,
-        mcts_time_fraction=args.eval_mcts_time_fraction,
-        mate_plies=args.eval_mate_plies,
-        mate_topk=args.eval_mate_topk,
-        mate_nodes=args.eval_mate_nodes,
-        mate_hash_mb=args.eval_mate_hash_mb,
         uci=args.uci,
         uci_depth=args.eval_uci_depth,
         uci_movetime_ms=args.eval_uci_movetime_ms,
@@ -1292,7 +1370,12 @@ def run(args):
             data_run_dir=paths["data_run_dir"],
             iteration=iteration,
         )
-        accepted = bool(eval_summary.get("accepted"))
+        arena_accepted = bool(eval_summary.get("accepted"))
+        teacher_validation_accepted = bool(teacher_validation.get("accepted", True))
+        accepted = bool(arena_accepted and teacher_validation_accepted)
+        eval_summary["arena_accepted"] = arena_accepted
+        eval_summary["teacher_validation_accepted"] = teacher_validation_accepted
+        eval_summary["final_accepted"] = accepted
         if accepted:
             atomic_copy(candidate_path, current_model)
             print("offline reinforce promoted:", current_model, flush=True)
@@ -1368,6 +1451,7 @@ def build_parser():
     )
     parser.add_argument("--reward-scale-cp", type=float, default=600.0)
     parser.add_argument("--teacher-policy-weight", type=float, default=0.10)
+    parser.add_argument("--teacher-value-weight", type=float, default=0.50)
     parser.add_argument("--teacher-policy-temp-cp", type=float, default=150.0)
     parser.add_argument("--actor-exploration-mix", type=float, default=0.05)
     parser.add_argument("--advantage-clip", type=float, default=1.0)
@@ -1407,6 +1491,14 @@ def build_parser():
     parser.add_argument("--validation-uci-multipv", type=int, default=1)
     parser.add_argument("--validation-uci-threads", type=int, default=1)
     parser.add_argument("--validation-uci-hash-mb", type=int, default=512)
+    parser.add_argument("--validation-gate", action="store_true", default=True)
+    parser.add_argument("--no-validation-gate", dest="validation_gate", action="store_false")
+    parser.add_argument("--validation-max-top1-regret-regression-cp", type=float, default=20.0)
+    parser.add_argument("--validation-max-composite-regret-regression-cp", type=float, default=20.0)
+    parser.add_argument("--validation-max-value-mae-regression", type=float, default=0.02)
+    parser.add_argument("--validation-max-value-rmse-regression", type=float, default=0.02)
+    parser.add_argument("--validation-min-value-sign-acc-delta", type=float, default=-0.02)
+    parser.add_argument("--validation-min-teacher-best-topk-delta", type=float, default=-0.02)
 
     parser.add_argument("--eval-games", type=int, default=100)
     parser.add_argument("--eval-sims", type=int, default=0)
@@ -1426,11 +1518,6 @@ def build_parser():
     parser.add_argument("--eval-c-puct-base", type=float, default=19652.0)
     parser.add_argument("--eval-c-puct-factor", type=float, default=1.0)
     parser.add_argument("--eval-fpu-reduction", type=float, default=0.15)
-    parser.add_argument("--eval-mcts-time-fraction", type=float, default=0.90)
-    parser.add_argument("--eval-mate-plies", type=int, default=0)
-    parser.add_argument("--eval-mate-topk", type=int, default=4)
-    parser.add_argument("--eval-mate-nodes", type=int, default=20000)
-    parser.add_argument("--eval-mate-hash-mb", type=int, default=16)
     parser.add_argument("--eval-uci-depth", type=int, default=10)
     parser.add_argument("--eval-uci-movetime-ms", type=int, default=0)
     parser.add_argument("--eval-uci-multipv", type=int, default=6)

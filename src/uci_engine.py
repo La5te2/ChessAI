@@ -65,12 +65,9 @@ class EngineConfig:
     c_puct_factor: float = 1.0
     fpu_reduction: float = 0.15
     virtual_loss: float = 0.0
-    mcts_time_fraction: float = 0.90
-    mate_plies: int = 0
-    mate_topk: int = 4
-    mate_nodes: int = 20000
-    mate_hash_mb: int = 16
+    multipv: int = 5
     root_topn: int = 5
+    score_scale: int = 1000
     log_search: bool = False
 
 
@@ -88,7 +85,7 @@ class UCIEngine:
         return [
             f"option name ModelPath type string default {cfg.model_path}",
             f"option name Device type string default {cfg.device}",
-            f"option name SearchType type combo default {cfg.search_type} var closed var only-mcts var mcts-mate",
+            f"option name SearchType type combo default {cfg.search_type} var closed var only-mcts",
             f"option name MCTSSims type spin default {cfg.mcts_sims} min 0 max 1000000",
             f"option name MCTSMinSims type spin default {cfg.mcts_min_sims} min 0 max 1000000",
             f"option name MCTSBatchSize type spin default {cfg.mcts_batch_size} min 1 max 4096",
@@ -103,12 +100,9 @@ class UCIEngine:
             f"option name CPuctFactor type string default {cfg.c_puct_factor}",
             f"option name FPUReduction type string default {cfg.fpu_reduction}",
             f"option name VirtualLoss type string default {cfg.virtual_loss}",
-            f"option name MCTSTimeFraction type string default {cfg.mcts_time_fraction}",
-            f"option name MatePlies type spin default {cfg.mate_plies} min 0 max 64",
-            f"option name MateTopK type spin default {cfg.mate_topk} min 0 max 256",
-            f"option name MateNodes type spin default {cfg.mate_nodes} min 0 max 10000000",
-            f"option name MateHashMB type spin default {cfg.mate_hash_mb} min 0 max 4096",
+            f"option name MultiPV type spin default {cfg.multipv} min 1 max 256",
             f"option name RootTopN type spin default {cfg.root_topn} min 1 max 256",
+            f"option name ScoreScale type spin default {cfg.score_scale} min 1 max 100000",
             f"option name LogSearch type check default {'true' if cfg.log_search else 'false'}",
         ]
 
@@ -166,18 +160,12 @@ class UCIEngine:
             cfg.fpu_reduction = max(0.0, as_float(value, cfg.fpu_reduction))
         elif key == "virtualloss":
             cfg.virtual_loss = max(0.0, as_float(value, cfg.virtual_loss))
-        elif key == "mctstimefraction":
-            cfg.mcts_time_fraction = max(0.0, min(1.0, as_float(value, cfg.mcts_time_fraction)))
-        elif key == "mateplies":
-            cfg.mate_plies = max(0, as_int(value, cfg.mate_plies))
-        elif key == "matetopk":
-            cfg.mate_topk = max(0, as_int(value, cfg.mate_topk))
-        elif key == "matenodes":
-            cfg.mate_nodes = max(0, as_int(value, cfg.mate_nodes))
-        elif key == "matehashmb":
-            cfg.mate_hash_mb = max(0, as_int(value, cfg.mate_hash_mb))
+        elif key == "multipv":
+            cfg.multipv = max(1, as_int(value, cfg.multipv))
         elif key == "roottopn":
             cfg.root_topn = max(1, as_int(value, cfg.root_topn))
+        elif key == "scorescale":
+            cfg.score_scale = max(1, as_int(value, cfg.score_scale))
         elif key == "logsearch":
             cfg.log_search = as_bool(value, cfg.log_search)
         else:
@@ -215,12 +203,10 @@ class UCIEngine:
         ):
             return self.model
 
-        print(f"loading model {path} on {device}", file=sys.stderr, flush=True)
         with contextlib.redirect_stdout(sys.stderr):
             self.model = load_model(path, device=device)
         self.loaded_model_path = path
         self.loaded_device = device
-        print("model ready", file=sys.stderr, flush=True)
         return self.model
 
     def set_position(self, line: str):
@@ -265,13 +251,54 @@ class UCIEngine:
             c_puct_factor=cfg.c_puct_factor,
             fpu_reduction=cfg.fpu_reduction,
             virtual_loss=cfg.virtual_loss,
-            mcts_time_fraction=cfg.mcts_time_fraction,
-            mate_plies=cfg.mate_plies,
-            mate_topk=cfg.mate_topk,
-            mate_nodes=cfg.mate_nodes,
-            mate_hash_mb=cfg.mate_hash_mb,
-            root_topn=cfg.root_topn,
+            root_topn=max(cfg.root_topn, cfg.multipv),
         )
+
+    def value_to_uci_score(self, value: float) -> int:
+        value = max(-0.999, min(0.999, float(value)))
+        return int(round(value * max(1, int(self.config.score_scale))))
+
+    def uci_score_tokens(self, row: Dict[str, object], info: Dict[str, object]) -> str:
+        if int(row.get("visits", 0) or 0) > 0:
+            score = self.value_to_uci_score(float(row.get("q", 0.0) or 0.0))
+        else:
+            score = self.value_to_uci_score(float(info.get("value", 0.0) or 0.0))
+        return f"score cp {score}"
+
+    def emit_standard_info(self, result, selected_move: Optional[chess.Move]):
+        info = result.info
+        elapsed_ms = int(round(float(info.get("elapsed_ms", 0.0) or 0.0)))
+        sims = int(info.get("sims_completed", 0) or 0)
+        nn_batches = int(info.get("nn_batches", 0) or 0)
+        avg_leaf_depth = float(info.get("avg_leaf_depth", 0.0) or 0.0)
+        max_leaf_depth = int(info.get("max_leaf_depth", 0) or 0)
+        depth = max(1, int(round(avg_leaf_depth)))
+        seldepth = max(depth, max_leaf_depth, 1)
+        nodes = max(1 if nn_batches > 0 else 0, sims)
+        nps = int(1000.0 * max(0, nodes) / max(1, elapsed_ms))
+        root_rows = list(info.get("root", []))[: max(1, int(self.config.multipv))]
+        if not root_rows and selected_move is not None:
+            root_rows = [{"move": selected_move.uci(), "visits": 0, "q": info.get("value", 0.0)}]
+
+        for index, row in enumerate(root_rows, 1):
+            move = str(row.get("move") or "")
+            if not move:
+                continue
+            pv = [move]
+            score = self.uci_score_tokens(row, info)
+            uci_print(
+                "info "
+                f"depth {depth} "
+                f"seldepth {seldepth} "
+                f"multipv {index} "
+                f"{score} "
+                f"nodes {nodes} "
+                f"nps {nps} "
+                f"time {elapsed_ms} "
+                f"hashfull 0 "
+                f"tbhits 0 "
+                f"pv {' '.join(pv)}"
+            )
 
     def parse_go(self, line: str) -> Dict[str, object]:
         tokens = line.split()[1:]
@@ -401,10 +428,10 @@ class UCIEngine:
                         f"{row.get('san')} {row.get('move')} "
                         f"p={float(row.get('p', 0.0)):.5f} "
                         f"visits={int(row.get('visits', 0))} "
-                        f"q={float(row.get('q', 0.0)):+.4f} "
-                        f"mate={row.get('mate')}"
+                        f"q={float(row.get('q', 0.0)):+.4f}"
                     )
 
+            self.emit_standard_info(result, move)
             uci_print(f"bestmove {move.uci() if move is not None else self.fallback_move(allowed)}")
         except Exception as exc:
             uci_print(f"info string search error: {exc}")
@@ -468,12 +495,9 @@ def parse_args():
     parser.add_argument("--c-puct-factor", type=float, default=1.0)
     parser.add_argument("--fpu-reduction", type=float, default=0.15)
     parser.add_argument("--virtual-loss", type=float, default=0.0)
-    parser.add_argument("--mcts-time-fraction", type=float, default=0.90)
-    parser.add_argument("--mate-plies", type=int, default=0)
-    parser.add_argument("--mate-topk", type=int, default=4)
-    parser.add_argument("--mate-nodes", type=int, default=20000)
-    parser.add_argument("--mate-hash-mb", type=int, default=16)
+    parser.add_argument("--multipv", type=int, default=5)
     parser.add_argument("--root-topn", type=int, default=5)
+    parser.add_argument("--score-scale", type=int, default=1000)
     parser.add_argument("--log-search", action="store_true", default=False)
     return parser.parse_args()
 
@@ -497,12 +521,9 @@ def config_from_args(args) -> EngineConfig:
         c_puct_factor=float(args.c_puct_factor),
         fpu_reduction=float(args.fpu_reduction),
         virtual_loss=float(args.virtual_loss),
-        mcts_time_fraction=float(args.mcts_time_fraction),
-        mate_plies=int(args.mate_plies),
-        mate_topk=int(args.mate_topk),
-        mate_nodes=int(args.mate_nodes),
-        mate_hash_mb=int(args.mate_hash_mb),
+        multipv=int(args.multipv),
         root_topn=int(args.root_topn),
+        score_scale=int(args.score_scale),
         log_search=bool(args.log_search),
     )
 
