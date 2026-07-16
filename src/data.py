@@ -38,7 +38,7 @@ def validate_supervised_h5(path: str, arch_type: str):
     expected_target_schema = str(schema["target_schema"])
 
     with h5py.File(path, "r") as h5:
-        for attr in ("arch_type", "state_encoding", "move_encoding", "target_schema"):
+        for attr in ("arch_type", "state_encoding", "move_encoding", "target_schema", "has_cmt"):
             if attr not in h5.attrs:
                 raise ValueError(f"{path} missing required attr {attr!r}")
 
@@ -46,6 +46,9 @@ def validate_supervised_h5(path: str, arch_type: str):
         actual_state_encoding = _decode_attr(h5.attrs["state_encoding"])
         actual_move_encoding = _decode_attr(h5.attrs["move_encoding"])
         actual_target_schema = _decode_attr(h5.attrs["target_schema"])
+        has_cmt = int(h5.attrs["has_cmt"])
+        if has_cmt not in (0, 1):
+            raise ValueError(f"{path} has_cmt={has_cmt!r}, expected 0 or 1")
         if actual_arch_type != arch_type:
             raise ValueError(
                 f"{path} arch_type={actual_arch_type!r}, expected {arch_type!r}"
@@ -94,6 +97,7 @@ def validate_supervised_h5(path: str, arch_type: str):
         "state_encoding": expected_state_encoding,
         "move_encoding": expected_move_encoding,
         "target_schema": expected_target_schema,
+        "has_cmt": has_cmt,
         "length": length,
         "datasets": tuple(schema["datasets"]),
     }
@@ -114,7 +118,6 @@ def read_resnet_pva_gad_row(h5, idx, state_codec):
         torch.tensor(float(h5["values"][idx]), dtype=torch.float32),
         torch.tensor(int(h5["adv_moves"][idx]), dtype=torch.long),
         torch.tensor(float(h5["adv_values"][idx]), dtype=torch.float32),
-        torch.tensor(float(h5["adv_weights"][idx]), dtype=torch.float32),
     )
 
 
@@ -133,6 +136,7 @@ class H5ChessDataset(Dataset):
         self.arch_type = metadata["arch_type"]
         self.state_encoding = metadata["state_encoding"]
         self.target_schema = metadata["target_schema"]
+        self.has_cmt = int(metadata["has_cmt"])
         self.move_encoding = metadata["move_encoding"]
         self.datasets = metadata["datasets"]
         self.length = int(metadata["length"])

@@ -26,7 +26,7 @@ class ArchitectureSpec:
     move_encoding: str
     supervised_datasets: Tuple[str, ...]
     target_schema: str
-    comment_advantage: bool = False
+    default_has_cmt: int
 
 
 ARCHITECTURES = {
@@ -36,6 +36,7 @@ ARCHITECTURES = {
         move_encoding=MOVE_ENCODING_AZ_64X73,
         supervised_datasets=("states", "moves", "values"),
         target_schema="pv_supervised",
+        default_has_cmt=1,
     ),
     RESNET_PVA_GAD: ArchitectureSpec(
         name=RESNET_PVA_GAD,
@@ -47,10 +48,9 @@ ARCHITECTURES = {
             "values",
             "adv_moves",
             "adv_values",
-            "adv_weights",
         ),
-        target_schema="pva_comment_supervised",
-        comment_advantage=True,
+        target_schema="pva_supervised",
+        default_has_cmt=1,
     ),
 }
 

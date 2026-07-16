@@ -148,7 +148,7 @@ Windows PowerShell 可把 README 里的多行 bash 命令改成单行，并把 `
 | 架构 | state encoding | move encoding | HDF5 datasets | 训练入口 | search profile |
 | --- | --- | --- | --- | --- | --- |
 | `resnet_pv_linear` | `resnet_pv_linear_18_planes` | `alphazero_64x73` | `states`, `moves`, `values` | supervised + offline-pv | policy/value + MCTS |
-| `resnet_pva_gad` | `resnet_pva_gad_square_tokens` | `sd_64x64_underpromo9` | `states`, `moves`, `values`, `adv_moves`, `adv_values`, `adv_weights` | supervised | policy/value/advantage + MCTS |
+| `resnet_pva_gad` | `square_tokens` | `sd_64x64_underpromo9` | `states`, `moves`, `values`, `adv_moves`, `adv_values` | supervised | policy/value/advantage + MCTS |
 
 每个 HDF5 都带有：
 
@@ -157,6 +157,7 @@ arch_type
 state_encoding
 move_encoding
 target_schema
+has_cmt
 ```
 
 训练前按目标架构重新 preprocess。`resnet_pv_linear` 也需要显式使用 `--arch-type resnet_pv_linear` 生成 HDF5。
@@ -170,6 +171,11 @@ target_schema
 - source-destination policy head
 - global-token value head
 - dueling advantage head
+
+架构相关训练参数：
+
+- `--channels` 默认值为 `128`。对 `resnet_pv_linear`，它表示卷积通道数；对 `resnet_pva_gad`，它表示 square/global token embedding 与 attention hidden size。
+- `--blocks` 默认值为 `10`。对 `resnet_pv_linear`，它表示 ResNet residual block 数；对 `resnet_pva_gad`，它表示 geometry attention block 数。
 
 `resnet_pv_linear` 使用 18-plane packbits state。`resnet_pva_gad` 使用紧凑 square-token state，HDF5 中 `states` 形状为 `(N, 67)`。
 
@@ -243,6 +249,7 @@ python src/preprocess.py \
   --input data/games.pgn \
   --output data/games-pv-linear.h5 \
   --arch-type resnet_pv_linear \
+  --has-cmt 1 \
   --chunk-size 32768 \
   --compression lzf \
   --max-games 2000000 \
@@ -258,6 +265,11 @@ moves
 values
 ```
 
+`resnet_pv_linear` 的 `--has-cmt` 默认值为 `1`。在该架构下：
+
+- `--has-cmt 1`：`policy` 来自 PGN 主线走法，`value` 来自 PGN 局面评价批注并转换为 side-to-move 视角。
+- `--has-cmt 0`：`policy` 来自 PGN 主线走法，`value` 来自对局结果并转换为 side-to-move 视角。
+
 ### 5.2 resnet_pva_gad
 
 ```bash
@@ -265,6 +277,7 @@ python src/preprocess.py \
   --input data/ccrl.pgn \
   --output data/games-pva-gad.h5 \
   --arch-type resnet_pva_gad \
+  --has-cmt 1 \
   --chunk-size 32768 \
   --compression lzf \
   --max-games 2000000 \
@@ -272,24 +285,29 @@ python src/preprocess.py \
   --log-every 10000
 ```
 
-`resnet_pva_gad` 读取 PGN 主线走法前后连续节点的 CCRL / Stockfish 风格评价批注：
+`resnet_pva_gad` 的 `--has-cmt` 默认值为 `1`。在该架构下：
+
+- `--has-cmt 1`：`policy` 来自 PGN 主线走法，`value` 来自 PGN 局面评价批注，`advantage` 来自走前/走后评价差值。
+- `--has-cmt 0`：`policy` 来自 PGN 主线走法，`value` 来自对局结果，`advantage` head 不参与监督。
+
+`--has-cmt 1` 读取 PGN 主线走法前后节点的 CCRL / Stockfish 风格评价批注：
 
 ```text
 {+0.60/16 193s}
 {(Rd8) +0.71/14 171s}
 ```
 
-批注数值按白方视角解析。`adv_values` 使用上一条有效评价与当前走法完成后的评价计算当前走子方视角的变化：
+批注数值按白方视角解析。`values` 使用当前节点评价并转换为 side-to-move 视角；缺少 `+/-` 数值的节点按 `0` 处理。`adv_values` 使用当前节点评价与当前走法完成后的评价计算当前走子方视角的变化：
 
 ```text
-白方: current - previous
-黑方: previous - current
+白方: after - before
+黑方: before - after
 target: tanh(min(0, delta) / 3)
 ```
 
 正差值写为 `0`，表示该走法保住了当前走子方的评价；负差值进入 advantage 监督目标。
 
-缺少前后连续评价批注的局面仍会进入 policy/value 监督，`adv_weights=0`，advantage loss 不参与该行；有前后连续评价批注的局面 `adv_weights=1`。使用 `analyze.py --pgn-comments` 可以把普通 PGN 转成带 UCI 评价批注的 `<name>_cmt.pgn`，再生成 `resnet_pva_gad` 的 HDF5。
+使用 `--has-cmt 1` 时，整盘主线至少需要一个可解析评价批注；整盘没有评价批注的 game 会被跳过。使用 `analyze.py --pgn-comments` 可以把普通 PGN 转成带 UCI 评价批注的 `<name>_cmt.pgn`，再生成 `resnet_pva_gad` 的 HDF5。
 
 ---
 
@@ -330,6 +348,11 @@ python src/train.py \
   --save-every 5000 \
   --log-every 100
 ```
+
+训练 loss 参数：
+
+- `resnet_pv_linear`：`--value-weight` 控制 value loss 权重；该架构没有 advantage head，`--advantage-weight` 不参与该架构训练。
+- `resnet_pva_gad`：`--value-weight` 控制 value loss 权重；`--advantage-weight` 控制 advantage loss 权重。训练数据为 `has_cmt=0` 时，advantage loss 关闭。
 
 本地 CPU smoke test：
 
@@ -376,6 +399,8 @@ python src/search.py \
 
 - `--search-type closed`：使用模型 policy/value 输出候选。
 - `--search-type only-mcts`：使用模型 policy/value 加 MCTS。
+- `resnet_pv_linear`：search 使用 policy/value。
+- `resnet_pva_gad`：search 使用 policy/value，并把 model advantage 作为架构特有搜索信号用于未访问节点估值。
 - `--mcts-sims`：MCTS simulations 软上限，表示模拟次数。
 - `--mcts-min-sims`：动态预算下的最小模拟次数。
 - `--movetime-ms`：完整 search 的时间预算。

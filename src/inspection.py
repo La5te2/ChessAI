@@ -170,18 +170,20 @@ def check_values(inspector: Inspector, h5, name: str, allowed=None, bounds=None)
 
 
 def check_supervised_attrs(inspector: Inspector, h5):
-    for name in ("arch_type", "state_encoding", "move_encoding", "target_schema"):
+    for name in ("arch_type", "state_encoding", "move_encoding", "target_schema", "has_cmt"):
         inspector.check(name in h5.attrs, f"missing attr: {name}")
-    if not all(name in h5.attrs for name in ("arch_type", "state_encoding", "move_encoding", "target_schema")):
-        return None, None, None, None
+    if not all(name in h5.attrs for name in ("arch_type", "state_encoding", "move_encoding", "target_schema", "has_cmt")):
+        return None, None, None, None, None
     try:
         arch_type = normalize_arch_type(decode_attr(h5.attrs["arch_type"]))
     except Exception as exc:
         inspector.error(str(exc))
-        return None, None, None, None
+        return None, None, None, None, None
     state_encoding = decode_attr(h5.attrs["state_encoding"])
     move_encoding = decode_attr(h5.attrs["move_encoding"])
     target_schema = decode_attr(h5.attrs["target_schema"])
+    has_cmt = int(h5.attrs["has_cmt"])
+    inspector.check(has_cmt in (0, 1), f"has_cmt={has_cmt!r}, expected 0 or 1")
     expected_state_encoding = architecture_spec(arch_type).state_encoding
     expected_move_encoding = architecture_spec(arch_type).move_encoding
     inspector.check(
@@ -200,10 +202,10 @@ def check_supervised_attrs(inspector: Inspector, h5):
         get_move_codec(move_encoding)
     except Exception as exc:
         inspector.error(str(exc))
-    return arch_type, state_encoding, move_encoding, target_schema
+    return arch_type, state_encoding, move_encoding, target_schema, has_cmt
 
 
-def check_resnet_pv_linear(inspector: Inspector, h5, state_encoding: str, move_encoding: str, target_schema: str):
+def check_resnet_pv_linear(inspector: Inspector, h5, state_encoding: str, move_encoding: str, target_schema: str, has_cmt: int):
     print("schema:", RESNET_PV_LINEAR)
     inspector.check(target_schema == "pv_supervised", f"target_schema={target_schema!r}, expected 'pv_supervised'")
     require_dataset_set(inspector, h5, ("states", "moves", "values"))
@@ -212,33 +214,32 @@ def check_resnet_pv_linear(inspector: Inspector, h5, state_encoding: str, move_e
     codec = get_move_codec(move_encoding)
     check_states(inspector, h5, length, state_codec)
     check_index_dataset(inspector, h5, "moves", codec.action_size)
-    check_values(inspector, h5, "values", allowed={-1, 0, 1})
+    check_values(inspector, h5, "values", bounds=(-1.0, 1.0))
 
 
-def check_resnet_pva_gad(inspector: Inspector, h5, state_encoding: str, move_encoding: str, target_schema: str):
+def check_resnet_pva_gad(inspector: Inspector, h5, state_encoding: str, move_encoding: str, target_schema: str, has_cmt: int):
     print("schema:", RESNET_PVA_GAD)
     inspector.check(
-        target_schema == "pva_comment_supervised",
-        f"target_schema={target_schema!r}, expected 'pva_comment_supervised'",
+        target_schema == "pva_supervised",
+        f"target_schema={target_schema!r}, expected 'pva_supervised'",
     )
     require_dataset_set(
         inspector,
         h5,
-        ("states", "moves", "values", "adv_moves", "adv_values", "adv_weights"),
+        ("states", "moves", "values", "adv_moves", "adv_values"),
     )
     length = check_same_length(
         inspector,
         h5,
-        ("states", "moves", "values", "adv_moves", "adv_values", "adv_weights"),
+        ("states", "moves", "values", "adv_moves", "adv_values"),
     )
     state_codec = get_state_codec(state_encoding)
     codec = get_move_codec(move_encoding)
     check_states(inspector, h5, length, state_codec)
     check_index_dataset(inspector, h5, "moves", codec.action_size)
     check_index_dataset(inspector, h5, "adv_moves", codec.action_size)
-    check_values(inspector, h5, "values", allowed={-1, 0, 1})
+    check_values(inspector, h5, "values", bounds=(-1.0, 1.0))
     check_values(inspector, h5, "adv_values", bounds=(-1.0, 1.0))
-    check_values(inspector, h5, "adv_weights", bounds=(0.0, 1.0))
 
 
 INSPECTION_HANDLERS = {
@@ -251,13 +252,13 @@ def inspect(path: str) -> bool:
     inspector = Inspector()
     with h5py.File(path, "r") as h5:
         print_summary(path, h5)
-        arch_type, state_encoding, move_encoding, target_schema = check_supervised_attrs(inspector, h5)
+        arch_type, state_encoding, move_encoding, target_schema, has_cmt = check_supervised_attrs(inspector, h5)
         if arch_type is not None:
             handler = INSPECTION_HANDLERS.get(arch_type)
             if handler is None:
                 inspector.error(f"no inspection schema registered for arch_type={arch_type!r}")
             else:
-                handler(inspector, h5, state_encoding, move_encoding, target_schema)
+                handler(inspector, h5, state_encoding, move_encoding, target_schema, has_cmt)
     print("INSPECTION OK" if inspector.ok else "INSPECTION FAILED")
     return inspector.ok
 

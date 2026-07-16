@@ -19,6 +19,7 @@ from move_codecs import get_move_codec
 from state_codecs import get_state_codec
 
 CCRL_EVAL_RE = re.compile(r"(?<![\w.])([+-](?:\d+(?:\.\d+)?|\.\d+))(?:/\d+)?")
+COMMENT_VALUE_SCALE_PAWNS = 3.0
 COMMENT_ADVANTAGE_DELTA_SCALE_PAWNS = 3.0
 
 NON_STATE_DATASET_LAYOUTS = {
@@ -32,7 +33,7 @@ NON_STATE_DATASET_LAYOUTS = {
         "shape": (0,),
         "maxshape": (None,),
         "chunks": lambda chunk_size: (min(chunk_size, 8192),),
-        "dtype": "int8",
+        "dtype": "float32",
     },
     "adv_moves": {
         "shape": (0,),
@@ -46,21 +47,14 @@ NON_STATE_DATASET_LAYOUTS = {
         "chunks": lambda chunk_size: (min(chunk_size, 8192),),
         "dtype": "float32",
     },
-    "adv_weights": {
-        "shape": (0,),
-        "maxshape": (None,),
-        "chunks": lambda chunk_size: (min(chunk_size, 8192),),
-        "dtype": "float32",
-    },
 }
 
 DATASET_DTYPES = {
     "states": np.uint8,
     "moves": np.uint16,
-    "values": np.int8,
+    "values": np.float32,
     "adv_moves": np.uint16,
     "adv_values": np.float32,
-    "adv_weights": np.float32,
 }
 
 
@@ -93,11 +87,21 @@ def comment_score_white(comment: str):
     except ValueError:
         return None
 
+
+def comment_score_white_or_zero(comment: str) -> float:
+    score = comment_score_white(comment)
+    return 0.0 if score is None else float(score)
+
+
+def comment_value_side_to_move(comment: str, turn: chess.Color) -> float:
+    white_score = comment_score_white_or_zero(comment)
+    side_score = white_score if turn == chess.WHITE else -white_score
+    return float(np.tanh(side_score / COMMENT_VALUE_SCALE_PAWNS))
+
+
 def comment_advantage_target(before_comment: str, after_comment: str, turn: chess.Color):
-    before_white = comment_score_white(before_comment)
-    after_white = comment_score_white(after_comment)
-    if before_white is None or after_white is None:
-        return None
+    before_white = comment_score_white_or_zero(before_comment)
+    after_white = comment_score_white_or_zero(after_comment)
     white_delta = after_white - before_white
     side_delta = white_delta if turn == chess.WHITE else -white_delta
     side_delta = min(0.0, side_delta)
@@ -109,6 +113,7 @@ def create_h5(
     compression_opts: int,
     chunk_size: int,
     arch_type: str,
+    has_cmt: int,
 ):
     spec = architecture_spec(arch_type)
     state_codec = get_state_codec(spec.state_encoding)
@@ -135,9 +140,16 @@ def create_h5(
     h5.attrs["state_encoding"] = spec.state_encoding
     h5.attrs["move_encoding"] = spec.move_encoding
     h5.attrs["value_perspective"] = "side_to_move"
+    h5.attrs["has_cmt"] = int(has_cmt)
     h5.attrs["arch_type"] = spec.name
     h5.attrs["target_schema"] = spec.target_schema
-    if spec.comment_advantage:
+    if int(has_cmt):
+        h5.attrs["comment_eval_perspective"] = "white"
+        h5.attrs["comment_value_source"] = "pgn_node_comment"
+        h5.attrs["comment_value_transform"] = (
+            f"tanh(side_to_move_pawn_score/{COMMENT_VALUE_SCALE_PAWNS:g})"
+        )
+    if spec.name == RESNET_PVA_GAD:
         h5.attrs["comment_eval_perspective"] = "white"
         h5.attrs["advantage_perspective"] = "side_to_move"
         h5.attrs["advantage_source"] = "ccrl_after_move_comment_delta"
@@ -161,7 +173,12 @@ def append_chunk(
         dataset[old:new] = np.asarray(buffers[name], dtype=DATASET_DTYPES[name])
 
 
-def pv_linear_row(board, node, child, action, value, state_codec):
+def pv_linear_row(board, node, child, action, white_value, state_codec, has_cmt):
+    value = (
+        comment_value_side_to_move(node.comment, board.turn)
+        if has_cmt
+        else float(white_value if board.turn == chess.WHITE else -white_value)
+    )
     return {
         "states": state_codec.encode_board(board),
         "moves": action,
@@ -169,33 +186,51 @@ def pv_linear_row(board, node, child, action, value, state_codec):
     }, None
 
 
-def pva_gad_row(board, node, child, action, value, state_codec):
-    adv_target = comment_advantage_target(
-        node.comment,
-        child.comment,
-        board.turn,
+def pva_gad_row(board, node, child, action, white_value, state_codec, has_cmt):
+    value = (
+        comment_value_side_to_move(node.comment, board.turn)
+        if has_cmt
+        else float(white_value if board.turn == chess.WHITE else -white_value)
     )
-    if adv_target is None:
-        adv_target = 0.0
-        adv_weight = 0.0
-        skip_reason = "unannotated_advantage"
-    else:
-        adv_weight = 1.0
-        skip_reason = None
+    adv_target = (
+        comment_advantage_target(node.comment, child.comment, board.turn)
+        if has_cmt
+        else 0.0
+    )
     return {
         "states": state_codec.encode_board(board),
         "moves": action,
         "values": value,
         "adv_moves": action,
         "adv_values": adv_target,
-        "adv_weights": adv_weight,
-    }, skip_reason
+    }, None
 
 
 PREPROCESS_ROW_BUILDERS = {
     RESNET_PV_LINEAR: pv_linear_row,
     RESNET_PVA_GAD: pva_gad_row,
 }
+
+
+def resolve_has_cmt(raw_value, spec) -> int:
+    if raw_value is None:
+        return int(spec.default_has_cmt)
+    value = int(raw_value)
+    if value not in (0, 1):
+        raise ValueError("--has-cmt must be 0 or 1")
+    return value
+
+
+def game_has_comment_eval(game) -> bool:
+    if comment_score_white(game.comment) is not None:
+        return True
+    node = game
+    while node.variations:
+        node = node.variation(0)
+        if comment_score_white(node.comment) is not None:
+            return True
+    return False
+
 
 def collect_game_offsets(path: str):
     """
@@ -248,6 +283,7 @@ def stratified_random_offsets(offsets, max_games):
 def preprocess(args):
     arch_type = normalize_arch_type(args.arch_type)
     spec = architecture_spec(arch_type)
+    has_cmt = resolve_has_cmt(args.has_cmt, spec)
     move_codec = get_move_codec(spec.move_encoding)
     state_codec = get_state_codec(spec.state_encoding)
     row_builder = PREPROCESS_ROW_BUILDERS[spec.name]
@@ -257,14 +293,16 @@ def preprocess(args):
         args.compression_opts,
         args.chunk_size,
         arch_type,
+        has_cmt,
     )
     buffers = {name: [] for name in spec.supervised_datasets}
-    games = positions = skipped_moves = unannotated_advantages = annotated_advantages = 0
+    games = positions = skipped_moves = skipped_games_no_cmt = 0
     print(
         "preprocess start:",
         f"input={args.input}",
         f"output={args.output}",
         f"arch_type={arch_type}",
+        f"has_cmt={has_cmt}",
         flush=True,
     )
 
@@ -282,6 +320,7 @@ def preprocess(args):
             f"games={games}",
             f"positions={live_positions()}",
             f"skipped_moves={skipped_moves}",
+            f"skipped_games_no_cmt={skipped_games_no_cmt}",
             f"output={args.output}",
             flush=True,
         )
@@ -297,7 +336,10 @@ def preprocess(args):
             values.clear()
 
     def process_game(game):
-        nonlocal skipped_moves, unannotated_advantages, annotated_advantages
+        nonlocal skipped_moves, skipped_games_no_cmt
+        if has_cmt and not game_has_comment_eval(game):
+            skipped_games_no_cmt += 1
+            return False
         white_value = result_to_white_value(game.headers.get("Result", "*"))
         board = game.board()
 
@@ -307,8 +349,15 @@ def preprocess(args):
             move = child.move
             try:
                 action = move_codec.move_to_index(move)
-                value = white_value if board.turn == chess.WHITE else -white_value
-                row, skip_reason = row_builder(board, node, child, action, value, state_codec)
+                row, skip_reason = row_builder(
+                    board,
+                    node,
+                    child,
+                    action,
+                    white_value,
+                    state_codec,
+                    has_cmt,
+                )
                 if row is None:
                     skipped_moves += 1
                     board.push(move)
@@ -316,11 +365,6 @@ def preprocess(args):
                     continue
                 for name, item in row.items():
                     buffers[name].append(item)
-                if spec.comment_advantage:
-                    if skip_reason == "unannotated_advantage":
-                        unannotated_advantages += 1
-                    else:
-                        annotated_advantages += 1
             except Exception:
                 skipped_moves += 1
             board.push(move)
@@ -329,6 +373,7 @@ def preprocess(args):
             first_name = spec.supervised_datasets[0]
             if len(buffers[first_name]) >= args.chunk_size:
                 flush_chunk()
+        return True
 
     try:
         if args.random_select:
@@ -348,9 +393,9 @@ def preprocess(args):
                         if game is None:
                             continue
 
-                        process_game(game)
-                        games += 1
-                        print_progress()
+                        if process_game(game):
+                            games += 1
+                            print_progress()
             else:
                 print("warning: no [Event ...] game offsets found; falling back to sequential read.")
                 args.random_select = False
@@ -364,14 +409,15 @@ def preprocess(args):
                     if game is None:
                         break
 
-                    process_game(game)
-                    games += 1
-                    print_progress()
+                    if process_game(game):
+                        games += 1
+                        print_progress()
 
         flush_chunk()
         h5.attrs["games"] = games
         h5.attrs["positions"] = positions
         h5.attrs["skipped_moves"] = skipped_moves
+        h5.attrs["skipped_games_no_cmt"] = skipped_games_no_cmt
         h5.attrs["random_select"] = bool(args.random_select)
         h5.flush()
     finally:
@@ -381,15 +427,14 @@ def preprocess(args):
         "games": games,
         "positions": positions,
         "skipped_moves": skipped_moves,
+        "skipped_games_no_cmt": skipped_games_no_cmt,
         "random_select": bool(args.random_select),
         "arch_type": arch_type,
+        "has_cmt": has_cmt,
         "state_encoding": spec.state_encoding,
         "target_schema": spec.target_schema,
         "output": args.output,
     }
-    if spec.comment_advantage:
-        summary["unannotated_advantages"] = unannotated_advantages
-        summary["annotated_advantages"] = annotated_advantages
     print("preprocess summary:", flush=True)
     print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
 
@@ -407,6 +452,16 @@ def parse_args():
     )
     parser.add_argument("--max-games", type=int, default=None)
     parser.add_argument("--random-select", action="store_true", default=False)
+    parser.add_argument(
+        "--has-cmt",
+        type=int,
+        choices=[0, 1],
+        default=None,
+        help=(
+            "Whether the PGN contains position evaluation comments. "
+            "Default: use the selected architecture spec."
+        ),
+    )
     parser.add_argument("--log-every", type=int, default=10000)
     return parser.parse_args()
 

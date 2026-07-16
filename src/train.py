@@ -46,7 +46,7 @@ def _resnet_pv_linear_loss(model, batch, losses, args, device, pin_memory):
 
 
 def _resnet_pva_gad_loss(model, batch, losses, args, device, pin_memory):
-    state, move, value_target, adv_move, adv_target, adv_weight = _to_device(
+    state, move, value_target, adv_move, adv_target = _to_device(
         batch,
         device,
         pin_memory,
@@ -55,9 +55,10 @@ def _resnet_pva_gad_loss(model, batch, losses, args, device, pin_memory):
     policy_loss = losses["policy"](heads["policy_logits"], move)
     value_loss = losses["value"](heads["value"].squeeze(1), value_target)
     chosen_advantage = heads["advantages"].gather(1, adv_move.unsqueeze(1)).squeeze(1)
-    advantage_loss = (
-        ((chosen_advantage - adv_target) ** 2) * adv_weight
-    ).sum() / torch.clamp(adv_weight.sum(), min=1.0)
+    if int(getattr(args, "has_cmt", 0)):
+        advantage_loss = losses["value"](chosen_advantage, adv_target)
+    else:
+        advantage_loss = chosen_advantage.sum() * 0.0
     loss = (
         policy_loss
         + args.value_weight * value_loss
@@ -113,12 +114,14 @@ def train(args):
     print(*start_parts, flush=True)
 
     dataset = H5ChessDataset(args.data, arch_type=args.arch_type)
+    args.has_cmt = int(dataset.has_cmt)
     print(
         "training data:",
         f"arch_type={dataset.arch_type}",
         f"state_encoding={dataset.state_encoding}",
         f"move_encoding={dataset.move_encoding}",
         f"target_schema={dataset.target_schema}",
+        f"has_cmt={dataset.has_cmt}",
         f"datasets={','.join(dataset.datasets)}",
         flush=True,
     )
