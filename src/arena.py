@@ -1,4 +1,4 @@
-"""Paired model comparison with Stockfish move-quality validation."""
+"""Paired model comparison with optional UCI move-quality validation."""
 
 from __future__ import annotations
 
@@ -17,12 +17,12 @@ import chess
 import chess.pgn
 import numpy as np
 
-from config import CONFIDENCE_Z, DEVICE, STOCKFISH_PATH
+from config import CONFIDENCE_Z, DEVICE, UCI_PATH
 from model import load_model
 from opening_book import make_arena_specs
 from search import SearchOptions, UnifiedSearch, VALID_SEARCH_TYPES
 from teacher import (
-    StockfishTeacher,
+    UciTeacher,
     TeacherConfig,
     move_accuracy_from_regret,
 )
@@ -64,6 +64,7 @@ def trace_search_info(info: Dict, root_topn: int) -> Dict:
     root_topn = max(0, int(root_topn))
     keys = (
         "search_type",
+        "decision_profile",
         "best_move",
         "best_san",
         "value",
@@ -94,6 +95,7 @@ def trace_search_info(info: Dict, root_topn: int) -> Dict:
 def pgn_search_comment(owner: str, info: Dict) -> str:
     parts = [
         f"owner={owner}",
+        f"profile={info.get('decision_profile', '?')}",
         f"best={info.get('best_san', info.get('best_move', '?'))}",
     ]
     if "mcts_completed" in info and "mcts_soft_cap" in info:
@@ -277,6 +279,7 @@ def play_arena_game(
             "san": san,
             "owner": owner,
             "candidate_color": "white" if candidate_color == chess.WHITE else "black",
+            "decision_profile": info.get("decision_profile"),
             "search": trace_search_info(info, trace_root_topn),
         })
         node = node.add_variation(move)
@@ -332,6 +335,8 @@ def _worker(job):
     )
     candidate = load_model(candidate_path, device=device)
     baseline = load_model(baseline_path, device=device)
+    candidate_arch = candidate.arch() if hasattr(candidate, "arch") else {}
+    baseline_arch = baseline.arch() if hasattr(baseline, "arch") else {}
     options = SearchOptions(
         search_type=search_type,
         mcts_sims=sims,
@@ -342,8 +347,15 @@ def _worker(job):
         c_puct_factor=c_puct_factor,
         fpu_reduction=fpu_reduction,
     )
-    candidate_searcher = UnifiedSearch(candidate, options, device=device)
-    baseline_searcher = UnifiedSearch(baseline, options, device=device)
+    candidate_searcher = UnifiedSearch(candidate, replace(options), device=device)
+    baseline_searcher = UnifiedSearch(baseline, replace(options), device=device)
+    progress_print(
+        progress,
+        f"arena worker {worker_index}: candidate_arch={candidate_arch.get('type')} "
+        f"candidate_profile={candidate_searcher.profile.name} "
+        f"baseline_arch={baseline_arch.get('type')} "
+        f"baseline_profile={baseline_searcher.profile.name}",
+    )
 
     scores = []
     counts = {"win": 0, "draw": 0, "loss": 0}
@@ -388,6 +400,10 @@ def _worker(job):
         "plies_total": plies_total,
         "traces": traces,
         "pgns": pgns,
+        "candidate_arch": candidate_arch,
+        "baseline_arch": baseline_arch,
+        "candidate_decision_profile": candidate_searcher.profile.name,
+        "baseline_decision_profile": baseline_searcher.profile.name,
     }
 
 
@@ -423,7 +439,7 @@ def evaluate_move_quality(
     log_every = max(0, int(log_every))
     progress_print(
         progress,
-        f"arena quality: analysing {total} moves with Stockfish "
+        f"arena quality: analysing {total} moves with UCI engine "
         f"workers={workers}",
     )
 
@@ -502,7 +518,7 @@ def _quality_worker(job):
         "baseline": {"regret": [], "accuracy": []},
     }
     total = len(traces)
-    with StockfishTeacher(config) as teacher:
+    with UciTeacher(config) as teacher:
         for index, row in enumerate(traces, 1):
             board = chess.Board(row["fen"])
             move = chess.Move.from_uci(row["move"])
@@ -546,13 +562,13 @@ def evaluate_models(
     c_puct_base=19652.0,
     c_puct_factor=1.0,
     fpu_reduction=0.15,
-    uci=STOCKFISH_PATH,
+    uci=UCI_PATH,
     uci_depth=8,
     uci_movetime_ms=0,
     uci_threads=4,
     uci_hash_mb=512,
     uci_multipv=4,
-    teacher_cache="data/selflearn/teacher_cache.sqlite",
+    teacher_cache="data/runs/arena_teacher_cache.sqlite",
     quality_loss_cap_cp=1000,
     pgn_output=None,
     trace_output=None,
@@ -650,6 +666,24 @@ def evaluate_models(
             counts[key] += int(value)
         for key, value in output["raw_results"].items():
             raw_results[key] = raw_results.get(key, 0) + int(value)
+    candidate_arch = next((output.get("candidate_arch") for output in outputs if output.get("candidate_arch")), {})
+    baseline_arch = next((output.get("baseline_arch") for output in outputs if output.get("baseline_arch")), {})
+    candidate_decision_profile = next(
+        (
+            output.get("candidate_decision_profile")
+            for output in outputs
+            if output.get("candidate_decision_profile")
+        ),
+        None,
+    )
+    baseline_decision_profile = next(
+        (
+            output.get("baseline_decision_profile")
+            for output in outputs
+            if output.get("baseline_decision_profile")
+        ),
+        None,
+    )
 
     score, ci_low, ci_high = normal_ci(scores)
 
@@ -721,8 +755,12 @@ def evaluate_models(
     return {
         "candidate": candidate_path,
         "candidate_sha256": candidate_hash,
+        "candidate_arch": candidate_arch,
+        "candidate_decision_profile": candidate_decision_profile,
         "baseline": baseline_path,
         "baseline_sha256": baseline_hash,
+        "baseline_arch": baseline_arch,
+        "baseline_decision_profile": baseline_decision_profile,
         **game_summary,
         "quality": quality,
         "quality_loss_cap_cp": int(quality_loss_cap_cp),
@@ -745,7 +783,7 @@ def evaluate_models(
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Compare models by paired games and Stockfish move quality"
+        description="Compare models by paired games and optional UCI move quality"
     )
     parser.add_argument("--candidate", required=True)
     parser.add_argument("--baseline", required=True)
@@ -770,13 +808,13 @@ def parse_args():
     parser.add_argument("--c-puct-factor", type=float, default=1.0)
     parser.add_argument("--fpu-reduction", type=float, default=0.15)
 
-    parser.add_argument("--uci", default=STOCKFISH_PATH)
+    parser.add_argument("--uci", default=UCI_PATH)
     parser.add_argument("--uci-depth", type=int, default=8)
     parser.add_argument("--uci-movetime-ms", type=int, default=0)
     parser.add_argument("--uci-threads", type=int, default=4)
     parser.add_argument("--uci-hash-mb", type=int, default=512)
     parser.add_argument("--uci-multipv", type=int, default=4)
-    parser.add_argument("--teacher-cache", default="data/selflearn/teacher_cache.sqlite")
+    parser.add_argument("--teacher-cache", default="data/runs/arena_teacher_cache.sqlite")
     parser.add_argument("--quality-loss-cap-cp", type=int, default=1000)
     parser.add_argument("--pgn-output", default=None)
     parser.add_argument("--trace-output", default=None)

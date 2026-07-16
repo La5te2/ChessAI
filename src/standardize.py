@@ -1,4 +1,4 @@
-"""Normalize a model checkpoint to the current policy/value-only format."""
+"""Normalize a model checkpoint to the registered checkpoint format."""
 
 import argparse
 import os
@@ -19,12 +19,11 @@ def main():
         raise FileNotFoundError(f"model not found: {model_path}")
 
     source_epoch, source_global_step, source_extra = checkpoint_metadata(model_path, device="cpu")
-    model = load_model(model_path, device="cpu")
+    model = load_model(model_path, device="cpu", infer_unknown_arch=True)
     model.eval()
 
     extra = dict(source_extra)
     extra["standardized"] = True
-    extra["standardize_note"] = "normalized to the current policy/value checkpoint format"
 
     tmp_path = f"{model_path}.standardize_tmp_{os.getpid()}"
     try:
@@ -39,13 +38,10 @@ def main():
 
         checkpoint = torch.load(model_path, map_location="cpu")
         keys = sorted(checkpoint.keys()) if isinstance(checkpoint, dict) else []
-        model_keys = sorted(checkpoint.get("model", {}).keys()) if isinstance(checkpoint, dict) else []
         print("standardization finished")
         print("model:", model_path)
         print("backup:", result.get("backup"))
         print("keys:", keys)
-        print("has optimizer:", isinstance(checkpoint, dict) and "optimizer" in checkpoint)
-        print("has gate_head:", any(key.startswith("gate_head.") for key in model_keys))
         print("arch:", checkpoint.get("arch") if isinstance(checkpoint, dict) else None)
         print("epoch:", checkpoint.get("epoch") if isinstance(checkpoint, dict) else None)
         print("global_step:", checkpoint.get("global_step") if isinstance(checkpoint, dict) else None)

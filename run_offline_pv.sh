@@ -2,13 +2,13 @@
 set -euo pipefail
 
 if [[ "${1:-}" != "--foreground" ]]; then
-  RUN_ID="reinforce_$(date +%Y%m%d_%H%M%S)_$$"
+  RUN_ID="offline_pv_$(date +%Y%m%d_%H%M%S)_$$"
   DATA_RUN_DIR="data/runs/${RUN_ID}"
   mkdir -p "${DATA_RUN_DIR}"
   nohup bash "$0" --foreground "${RUN_ID}" > "${DATA_RUN_DIR}/info.log" 2>&1 < /dev/null &
   PID="$!"
   echo "${PID}" > "${DATA_RUN_DIR}/pid"
-  echo "reinforce launched"
+  echo "offline-pv launched"
   echo "run_id=${RUN_ID}"
   echo "pid=${PID}"
   echo "log=${DATA_RUN_DIR}/info.log"
@@ -17,7 +17,7 @@ if [[ "${1:-}" != "--foreground" ]]; then
 fi
 
 RUN_ID="${2:?missing run id}"
-export REINFORCE_RUN_ID="${RUN_ID}"
+export OFFLINE_PV_RUN_ID="${RUN_ID}"
 
 MODEL="models/chessnet.pth"
 FEN_SOURCE="data/games.pgn"
@@ -36,6 +36,8 @@ ARENA_REPLAY_POSITIONS_PER_ITER=10000
 SAMPLE_TOPK=6
 REWARD_SCALE_CP=600
 TEACHER_POLICY_WEIGHT=0.10
+TEACHER_RANK_WEIGHT=0.10
+TEACHER_RANK_MIN_REWARD_GAP=0.0
 TEACHER_VALUE_WEIGHT=0.50
 TEACHER_POLICY_TEMP_CP=150
 ACTOR_EXPLORATION_MIX=0.05
@@ -96,7 +98,7 @@ EVAL_MIN_ACCURACY_IMPROVEMENT=0.0
 LOG_EVERY=50
 SEED=2026
 
-echo "reinforce foreground start"
+echo "offline-pv foreground start"
 echo "run_id=${RUN_ID}"
 echo "model=${MODEL}"
 echo "seed=${SEED}"
@@ -104,13 +106,13 @@ echo "offline labels: fen_source=${FEN_SOURCE} positions_per_iter=${POSITIONS_PE
 echo "arena replay: window=${ARENA_REPLAY_WINDOW} positions=${ARENA_REPLAY_POSITIONS} positions_per_iter=${ARENA_REPLAY_POSITIONS_PER_ITER}"
 echo "actor actions: topk=${SAMPLE_TOPK} include_teacher_best=true exploration_mix=${ACTOR_EXPLORATION_MIX}"
 echo "reward: continuous_tanh_cp scale_cp=${REWARD_SCALE_CP} advantage_clip=${ADVANTAGE_CLIP}"
-echo "teacher targets: policy_weight=${TEACHER_POLICY_WEIGHT} value_weight=${TEACHER_VALUE_WEIGHT} policy_temp_cp=${TEACHER_POLICY_TEMP_CP}"
+echo "offline-pv targets: policy_weight=${TEACHER_POLICY_WEIGHT} rank_weight=${TEACHER_RANK_WEIGHT} value_weight=${TEACHER_VALUE_WEIGHT} policy_temp_cp=${TEACHER_POLICY_TEMP_CP}"
 echo "teacher: uci=${UCI} depth=${UCI_DEPTH} multipv=${UCI_MULTIPV} threads=${UCI_THREADS}"
 echo "train: epochs=${EPOCHS} train_max_steps=${TRAIN_MAX_STEPS} batch_size=${BATCH_SIZE} actor_weight=${ACTOR_WEIGHT} critic_weight=${CRITIC_WEIGHT} entropy_weight=${ENTROPY_WEIGHT}"
 echo "teacher validation: source=${VALIDATION_SOURCE} positions=${VALIDATION_POSITIONS} offset=${VALIDATION_OFFSET} topk=${VALIDATION_TOPK} uci_depth=${VALIDATION_UCI_DEPTH} uci_multipv=${VALIDATION_UCI_MULTIPV} top1_tol_cp=${VALIDATION_MAX_TOP1_REGRET_REGRESSION_CP} composite_tol_cp=${VALIDATION_MAX_COMPOSITE_REGRET_REGRESSION_CP}"
 echo "eval: games=${EVAL_GAMES} search_type=${EVAL_SEARCH_TYPE} sims=${EVAL_SIMS} movetime_ms=${EVAL_MOVETIME_MS} c_puct=${EVAL_C_PUCT} fpu_reduction=${EVAL_FPU_REDUCTION} min_net_wins=${EVAL_MIN_NET_WINS} min_acpl_improvement=${EVAL_MIN_ACPL_IMPROVEMENT} min_accuracy_improvement=${EVAL_MIN_ACCURACY_IMPROVEMENT} opening_book=${EVAL_OPENING_BOOK}"
 
-exec python src/reinforce.py \
+exec python src/offline_pv.py \
   --model "${MODEL}" \
   --fen-source "${FEN_SOURCE}" \
   --uci "${UCI}" \
@@ -126,6 +128,8 @@ exec python src/reinforce.py \
   --sample-topk "${SAMPLE_TOPK}" \
   --reward-scale-cp "${REWARD_SCALE_CP}" \
   --teacher-policy-weight "${TEACHER_POLICY_WEIGHT}" \
+  --teacher-rank-weight "${TEACHER_RANK_WEIGHT}" \
+  --teacher-rank-min-reward-gap "${TEACHER_RANK_MIN_REWARD_GAP}" \
   --teacher-value-weight "${TEACHER_VALUE_WEIGHT}" \
   --teacher-policy-temp-cp "${TEACHER_POLICY_TEMP_CP}" \
   --actor-exploration-mix "${ACTOR_EXPLORATION_MIX}" \

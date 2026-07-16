@@ -1,4 +1,4 @@
-"""Acceptance policy helpers for candidate model promotion."""
+"""Arena-result acceptance helpers."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Polyglot-only opening book sampling for arena and self-learning."""
+"""Polyglot opening book sampling for arena and offline-pv evaluation."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ import chess.engine
 import chess.pgn
 import chess.polyglot
 
-from config import STOCKFISH_PATH
+from config import UCI_PATH
 
 
 POLYGLOT_ENTRY_STRUCT = struct.Struct(">QHHI")
@@ -775,11 +775,11 @@ def generate_opening_book_from_pgn(args):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Polyglot opening book sampling and Stockfish verification"
+        description="Polyglot opening book sampling and UCI verification"
     )
     parser.add_argument("--verify", default=None)
     parser.add_argument("--pgn", default=None)
-    parser.add_argument("--uci", default=STOCKFISH_PATH)
+    parser.add_argument("--uci", default=UCI_PATH)
     parser.add_argument("--output", default=None)
     parser.add_argument("--in-place", action="store_true", default=False)
     parser.add_argument("--max-abs-cp", type=int, default=80)

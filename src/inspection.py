@@ -1,133 +1,274 @@
 import argparse
 import os
 import sys
+from typing import Iterable, Tuple
 
-import chess.pgn
 import h5py
 import numpy as np
 
-from chess_env import board_to_packed
-from config import NUM_ACTIONS
-from move_encoder import move_to_index
+from architectures import (
+    RESNET_PVA_GAD,
+    RESNET_PV_LINEAR,
+    architecture_spec,
+    normalize_arch_type,
+)
+from move_codecs import get_move_codec
+from state_codecs import get_state_codec
 
 
-def result_to_white_value(result: str) -> int:
-    if result == "1-0":
-        return 1
-    if result == "0-1":
-        return -1
-    return 0
+CHUNK_ROWS = 65536
+MAX_ERRORS = 20
 
 
-def expected_value(board, white_value: int) -> int:
-    if white_value == 0:
+class Inspector:
+    def __init__(self):
+        self.errors = 0
+
+    def error(self, message: str):
+        self.errors += 1
+        print(f"[ERROR] {message}")
+
+    def check(self, condition: bool, message: str):
+        if not condition:
+            self.error(message)
+
+    @property
+    def ok(self) -> bool:
+        return self.errors == 0
+
+
+def decode_attr(value) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="ignore")
+    if hasattr(value, "decode"):
+        return value.decode("utf-8", errors="ignore")
+    return str(value)
+
+
+def dataset_names(h5) -> set:
+    return set(str(name) for name in h5.keys())
+
+
+def print_summary(path: str, h5):
+    print("file:", path)
+    print("size_gb:", f"{os.path.getsize(path) / 1024**3:.4f}")
+    print("keys:", list(h5.keys()))
+    for key in h5.keys():
+        dataset = h5[key]
+        print(key, dataset.shape, dataset.dtype)
+    print("attrs:", dict(h5.attrs))
+
+
+def iter_chunks(dataset, rows: int = CHUNK_ROWS) -> Iterable[Tuple[int, np.ndarray]]:
+    total = int(dataset.shape[0])
+    for start in range(0, total, rows):
+        end = min(total, start + rows)
+        yield start, np.asarray(dataset[start:end])
+
+
+def require_datasets(inspector: Inspector, h5, required):
+    names = dataset_names(h5)
+    missing = [name for name in required if name not in names]
+    for name in missing:
+        inspector.error(f"missing dataset: {name}")
+    return not missing
+
+
+def require_dataset_set(inspector: Inspector, h5, expected):
+    names = dataset_names(h5)
+    missing = sorted(set(expected) - names)
+    extra = sorted(names - set(expected))
+    for name in missing:
+        inspector.error(f"missing dataset: {name}")
+    for name in extra:
+        inspector.error(f"unexpected dataset for schema: {name}")
+    return not missing and not extra
+
+
+def check_same_length(inspector: Inspector, h5, names):
+    lengths = {}
+    for name in names:
+        if name in h5:
+            lengths[name] = int(h5[name].shape[0])
+    if not lengths:
         return 0
-    return white_value if board.turn else -white_value
+    expected = next(iter(lengths.values()))
+    for name, length in lengths.items():
+        inspector.check(
+            length == expected,
+            f"{name} length={length} does not match expected length={expected}",
+        )
+    inspector.check(expected > 0, "dataset length is zero")
+    return expected
 
 
-def print_summary(path):
+def check_states(inspector: Inspector, h5, length: int, state_codec):
+    if "states" not in h5:
+        return
+    states = h5["states"]
+    expected_shape = (length, *state_codec.storage_shape)
+    inspector.check(
+        states.shape == expected_shape,
+        f"states shape={states.shape}, expected {expected_shape}",
+    )
+    inspector.check(
+        states.dtype == np.dtype(state_codec.storage_dtype),
+        f"states dtype={states.dtype}, expected {state_codec.storage_dtype}",
+    )
+
+
+def check_index_dataset(inspector: Inspector, h5, name: str, action_size: int):
+    if name not in h5:
+        return
+    dataset = h5[name]
+    inspector.check(
+        np.issubdtype(dataset.dtype, np.integer),
+        f"{name} dtype={dataset.dtype}, expected integer",
+    )
+    for start, chunk in iter_chunks(dataset):
+        if chunk.size == 0:
+            continue
+        bad = np.where((chunk < 0) | (chunk >= action_size))[0]
+        if bad.size:
+            index = int(start + bad[0])
+            inspector.error(
+                f"{name}[{index}]={int(chunk[bad[0]])} outside [0, {action_size})"
+            )
+            if inspector.errors >= MAX_ERRORS:
+                return
+
+
+def check_values(inspector: Inspector, h5, name: str, allowed=None, bounds=None):
+    if name not in h5:
+        return
+    dataset = h5[name]
+    for start, chunk in iter_chunks(dataset):
+        if chunk.size == 0:
+            continue
+        if not np.isfinite(chunk).all():
+            bad = np.where(~np.isfinite(chunk))[0][0]
+            inspector.error(f"{name}[{int(start + bad)}] is not finite")
+            return
+        if allowed is not None:
+            allowed_values = np.asarray(list(allowed))
+            ok = np.isin(chunk, allowed_values)
+            if not bool(ok.all()):
+                bad = np.where(~ok)[0][0]
+                inspector.error(
+                    f"{name}[{int(start + bad)}]={chunk[bad]} outside {sorted(allowed)}"
+                )
+                return
+        if bounds is not None:
+            lo, hi = bounds
+            bad = np.where((chunk < lo) | (chunk > hi))[0]
+            if bad.size:
+                index = int(start + bad[0])
+                inspector.error(
+                    f"{name}[{index}]={float(chunk[bad[0]])} outside [{lo}, {hi}]"
+                )
+                return
+
+
+def check_supervised_attrs(inspector: Inspector, h5):
+    for name in ("arch_type", "state_encoding", "move_encoding", "target_schema"):
+        inspector.check(name in h5.attrs, f"missing attr: {name}")
+    if not all(name in h5.attrs for name in ("arch_type", "state_encoding", "move_encoding", "target_schema")):
+        return None, None, None, None
+    try:
+        arch_type = normalize_arch_type(decode_attr(h5.attrs["arch_type"]))
+    except Exception as exc:
+        inspector.error(str(exc))
+        return None, None, None, None
+    state_encoding = decode_attr(h5.attrs["state_encoding"])
+    move_encoding = decode_attr(h5.attrs["move_encoding"])
+    target_schema = decode_attr(h5.attrs["target_schema"])
+    expected_state_encoding = architecture_spec(arch_type).state_encoding
+    expected_move_encoding = architecture_spec(arch_type).move_encoding
+    inspector.check(
+        state_encoding == expected_state_encoding,
+        f"state_encoding={state_encoding!r}, expected {expected_state_encoding!r} for {arch_type}",
+    )
+    inspector.check(
+        move_encoding == expected_move_encoding,
+        f"move_encoding={move_encoding!r}, expected {expected_move_encoding!r} for {arch_type}",
+    )
+    try:
+        get_state_codec(state_encoding)
+    except Exception as exc:
+        inspector.error(str(exc))
+    try:
+        get_move_codec(move_encoding)
+    except Exception as exc:
+        inspector.error(str(exc))
+    return arch_type, state_encoding, move_encoding, target_schema
+
+
+def check_resnet_pv_linear(inspector: Inspector, h5, state_encoding: str, move_encoding: str, target_schema: str):
+    print("schema:", RESNET_PV_LINEAR)
+    inspector.check(target_schema == "pv_supervised", f"target_schema={target_schema!r}, expected 'pv_supervised'")
+    require_dataset_set(inspector, h5, ("states", "moves", "values"))
+    length = check_same_length(inspector, h5, ("states", "moves", "values"))
+    state_codec = get_state_codec(state_encoding)
+    codec = get_move_codec(move_encoding)
+    check_states(inspector, h5, length, state_codec)
+    check_index_dataset(inspector, h5, "moves", codec.action_size)
+    check_values(inspector, h5, "values", allowed={-1, 0, 1})
+
+
+def check_resnet_pva_gad(inspector: Inspector, h5, state_encoding: str, move_encoding: str, target_schema: str):
+    print("schema:", RESNET_PVA_GAD)
+    inspector.check(
+        target_schema == "pva_comment_supervised",
+        f"target_schema={target_schema!r}, expected 'pva_comment_supervised'",
+    )
+    require_dataset_set(
+        inspector,
+        h5,
+        ("states", "moves", "values", "adv_moves", "adv_values", "adv_weights"),
+    )
+    length = check_same_length(
+        inspector,
+        h5,
+        ("states", "moves", "values", "adv_moves", "adv_values", "adv_weights"),
+    )
+    state_codec = get_state_codec(state_encoding)
+    codec = get_move_codec(move_encoding)
+    check_states(inspector, h5, length, state_codec)
+    check_index_dataset(inspector, h5, "moves", codec.action_size)
+    check_index_dataset(inspector, h5, "adv_moves", codec.action_size)
+    check_values(inspector, h5, "values", allowed={-1, 0, 1})
+    check_values(inspector, h5, "adv_values", bounds=(-1.0, 1.0))
+    check_values(inspector, h5, "adv_weights", bounds=(0.0, 1.0))
+
+
+INSPECTION_HANDLERS = {
+    RESNET_PV_LINEAR: check_resnet_pv_linear,
+    RESNET_PVA_GAD: check_resnet_pva_gad,
+}
+
+
+def inspect(path: str) -> bool:
+    inspector = Inspector()
     with h5py.File(path, "r") as h5:
-        print("file:", path)
-        print("size_gb:", f"{os.path.getsize(path) / 1024**3:.4f}")
-        print("keys:", list(h5.keys()))
-        for key in h5.keys():
-            print(key, h5[key].shape, h5[key].dtype)
-        print("attrs:", dict(h5.attrs))
-
-
-def check_probability_datasets(path, count):
-    errors = 0
-    checked = 0
-    names = ("policy", "target_policy", "mcts_policy", "teacher_policy")
-    with h5py.File(path, "r") as h5:
-        present = [name for name in names if name in h5]
-        if not present:
-            print("no dense policy datasets found")
-            return True
-        total_rows = min(int(h5[present[0]].shape[0]), int(count))
-        for row_index in range(total_rows):
-            for name in present:
-                row = np.asarray(h5[name][row_index], dtype=np.float32)
-                if row.shape != (NUM_ACTIONS,):
-                    print(f"[ERROR] {name}[{row_index}] shape={row.shape}")
-                    errors += 1
-                    continue
-                if not np.isfinite(row).all():
-                    print(f"[ERROR] {name}[{row_index}] has non-finite values")
-                    errors += 1
-                    continue
-                total = float(row.sum())
-                if total > 0 and abs(total - 1.0) > 0.02:
-                    print(f"[ERROR] {name}[{row_index}] probability sum={total:.6f}")
-                    errors += 1
-            checked += 1
-            if errors >= 20:
-                break
-    print(f"probability check rows={checked}, errors={errors}")
-    return errors == 0
-
-
-def verify_against_pgn(h5_path, pgn_path, count):
-    errors = 0
-    checked = 0
-    with h5py.File(h5_path, "r") as h5:
-        for key in ("states", "moves", "values"):
-            if key not in h5:
-                raise KeyError(f"HDF5 missing dataset: {key}")
-
-        states = h5["states"]
-        moves = h5["moves"]
-        values = h5["values"]
-        with open(pgn_path, "r", encoding="utf-8", errors="ignore") as handle:
-            while checked < count:
-                game = chess.pgn.read_game(handle)
-                if game is None:
-                    break
-                board = game.board()
-                white_value = result_to_white_value(game.headers.get("Result", "*"))
-                for move in game.mainline_moves():
-                    if checked >= count:
-                        break
-                    expected_move = move_to_index(move)
-                    expected_state = board_to_packed(board)
-                    expected_result = expected_value(board, white_value)
-                    ok = True
-                    if int(moves[checked]) != expected_move:
-                        print(f"[ERROR] idx={checked} move mismatch")
-                        ok = False
-                    if not np.array_equal(states[checked], expected_state):
-                        print(f"[ERROR] idx={checked} state mismatch")
-                        ok = False
-                    if int(values[checked]) != expected_result:
-                        print(f"[ERROR] idx={checked} value mismatch")
-                        ok = False
-                    if not ok:
-                        errors += 1
-                        if errors >= 20:
-                            return False
-                    board.push(move)
-                    checked += 1
-    print(f"verify checked={checked}, errors={errors}")
-    return errors == 0
+        print_summary(path, h5)
+        arch_type, state_encoding, move_encoding, target_schema = check_supervised_attrs(inspector, h5)
+        if arch_type is not None:
+            handler = INSPECTION_HANDLERS.get(arch_type)
+            if handler is None:
+                inspector.error(f"no inspection schema registered for arch_type={arch_type!r}")
+            else:
+                handler(inspector, h5, state_encoding, move_encoding, target_schema)
+    print("INSPECTION OK" if inspector.ok else "INSPECTION FAILED")
+    return inspector.ok
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Inspect supervised or self-learning HDF5 files")
-    parser.add_argument("path")
-    parser.add_argument("--verify-pgn", default=None)
-    parser.add_argument("--verify-count", type=int, default=1000)
-    parser.add_argument("--check-probabilities", action="store_true", default=False)
+    parser = argparse.ArgumentParser(description="Inspect a ChessAI HDF5 file")
+    parser.add_argument("--path", required=True)
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    print_summary(args.path)
-    ok = True
-    if args.verify_pgn:
-        ok = verify_against_pgn(args.path, args.verify_pgn, args.verify_count) and ok
-    if args.check_probabilities:
-        ok = check_probability_datasets(args.path, args.verify_count) and ok
-    print("VERIFY OK" if ok else "VERIFY FAILED")
-    if not ok:
+    if not inspect(args.path):
         sys.exit(1)

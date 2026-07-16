@@ -1,4 +1,4 @@
-"""Stockfish teacher used only by self-learning and model-quality validation."""
+"""UCI teacher utilities for move scoring and regret calculation."""
 
 from __future__ import annotations
 
@@ -14,23 +14,21 @@ import chess
 import chess.engine
 import numpy as np
 
-from config import NUM_ACTIONS, STOCKFISH_PATH
-from move_encoder import move_to_index
+from config import UCI_PATH
 
 MATE_SCORE_CP = 100000
-CACHE_VERSION = "teacher-v2"
+TEACHER_CACHE_NAMESPACE = "uci-teacher-regret"
 
 
 @dataclass
 class TeacherConfig:
-    uci: str = STOCKFISH_PATH
+    uci: str = UCI_PATH
     depth: int = 10
     movetime_ms: int = 0
     multipv: int = 8
     threads: int = 4
     hash_mb: int = 512
-    policy_temperature_cp: float = 80.0
-    cache_path: Optional[str] = "data/selflearn/teacher_cache.sqlite"
+    cache_path: Optional[str] = None
 
 
 class TeacherCache:
@@ -68,7 +66,7 @@ class TeacherCache:
             self.conn = None
 
 
-class StockfishTeacher:
+class UciTeacher:
     def __init__(self, config: TeacherConfig):
         self.config = config
         if not os.path.exists(config.uci):
@@ -137,34 +135,14 @@ class StockfishTeacher:
         info = self.engine.analyse(child, self._limit())
         return self._score_cp(info, pov)
 
-    def _policy_from_move_scores(self, move_scores):
-        rows = [
-            {"move": move, "score_cp": int(score)}
-            for move, score in move_scores.items()
-        ]
-        rows.sort(key=lambda row: (-row["score_cp"], row["move"]))
-        if not rows:
-            return {}
-
-        scores = np.asarray([row["score_cp"] for row in rows], dtype=np.float64)
-        temperature = max(1e-6, float(self.config.policy_temperature_cp))
-        logits = (scores - scores.max()) / temperature
-        probabilities = np.exp(logits)
-        probabilities /= max(1e-12, probabilities.sum())
-        return {
-            row["move"]: float(probability)
-            for row, probability in zip(rows, probabilities)
-        }
-
     def _cache_key(self, board, played_move):
         raw = "|".join([
-            CACHE_VERSION,
+            TEACHER_CACHE_NAMESPACE,
             board.fen(),
             played_move.uci() if played_move else "-",
             str(self.config.depth),
             str(self.config.movetime_ms),
             str(self.config.multipv),
-            str(self.config.policy_temperature_cp),
         ])
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
@@ -202,9 +180,7 @@ class StockfishTeacher:
 
         if not rows:
             legal = sorted(board.legal_moves, key=lambda move: move.uci())
-            probability = 1.0 / max(1, len(legal))
             payload = {
-                "policy_moves": {move.uci(): probability for move in legal},
                 "move_scores_cp": {move.uci(): 0 for move in legal},
                 "value": 0.0,
                 "best_move": legal[0].uci() if legal else None,
@@ -218,7 +194,6 @@ class StockfishTeacher:
 
         rows.sort(key=lambda row: row["score_cp"], reverse=True)
         move_scores = {row["move"]: int(row["score_cp"]) for row in rows}
-        policy_moves = self._policy_from_move_scores(move_scores)
 
         best_move = rows[0]["move"]
         best_score = int(rows[0]["score_cp"])
@@ -236,7 +211,6 @@ class StockfishTeacher:
                 played_score = int(child_score) if child_score is not None else best_score
 
         payload = {
-            "policy_moves": policy_moves,
             "move_scores_cp": move_scores,
             "value": float(teacher_value),
             "best_move": best_move,
@@ -289,7 +263,6 @@ class StockfishTeacher:
 
         if move_scores:
             result["move_scores_cp"] = move_scores
-            result["policy_moves"] = self._policy_from_move_scores(move_scores)
             ordered = sorted(
                 move_scores.items(),
                 key=lambda item: (-int(item[1]), item[0]),
@@ -314,66 +287,6 @@ class StockfishTeacher:
         result["teacher_label_topk"] = len(scored_candidates)
         return result
 
-    @staticmethod
-    def dense_policy(board: chess.Board, result: Dict) -> np.ndarray:
-        policy = np.zeros(NUM_ACTIONS, dtype=np.float32)
-        for uci, probability in result.get("policy_moves", {}).items():
-            try:
-                move = chess.Move.from_uci(uci)
-                if move in board.legal_moves:
-                    policy[move_to_index(move)] = float(probability)
-            except Exception:
-                continue
-        total = float(policy.sum())
-        if total <= 0:
-            legal = list(board.legal_moves)
-            if legal:
-                probability = 1.0 / len(legal)
-                for move in legal:
-                    policy[move_to_index(move)] = probability
-        else:
-            policy /= total
-        return policy
-
-
-def teacher_weight_from_result(result: Dict) -> float:
-    regret = max(0.0, float(result.get("regret_cp", 0.0)))
-    margin = max(0.0, float(result.get("margin_cp", 0.0)))
-
-    if regret <= 30:
-        base = 0.05
-    elif regret <= 150:
-        base = 0.05 + 0.45 * (regret - 30.0) / 120.0
-    elif regret <= 300:
-        base = 0.50 + 0.35 * (regret - 150.0) / 150.0
-    else:
-        base = 0.95
-
-    confidence = min(1.0, max(0.25, margin / 120.0))
-    return float(min(0.95, max(0.0, base * confidence)))
-
-
-def acceptable_moves(
-    result: Dict,
-    tolerance_cp: int = 35,
-    max_answers: int = 8,
-) -> List[str]:
-    scores = result.get("move_scores_cp") or {}
-    if not scores:
-        best = result.get("best_move")
-        return [best] if best else []
-
-    best_score = max(int(score) for score in scores.values())
-    answers = [
-        move
-        for move, score in scores.items()
-        if best_score - int(score) <= max(0, int(tolerance_cp))
-    ]
-    answers.sort(key=lambda move: (-int(scores[move]), move))
-    if not answers and result.get("best_move"):
-        answers = [result["best_move"]]
-    return answers[: max(1, int(max_answers))]
-
 
 def move_accuracy_from_regret(regret_cp: float) -> float:
     regret = max(0.0, float(regret_cp))
@@ -381,18 +294,15 @@ def move_accuracy_from_regret(regret_cp: float) -> float:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Inspect a position with the Stockfish teacher")
+    parser = argparse.ArgumentParser(description="Inspect a position with the UCI teacher")
     parser.add_argument("--fen", default="startpos")
     parser.add_argument("--played-move", default=None)
-    parser.add_argument("--uci", default=STOCKFISH_PATH)
+    parser.add_argument("--uci", default=UCI_PATH)
     parser.add_argument("--uci-depth", type=int, default=10)
     parser.add_argument("--uci-movetime-ms", type=int, default=0)
     parser.add_argument("--uci-multipv", type=int, default=8)
     parser.add_argument("--uci-threads", type=int, default=4)
     parser.add_argument("--uci-hash-mb", type=int, default=512)
-    parser.add_argument("--teacher-policy-temperature-cp", type=float, default=80.0)
-    parser.add_argument("--teacher-cache", default="data/selflearn/teacher_cache.sqlite")
-    parser.add_argument("--answer-tolerance-cp", type=int, default=35)
     return parser.parse_args()
 
 
@@ -407,16 +317,9 @@ def main():
         multipv=args.uci_multipv,
         threads=args.uci_threads,
         hash_mb=args.uci_hash_mb,
-        policy_temperature_cp=args.teacher_policy_temperature_cp,
-        cache_path=args.teacher_cache,
     )
-    with StockfishTeacher(config) as teacher:
+    with UciTeacher(config) as teacher:
         result = teacher.analyse(board, played_move=played_move)
-    result["teacher_weight"] = teacher_weight_from_result(result)
-    result["acceptable_moves"] = acceptable_moves(
-        result,
-        tolerance_cp=args.answer_tolerance_cp,
-    )
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 

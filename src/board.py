@@ -103,9 +103,13 @@ def board_search_process(job: Dict, output_queue, cancel_event):
         board = chess.Board(str(job["fen"]))
         parameters = dict(job["parameters"])
         model_path = str(job.get("model_path") or "").strip()
-        if not model_path:
-            raise RuntimeError("model path is empty")
-        model = load_model(model_path, device=str(parameters.get("device", DEVICE)))
+        if model_path.lower() == "none":
+            model_path = ""
+        model = (
+            load_model(model_path, device=str(parameters.get("device", DEVICE)))
+            if model_path
+            else None
+        )
         options = search_options_from_parameters(
             parameters,
             root_topn=int(job.get("root_topn") or parameters.get("root_topn", 8) or 8),
@@ -370,8 +374,6 @@ class ChessEngine:
         user_side: str,
         from_current_position: bool,
     ):
-        if not self.model_loaded:
-            raise RuntimeError("load a model and apply its parameters first")
         if not from_current_position:
             self.reset("startpos")
         self.user_color = color_from_side(user_side)
@@ -419,7 +421,6 @@ class ChessEngine:
     def is_ai_turn(self) -> bool:
         return (
             self.playing_with_ai
-            and self.model_loaded
             and self.board.turn == self.ai_color
         )
 
@@ -495,8 +496,6 @@ class ChessEngine:
         progress_callback: Optional[Callable[[Dict], None]] = None,
         board_snapshot: Optional[chess.Board] = None,
     ) -> Tuple[chess.Move, Dict]:
-        if not self.model_loaded:
-            raise RuntimeError("load a model and apply its parameters first")
         if not self.playing_with_ai:
             raise RuntimeError("start Play first")
         if not self.is_ai_turn():
@@ -577,8 +576,6 @@ class ChessEngine:
         progress_callback: Optional[Callable[[Dict], None]] = None,
         board_snapshot: Optional[chess.Board] = None,
     ) -> Tuple[List[Dict], Dict]:
-        if not self.model_loaded:
-            raise RuntimeError("load a model and apply its parameters first")
         options = dataclasses.replace(
             self.search_options(),
             root_topn=max(1, int(topn)),
@@ -987,12 +984,7 @@ class ChessBoardApp:
             except Exception:
                 pass
 
-        model_state = (
-            tk.NORMAL
-            if self.engine.model_loaded
-            else tk.DISABLED
-        )
-        self.play_ai_button.configure(state=model_state)
+        self.play_ai_button.configure(state=tk.NORMAL)
         self.simulator_button.configure(
             state=(
                 tk.NORMAL
@@ -1146,7 +1138,6 @@ class ChessBoardApp:
             )
         elif (
             self.engine.mode == "simulator"
-            and self.engine.model_loaded
             and self.engine.ai_suggest_open
         ):
             self.pending_ai_after_id = self.root.after(
@@ -1514,7 +1505,6 @@ class ChessBoardApp:
         if (
             self.engine.mode != "simulator"
             or self.engine.game_over()
-            or not self.engine.model_loaded
             or not self.engine.ai_suggest_open
         ):
             return
@@ -1621,14 +1611,6 @@ class ChessBoardApp:
             )
 
     def start_ai_game(self):
-        if not self.engine.model_loaded:
-            messagebox.showinfo(
-                "Play",
-                "Load a model and apply its parameters first.",
-                parent=self.root,
-            )
-            return
-
         side_answer = messagebox.askyesnocancel(
             "Play",
             "Choose your side.\n\nYes = White\nNo = Black",

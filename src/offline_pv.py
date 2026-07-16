@@ -1,7 +1,7 @@
-"""Offline Stockfish-rewarded actor-critic training.
+"""Offline-PV UCI-rewarded actor-critic training.
 
-This entry point keeps the reinforce run/gate shape and performs offline FEN
-labeling:
+This entry point is intentionally bound to resnet_pv_linear and performs
+offline FEN labeling:
 
 1. Read positions sequentially from a PGN or an HDF5 file with a `fens` dataset.
 2. Let the current model propose policy top-k legal moves at sim=0.
@@ -33,35 +33,44 @@ from torch.utils.data import DataLoader, Dataset
 
 from acceptance import attach_arena_acceptance
 from arena import evaluate_models, worker_cache_path
-from chess_env import board_to_packed, packed_to_tensor
+from architectures import RESNET_PV_LINEAR, architecture_spec
+from checkpoint_io import atomic_copy_with_backup
 from config import (
     DEVICE,
     MODEL_DIR,
     MODEL_PATH,
-    NUM_ACTIONS,
     PGN_PATH,
-    STOCKFISH_PATH,
+    UCI_PATH,
     WEIGHT_DECAY,
 )
 from model import load_model, save_model
-from move_encoder import move_to_index
+from move_codecs import get_move_codec
 from search import VALID_SEARCH_TYPES
-from teacher import MATE_SCORE_CP, StockfishTeacher, TeacherConfig
+from state_codecs import get_state_codec
+from teacher import MATE_SCORE_CP, UciTeacher, TeacherConfig
 
 
 DEFAULT_DATA_RUNS_DIR = os.path.join("data", "runs")
 DEFAULT_MODEL_RUNS_DIR = os.path.join(MODEL_DIR, "runs")
+PV_ARCH_SPEC = architecture_spec(RESNET_PV_LINEAR)
+PV_MOVE_CODEC = get_move_codec(PV_ARCH_SPEC.move_encoding)
+PV_STATE_CODEC = get_state_codec(PV_ARCH_SPEC.state_encoding)
+PV_ACTION_SIZE = PV_MOVE_CODEC.action_size
+
+
+def move_to_index(move: chess.Move) -> int:
+    return PV_MOVE_CODEC.move_to_index(move)
 
 
 def create_run_id() -> str:
-    return time.strftime("reinforce_%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:4]
+    return time.strftime("offline_pv_%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:4]
 
 
 def prepare_run_paths(args):
-    run_id = os.environ.get("REINFORCE_RUN_ID") or create_run_id()
+    run_id = os.environ.get("OFFLINE_PV_RUN_ID") or create_run_id()
     run_id = str(run_id).strip().replace("\\", "/").split("/")[-1]
-    if not run_id.startswith("reinforce_"):
-        raise ValueError("system run id must start with reinforce_")
+    if not run_id.startswith("offline_pv_"):
+        raise ValueError("system run id must start with offline_pv_")
     data_dir = os.path.join(DEFAULT_DATA_RUNS_DIR, run_id)
     model_dir = os.path.join(DEFAULT_MODEL_RUNS_DIR, run_id)
     os.makedirs(data_dir, exist_ok=True)
@@ -76,21 +85,16 @@ def prepare_run_paths(args):
     }
 
 
-def atomic_copy(src: str, dst: str):
-    os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
-    tmp = os.path.join(
-        os.path.dirname(dst) or ".",
-        f".{os.path.basename(dst)}.tmp_{os.getpid()}",
-    )
-    try:
-        shutil.copy2(src, tmp)
-        os.replace(tmp, dst)
-    finally:
-        if os.path.exists(tmp):
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
+def require_resnet_pv_linear_model(path: str) -> str:
+    model = load_model(path, device="cpu")
+    arch = model.arch() if hasattr(model, "arch") else {}
+    arch_type = arch.get("type") if isinstance(arch, dict) else None
+    if arch_type != RESNET_PV_LINEAR:
+        raise RuntimeError(
+            "offline_pv only supports resnet_pv_linear checkpoints; "
+            f"got arch_type={arch_type!r} from {path}"
+        )
+    return str(arch_type)
 
 
 def decode_h5_string(value) -> str:
@@ -317,9 +321,9 @@ def legal_policy_candidates(
         except Exception:
             continue
     if not legal_pairs:
-        return [], np.zeros(NUM_ACTIONS, dtype=np.float32), 0.0
+        return [], np.zeros(PV_ACTION_SIZE, dtype=np.float32), 0.0
 
-    state = torch.from_numpy(packed_to_tensor(board_to_packed(board))).unsqueeze(0).to(device)
+    state = torch.from_numpy(PV_STATE_CODEC.tensor_from_board(board)).unsqueeze(0).to(device)
     with torch.no_grad():
         logits, value = model(state)
         logits = logits[0].detach().float().cpu()
@@ -329,7 +333,7 @@ def legal_policy_candidates(
     legal_logits = logits[torch.from_numpy(indices)]
     legal_probs = F.softmax(legal_logits, dim=0).numpy().astype(np.float32)
 
-    dense_policy = np.zeros(NUM_ACTIONS, dtype=np.float32)
+    dense_policy = np.zeros(PV_ACTION_SIZE, dtype=np.float32)
     for index, probability in zip(indices, legal_probs):
         dense_policy[int(index)] = float(probability)
 
@@ -354,9 +358,9 @@ def rl_targets_from_scores(
     reward_scale_cp: float,
     teacher_policy_temp_cp: float,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, float]:
-    candidate_mask = np.zeros(NUM_ACTIONS, dtype=np.uint8)
-    action_rewards = np.zeros(NUM_ACTIONS, dtype=np.float32)
-    teacher_policy = np.zeros(NUM_ACTIONS, dtype=np.float32)
+    candidate_mask = np.zeros(PV_ACTION_SIZE, dtype=np.uint8)
+    action_rewards = np.zeros(PV_ACTION_SIZE, dtype=np.float32)
+    teacher_policy = np.zeros(PV_ACTION_SIZE, dtype=np.float32)
     rows = []
     legal = set(board.legal_moves)
     usable = []
@@ -378,15 +382,15 @@ def rl_targets_from_scores(
         dtype=np.float32,
     )
     teacher_logits -= float(np.max(teacher_logits))
-    teacher_weights = np.exp(teacher_logits).astype(np.float32)
-    teacher_weights /= max(1e-12, float(teacher_weights.sum()))
-    for (move, score), weight in zip(usable, teacher_weights):
+    teacher_probabilities = np.exp(teacher_logits).astype(np.float32)
+    teacher_probabilities /= max(1e-12, float(teacher_probabilities.sum()))
+    for (move, score), probability in zip(usable, teacher_probabilities):
         regret = max(0, int(best_score - score))
         reward = reward_from_cp(score, reward_scale_cp)
         index = move_to_index(move)
         candidate_mask[index] = 1
         action_rewards[index] = float(reward)
-        teacher_policy[index] = float(weight)
+        teacher_policy[index] = float(probability)
         rows.append({
             "move": move.uci(),
             "score_cp": int(score),
@@ -485,7 +489,7 @@ def label_worker(job):
     total_top1_regret = 0.0
     total_actions = 0
     labeled = 0
-    with StockfishTeacher(teacher_config) as teacher:
+    with UciTeacher(teacher_config) as teacher:
         for global_index, fen in specs:
             board = chess.Board(fen)
             candidates, model_policy, model_value = legal_policy_candidates(
@@ -526,7 +530,7 @@ def label_worker(job):
             action_count = int(candidate_mask.sum())
             best_score = int(teacher_result.get("best_score_cp", 0))
             rows.append({
-                "state": board_to_packed(board),
+                "state": PV_STATE_CODEC.encode_board(board),
                 "candidate_mask": candidate_mask,
                 "action_rewards": action_rewards,
                 "teacher_policy": teacher_policy,
@@ -581,7 +585,10 @@ def write_offline_h5(path: str, rows: List[Dict], summary: Dict):
     with h5py.File(path, "w") as h5:
         h5.create_dataset(
             "states",
-            data=np.asarray([row["state"] for row in rows], dtype=np.uint8).reshape(count, 18, 8),
+            data=np.asarray([row["state"] for row in rows], dtype=np.uint8).reshape(
+                count,
+                *PV_STATE_CODEC.storage_shape,
+            ),
             dtype="uint8",
             chunks=True,
             compression="lzf",
@@ -610,7 +617,11 @@ def write_offline_h5(path: str, rows: List[Dict], summary: Dict):
         ]:
             h5.create_dataset(key, data=np.asarray([row[key] for row in rows], dtype=dtype))
         h5.attrs["summary_json"] = json.dumps(summary, ensure_ascii=False)
-        h5.attrs["generator"] = "offline_actor_critic"
+        h5.attrs["generator"] = "offline_pv_actor_critic"
+        h5.attrs["arch_type"] = PV_ARCH_SPEC.name
+        h5.attrs["state_encoding"] = PV_ARCH_SPEC.state_encoding
+        h5.attrs["move_encoding"] = PV_ARCH_SPEC.move_encoding
+        h5.attrs["target_schema"] = "offline_pv_actor_critic"
 
 
 def generate_offline_data(
@@ -629,7 +640,7 @@ def generate_offline_data(
     fens = dedupe_fens([*source_fens, *replay_fens])
     replay_used = max(0, len(fens) - len(dedupe_fens(source_fens)))
     print(
-        "offline reinforce labeling start:",
+        "offline-pv labeling start:",
         f"iteration={iteration}",
         f"model={model_path}",
         f"source={args.fen_source or PGN_PATH}",
@@ -697,7 +708,7 @@ def generate_offline_data(
         "workers": worker_summaries,
     }
     write_offline_h5(output_path, rows, summary)
-    print("offline reinforce label summary:", flush=True)
+    print("offline-pv label summary:", flush=True)
     print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
     return summary
 
@@ -705,6 +716,10 @@ def generate_offline_data(
 class OfflineDataset(Dataset):
     def __init__(self, path: str):
         with h5py.File(path, "r") as h5:
+            if "state_encoding" not in h5.attrs:
+                raise ValueError(f"{path} missing required attr 'state_encoding'")
+            self.state_encoding = str(h5.attrs["state_encoding"])
+            self.state_codec = get_state_codec(self.state_encoding)
             self.states = np.asarray(h5["states"], dtype=np.uint8)
             self.candidate_mask = np.asarray(h5["candidate_mask"], dtype=np.bool_)
             self.action_rewards = np.asarray(h5["action_rewards"], dtype=np.float32)
@@ -716,7 +731,7 @@ class OfflineDataset(Dataset):
 
     def __getitem__(self, index):
         return (
-            torch.from_numpy(packed_to_tensor(self.states[index])),
+            torch.from_numpy(self.state_codec.decode_state(self.states[index])),
             torch.from_numpy(self.candidate_mask[index]),
             torch.from_numpy(self.action_rewards[index]),
             torch.from_numpy(self.teacher_policy[index]),
@@ -761,17 +776,48 @@ def actor_critic_losses(
     entropy = -(policy * log_policy).sum(dim=1).mean()
     teacher_target = teacher_policy / teacher_policy.sum(dim=1, keepdim=True).clamp_min(1e-12)
     teacher_policy_loss = -(teacher_target.detach() * raw_log_policy).sum(dim=1).mean()
+    ranking_loss = pairwise_teacher_ranking_loss(
+        logits=logits,
+        candidate_mask=candidate_mask,
+        action_rewards=action_rewards,
+        min_gap=float(getattr(args, "teacher_rank_min_reward_gap", 0.0)),
+    )
     return (
         actor_loss,
         critic_loss,
         teacher_value_loss,
         entropy,
         teacher_policy_loss,
+        ranking_loss,
         critic_target.mean(),
     )
 
 
-def train_offline_actor_critic(args, source_model: str, data_path: str, candidate_path: str) -> Dict:
+def pairwise_teacher_ranking_loss(
+    logits: torch.Tensor,
+    candidate_mask: torch.Tensor,
+    action_rewards: torch.Tensor,
+    min_gap: float = 0.0,
+) -> torch.Tensor:
+    losses = []
+    threshold = max(0.0, float(min_gap))
+    for row in range(logits.shape[0]):
+        indices = torch.nonzero(candidate_mask[row], as_tuple=False).flatten()
+        if indices.numel() < 2:
+            continue
+        rewards = action_rewards[row, indices]
+        reward_gap = rewards[:, None] - rewards[None, :]
+        better, worse = torch.where(reward_gap > threshold)
+        if better.numel() == 0:
+            continue
+        logit_gap = logits[row, indices[better]] - logits[row, indices[worse]]
+        losses.append(F.softplus(-logit_gap).mean())
+    if not losses:
+        return logits.sum() * 0.0
+    return torch.stack(losses).mean()
+
+
+def train_offline_pv_actor_critic(args, source_model: str, data_path: str, candidate_path: str) -> Dict:
     random.seed(int(args.seed))
     np.random.seed(int(args.seed) % (2 ** 32 - 1))
     torch.manual_seed(int(args.seed))
@@ -834,6 +880,7 @@ def train_offline_actor_critic(args, source_model: str, data_path: str, candidat
                     teacher_value_loss,
                     entropy,
                     teacher_policy_loss,
+                    ranking_loss,
                     mean_reward,
                 ) = actor_critic_losses(
                     logits,
@@ -860,6 +907,7 @@ def train_offline_actor_critic(args, source_model: str, data_path: str, candidat
                     - float(args.entropy_weight) * entropy
                     + float(args.kl_weight) * kl_loss
                     + float(args.teacher_policy_weight) * teacher_policy_loss
+                    + float(getattr(args, "teacher_rank_weight", 0.0)) * ranking_loss
                 )
 
             scaler.scale(loss).backward()
@@ -879,12 +927,13 @@ def train_offline_actor_critic(args, source_model: str, data_path: str, candidat
                 "reward": float(mean_reward.item()),
                 "entropy": float(entropy.item()),
                 "teacher_policy": float(teacher_policy_loss.item()),
+                "teacher_rank": float(ranking_loss.item()),
                 "kl": float(kl_loss.item()),
                 "loss": float(loss.item()),
             }
             if args.log_every > 0 and (step == 1 or step % int(args.log_every) == 0):
                 print(
-                    "offline reinforce train step:",
+                    "offline-pv train step:",
                     f"epoch={epoch}",
                     f"step={step}",
                     f"actor={last_metrics['actor']:.4f}",
@@ -893,6 +942,7 @@ def train_offline_actor_critic(args, source_model: str, data_path: str, candidat
                     f"reward={last_metrics['reward']:+.4f}",
                     f"entropy={last_metrics['entropy']:.4f}",
                     f"teacher_policy={last_metrics['teacher_policy']:.4f}",
+                    f"teacher_rank={last_metrics['teacher_rank']:.4f}",
                     f"kl={last_metrics['kl']:.4f}",
                     f"loss={last_metrics['loss']:.4f}",
                     flush=True,
@@ -906,18 +956,17 @@ def train_offline_actor_critic(args, source_model: str, data_path: str, candidat
     save_model(
         candidate_path,
         student,
-        optimizer=optimizer,
         epoch=max(0, int(args.epochs) - 1),
         global_step=step,
         extra={
-            "type": "offline_actor_critic",
+            "type": "offline_pv_actor_critic",
             "source_model": source_model,
             "offline_data": data_path,
             "last_metrics": last_metrics,
         },
     )
     print(
-        "offline reinforce candidate saved:",
+        "offline-pv candidate saved:",
         f"path={candidate_path}",
         f"steps={step}",
         flush=True,
@@ -952,7 +1001,7 @@ def teacher_validation_worker(job):
     teacher_values = []
     teacher_best_topk_hits = 0
     teacher_best_action_hits = 0
-    with StockfishTeacher(teacher_config) as teacher:
+    with UciTeacher(teacher_config) as teacher:
         for global_index, fen in specs:
             board = chess.Board(fen)
             candidates, model_policy, model_value = legal_policy_candidates(
@@ -1184,7 +1233,7 @@ def evaluate_teacher_validation(args, candidate_path: str, baseline_path: str) -
 
     fens = load_validation_fens(args)
     print(
-        "offline reinforce teacher validation start:",
+        "offline-pv teacher validation start:",
         f"source={args.validation_source or args.fen_source or PGN_PATH}",
         f"positions={len(fens)}",
         f"topk={args.validation_topk}",
@@ -1243,7 +1292,7 @@ def evaluate_teacher_validation(args, candidate_path: str, baseline_path: str) -
         ),
     }
     result = attach_teacher_validation_acceptance(args, result)
-    print("offline reinforce teacher validation summary:", flush=True)
+    print("offline-pv teacher validation summary:", flush=True)
     print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
     return result
 
@@ -1300,7 +1349,7 @@ def evaluate_candidate(
             arena_fens_path(data_run_dir, iteration),
         )
         metrics["arena_replay"] = replay_summary
-        print("offline reinforce arena replay fens:", flush=True)
+        print("offline-pv arena replay fens:", flush=True)
         print(json.dumps(replay_summary, ensure_ascii=False, indent=2), flush=True)
 
     metrics = attach_arena_acceptance(
@@ -1309,7 +1358,7 @@ def evaluate_candidate(
         min_acpl_improvement=args.eval_min_acpl_improvement,
         min_accuracy_improvement=args.eval_min_accuracy_improvement,
     )
-    print("offline reinforce arena summary:", flush=True)
+    print("offline-pv arena summary:", flush=True)
     print(json.dumps(metrics, ensure_ascii=False, indent=2), flush=True)
     return metrics
 
@@ -1317,17 +1366,19 @@ def evaluate_candidate(
 def run(args):
     if not os.path.exists(args.model):
         raise FileNotFoundError(f"model not found: {args.model}")
+    arch_type = require_resnet_pv_linear_model(args.model)
 
     paths = prepare_run_paths(args)
     current_model = paths["current_model"]
     shutil.copy2(args.model, current_model)
-    print("offline reinforce current model initialized:", current_model, flush=True)
-    print("offline reinforce run id:", paths["run_id"], flush=True)
-    print("offline reinforce data run directory:", paths["data_run_dir"], flush=True)
-    print("offline reinforce model run directory:", paths["model_run_dir"], flush=True)
+    print("offline-pv current model initialized:", current_model, flush=True)
+    print("offline-pv run id:", paths["run_id"], flush=True)
+    print("offline-pv data run directory:", paths["data_run_dir"], flush=True)
+    print("offline-pv model run directory:", paths["model_run_dir"], flush=True)
     print(
-        "offline reinforce start:",
+        "offline-pv start:",
         f"model={args.model}",
+        f"arch_type={arch_type}",
         f"iterations={args.iterations}",
         f"positions_per_iter={args.positions_per_iter}",
         f"device={args.device}",
@@ -1337,7 +1388,7 @@ def run(args):
 
     summaries = []
     for iteration in range(1, int(args.iterations) + 1):
-        print(f"offline reinforce iteration {iteration}", flush=True)
+        print(f"offline-pv iteration {iteration}", flush=True)
         data_path = os.path.join(paths["data_run_dir"], f"offline_iter_{iteration:03d}.h5")
         candidate_path = os.path.join(
             paths["model_run_dir"],
@@ -1352,7 +1403,7 @@ def run(args):
             data_run_dir=paths["data_run_dir"],
         )
 
-        train_summary = train_offline_actor_critic(
+        train_summary = train_offline_pv_actor_critic(
             args,
             source_model=current_model,
             data_path=data_path,
@@ -1377,10 +1428,15 @@ def run(args):
         eval_summary["teacher_validation_accepted"] = teacher_validation_accepted
         eval_summary["final_accepted"] = accepted
         if accepted:
-            atomic_copy(candidate_path, current_model)
-            print("offline reinforce promoted:", current_model, flush=True)
+            promotion = atomic_copy_with_backup(
+                candidate_path,
+                current_model,
+                make_backup=False,
+            )
+            eval_summary["promotion"] = promotion
+            print("offline-pv promoted:", current_model, flush=True)
         else:
-            print("offline reinforce candidate rejected:", candidate_path, flush=True)
+            print("offline-pv candidate rejected:", candidate_path, flush=True)
 
         iteration_summary = {
             "iteration": int(iteration),
@@ -1404,19 +1460,22 @@ def run(args):
                 ensure_ascii=False,
                 indent=2,
             )
-        print("offline reinforce iteration summary:", flush=True)
+        print("offline-pv iteration summary:", flush=True)
         print(json.dumps(iteration_summary, ensure_ascii=False, indent=2), flush=True)
 
-    print("offline reinforce complete:", current_model, flush=True)
+    print("offline-pv complete:", current_model, flush=True)
 
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Offline Stockfish-rewarded actor-critic training for ChessAI."
+        description=(
+            "Offline-PV UCI-rewarded actor-critic training for "
+            "resnet_pv_linear ChessAI checkpoints."
+        )
     )
     parser.add_argument("--model", default=MODEL_PATH)
     parser.add_argument("--fen-source", default=PGN_PATH)
-    parser.add_argument("--uci", default=STOCKFISH_PATH)
+    parser.add_argument("--uci", default=UCI_PATH)
     parser.add_argument("--device", default=DEVICE)
     parser.add_argument("--label-device", default=None)
     parser.add_argument("--validation-device", default=None)
@@ -1451,6 +1510,8 @@ def build_parser():
     )
     parser.add_argument("--reward-scale-cp", type=float, default=600.0)
     parser.add_argument("--teacher-policy-weight", type=float, default=0.10)
+    parser.add_argument("--teacher-rank-weight", type=float, default=0.10)
+    parser.add_argument("--teacher-rank-min-reward-gap", type=float, default=0.0)
     parser.add_argument("--teacher-value-weight", type=float, default=0.50)
     parser.add_argument("--teacher-policy-temp-cp", type=float, default=150.0)
     parser.add_argument("--actor-exploration-mix", type=float, default=0.05)

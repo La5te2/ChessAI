@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import random
 import shlex
 import sys
 from dataclasses import dataclass
@@ -10,8 +11,8 @@ from typing import Dict, List, Optional, Set
 import chess
 
 from config import CPUCT, DEFAULT_SIMS, DEVICE
+from decision import profile_for_model
 from model import load_model
-from move_encoder import move_to_index
 from search import SearchOptions, UnifiedSearch, VALID_SEARCH_TYPES
 
 
@@ -77,6 +78,7 @@ class UCIEngine:
         self.board = chess.Board()
         self.debug = False
         self.model = None
+        self.codec = None
         self.loaded_model_path: Optional[str] = None
         self.loaded_device: Optional[str] = None
 
@@ -115,6 +117,7 @@ class UCIEngine:
 
     def _mark_model_dirty(self):
         self.model = None
+        self.codec = None
         self.loaded_model_path = None
         self.loaded_device = None
 
@@ -191,6 +194,7 @@ class UCIEngine:
         device = self.config.device.strip() or DEVICE
         if path.lower() == "none":
             self.model = None
+            self.codec = None
             self.loaded_model_path = path
             self.loaded_device = device
             return None
@@ -205,6 +209,7 @@ class UCIEngine:
 
         with contextlib.redirect_stdout(sys.stderr):
             self.model = load_model(path, device=device)
+        self.codec = profile_for_model(self.model).move_codec
         self.loaded_model_path = path
         self.loaded_device = device
         return self.model
@@ -402,15 +407,19 @@ class UCIEngine:
             move = result.move
 
             if allowed is not None and move not in allowed:
-                candidates = sorted(
-                    allowed,
-                    key=lambda candidate: (
-                        float(result.policy[move_to_index(candidate)]),
-                        candidate.uci(),
-                    ),
-                    reverse=True,
-                )
-                move = candidates[0] if candidates else None
+                candidates = list(allowed)
+                if self.codec is None:
+                    move = random.choice(candidates) if candidates else None
+                else:
+                    candidates = sorted(
+                        candidates,
+                        key=lambda candidate: (
+                            float(result.policy[self.codec.move_to_index(candidate)]),
+                            candidate.uci(),
+                        ),
+                        reverse=True,
+                    )
+                    move = candidates[0] if candidates else None
 
             if self.config.log_search or self.debug:
                 info = result.info

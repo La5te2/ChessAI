@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import math
+import random
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -16,11 +17,10 @@ from config import (
     DEFAULT_SIMS,
     DEVICE,
     MODEL_PATH,
-    NUM_ACTIONS,
 )
+from decision import profile_for_model
 from evaluator import BatchedEvaluator
 from model import load_model
-from move_encoder import move_to_index, policy_to_legal_distribution
 
 def count_pieces(board: chess.Board) -> int:
     return len(board.piece_map())
@@ -49,15 +49,15 @@ def terminal_value_side_to_move(board: chess.Board):
     return 1.0 if outcome.winner == board.turn else -1.0
 
 
-def normalize_policy(policy: np.ndarray, board: chess.Board) -> np.ndarray:
-    output = np.zeros(NUM_ACTIONS, dtype=np.float32)
+def normalize_policy(policy: np.ndarray, board: chess.Board, codec) -> np.ndarray:
+    output = np.zeros(codec.action_size, dtype=np.float32)
     legal = list(board.legal_moves)
     if not legal:
         return output
 
     total = 0.0
     for move in legal:
-        index = move_to_index(move)
+        index = codec.move_to_index(move)
         value = max(0.0, float(policy[index])) if index < len(policy) else 0.0
         output[index] = value
         total += value
@@ -65,7 +65,7 @@ def normalize_policy(policy: np.ndarray, board: chess.Board) -> np.ndarray:
     if total <= 0:
         probability = 1.0 / len(legal)
         for move in legal:
-            output[move_to_index(move)] = probability
+            output[codec.move_to_index(move)] = probability
     else:
         output /= total
     return output
@@ -101,8 +101,9 @@ def normalize_search_type(search_type: str) -> str:
 
 
 class MCTSNode:
-    def __init__(self, prior=0.0):
+    def __init__(self, prior=0.0, profile_state: Optional[Dict[str, Any]] = None):
         self.prior = float(prior)
+        self.profile_state = dict(profile_state or {})
         self.visit_count = 0
         self.value_sum = 0.0
         self.virtual_visits = 0
@@ -166,6 +167,9 @@ class MCTS:
         self.model = model
         self.options = options
         self.device = str(device)
+        self.profile = profile_for_model(model)
+        self.codec = self.profile.move_codec
+        self.action_size = self.codec.action_size
         self.evaluator = BatchedEvaluator(
             model,
             device=self.device,
@@ -198,7 +202,12 @@ class MCTS:
         )
 
     def _ucb_score(self, parent: MCTSNode, child: MCTSNode):
-        q_from_parent = -child.q if child.visit_count > 0 else self._fpu_value(parent)
+        fpu = self._fpu_value(parent)
+        q_from_parent = (
+            -child.q
+            if child.visit_count > 0
+            else self.profile.unvisited_q_from_parent(fpu, child)
+        )
         visits = child.visit_count + child.virtual_visits
         exploration = (
             self._scheduled_c_puct(parent)
@@ -219,11 +228,18 @@ class MCTS:
             ),
         )
 
-    def _expand_from_policy(self, node: MCTSNode, board: chess.Board, policy):
-        priors = policy_to_legal_distribution(policy, board, normalize=True)
+    def _expand_from_policy(
+        self,
+        node: MCTSNode,
+        board: chess.Board,
+        policy,
+        expansion_payload=None,
+    ):
+        priors = self.codec.policy_to_legal_distribution(policy, board, normalize=True)
         if not node.expanded():
             for move, prior in priors.items():
-                node.children[move] = MCTSNode(prior=prior)
+                profile_state = self.profile.child_profile_state(expansion_payload, move)
+                node.children[move] = MCTSNode(prior=prior, profile_state=profile_state)
             self.expanded_nodes += 1
 
     @staticmethod
@@ -257,14 +273,14 @@ class MCTS:
         }
 
     def _policy_from_root(self, root: MCTSNode, board: chess.Board, root_policy):
-        policy = np.zeros(NUM_ACTIONS, dtype=np.float32)
+        policy = np.zeros(self.action_size, dtype=np.float32)
         for move, child in root.children.items():
-            policy[move_to_index(move)] = (
+            policy[self.codec.move_to_index(move)] = (
                 float(child.visit_count) + max(0.0, float(child.prior))
             )
         if float(policy.sum()) <= 0:
             policy = np.asarray(root_policy, dtype=np.float32)
-        return normalize_policy(policy, board)
+        return normalize_policy(policy, board, self.codec)
 
     def _select_leaf(self, root: MCTSNode, root_board: chess.Board):
         node = root
@@ -302,6 +318,7 @@ class MCTS:
             stats = {
                 "sims_completed": 0,
                 "dynamic_target": 0,
+                "decision_profile": self.profile.name,
                 "uncertainty": 0.0,
                 "expanded_nodes": 0,
                 "nn_batches": 0,
@@ -312,19 +329,20 @@ class MCTS:
                 "root_fpu": self._fpu_value(root),
             }
             stats.update(self._depth_stats())
-            return np.zeros(NUM_ACTIONS, dtype=np.float32), terminal, stats
+            return np.zeros(self.action_size, dtype=np.float32), terminal, stats
 
-        root_policy, root_value = self.evaluator.evaluate_one(board)
+        root_policy, root_value, root_payload = self.evaluator.evaluate_one_full(board)
         self.nn_batches += 1
-        self._expand_from_policy(root, board, root_policy)
+        self._expand_from_policy(root, board, root_policy, root_payload)
 
         soft_cap = max(0, int(self.options.mcts_sims))
         batch_size = max(1, int(self.options.mcts_batch_size))
         if soft_cap <= 0:
-            policy = normalize_policy(root_policy, board)
+            policy = normalize_policy(root_policy, board, self.codec)
             stats = {
                 "sims_completed": 0,
                 "dynamic_target": 0,
+                "decision_profile": self.profile.name,
                 "uncertainty": root_uncertainty(root),
                 "expanded_nodes": self.expanded_nodes,
                 "nn_batches": self.nn_batches,
@@ -373,6 +391,7 @@ class MCTS:
             stats = {
                 "sims_completed": int(sims_completed),
                 "dynamic_target": int(dynamic_target),
+                "decision_profile": self.profile.name,
                 "uncertainty": float(root_uncertainty(root)),
                 "expanded_nodes": int(self.expanded_nodes),
                 "nn_batches": int(self.nn_batches),
@@ -439,14 +458,18 @@ class MCTS:
                 selected.append((leaf, leaf_board, path))
 
             if selected:
-                policies, values = self.evaluator.evaluate_boards(
+                evaluation = self.evaluator.evaluate_boards_full(
                     [item[1] for item in selected]
                 )
                 self.nn_batches += 1
-                for (leaf, leaf_board, path), policy, value in zip(
-                    selected, policies, values
-                ):
-                    self._expand_from_policy(leaf, leaf_board, policy)
+                for index, (leaf, leaf_board, path) in enumerate(selected):
+                    policy = evaluation.policies[index]
+                    value = evaluation.values[index]
+                    payload = self.profile.payload_for_index(
+                        evaluation.expansion_payload,
+                        index,
+                    )
+                    self._expand_from_policy(leaf, leaf_board, policy, payload)
                     self._clear_virtual(path)
                     self._backpropagate(path, float(value))
                     sims_completed += 1
@@ -468,6 +491,7 @@ class MCTS:
         stats = {
             "sims_completed": int(sims_completed),
             "dynamic_target": int(dynamic_target),
+            "decision_profile": self.profile.name,
             "uncertainty": float(root_uncertainty(root)),
             "expanded_nodes": int(self.expanded_nodes),
             "nn_batches": int(self.nn_batches),
@@ -493,19 +517,32 @@ class UnifiedSearch:
         elif device is None:
             device = DEVICE
         self.device = str(device)
+        self.profile = profile_for_model(self.model) if self.model is not None else None
+        self.codec = self.profile.move_codec if self.profile is not None else None
         if self.model is not None:
             self.model.to(self.device)
             self.model.eval()
 
+    def _uniform_probability(self, board: chess.Board) -> float:
+        return 1.0 / max(1, board.legal_moves.count())
+
+    def _policy_value_for_move(
+        self,
+        board: chess.Board,
+        policy: np.ndarray,
+        move: chess.Move,
+    ) -> float:
+        if self.codec is None:
+            return self._uniform_probability(board)
+        index = self.codec.move_to_index(move)
+        return float(policy[index]) if index < len(policy) else 0.0
+
     def _policy_only(self, board: chess.Board):
         legal = list(board.legal_moves)
-        policy = np.zeros(NUM_ACTIONS, dtype=np.float32)
+        policy = np.zeros(self.codec.action_size if self.codec is not None else 0, dtype=np.float32)
         if not legal:
             return policy, 0.0
         if self.model is None:
-            probability = 1.0 / len(legal)
-            for move in legal:
-                policy[move_to_index(move)] = probability
             return policy, 0.0
 
         evaluator = BatchedEvaluator(
@@ -514,17 +551,18 @@ class UnifiedSearch:
             batch_size=max(1, int(self.options.mcts_batch_size)),
         )
         raw_policy, value = evaluator.evaluate_one(board)
-        return normalize_policy(raw_policy, board), float(value)
+        return normalize_policy(raw_policy, board, self.codec), float(value)
 
-    @staticmethod
-    def _select_top_move(board, policy):
+    def _select_top_move(self, board, policy):
         legal = list(board.legal_moves)
         if not legal:
             return None
+        if self.codec is None:
+            return random.choice(legal)
         return max(
             legal,
             key=lambda move: (
-                max(0.0, float(policy[move_to_index(move)])),
+                max(0.0, self._policy_value_for_move(board, policy, move)),
                 move.uci(),
             ),
         )
@@ -547,34 +585,36 @@ class UnifiedSearch:
 
         root_node = stats.get("root_node")
         mcts_move = self._select_top_move(root_board, policy)
-        move = self._select_top_move(root_board, policy)
+        move = mcts_move
         if move is None or move not in legal:
             move = max(
                 legal,
                 key=lambda candidate: (
-                    float(policy[move_to_index(candidate)]),
+                    self._policy_value_for_move(root_board, policy, candidate),
                     candidate.uci(),
                 ),
             )
 
         root_lines = []
         for candidate in legal:
-            index = move_to_index(candidate)
+            policy_value = self._policy_value_for_move(root_board, policy, candidate)
             child = (
                 root_node.children.get(candidate)
                 if root_node is not None
                 else None
             )
-            root_lines.append({
+            row = {
                 "move": candidate.uci(),
                 "san": safe_san(root_board, candidate),
                 "selected": candidate == move,
-                "p": float(policy[index]),
-                "mcts_p": float(policy[index]),
+                "p": float(policy_value),
+                "mcts_p": float(policy_value),
                 "visits": int(child.visit_count) if child is not None else 0,
-                "prior": float(child.prior) if child is not None else float(policy[index]),
+                "prior": float(child.prior) if child is not None else float(policy_value),
                 "q": float(-child.q) if child is not None else 0.0,
-            })
+            }
+            row.update(self.profile.root_row_fields(child) if self.profile is not None else {})
+            root_lines.append(row)
         root_lines.sort(
             key=lambda row: (
                 row["selected"],
@@ -595,6 +635,12 @@ class UnifiedSearch:
 
         info = {
             "search_type": search_type,
+            "decision_profile": str(
+                stats.get(
+                    "decision_profile",
+                    self.profile.name if self.profile is not None else "uniform_legal",
+                )
+            ),
             "partial": bool(partial),
             "cancelled": bool(stats.get("cancelled", False)),
             "value": float(value),
@@ -621,7 +667,7 @@ class UnifiedSearch:
             "timeout": bool(timed_out),
             "elapsed_ms": round(elapsed_ms, 2),
             "selection": {
-                "selection_mode": "top1",
+                "selection_mode": "uniform_legal" if self.codec is None else "top1",
                 "selected_move": move.uci(),
             },
             "root": root_lines[: max(1, int(self.options.root_topn))],
@@ -663,6 +709,7 @@ class UnifiedSearch:
             stats = {
                 "sims_completed": 0,
                 "dynamic_target": 0,
+                "decision_profile": self.profile.name if self.profile is not None else "uniform_legal",
                 "uncertainty": 0.0,
                 "expanded_nodes": 0,
                 "nn_batches": 1 if self.model is not None else 0,
@@ -811,6 +858,7 @@ def main():
     result = UnifiedSearch(model, options, device=args.device).search(board)
     print("fen:", board.fen())
     print("best:", result.info["best_san"], result.move.uci())
+    print("decision_profile:", result.info["decision_profile"])
     print("value:", result.value)
     print(
         "mcts:",
@@ -830,10 +878,13 @@ def main():
     print("root:")
     for index, row in enumerate(result.info.get("root", []), 1):
         marker = "*" if row.get("selected") else " "
+        extra = ""
+        if "adv" in row:
+            extra += f" adv={float(row['adv']):+.4f}"
         print(
             f"{marker}{index:2d}. {row['san']:8s} {row['move']:5s} "
             f"p={row['p']:.5f} mcts={row['mcts_p']:.5f} "
-            f"visits={row['visits']:4d} q={row['q']:+.4f}"
+            f"visits={row['visits']:4d} q={row['q']:+.4f}{extra}"
         )
 
 

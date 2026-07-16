@@ -4,6 +4,12 @@ import os
 import torch
 from torch.utils.data import DataLoader
 
+from architectures import (
+    DEFAULT_ARCH_TYPE,
+    RESNET_PVA_GAD,
+    RESNET_PV_LINEAR,
+    SUPPORTED_ARCH_TYPES,
+)
 from config import (
     BATCH_SIZE,
     DEVICE,
@@ -16,7 +22,74 @@ from config import (
     WEIGHT_DECAY,
 )
 from data import H5ChessDataset
-from model import DEFAULT_ARCH_TYPE, SUPPORTED_ARCH_TYPES, create_model, save_model
+from model import (
+    create_model,
+    save_model,
+)
+
+
+def _to_device(batch, device, pin_memory):
+    return tuple(item.to(device, non_blocking=pin_memory) for item in batch)
+
+
+def _resnet_pv_linear_loss(model, batch, losses, args, device, pin_memory):
+    state, move, value_target = _to_device(batch, device, pin_memory)
+    heads = model.forward_heads(state)
+    policy_loss = losses["policy"](heads["policy_logits"], move)
+    value_loss = losses["value"](heads["value"].squeeze(1), value_target)
+    loss = policy_loss + args.value_weight * value_loss
+    return loss, {
+        "policy": float(policy_loss.item()),
+        "value": float(value_loss.item()),
+        "loss": float(loss.item()),
+    }
+
+
+def _resnet_pva_gad_loss(model, batch, losses, args, device, pin_memory):
+    state, move, value_target, adv_move, adv_target, adv_weight = _to_device(
+        batch,
+        device,
+        pin_memory,
+    )
+    heads = model.forward_heads(state)
+    policy_loss = losses["policy"](heads["policy_logits"], move)
+    value_loss = losses["value"](heads["value"].squeeze(1), value_target)
+    chosen_advantage = heads["advantages"].gather(1, adv_move.unsqueeze(1)).squeeze(1)
+    advantage_loss = (
+        ((chosen_advantage - adv_target) ** 2) * adv_weight
+    ).sum() / torch.clamp(adv_weight.sum(), min=1.0)
+    loss = (
+        policy_loss
+        + args.value_weight * value_loss
+        + args.advantage_weight * advantage_loss
+    )
+    return loss, {
+        "policy": float(policy_loss.item()),
+        "value": float(value_loss.item()),
+        "advantage": float(advantage_loss.item()),
+        "loss": float(loss.item()),
+    }
+
+
+TRAIN_HANDLERS = {
+    RESNET_PV_LINEAR: {
+        "loss": _resnet_pv_linear_loss,
+        "metrics": ("policy", "value"),
+        "start_fields": (),
+    },
+    RESNET_PVA_GAD: {
+        "loss": _resnet_pva_gad_loss,
+        "metrics": ("policy", "value", "advantage"),
+        "start_fields": ("advantage_weight",),
+    },
+}
+
+
+def _handler_for_arch(arch_type: str):
+    try:
+        return TRAIN_HANDLERS[arch_type]
+    except KeyError as exc:
+        raise ValueError(f"no train handler registered for {arch_type!r}") from exc
 
 
 def train(args):
@@ -24,19 +97,34 @@ def train(args):
     device = str(args.device)
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     pin_memory = device.startswith("cuda")
-    print(
+    handler = _handler_for_arch(args.arch_type)
+    start_parts = [
         "training start:",
         f"data={args.data}",
         f"out={output_path}",
+        f"arch_type={args.arch_type}",
         f"device={device}",
         f"epochs={args.epochs}",
         f"batch_size={args.batch_size}",
         f"max_steps={args.max_steps}",
+    ]
+    for field in handler["start_fields"]:
+        start_parts.append(f"{field}={getattr(args, field)}")
+    print(*start_parts, flush=True)
+
+    dataset = H5ChessDataset(args.data, arch_type=args.arch_type)
+    print(
+        "training data:",
+        f"arch_type={dataset.arch_type}",
+        f"state_encoding={dataset.state_encoding}",
+        f"move_encoding={dataset.move_encoding}",
+        f"target_schema={dataset.target_schema}",
+        f"datasets={','.join(dataset.datasets)}",
         flush=True,
     )
 
     loader = DataLoader(
-        H5ChessDataset(args.data),
+        dataset,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.workers,
@@ -50,21 +138,26 @@ def train(args):
         blocks=args.blocks,
         device=device,
     )
-    print(
+    model_arch = model.arch()
+    model_parts = [
         "created model:",
         f"arch_type={args.arch_type}",
         f"channels={args.channels}",
         f"blocks={args.blocks}",
-        flush=True,
-    )
+    ]
+    if "attention_blocks" in model_arch:
+        model_parts.append(f"attention_blocks={model_arch['attention_blocks']}")
+    print(*model_parts, flush=True)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
-    policy_loss_fn = torch.nn.CrossEntropyLoss()
-    value_loss_fn = torch.nn.MSELoss()
+    losses = {
+        "policy": torch.nn.CrossEntropyLoss(),
+        "value": torch.nn.MSELoss(),
+    }
     amp_enabled = bool(args.amp and device.startswith("cuda"))
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
@@ -73,24 +166,20 @@ def train(args):
     model.train()
 
     for epoch in range(args.epochs):
-        total_policy = 0.0
-        total_value = 0.0
+        totals = {name: 0.0 for name in handler["metrics"]}
         batches = 0
 
-        for state, move, value_target in loader:
-            state = state.to(device, non_blocking=pin_memory)
-            move = move.to(device, non_blocking=pin_memory)
-            value_target = value_target.to(device, non_blocking=pin_memory)
-
+        for batch in loader:
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", enabled=amp_enabled):
-                policy_logits, value = model(state)
-                policy_loss = policy_loss_fn(policy_logits, move)
-                value_loss = value_loss_fn(
-                    value.squeeze(1),
-                    value_target,
+                loss, metrics = handler["loss"](
+                    model,
+                    batch,
+                    losses,
+                    args,
+                    device,
+                    pin_memory,
                 )
-                loss = policy_loss + args.value_weight * value_loss
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -98,8 +187,8 @@ def train(args):
 
             global_step += 1
             batches += 1
-            total_policy += float(policy_loss.item())
-            total_value += float(value_loss.item())
+            for name in handler["metrics"]:
+                totals[name] += float(metrics[name])
             if (
                 args.log_every > 0
                 and (
@@ -107,15 +196,15 @@ def train(args):
                     or global_step % args.log_every == 0
                 )
             ):
-                print(
+                parts = [
                     "train step:",
                     f"epoch={epoch}",
                     f"global_step={global_step}",
-                    f"policy={policy_loss.item():.4f}",
-                    f"value={value_loss.item():.4f}",
-                    f"loss={loss.item():.4f}",
-                    flush=True,
-                )
+                ]
+                for name in handler["metrics"]:
+                    parts.append(f"{name}={metrics[name]:.4f}")
+                parts.append(f"loss={metrics['loss']:.4f}")
+                print(*parts, flush=True)
 
             if args.save_every > 0 and global_step % args.save_every == 0:
                 save_model(
@@ -143,12 +232,13 @@ def train(args):
             global_step=global_step,
             extra={"type": "supervised"},
         )
-        print(
-            f"epoch={epoch}, steps={global_step}, "
-            f"policy={total_policy / max(1, batches):.4f}, "
-            f"value={total_value / max(1, batches):.4f}",
-            flush=True,
-        )
+        parts = [
+            f"epoch={epoch}",
+            f"steps={global_step}",
+        ]
+        for name in handler["metrics"]:
+            parts.append(f"{name}={totals[name] / max(1, batches):.4f}")
+        print(", ".join(parts), flush=True)
         if stop:
             break
 
@@ -166,6 +256,7 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=LR)
     parser.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY)
     parser.add_argument("--value-weight", type=float, default=VALUE_LOSS_WEIGHT)
+    parser.add_argument("--advantage-weight", type=float, default=VALUE_LOSS_WEIGHT)
     parser.add_argument(
         "--arch-type",
         choices=sorted(SUPPORTED_ARCH_TYPES),

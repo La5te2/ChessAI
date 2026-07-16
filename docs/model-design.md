@@ -18,6 +18,37 @@ Gadidae 当前已经是一个可以下棋的神经网络引擎原型，但如果
 - 能在单 GPU 或 CPU 可承受的资源下验证。
 - 能解释为什么模型在 `search=closed` 和 `MCTS` 下都变强。
 
+## 近期取舍
+
+当前默认实现是 `resnet_pv_linear`，`resnet_pva_gad` 是仍需实验验证的半 Chessformer 候选：
+
+```text
+ResNet trunk
+  -> 6 geometry self-attention blocks
+  -> source-destination policy / dueling advantage head
+  -> token value head
+```
+
+对应代码架构名：
+
+```text
+resnet_pva_gad
+```
+
+这个候选把三个低风险改动合在一起：
+
+- `geometry attention`：把同行、同列、斜线、马步、王步和距离关系作为 attention bias。
+- `source-destination policy head`：使用 `64x64 + 64x9` action space，贴近棋子从源格到目标格的动作结构。
+- `dueling advantage head`：单独输出 `A(s,a)`，表达同一局面内某个动作的相对优势。
+
+暂缓方向：
+
+- `Search-Consistency Training` 需要额外采样 closed / low-sim / high-sim 输出，成本高，并且当前无法证明高 sims 决策稳定更好。
+- `Search-Aware Model` 与 `search-gain-head` 很理想，但训练信号难定义，先不作为近期目标。
+- `Piece-Token Transformer` 作为第三类模型路线，等输入、mask、policy head 重新设计后再做。
+- `NNUE-inspired` 作为独立 CPU 模型路线，目标是 CPU 高速评估和增量更新。
+- 基于高 sims 选择的训练目标暂不推进。
+
 ## 当前基线
 
 当前模型是残差 CNN：
@@ -33,16 +64,18 @@ Gadidae 当前已经是一个可以下棋的神经网络引擎原型，但如果
 当前训练大致分两层：
 
 - `train.py`：从人类棋谱监督学习 policy，value 来自棋局结果。
-- `reinforce.py`：从 PGN/H5/FEN 抽局面，让当前模型提出候选走法，再由 Stockfish 评价候选，生成 reward / teacher policy / teacher value，用离线 actor-critic 方式训练。
+- `offline_pv.py`：从 PGN/H5/FEN 抽局面，让 `resnet_pv_linear` 当前模型提出候选走法，再由 Stockfish 评价候选，生成 reward / teacher policy / teacher value，用离线 actor-critic 方式训练。
 
 当前搜索大致是：
 
 - `closed`：直接使用模型 policy/value。
 - `only-mcts`：使用模型 policy/value 引导 MCTS。
 
+决策层按 checkpoint `arch.type` 分派。`resnet_pv_linear` 的 profile 使用 `alphazero_64x73` policy/value 与 FPU，`resnet_pva_gad` 的 profile 使用 `sd_64x64_underpromo9` policy/value/advantage，并用 FPU + advantage 初始化未访问动作。
+
 这说明当前瓶颈不只是搜索参数，而是模型对“某一步棋到底好不好”的内部表示还不够强。
 
-## 方向一：Action-Conditioned Value / Q Head
+## 方向一：Action-Conditioned Advantage Head
 
 这是最值得优先考虑的方向。
 
@@ -63,35 +96,35 @@ q(s, a): 当前局面下走某一步之后，这一步本身有多好
 
 ### 为什么它更通用
 
-`Q(s, a)` 不是国际象棋专用概念。任何决策系统都可以使用：
+`A(s, a)` 不是国际象棋专用概念。任何决策系统都可以使用：
 
 - 当前状态 `s`
 - 可选动作 `a`
-- 动作价值 `Q(s, a)`
+- 动作价值 `A(s, a)`
 
 这比 tactic 更接近通用方法。
 
 ### 怎么落到当前项目
 
-可以给模型增加一个 `q_head`：
+可以给模型增加一个 `advantage_head`：
 
 ```text
 shared trunk
   -> policy logits: 4672
   -> value: 1
-  -> q values: 4672
+  -> advantage values: 4672
 ```
 
-其中 `q_head[index(move)]` 直接估计该走法的连续质量，可以用 Stockfish regret 转换成目标：
+其中 `advantage_head[index(move)]` 直接估计该走法相对同局面候选动作的质量，可以用 Stockfish regret 转换成目标：
 
 ```text
-q_target = f(regret_cp)
+advantage_target = f(regret_cp)
 ```
 
 例如：
 
 ```text
-q_target = tanh((best_score_cp - move_score_cp) / scale)
+advantage_target = -tanh(regret_cp / scale)
 ```
 
 或者保持和当前 reward 一致：
@@ -104,10 +137,10 @@ reward = 1 - clamp(regret_cp / reward_scale_cp, 0, 2)
 
 ### 对 MCTS 的作用
 
-当前 MCTS 中，未访问子节点的初始价值主要依赖 FPU 和父节点估计。加入 `q_head` 后，可以改成：
+当前 MCTS 中，未访问子节点的初始价值主要依赖 FPU 和父节点估计。加入 `advantage_head` 后，可以改成：
 
 ```text
-child_initial_q = q_head(s, a)
+child_initial_q = FPU(s) + advantage_head(s, a)
 ```
 
 这会直接改善：
@@ -119,9 +152,9 @@ child_initial_q = q_head(s, a)
 
 ### 主要风险
 
-- `q_head` 输出 4672 个动作值，会增加参数和显存。
+- `advantage_head` 输出 4672 个动作值，会增加参数和显存。
 - 只有 top-k 被教师机评价，未评价动作必须 mask。
-- 如果 reward scale 设计不好，Q 会变成粗糙二分类。
+- 如果 reward scale 设计不好，advantage 会变成粗糙二分类。
 
 ### 优先级
 
@@ -131,10 +164,10 @@ child_initial_q = q_head(s, a)
 
 ## 方向二：Dueling Policy-Value-Q Architecture
 
-可以把 `Q(s, a)` 拆成：
+可以把 `A(s, a)` 拆成：
 
 ```text
-Q(s, a) = V(s) + A(s, a)
+A(s, a) = V(s) + A(s, a)
 ```
 
 其中：
@@ -146,7 +179,7 @@ Q(s, a) = V(s) + A(s, a)
 
 ### 为什么它适合当前项目
 
-国际象棋里很多局面本身已经很差或很好。模型如果直接学 `Q(s, a)`，可能会把局面价值和动作质量混在一起。
+国际象棋里很多局面本身已经很差或很好。模型如果直接学 `A(s, a)`，可能会把局面价值和动作质量混在一起。
 
 例如：
 
@@ -167,24 +200,24 @@ Q(s, a) = V(s) + A(s, a)
 ```text
 shared trunk
   -> value head V(s)
+  -> value head V(s)
   -> advantage head A(s, a)
-  -> q head Q(s, a) = V(s) + A(s, a) - mean_legal(A)
   -> policy head
 ```
 
 ### 对训练的要求
 
-需要让 `value` 学教师机局面评价，让 `advantage/q` 学候选动作 regret。
+需要让 `value` 学教师机局面评价，让 `advantage` 学候选动作 regret。
 
 这比单纯 policy distillation 更清楚：
 
 - policy 学“该下什么”。
 - value 学“局面怎样”。
-- q/advantage 学“这一步相对怎样”。
+- advantage 学“这一步相对怎样”。
 
 ### 优先级
 
-高，但建议在普通 `q_head` 跑通后再做。
+高。
 
 ## 方向三：Search-Consistency Training
 
@@ -250,7 +283,7 @@ Stockfish/evaluator 提供质量评价。
 
 中高。
 
-它和 `q_head` 可以结合，但单独做可能仍然被弱 value 限制。
+它和 `advantage_head` 可以结合，但单独做可能仍然被弱 value 限制。
 
 ## 方向四：Search-Aware Model
 
@@ -297,7 +330,7 @@ search_gain_head(s)
 
 中。
 
-它更像搜索预算控制层，最好在 policy/value/q 稳定后再做。
+它更像搜索预算控制层，最好在 policy/value/advantage 稳定后再做。
 
 ## 方向五：更强的 Board Network
 
@@ -315,7 +348,7 @@ blocks
 优点：
 
 - 最简单。
-- 和当前代码兼容度高。
+- 对当前代码改动范围小。
 - 容易验证。
 
 缺点：
@@ -466,7 +499,7 @@ Gadidae-CPU: NNUE-inspired value/q evaluator
 
 ```text
 ResNet teacher -> CPU model distillation
-Stockfish regret -> CPU model q/value training
+Stockfish regret -> CPU model advantage/value training
 ```
 
 ### 通用意义
@@ -481,14 +514,14 @@ Stockfish regret -> CPU model q/value training
 
 ## 方向七：Offline Evaluator-Guided RL
 
-这是当前 `reinforce.py` 的路线。
+这是当前 `offline_pv.py` 的路线。
 
 抽象成通用方法就是：
 
 ```text
 已有模型提出候选动作。
 外部 evaluator 给每个候选动作打分。
-模型用这些反馈更新 policy/value/q。
+模型用这些反馈更新 policy/value/advantage。
 ```
 
 Stockfish 只是当前 evaluator。
@@ -502,7 +535,7 @@ Stockfish 只是当前 evaluator。
 ### 问题
 
 - 很容易退化成 evaluator distillation。
-- 如果只有 policy/value，没有 q，模型可能学不到“某步棋为什么错”。
+- 如果只有 policy/value，没有 advantage，模型可能学不到“某步棋为什么错”。
 - 如果候选 top-k 太窄，模型看不到真正好棋。
 - 如果 reward scale 不合适，学习信号会过粗或过饱和。
 
@@ -510,7 +543,7 @@ Stockfish 只是当前 evaluator。
 
 这条路线继续走时，应优先配合：
 
-- `q_head`
+- `advantage_head`
 - teacher value
 - teacher policy soft distribution
 - search consistency validation
@@ -544,7 +577,7 @@ self-play
 ```text
 Stockfish 继续做验证器。
 模型/MCTS 生成候选和分布。
-q/value 学会更稳定后，逐步减少对 Stockfish 的训练依赖。
+advantage/value 学会更稳定后，逐步减少对 Stockfish 的训练依赖。
 ```
 
 ### 优先级
@@ -596,7 +629,7 @@ q/value 学会更稳定后，逐步减少对 Stockfish 的训练依赖。
 
 MCTS 参数可以改善表现，但不会让模型参数变聪明。
 
-如果 `closed` 很弱，高 sims 又不稳定，根因仍然是 policy/value/q 表示不足。
+如果 `closed` 很弱，高 sims 又不稳定，根因仍然是 policy/value/advantage 表示不足。
 
 ### 纯 Stockfish 蒸馏
 
@@ -626,11 +659,11 @@ Transformer 是通用方法，但在当前资源下不一定划算。
 
 改动：
 
-- 增加 `q_head`。
-- reinforce 数据保存 `q_target` 或 action reward。
-- loss 中加入 masked q loss。
-- validation 加入 q/ranking/regret 指标。
-- MCTS 使用 q 初始化未访问子节点。
+- 增加 `advantage_head`。
+- offline-pv 数据保存 `advantage_target` 或 action reward。
+- loss 中加入 masked advantage loss。
+- validation 加入 advantage/ranking/regret 指标。
+- MCTS 使用 FPU + advantage 初始化未访问子节点。
 
 预期收益：
 
@@ -651,7 +684,7 @@ Transformer 是通用方法，但在当前资源下不一定划算。
 
 - 将 policy head 改为 `73x8x8` plane 输出。
 - 保持 move encoder 不变，只改变 head 形状。
-- 对比旧 linear policy head。
+- 对比 `resnet_pv_linear` 的 linear policy head。
 
 预期收益：
 
@@ -708,7 +741,7 @@ Transformer 是通用方法，但在当前资源下不一定划算。
 - composite regret。
 - teacher best in top-k。
 - value MAE / RMSE / sign accuracy。
-- 如果有 q head，记录 q MAE、best-q move regret、policy-q disagreement。
+- 如果有 advantage head，记录 advantage MAE、best-adv move regret、policy-adv disagreement。
 - CPU 单步延迟。
 - GPU 训练吞吐。
 
@@ -716,9 +749,9 @@ Transformer 是通用方法，但在当前资源下不一定划算。
 
 ```text
 baseline ResNet policy/value
-baseline + q_head
-baseline + q_head + plane policy head
-baseline + q_head + search consistency
+baseline + advantage_head
+baseline + advantage_head + plane policy head
+baseline + advantage_head + search consistency
 ```
 
 ## 当前结论
@@ -729,8 +762,8 @@ baseline + q_head + search consistency
 
 ```text
 policy/value 模型
-  -> policy/value/q 模型
-  -> search-aware policy/value/q 模型
+  -> policy/value/advantage 模型
+  -> search-aware policy/value/advantage 模型
   -> CPU-friendly evaluator
 ```
 
@@ -740,4 +773,3 @@ policy/value 模型
 一个神经网络如何学习动作价值，
 以及如何和搜索稳定协作。
 ```
-

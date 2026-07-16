@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
+import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, TextIO
@@ -9,8 +11,8 @@ from typing import Dict, Iterable, List, Optional, TextIO
 import chess
 import chess.pgn
 
-from config import STOCKFISH_PATH
-from teacher import StockfishTeacher, TeacherConfig, move_accuracy_from_regret
+from config import UCI_PATH
+from teacher import UciTeacher, TeacherConfig, move_accuracy_from_regret
 
 
 MATE_CP_THRESHOLD = 90000
@@ -38,6 +40,19 @@ def cp_text(value: int) -> str:
     if abs(value) >= MATE_CP_THRESHOLD:
         return "+mate" if value > 0 else "-mate"
     return f"{value:+d}"
+
+
+def white_cp_from_mover_cp(board: chess.Board, cp: int) -> int:
+    return int(cp) if board.turn == chess.WHITE else -int(cp)
+
+
+def pgn_eval_comment_from_white_cp(cp: int) -> str:
+    cp = int(cp)
+    if abs(cp) >= MATE_CP_THRESHOLD:
+        pawns = 1000.0 if cp > 0 else -1000.0
+    else:
+        pawns = float(cp) / 100.0
+    return f"{pawns:+.2f}"
 
 
 def regret_mark(regret_cp: int) -> str:
@@ -108,32 +123,82 @@ def iter_games(handle: TextIO) -> Iterable[chess.pgn.Game]:
         yield game
 
 
+def render_pgn(game: chess.pgn.Game, columns: int = 88) -> str:
+    exporter = chess.pgn.StringExporter(
+        headers=True,
+        variations=False,
+        comments=True,
+        columns=None if int(columns) <= 0 else int(columns),
+    )
+    text = game.accept(exporter)
+    if int(columns) <= 0:
+        return text
+    return wrap_pgn_comments(text, columns=int(columns))
+
+
+def wrap_pgn_comments(text: str, columns: int) -> str:
+    wrapped_lines = []
+    width = max(40, int(columns) - 4)
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not (stripped.startswith("{") and stripped.endswith("}")):
+            wrapped_lines.append(line)
+            continue
+        content = stripped[1:-1].strip()
+        content = re.sub(r",(?=\S)", ", ", content)
+        parts = textwrap.wrap(
+            content,
+            width=width,
+            break_long_words=True,
+            break_on_hyphens=False,
+        )
+        if len(parts) <= 1:
+            wrapped_lines.append("{ " + content + " }")
+            continue
+        wrapped_lines.append("{ " + parts[0])
+        for part in parts[1:-1]:
+            wrapped_lines.append("  " + part)
+        wrapped_lines.append("  " + parts[-1] + " }")
+    return "\n".join(wrapped_lines)
+
+
 def row_comment(row: MoveRow) -> str:
     if row.regret_cp >= MATE_CP_THRESHOLD:
         return "Decisive blunder: enters a forced mate line."
     if row.regret_cp > 300:
-        return f"Large blunder; Stockfish prefers {row.best_label}."
+        return f"Large blunder; UCI engine prefers {row.best_label}."
     if row.regret_cp > 200:
-        return f"Major defensive failure; Stockfish prefers {row.best_label}."
+        return f"Major defensive failure; UCI engine prefers {row.best_label}."
     if row.regret_cp > 80:
-        return f"Clear inaccuracy; Stockfish prefers {row.best_label}."
+        return f"Clear inaccuracy; UCI engine prefers {row.best_label}."
     if row.regret_cp > 50:
-        return f"Small but visible inaccuracy; Stockfish prefers {row.best_label}."
-    return f"Minor difference; Stockfish slightly prefers {row.best_label}."
+        return f"Small but visible inaccuracy; UCI engine prefers {row.best_label}."
+    return f"Minor difference; UCI engine slightly prefers {row.best_label}."
 
 
 def analyse_game(
     game: chess.pgn.Game,
     game_number: int,
-    teacher: StockfishTeacher,
+    teacher: UciTeacher,
     top_count: int,
     critical_threshold_cp: int,
-) -> tuple[str, Dict]:
+    annotate_pgn: bool = False,
+) -> tuple[str, Dict, chess.pgn.Game]:
     board = game.board()
     rows: List[MoveRow] = []
     last_move_label = "-"
+    node = game
+
+    if annotate_pgn:
+        root_result = teacher.analyse(board, played_move=None)
+        root_cp = white_cp_from_mover_cp(
+            board,
+            int(root_result.get("best_score_cp", 0)),
+        )
+        game.comment = pgn_eval_comment_from_white_cp(root_cp)
 
     for ply, move in enumerate(game.mainline_moves(), 1):
+        child = node.variation(0)
         prefix = side_prefix(board)
         played_san = board.san(move)
         played_label = move_with_prefix(prefix, played_san)
@@ -160,7 +225,12 @@ def analyse_game(
         )
         rows.append(row)
         last_move_label = played_label
+        if annotate_pgn:
+            child.comment = pgn_eval_comment_from_white_cp(
+                white_cp_from_mover_cp(board, row.played_cp)
+            )
         board.push(move)
+        node = child
 
     text = render_game(
         game=game,
@@ -170,7 +240,7 @@ def analyse_game(
         last_move_label=last_move_label,
         critical_threshold_cp=critical_threshold_cp,
     )
-    return text, summarize_rows(rows)
+    return text, summarize_rows(rows), game
 
 
 def summarize_rows(rows: List[MoveRow]) -> Dict:
@@ -233,7 +303,7 @@ def render_game(
         row = summary["mate_coded"][0]
         lines.append("")
         lines.append(
-            f"Note: {row.move_label} is scored as {cp_text(row.played_cp)} by Stockfish, "
+            f"Note: {row.move_label} is scored as {cp_text(row.played_cp)} by the UCI engine, "
             f"so its regret is encoded as {row.regret_cp} cp."
         )
         if len(summary["mate_coded"]) > 1:
@@ -247,10 +317,10 @@ def render_game(
     if biggest is None:
         lines.append("No moves were found in the PGN mainline.")
     elif biggest.regret_cp <= 50:
-        lines.append("The mainline is very close to Stockfish's preferred play.")
+        lines.append("The mainline is very close to the UCI engine's preferred play.")
     else:
         lines.append(
-            f"The largest swing is {biggest.move_label}, where Stockfish prefers "
+            f"The largest swing is {biggest.move_label}, where the UCI engine prefers "
             f"{biggest.best_label}."
         )
         lines.append(
@@ -300,7 +370,7 @@ def render_game(
     if critical_rows:
         for row in critical_rows:
             top = ", ".join(row.top_moves) if row.top_moves else row.best_label
-            lines.append(f"{row.move_label:<10} Stockfish: {top}")
+            lines.append(f"{row.move_label:<10} UCI: {top}")
     else:
         lines.append("No critical rows to list.")
     return "\n".join(lines)
@@ -312,9 +382,16 @@ def output_path_for(input_path: str, output_path: Optional[str]) -> Path:
     return Path(input_path).with_suffix(".cmt")
 
 
+def pgn_output_path_for(input_path: str, output_path: Optional[str]) -> Path:
+    if output_path:
+        return Path(output_path)
+    path = Path(input_path)
+    return path.with_name(f"{path.stem}_cmt.pgn")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Analyse PGN mainlines with Stockfish and write a .cmt report.",
+        description="Analyse PGN mainlines with a UCI engine and write a .cmt report.",
     )
     parser.add_argument("--input", required=True, help="Path to a PGN file.")
     parser.add_argument(
@@ -349,8 +426,11 @@ def parse_args():
     )
     parser.add_argument("--critical-threshold-cp", type=int, default=50)
     parser.add_argument("--top-moves", type=int, default=3)
+    parser.add_argument("--pgn-comments", action="store_true", default=False)
+    parser.add_argument("--pgn-output", default=None)
+    parser.add_argument("--pgn-columns", type=int, default=88)
 
-    parser.add_argument("--uci", default=STOCKFISH_PATH)
+    parser.add_argument("--uci", default=UCI_PATH)
     parser.add_argument("--uci-depth", type=int, default=14)
     parser.add_argument("--uci-movetime-ms", type=int, default=0)
     parser.add_argument("--uci-multipv", type=int, default=5)
@@ -392,6 +472,7 @@ def main():
     )
 
     reports: List[str] = []
+    annotated_games: List[chess.pgn.Game] = []
     selected = 0
     totals = {
         "games": 0,
@@ -404,18 +485,21 @@ def main():
     }
 
     with open(input_path, "r", encoding="utf-8", errors="ignore") as handle:
-        with StockfishTeacher(config) as teacher:
+        with UciTeacher(config) as teacher:
             for game_number, game in enumerate(iter_games(handle), 1):
                 if not args.all_games and game_number != int(args.game_index):
                     continue
-                report, summary = analyse_game(
+                report, summary, annotated_game = analyse_game(
                     game=game,
                     game_number=game_number,
                     teacher=teacher,
                     top_count=args.top_moves,
                     critical_threshold_cp=args.critical_threshold_cp,
+                    annotate_pgn=args.pgn_comments,
                 )
                 reports.append(report)
+                if args.pgn_comments:
+                    annotated_games.append(annotated_game)
                 selected += 1
                 totals["games"] += 1
                 totals["moves"] += summary["moves"]
@@ -478,6 +562,15 @@ def main():
         handle.write(text)
 
     print(f"pgn analysis saved: {out_path}", flush=True)
+
+    if args.pgn_comments:
+        pgn_out_path = pgn_output_path_for(str(input_path), args.pgn_output)
+        os.makedirs(pgn_out_path.parent or ".", exist_ok=True)
+        with open(pgn_out_path, "w", encoding="utf-8") as handle:
+            for game in annotated_games:
+                handle.write(render_pgn(game, columns=args.pgn_columns))
+                handle.write("\n\n")
+        print(f"annotated pgn saved: {pgn_out_path}", flush=True)
 
 
 if __name__ == "__main__":
