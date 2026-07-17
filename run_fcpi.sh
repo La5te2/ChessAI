@@ -19,7 +19,7 @@ fi
 RUN_ID="${2:?missing run id}"
 export FCPI_RUN_ID="${RUN_ID}"
 
-MODEL="models/candidate.pth"
+MODEL="models/chessnet.pth"
 DEVICE="cuda"
 
 ITERATIONS=5
