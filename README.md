@@ -589,7 +589,8 @@ MODEL=models/candidate.pth
 ITERATIONS=1
 GAMES_PER_ITER=500
 GAMES_IN_FLIGHT=64
-MAX_PLIES=160
+MAX_PLIES=240
+POSITIONS_PER_GAME=64
 EPOCHS=4
 TRAIN_MAX_STEPS=2000
 EVAL_GAMES=200
@@ -611,6 +612,10 @@ COUNTERFACTUAL_LAMBDA=0.80
 所有候选至少展开 `MIN_PLIES`。之后根据相邻局面的 Bellman residual、不同深度的 Q 变化和候选在根节点的竞争性计算优先级，将剩余评价预算集中到高优先级分支，单个分支最多展开到 `MAX_PLIES`。`TARGET_AVERAGE_PLIES` 直接控制每批候选的目标平均展开深度；终局分支或最大深度限制可能使实际值略低。`LAMBDA` 以几何权重混合各深度 Q；该过程不维护 visits 和搜索树。
 
 `info.log` 中的 `counterfactual summary` 会输出 `average_depth`、`depth_histogram`、`target_average_plies` 和 `budget_utilization`，用于确认实际计算量与目标预算。
+
+自对战先在完整轨迹上计算 TD(lambda)，再按局处理训练 position：同一局中编码后完全相同的模型 state 只保留一次；超过 `POSITIONS_PER_GAME` 时均匀无放回采样，并保持选中 position 的时间顺序。不同棋局之间保留自然重复频率。日志与 `summary.json` 会记录原始、去重后和最终选中的 position 数量。
+
+达到 `MAX_PLIES` 时，正式规则已经判定的将死、逼和、子力不足、重复或五十回合结果照常使用；仍未终局的轨迹使用当前模型对尾部局面的连续 Value bootstrap，不强制改写为和棋。
 
 输出：
 

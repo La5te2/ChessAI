@@ -15,7 +15,7 @@ import random
 import shutil
 import time
 import uuid
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import chess
 import h5py
@@ -424,20 +424,56 @@ def assign_td_lambda_returns(
     for trajectory in trajectories:
         if trajectory.board.is_game_over(claim_draw=True):
             next_return = terminal_value(trajectory.board)
-            final_bootstrap = next_return
         else:
             next_return = float(next(truncated_values))
-            final_bootstrap = next_return
+        final_value = next_return
         positions = trajectory.positions
         for index in range(len(positions) - 1, -1, -1):
             next_value = (
-                final_bootstrap
+                final_value
                 if index + 1 == len(positions)
                 else float(positions[index + 1].root_value)
             )
             current_return = -((1.0 - lam) * next_value + lam * next_return)
             positions[index].value_target = float(np.clip(current_return, -1.0, 1.0))
             next_return = current_return
+
+
+def sample_trajectory_positions(
+    trajectories: Sequence[Trajectory],
+    positions_per_game: int,
+    rng: np.random.Generator,
+) -> Tuple[List[RawPosition], Dict[str, int]]:
+    limit = max(1, int(positions_per_game))
+    selected: List[RawPosition] = []
+    source_positions = 0
+    unique_positions = 0
+    capped_games = 0
+    for trajectory in trajectories:
+        source_positions += len(trajectory.positions)
+        unique = []
+        seen_states = set()
+        for position in trajectory.positions:
+            state_key = np.ascontiguousarray(position.state).tobytes()
+            if state_key in seen_states:
+                continue
+            seen_states.add(state_key)
+            unique.append(position)
+        unique_positions += len(unique)
+        if len(unique) > limit:
+            indices = np.sort(rng.choice(len(unique), size=limit, replace=False))
+            selected.extend(unique[int(index)] for index in indices)
+            capped_games += 1
+        else:
+            selected.extend(unique)
+    return selected, {
+        "games": len(trajectories),
+        "source_positions": source_positions,
+        "unique_positions": unique_positions,
+        "selected_positions": len(selected),
+        "positions_per_game": limit,
+        "capped_games": capped_games,
+    }
 
 
 def collect_selfplay(
@@ -522,14 +558,18 @@ def collect_selfplay(
                     )
                 )
                 board.push(move)
-                if board.is_game_over(claim_draw=True) or len(trajectory.positions) >= args.max_plies:
+                game_over = board.is_game_over(claim_draw=True)
+                reached_limit = len(trajectory.positions) >= args.max_plies
+                if game_over or reached_limit:
                     trajectories.append(trajectory)
+                    truncated = reached_limit and not game_over
                     print(
                         "fcpi game:",
                         f"completed={len(trajectories)}/{len(specs)}",
                         f"game_id={trajectory.game_id}",
                         f"plies={len(trajectory.positions)}",
-                        f"result={result_label(board, len(trajectory.positions) >= args.max_plies)}",
+                        f"result={result_label(board, truncated)}",
+                        f"truncated={str(truncated).lower()}",
                         flush=True,
                     )
                 else:
@@ -541,7 +581,18 @@ def collect_selfplay(
         evaluator,
         evolution.td_lambda(args),
     )
-    records = [position for trajectory in trajectories for position in trajectory.positions]
+    sample_rng = np.random.default_rng(args.seed + iteration + 1_000_003)
+    records, sampling_summary = sample_trajectory_positions(
+        trajectories,
+        args.positions_per_game,
+        sample_rng,
+    )
+    evolution.last_sampling_summary = sampling_summary
+    print(
+        "fcpi position sampling:",
+        json.dumps(sampling_summary, ensure_ascii=False),
+        flush=True,
+    )
     evolution.construct_targets(records, evaluator, args)
     print(
         "fcpi self-play finished:",
@@ -625,6 +676,7 @@ def write_base_fcpi_h5(path: str, records: Sequence[RawPosition], evolution, arg
         "legal_width": legal_width,
         "counterfactual_width": candidate_width,
         "formula": evolution.formula_name,
+        "sampling": dict(getattr(evolution, "last_sampling_summary", {})),
         "counterfactual": dict(getattr(evolution, "last_target_summary", {})),
     }
 
@@ -1251,7 +1303,8 @@ def common_parser(add_help=True):
     parser.add_argument("--iterations", type=int, default=1)
     parser.add_argument("--games-per-iter", type=int, default=200)
     parser.add_argument("--games-in-flight", type=int, default=32)
-    parser.add_argument("--max-plies", type=int, default=160)
+    parser.add_argument("--max-plies", type=int, default=240)
+    parser.add_argument("--positions-per-game", type=int, default=64)
     parser.add_argument("--opening-book", default="data/openings.gen.bin")
     parser.add_argument("--book-plies", type=int, default=8)
     parser.add_argument("--max-book-positions", type=int, default=50000)
@@ -1269,7 +1322,7 @@ def common_parser(add_help=True):
     parser.add_argument("--eval-games", type=int, default=100)
     parser.add_argument("--eval-sims", type=int, default=0)
     parser.add_argument("--eval-workers", type=int, default=1)
-    parser.add_argument("--eval-max-plies", type=int, default=160)
+    parser.add_argument("--eval-max-plies", type=int, default=240)
     parser.add_argument("--eval-opening-book", default="data/openings.gen.bin")
     parser.add_argument("--eval-book-plies", type=int, default=8)
     parser.add_argument("--eval-max-book-positions", type=int, default=50000)
@@ -1305,6 +1358,7 @@ def parse_args():
     args.iterations = max(1, int(args.iterations))
     args.games_per_iter = max(1, int(args.games_per_iter))
     args.max_plies = max(1, int(args.max_plies))
+    args.positions_per_game = max(1, int(args.positions_per_game))
     args.validation_fraction = float(np.clip(args.validation_fraction, 0.0, 0.9))
     return args, evolution
 

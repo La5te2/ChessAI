@@ -595,6 +595,7 @@ Q_expand = sum[h=1..H-1] (1-lambda) * lambda^(h-1) * q_h
 该架构只更新已有的 policy/value：
 
 - closed self-play 通过 TD(lambda) 生成 value target。
+- TD(lambda) 先作用于完整轨迹；随后每局按模型 state 去重，并对超长轨迹执行固定上限的均匀无放回 position 采样，避免错误长局按长度获得线性权重。
 - policy 给出合法招法先验与反事实候选。
 - 小候选集执行自适应多步 value expansion，后续 rollout 按冻结 Policy 排序。
 - 实际走出的动作额外融合轨迹 return。
