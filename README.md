@@ -22,6 +22,7 @@ ChessAI/
     user-pgn/
     lichess/
     runs/offline_pv_YYYYMMDD_HHMMSS_pid/
+    runs/fcpi_YYYYMMDD_HHMMSS_id/
   models/
     chessnet.pth
     candidate.pth
@@ -42,6 +43,7 @@ ChessAI/
     data.py
     decision.py
     evaluator.py
+    fcpi.py
     inspection.py
     model.py
     move_codecs.py
@@ -56,6 +58,7 @@ ChessAI/
     uci_engine.py
   run_opening.sh
   run_offline_pv.sh
+  run_fcpi.sh
   run_board.vbs
   setup_lichess_bot.sh
   run_lichess_bot.sh
@@ -81,16 +84,17 @@ ChessAI/
 
 `src` 文件：
 
-- `acceptance.py`：arena 结果 gate 和 move-quality gate。
+- `acceptance.py`：根据 arena paired-game 结果执行 candidate gate。
 - `analyze.py`：用 UCI 引擎分析 PGN，生成 `.cmt` 和带评价批注的 `_cmt.pgn`。
 - `architectures.py`：架构注册表，定义每个架构的 state encoding、move encoding 和 HDF5 schema。
-- `arena.py`：两个模型 paired games 对战，输出胜负统计、PGN、trace 和 UCI move-quality。
+- `arena.py`：两个模型 paired games 对战，输出胜负统计、PGN 和 trace。
 - `board.py`：Tk GUI 棋盘，支持加载模型、下棋、翻转棋盘和实时搜索显示。
 - `checkpoint_io.py`：checkpoint 原子写回和备份工具。
 - `config.py`：默认路径、设备、训练参数、搜索参数和平台化 UCI 路径。
 - `data.py`：supervised HDF5 schema 校验和 PyTorch Dataset。
 - `decision.py`：模型到 search 的决策适配层；按 `arch_type` 选择 state codec、move codec、MCTS profile 和架构特有搜索信号。
 - `evaluator.py`：batched neural inference，供 MCTS 批量评估叶子局面。
+- `fcpi.py`：按 checkpoint 架构分派独立 FCPI 进化公式，执行 closed self-play、反事实目标训练与 arena gate。
 - `inspection.py`：检查 `preprocess.py` 生成的 supervised HDF5 是否符合对应架构。
 - `model.py`：模型结构、架构识别、checkpoint 加载和保存。
 - `move_codecs.py`：招法编码、解码、合法招法概率映射和 action size。
@@ -147,8 +151,8 @@ Windows PowerShell 可把 README 里的多行 bash 命令改成单行，并把 `
 
 | 架构 | state encoding | move encoding | HDF5 datasets | 训练入口 | search profile |
 | --- | --- | --- | --- | --- | --- |
-| `resnet_pv_linear` | `resnet_pv_linear_18_planes` | `alphazero_64x73` | `states`, `moves`, `values` | supervised + offline-pv | policy/value + MCTS |
-| `resnet_pva_gad` | `square_tokens` | `sd_64x64_underpromo9` | `states`, `moves`, `values`, `adv_moves`, `adv_values` | supervised | policy/value/advantage + MCTS |
+| `resnet_pv_linear` | `resnet_pv_linear_18_planes` | `alphazero_64x73` | `states`, `moves`, `values` | supervised + offline-pv + FCPI | policy/value + MCTS |
+| `resnet_pva_gad` | `resnet_pva_gad_square_tokens` | `sd_64x64_underpromo9` | `states`, `moves`, `values`, `adv_moves`, `adv_values` | supervised + FCPI | policy/value/advantage + MCTS |
 
 每个 HDF5 都带有：
 
@@ -170,7 +174,7 @@ has_cmt
 - global-context dynamic relation bias
 - source-destination policy head
 - global-token value head
-- dueling advantage head
+- value-scaled dueling advantage head
 
 架构相关训练参数：
 
@@ -297,15 +301,15 @@ python src/preprocess.py \
 {(Rd8) +0.71/14 171s}
 ```
 
-批注数值按白方视角解析。`values` 使用当前节点评价并转换为 side-to-move 视角；缺少 `+/-` 数值的节点按 `0` 处理。`adv_values` 使用当前节点评价与当前走法完成后的评价计算当前走子方视角的变化：
+批注数值按白方视角解析。`values` 使用当前节点评价并转换为 side-to-move 视角；缺少 `+/-` 数值的节点按 `0` 处理。`adv_values` 先把走前、走后评价分别转换到 value head 的 `[-1, 1]` 尺度，再计算当前走子方视角的变化：
 
 ```text
-白方: after - before
-黑方: before - after
-target: tanh(min(0, delta) / 3)
+before_value = tanh(side_to_move_before_pawn_score / 3)
+after_value  = tanh(side_to_move_after_pawn_score / 3)
+target       = clip(min(0, after_value - before_value), -1, 0)
 ```
 
-正差值写为 `0`，表示该走法保住了当前走子方的评价；负差值进入 advantage 监督目标。
+正差值写为 `0`，表示该走法保住了当前走子方的评价；负差值进入 advantage 监督目标。advantage 与 value 使用同一数值尺度，因此 search 中的 `FPU + advantage` 具有直接的 value 含义。
 
 使用 `--has-cmt 1` 时，整盘主线至少需要一个可解析评价批注；整盘没有评价批注的 game 会被跳过。使用 `analyze.py --pgn-comments` 可以把普通 PGN 转成带 UCI 评价批注的 `<name>_cmt.pgn`，再生成 `resnet_pva_gad` 的 HDF5。
 
@@ -433,14 +437,6 @@ python src/arena.py \
   --search-type closed \
   --sims 0 \
   --movetime-ms 0 \
-  --uci models/stockfish/stockfish \
-  --uci-depth 16 \
-  --uci-movetime-ms 0 \
-  --uci-multipv 1 \
-  --uci-threads 1 \
-  --uci-hash-mb 512 \
-  --teacher-cache data/runs/arena_teacher_cache.sqlite \
-  --quality-loss-cap-cp 1000 \
   --pgn-output data/runs/arena.pgn \
   --log-every 1
 ```
@@ -452,8 +448,9 @@ arena 行为：
 - `--search-type closed` 使用模型直出的 policy/value。
 - `--search-type only-mcts` 使用模型 policy/value 加 MCTS。
 - `--games 100` 使用 50 个 unique start positions。
-- `--workers` 控制并行对局和 Stockfish move-quality 分析。
-- 输出 W/D/L、net wins、score、Elo diff、ACPL、accuracy、inaccuracy、mistake、blunder。
+- `--workers` 控制并行对局。
+- 输出 W/D/L、net wins、score、score confidence interval 和 Elo diff。
+- arena 与 acceptance 使用模型对战结果作为独立比较与 gate 信号。
 - `--pgn-output` 保存棋谱。
 - `--trace-output` 保存逐手 search 细节。
 - 从标准初始局面开始时使用 `--opening-book ""`。
@@ -462,7 +459,7 @@ arena 行为：
 Windows CPU smoke test：
 
 ```powershell
-python src/arena.py --candidate models/candidate.pth --baseline models/champion.pth --device cpu --games 1 --workers 1 --max-plies 20 --opening-book "" --search-type closed --sims 0 --movetime-ms 0 --uci models/stockfish/stockfish.exe --uci-depth 8 --uci-multipv 1 --uci-threads 1 --teacher-cache data/user-pgn/arena_cache.sqlite --pgn-output data/user-pgn/arena_smoke.pgn --log-every 1
+python src/arena.py --candidate models/candidate.pth --baseline models/champion.pth --device cpu --games 1 --workers 1 --max-plies 20 --opening-book "" --search-type closed --sims 0 --movetime-ms 0 --pgn-output data/user-pgn/arena_smoke.pgn --log-every 1
 ```
 
 ---
@@ -527,7 +524,7 @@ EVAL_MIN_NET_WINS=0
 7. actor 使用 `reward - value` advantage 更新 policy。
 8. critic 学习当前候选策略的期望 reward。
 9. teacher validation 检查 policy regret 与 value 误差。
-10. arena gate 比较 `candidate_iter_*.pth` 与本 run 的 `current.pth`。
+10. arena 使用 paired-game 结果比较 `candidate_iter_*.pth` 与本 run 的 `current.pth`。
 11. 通过 gate 后写回本 run 的 `current.pth`。
 
 replay 参数：
@@ -561,7 +558,78 @@ models/runs/<run-id>/candidate_iter_*.pth
 
 ---
 
-## 10. GUI Board
+## 10. FCPI
+
+FCPI（Folded Counterfactual Policy Iteration，折叠式反事实策略迭代）在采样和验收时均可使用 `closed` 模型。它通过自对战回报与少量自适应多步反事实评价生成训练信号，运行过程不调用 UCI 教师机。
+
+启动后台 run：
+
+```bash
+bash run_fcpi.sh
+```
+
+查看最新 run：
+
+```bash
+RUN_ID="$(ls -td data/runs/fcpi_* | head -1 | xargs basename)"
+tail -f "data/runs/$RUN_ID/info.log"
+```
+
+`fcpi.py` 先读取 `--model` checkpoint 的 `arch.type`，再选择该架构的 FCPI 实现与参数表。FCPI 的 TD、反事实 value expansion、KL policy improvement 和 arena gate 原理通用；每个架构单独定义 rollout 排序及目标到自身 heads 的投影：
+
+- `resnet_pv_linear`：rollout 按 Policy 排序；多深度 Value 混合形成反事实 Q；训练 policy/value。
+- `resnet_pva_gad`：rollout 按 Policy+Advantage 排序；多深度 Value 与 `V(s)+A(s,a)` 融合；训练 policy/value/advantage，其中 advantage target 为 `Q_target(s,a)-V_target(s)`。
+
+FCPI 一次只训练一个 checkpoint。入口先识别 `arch.type`，再由对应架构注册同一组用户参数、提供自己的默认值，并把例如 `--counterfactual-topk` 映射为该架构内部的独立参数变量。`resnet_pva_gad` 还会注册仅供其 Advantage 路径使用的参数；这些参数不会出现在 `resnet_pv_linear` 命令中。
+
+`run_fcpi.sh` 默认参数适合先对 `models/candidate.pth` 做一轮实验。常用参数：
+
+```text
+MODEL=models/candidate.pth
+ITERATIONS=1
+GAMES_PER_ITER=500
+GAMES_IN_FLIGHT=64
+MAX_PLIES=160
+EPOCHS=4
+TRAIN_MAX_STEPS=2000
+EVAL_GAMES=200
+EVAL_SEARCH_TYPE=closed
+EVAL_SIMS=0
+EVAL_MIN_NET_WINS=4
+```
+
+自适应多步参数只输入一次。以下为 `resnet_pv_linear` 默认值；加载 `resnet_pva_gad` 时，同名参数会采用该架构在脚本中定义的默认值：
+
+```text
+COUNTERFACTUAL_TOPK=6
+COUNTERFACTUAL_MIN_PLIES=2
+COUNTERFACTUAL_MAX_PLIES=6
+COUNTERFACTUAL_TARGET_AVERAGE_PLIES=4.0
+COUNTERFACTUAL_LAMBDA=0.80
+```
+
+所有候选至少展开 `MIN_PLIES`。之后根据相邻局面的 Bellman residual、不同深度的 Q 变化和候选在根节点的竞争性计算优先级，将剩余评价预算集中到高优先级分支，单个分支最多展开到 `MAX_PLIES`。`TARGET_AVERAGE_PLIES` 直接控制每批候选的目标平均展开深度；终局分支或最大深度限制可能使实际值略低。`LAMBDA` 以几何权重混合各深度 Q；该过程不维护 visits 和搜索树。
+
+`info.log` 中的 `counterfactual summary` 会输出 `average_depth`、`depth_histogram`、`target_average_plies` 和 `budget_utilization`，用于确认实际计算量与目标预算。
+
+输出：
+
+```text
+data/runs/<run-id>/info.log
+data/runs/<run-id>/pid
+data/runs/<run-id>/fcpi_iter_*.h5
+data/runs/<run-id>/summary.json
+models/runs/<run-id>/current.pth
+models/runs/<run-id>/candidate_iter_*.pth
+```
+
+每轮 candidate 先执行架构对应的目标验证，再与本 run 的 `current.pth` 进行 paired arena。`net_wins` 达到 `EVAL_MIN_NET_WINS` 后，candidate 原子写入本 run 的 `current.pth`。
+
+FCPI 提供 policy/value/advantage 的可学习改进信号；实际棋力提升仍由 arena 结果确认。目标网络误差、自对战分布偏移和有限反事实候选都会影响结果，因此单轮 loss 下降不等价于 Elo 上升。
+
+---
+
+## 11. GUI Board
 
 启动 GUI：
 
@@ -606,7 +674,7 @@ GUI 功能：
 
 ---
 
-## 11. UCI Engine
+## 12. UCI Engine
 
 启动：
 
@@ -666,7 +734,7 @@ UCI 输出使用标准 `info ... score cp ... multipv ... pv ...` 与 `bestmove 
 
 ---
 
-## 12. Lichess Bot
+## 13. Lichess Bot
 
 安装 lichess-bot：
 
@@ -742,7 +810,7 @@ export no_proxy=localhost,127.0.0.1,::1
 
 ---
 
-## 13. PGN 分析
+## 14. PGN 分析
 
 ```bash
 python src/analyze.py \
@@ -800,7 +868,7 @@ python src/preprocess.py \
 
 ---
 
-## 14. 数据检查
+## 15. 数据检查
 
 监督 HDF5：
 
@@ -813,7 +881,7 @@ python src/inspection.py --path data/games-pva-gad.h5
 
 ---
 
-## 15. 控制台输出
+## 16. 控制台输出
 
 `--log-every` 控制 step / game / labeling 进度行：
 
@@ -822,8 +890,10 @@ preprocess progress: ...
 train step: ...
 offline label: ...
 offline-pv train step: ...
+fcpi self-play start: ...
+fcpi game ...
+fcpi train: ...
 arena worker ... game ...
-arena quality worker ...:
 ```
 
 阶段汇总使用 JSON：
@@ -833,18 +903,19 @@ preprocess summary:
 offline-pv label summary:
 offline-pv teacher validation summary:
 offline-pv arena summary:
+fcpi self-play finished: ...
 arena game summary:
 arena: finished ...
 ```
 
 ---
 
-## 16. 后台进程管理
+## 17. 后台进程管理
 
-查看 offline-pv：
+查看 offline-pv / FCPI：
 
 ```bash
-ps -ef | grep -E "offline_pv.py|stockfish" | grep -v grep
+ps -ef | grep -E "offline_pv.py|fcpi.py|stockfish" | grep -v grep
 ```
 
 查看某个 run：
@@ -896,7 +967,7 @@ bash stop_lichess_bot.sh <run-id>
 
 ---
 
-## 17. 空间维护
+## 18. 空间维护
 
 查看占用：
 
@@ -916,6 +987,13 @@ find . -type f -name "*.pyc" -delete
 ```bash
 rm -rf data/runs/offline_pv_*
 rm -rf models/runs/offline_pv_*
+```
+
+清理 FCPI run：
+
+```bash
+rm -rf data/runs/fcpi_*
+rm -rf models/runs/fcpi_*
 ```
 
 清理模型备份：

@@ -49,7 +49,7 @@ ARCHITECTURES = {
             "adv_moves",
             "adv_values",
         ),
-        target_schema="pva_supervised",
+        target_schema="pva_value_scaled_advantage",
         default_has_cmt=1,
     ),
 }

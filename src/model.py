@@ -181,7 +181,7 @@ class SourceDestinationActionHead(nn.Module):
         )
 
 
-class DuelingAdvantageHead(nn.Module):
+class ValueScaledAdvantageHead(nn.Module):
     def __init__(self, channels: int, action_size: int):
         super().__init__()
         self.action_head = SourceDestinationActionHead(
@@ -191,9 +191,7 @@ class DuelingAdvantageHead(nn.Module):
         )
 
     def forward(self, x):
-        advantage = self.action_head(x)
-        advantage = advantage - advantage.mean(dim=1, keepdim=True)
-        return torch.tanh(advantage)
+        return torch.tanh(self.action_head(x))
 
 
 class TokenValueHead(nn.Module):
@@ -358,8 +356,8 @@ class ResNetPVAGadModel(nn.Module):
         self.policy_head_type = "source_destination"
         self.value_head = TokenValueHead(self.channels)
         self.value_head_type = "global_token_mlp"
-        self.advantage_head = DuelingAdvantageHead(self.channels, self.action_size)
-        self.advantage_head_type = "dueling_advantage_source_destination"
+        self.advantage_head = ValueScaledAdvantageHead(self.channels, self.action_size)
+        self.advantage_head_type = "value_scaled_source_destination"
 
     def arch(self) -> Dict[str, Any]:
         return {

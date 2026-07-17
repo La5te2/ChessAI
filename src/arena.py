@@ -1,4 +1,4 @@
-"""Paired model comparison with optional UCI move-quality validation."""
+"""Paired model comparison based on game results."""
 
 from __future__ import annotations
 
@@ -11,21 +11,16 @@ import multiprocessing as mp
 import os
 import re
 import textwrap
-from typing import Dict, List
+from typing import Dict
 
 import chess
 import chess.pgn
 import numpy as np
 
-from config import CONFIDENCE_Z, DEVICE, UCI_PATH
+from config import CONFIDENCE_Z, DEVICE
 from model import load_model
 from opening_book import make_arena_specs
 from search import SearchOptions, UnifiedSearch, VALID_SEARCH_TYPES
-from teacher import (
-    UciTeacher,
-    TeacherConfig,
-    move_accuracy_from_regret,
-)
 
 
 def progress_print(enabled: bool, *parts):
@@ -181,13 +176,6 @@ def wrap_pgn_comments(text: str, columns: int) -> str:
     return "\n".join(wrapped_lines)
 
 
-def worker_cache_path(cache_path, worker_index, worker_count):
-    if not cache_path or int(worker_count) <= 1:
-        return cache_path
-    root, ext = os.path.splitext(cache_path)
-    return f"{root}.worker{int(worker_index)}{ext or '.sqlite'}"
-
-
 def score_from_result(result: str, candidate_color: chess.Color) -> float:
     if result in {"1/2-1/2", "*"}:
         return 0.5
@@ -239,17 +227,20 @@ def play_arena_game(
     pgn_columns=88,
     claim_draws=False,
     trace_root_topn=12,
+    collect_trace=True,
+    collect_pgn=True,
 ):
     board = chess.Board(start_fen)
-    game = chess.pgn.Game()
-    game.headers["Event"] = "ChessAI Arena"
-    if game_id is not None:
-        game.headers["Round"] = str(game_id)
-    game.headers["White"] = "candidate" if candidate_color == chess.WHITE else "baseline"
-    game.headers["Black"] = "baseline" if candidate_color == chess.WHITE else "candidate"
-    if start_fen != chess.Board().fen():
-        game.headers["SetUp"] = "1"
-        game.headers["FEN"] = start_fen
+    game = chess.pgn.Game() if collect_pgn else None
+    if game is not None:
+        game.headers["Event"] = "ChessAI Arena"
+        if game_id is not None:
+            game.headers["Round"] = str(game_id)
+        game.headers["White"] = "candidate" if candidate_color == chess.WHITE else "baseline"
+        game.headers["Black"] = "baseline" if candidate_color == chess.WHITE else "candidate"
+        if start_fen != chess.Board().fen():
+            game.headers["SetUp"] = "1"
+            game.headers["FEN"] = start_fen
     node = game
     trace = []
     ply = 0
@@ -271,20 +262,22 @@ def play_arena_game(
             )
 
         san = safe_san(board, move)
-        trace.append({
-            "game_id": game_id,
-            "ply": ply + 1,
-            "fen": board.fen(),
-            "move": move.uci(),
-            "san": san,
-            "owner": owner,
-            "candidate_color": "white" if candidate_color == chess.WHITE else "black",
-            "decision_profile": info.get("decision_profile"),
-            "search": trace_search_info(info, trace_root_topn),
-        })
-        node = node.add_variation(move)
-        if pgn_comments:
-            node.comment = pgn_search_comment(owner, info)
+        if collect_trace:
+            trace.append({
+                "game_id": game_id,
+                "ply": ply + 1,
+                "fen": board.fen(),
+                "move": move.uci(),
+                "san": san,
+                "owner": owner,
+                "candidate_color": "white" if candidate_color == chess.WHITE else "black",
+                "decision_profile": info.get("decision_profile"),
+                "search": trace_search_info(info, trace_root_topn),
+            })
+        if node is not None:
+            node = node.add_variation(move)
+            if pgn_comments:
+                node.comment = pgn_search_comment(owner, info)
         board.push(move)
         ply += 1
 
@@ -294,14 +287,15 @@ def play_arena_game(
         max_plies=max_plies,
         claim_draws=bool(claim_draws),
     )
-    game.headers["Result"] = result_string
-    game.headers["Termination"] = termination
+    if game is not None:
+        game.headers["Result"] = result_string
+        game.headers["Termination"] = termination
     return (
         result_string,
         score_from_result(result_string, candidate_color),
         ply,
         trace,
-        render_pgn(game, columns=pgn_columns),
+        render_pgn(game, columns=pgn_columns) if game is not None else None,
     )
 
 
@@ -326,6 +320,8 @@ def _worker(job):
         pgn_columns,
         claim_draws,
         trace_root_topn,
+        collect_trace,
+        collect_pgn,
         progress,
     ) = job
 
@@ -378,13 +374,16 @@ def _worker(job):
             pgn_columns=pgn_columns,
             claim_draws=claim_draws,
             trace_root_topn=trace_root_topn,
+            collect_trace=collect_trace,
+            collect_pgn=collect_pgn,
         )
         scores.append(score)
         counts[outcome_from_score(score)] += 1
         raw_results[result] = raw_results.get(result, 0) + 1
         plies_total += plies
         traces.extend(trace)
-        pgns.append(pgn)
+        if pgn is not None:
+            pgns.append(pgn)
         progress_print(
             progress,
             f"arena worker {worker_index}: game {local_index}/{total_specs} "
@@ -407,142 +406,6 @@ def _worker(job):
     }
 
 
-def evaluate_move_quality(
-    traces: List[Dict],
-    teacher_config: TeacherConfig,
-    loss_cap_cp: int = 1000,
-    log_every: int = 1000,
-    workers: int = 1,
-    progress: bool = True,
-):
-    total = len(traces)
-    if total == 0:
-        return {
-            "candidate": {
-                "moves": 0,
-                "acpl": None,
-                "accuracy": None,
-                "blunders": 0,
-                "mistakes": 0,
-                "inaccuracies": 0,
-            },
-            "baseline": {
-                "moves": 0,
-                "acpl": None,
-                "accuracy": None,
-                "blunders": 0,
-                "mistakes": 0,
-                "inaccuracies": 0,
-            },
-        }
-    workers = max(1, min(int(workers), max(1, total)))
-    log_every = max(0, int(log_every))
-    progress_print(
-        progress,
-        f"arena quality: analysing {total} moves with UCI engine "
-        f"workers={workers}",
-    )
-
-    splits = [total // workers] * workers
-    for index in range(total % workers):
-        splits[index] += 1
-
-    jobs = []
-    offset = 0
-    for worker_index, count in enumerate(splits, 1):
-        if count <= 0:
-            continue
-        subset = traces[offset:offset + count]
-        offset += count
-        jobs.append((
-            worker_index,
-            len(splits),
-            subset,
-            teacher_config,
-            loss_cap_cp,
-            log_every,
-            progress,
-        ))
-
-    if len(jobs) == 1:
-        outputs = [_quality_worker(jobs[0])]
-    else:
-        with mp.get_context("spawn").Pool(processes=len(jobs)) as pool:
-            outputs = pool.map(_quality_worker, jobs)
-
-    values = {
-        "candidate": {"regret": [], "accuracy": []},
-        "baseline": {"regret": [], "accuracy": []},
-    }
-    for output in outputs:
-        for owner in ("candidate", "baseline"):
-            values[owner]["regret"].extend(output[owner]["regret"])
-            values[owner]["accuracy"].extend(output[owner]["accuracy"])
-
-    metrics = {}
-    for owner in ("candidate", "baseline"):
-        regrets = values[owner]["regret"]
-        accuracies = values[owner]["accuracy"]
-        metrics[owner] = {
-            "moves": len(regrets),
-            "acpl": float(np.mean(regrets)) if regrets else None,
-            "accuracy": float(np.mean(accuracies)) if accuracies else None,
-            "blunders": int(sum(regret >= 300 for regret in regrets)),
-            "mistakes": int(sum(100 <= regret < 300 for regret in regrets)),
-            "inaccuracies": int(sum(50 <= regret < 100 for regret in regrets)),
-        }
-    return metrics
-
-
-def _quality_worker(job):
-    (
-        worker_index,
-        worker_count,
-        traces,
-        teacher_config,
-        loss_cap_cp,
-        log_every,
-        progress,
-    ) = job
-
-    config = replace(
-        teacher_config,
-        cache_path=worker_cache_path(
-            teacher_config.cache_path,
-            worker_index,
-            worker_count,
-        ),
-    )
-    values = {
-        "candidate": {"regret": [], "accuracy": []},
-        "baseline": {"regret": [], "accuracy": []},
-    }
-    total = len(traces)
-    with UciTeacher(config) as teacher:
-        for index, row in enumerate(traces, 1):
-            board = chess.Board(row["fen"])
-            move = chess.Move.from_uci(row["move"])
-            if move not in board.legal_moves:
-                continue
-            result = teacher.analyse(board, played_move=move)
-            regret = float(
-                min(
-                    max(1, int(loss_cap_cp)),
-                    max(0, int(result.get("regret_cp", 0))),
-                )
-            )
-            owner = row["owner"]
-            values[owner]["regret"].append(regret)
-            values[owner]["accuracy"].append(move_accuracy_from_regret(regret))
-            if log_every > 0 and (index == total or index % log_every == 0):
-                progress_print(
-                    progress,
-                    f"arena quality worker {worker_index}: "
-                    f"{index}/{total} moves analysed",
-                )
-    return values
-
-
 def evaluate_models(
     candidate_path,
     baseline_path,
@@ -562,14 +425,6 @@ def evaluate_models(
     c_puct_base=19652.0,
     c_puct_factor=1.0,
     fpu_reduction=0.15,
-    uci=UCI_PATH,
-    uci_depth=8,
-    uci_movetime_ms=0,
-    uci_threads=4,
-    uci_hash_mb=512,
-    uci_multipv=4,
-    teacher_cache="data/runs/arena_teacher_cache.sqlite",
-    quality_loss_cap_cp=1000,
     pgn_output=None,
     trace_output=None,
     pgn_comments=False,
@@ -642,6 +497,8 @@ def evaluate_models(
             pgn_columns,
             claim_draws,
             trace_root_topn,
+            bool(trace_output),
+            bool(pgn_output),
             progress,
         ))
 
@@ -712,23 +569,6 @@ def evaluate_models(
         json.dumps(game_summary, ensure_ascii=False, indent=2),
     )
 
-    teacher_config = TeacherConfig(
-        uci=uci,
-        depth=uci_depth,
-        movetime_ms=uci_movetime_ms,
-        multipv=uci_multipv,
-        threads=uci_threads,
-        hash_mb=uci_hash_mb,
-        cache_path=teacher_cache,
-    )
-    quality = evaluate_move_quality(
-        traces,
-        teacher_config,
-        loss_cap_cp=quality_loss_cap_cp,
-        log_every=log_every,
-        workers=workers,
-        progress=progress,
-    )
     progress_print(
         progress,
         "arena: finished",
@@ -762,8 +602,6 @@ def evaluate_models(
         "baseline_arch": baseline_arch,
         "baseline_decision_profile": baseline_decision_profile,
         **game_summary,
-        "quality": quality,
-        "quality_loss_cap_cp": int(quality_loss_cap_cp),
         "search_type": str(search_type),
         "sims_soft_cap": int(effective_sims),
         "mcts_batch_size": int(mcts_batch_size),
@@ -783,7 +621,7 @@ def evaluate_models(
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Compare models by paired games and optional UCI move quality"
+        description="Compare models by paired games"
     )
     parser.add_argument("--candidate", required=True)
     parser.add_argument("--baseline", required=True)
@@ -808,14 +646,6 @@ def parse_args():
     parser.add_argument("--c-puct-factor", type=float, default=1.0)
     parser.add_argument("--fpu-reduction", type=float, default=0.15)
 
-    parser.add_argument("--uci", default=UCI_PATH)
-    parser.add_argument("--uci-depth", type=int, default=8)
-    parser.add_argument("--uci-movetime-ms", type=int, default=0)
-    parser.add_argument("--uci-threads", type=int, default=4)
-    parser.add_argument("--uci-hash-mb", type=int, default=512)
-    parser.add_argument("--uci-multipv", type=int, default=4)
-    parser.add_argument("--teacher-cache", default="data/runs/arena_teacher_cache.sqlite")
-    parser.add_argument("--quality-loss-cap-cp", type=int, default=1000)
     parser.add_argument("--pgn-output", default=None)
     parser.add_argument("--trace-output", default=None)
     parser.add_argument("--pgn-comments", action="store_true", default=False)
@@ -847,14 +677,6 @@ def main():
         c_puct_base=args.c_puct_base,
         c_puct_factor=args.c_puct_factor,
         fpu_reduction=args.fpu_reduction,
-        uci=args.uci,
-        uci_depth=args.uci_depth,
-        uci_movetime_ms=args.uci_movetime_ms,
-        uci_threads=args.uci_threads,
-        uci_hash_mb=args.uci_hash_mb,
-        uci_multipv=args.uci_multipv,
-        teacher_cache=args.teacher_cache,
-        quality_loss_cap_cp=args.quality_loss_cap_cp,
         pgn_output=args.pgn_output,
         trace_output=args.trace_output,
         pgn_comments=args.pgn_comments,

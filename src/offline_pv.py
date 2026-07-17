@@ -32,7 +32,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from acceptance import attach_arena_acceptance
-from arena import evaluate_models, worker_cache_path
+from arena import evaluate_models
 from architectures import RESNET_PV_LINEAR, architecture_spec
 from checkpoint_io import atomic_copy_with_backup
 from config import (
@@ -47,7 +47,7 @@ from model import load_model, save_model
 from move_codecs import get_move_codec
 from search import VALID_SEARCH_TYPES
 from state_codecs import get_state_codec
-from teacher import MATE_SCORE_CP, UciTeacher, TeacherConfig
+from teacher import MATE_SCORE_CP, UciTeacher, TeacherConfig, worker_cache_path
 
 
 DEFAULT_DATA_RUNS_DIR = os.path.join("data", "runs")
@@ -1330,14 +1330,6 @@ def evaluate_candidate(
         c_puct_base=args.eval_c_puct_base,
         c_puct_factor=args.eval_c_puct_factor,
         fpu_reduction=args.eval_fpu_reduction,
-        uci=args.uci,
-        uci_depth=args.eval_uci_depth,
-        uci_movetime_ms=args.eval_uci_movetime_ms,
-        uci_multipv=args.eval_uci_multipv,
-        uci_threads=args.uci_threads,
-        uci_hash_mb=args.uci_hash_mb,
-        quality_loss_cap_cp=args.eval_quality_loss_cap_cp,
-        teacher_cache=args.teacher_cache,
         trace_output=trace_output,
         trace_root_topn=0,
         log_every=args.log_every,
@@ -1355,8 +1347,6 @@ def evaluate_candidate(
     metrics = attach_arena_acceptance(
         metrics,
         min_net_wins=args.eval_min_net_wins,
-        min_acpl_improvement=args.eval_min_acpl_improvement,
-        min_accuracy_improvement=args.eval_min_accuracy_improvement,
     )
     print("offline-pv arena summary:", flush=True)
     print(json.dumps(metrics, ensure_ascii=False, indent=2), flush=True)
@@ -1579,13 +1569,7 @@ def build_parser():
     parser.add_argument("--eval-c-puct-base", type=float, default=19652.0)
     parser.add_argument("--eval-c-puct-factor", type=float, default=1.0)
     parser.add_argument("--eval-fpu-reduction", type=float, default=0.15)
-    parser.add_argument("--eval-uci-depth", type=int, default=10)
-    parser.add_argument("--eval-uci-movetime-ms", type=int, default=0)
-    parser.add_argument("--eval-uci-multipv", type=int, default=6)
-    parser.add_argument("--eval-quality-loss-cap-cp", type=int, default=1000)
     parser.add_argument("--eval-min-net-wins", type=int, default=5)
-    parser.add_argument("--eval-min-acpl-improvement", type=float, default=0.0)
-    parser.add_argument("--eval-min-accuracy-improvement", type=float, default=0.0)
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--seed", type=int, default=2026)
     return parser

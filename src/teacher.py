@@ -20,6 +20,13 @@ MATE_SCORE_CP = 100000
 TEACHER_CACHE_NAMESPACE = "uci-teacher-regret"
 
 
+def worker_cache_path(cache_path, worker_index, worker_count):
+    if not cache_path or int(worker_count) <= 1:
+        return cache_path
+    root, ext = os.path.splitext(cache_path)
+    return f"{root}.worker{int(worker_index)}{ext or '.sqlite'}"
+
+
 @dataclass
 class TeacherConfig:
     uci: str = UCI_PATH

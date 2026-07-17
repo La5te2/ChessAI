@@ -20,7 +20,6 @@ from state_codecs import get_state_codec
 
 CCRL_EVAL_RE = re.compile(r"(?<![\w.])([+-](?:\d+(?:\.\d+)?|\.\d+))(?:/\d+)?")
 COMMENT_VALUE_SCALE_PAWNS = 3.0
-COMMENT_ADVANTAGE_DELTA_SCALE_PAWNS = 3.0
 
 NON_STATE_DATASET_LAYOUTS = {
     "moves": {
@@ -100,12 +99,9 @@ def comment_value_side_to_move(comment: str, turn: chess.Color) -> float:
 
 
 def comment_advantage_target(before_comment: str, after_comment: str, turn: chess.Color):
-    before_white = comment_score_white_or_zero(before_comment)
-    after_white = comment_score_white_or_zero(after_comment)
-    white_delta = after_white - before_white
-    side_delta = white_delta if turn == chess.WHITE else -white_delta
-    side_delta = min(0.0, side_delta)
-    return float(np.tanh(side_delta / COMMENT_ADVANTAGE_DELTA_SCALE_PAWNS))
+    before_value = comment_value_side_to_move(before_comment, turn)
+    after_value = comment_value_side_to_move(after_comment, turn)
+    return float(np.clip(min(0.0, after_value - before_value), -1.0, 0.0))
 
 def create_h5(
     path: str,
@@ -152,9 +148,9 @@ def create_h5(
     if spec.name == RESNET_PVA_GAD:
         h5.attrs["comment_eval_perspective"] = "white"
         h5.attrs["advantage_perspective"] = "side_to_move"
-        h5.attrs["advantage_source"] = "ccrl_after_move_comment_delta"
+        h5.attrs["advantage_source"] = "comment_value_after_minus_before"
         h5.attrs["advantage_transform"] = (
-            f"tanh(min(side_to_move_delta_pawn_score,0)/{COMMENT_ADVANTAGE_DELTA_SCALE_PAWNS:g})"
+            "clip(min(side_to_move_value_after-side_to_move_value_before,0),-1,0)"
         )
     return h5, datasets
 

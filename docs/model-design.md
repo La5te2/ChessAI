@@ -557,34 +557,80 @@ Stockfish 只是当前 evaluator。
 
 但它更像实验框架，不是最终答案。
 
-## 方向八：Model-Based Policy Improvement
+## 方向八：Folded Counterfactual Policy Iteration
 
-当前模型依赖 Stockfish 做 evaluator。未来如果模型足够强，可以让模型自己产生改进目标。
-
-类似 AlphaZero：
+该方法简称 `FCPI`，中文名为“折叠式反事实策略迭代”。目标是在自对战采集阶段关闭 MCTS，再把少量反事实后继评价形成的策略改进折叠回模型。
 
 ```text
-self-play
-  -> MCTS policy improvement
-  -> train policy/value
-  -> stronger model
+closed self-play
+  -> TD(lambda) value targets from game outcomes
+  -> adaptive multi-ply value expansion for a small action set
+  -> target-network counterfactual Q estimates mixed across depths
+  -> KL-regularized improved policy
+  -> train policy/value/value-scaled advantage
+  -> stronger closed model
 ```
 
-但现阶段模型还不够强，直接走这条风险很高。
+FCPI 的策略迭代原理与 head 类型无关。入口读取 checkpoint 的架构后，由架构实现定义 rollout 排序，以及通用 policy/value/Q 目标到自身 heads 的投影；缺少某个 head 时不生成该 head 的空目标。
 
-更现实的中间路线是：
+反事实 value expansion 在深度 `h` 的估计为：
 
 ```text
-Stockfish 继续做验证器。
-模型/MCTS 生成候选和分布。
-advantage/value 学会更稳定后，逐步减少对 Stockfish 的训练依赖。
+q_h(s,a) = (-1)^h * V_ref(s_h)
 ```
+
+若 `s_h` 已终局，则使用精确 WDL。最终使用截断 lambda 混合：
+
+```text
+Q_expand = sum[h=1..H-1] (1-lambda) * lambda^(h-1) * q_h
+           + lambda^(H-1) * q_H
+```
+
+所有候选先达到最小深度。每批候选具有目标平均展开深度，即这一批允许使用的 Value 评价预算。达到最小深度后，分支优先级由相邻 Value 的 Bellman residual、不同深度 Q 的变化和根节点竞争性共同决定；预算优先分配给高优先级分支，单个分支受最大深度约束。
+
+该预算控制器用目标平均深度替代固定 residual/change 阈值。目标平均深度控制总成本，分支优先级控制成本分布，因此模型变强或局面分布改变时无需重新猜测绝对阈值。终局分支和最大深度可能使实际平均深度低于目标，运行汇总会报告预算利用率。它只执行批量 principal rollout，不维护 tree、visits 或 UCB，因此属于自适应 value expansion，而不是 MCTS。
+
+### resnet_pv_linear FCPI
+
+该架构只更新已有的 policy/value：
+
+- closed self-play 通过 TD(lambda) 生成 value target。
+- policy 给出合法招法先验与反事实候选。
+- 小候选集执行自适应多步 value expansion，后续 rollout 按冻结 Policy 排序。
+- 实际走出的动作额外融合轨迹 return。
+- 未执行反事实评价的合法动作以 `V_ref(s)` 为基线，避免从 policy target 中消失。
+- KL 正则策略目标训练 policy，TD(lambda) target 训练 value。
+
+该架构不存在 advantage head，因此 FCPI 不生成或猜测 advantage。
+
+### resnet_pva_gad FCPI
+
+该架构的三个 head 分工为：
+
+- policy 给出当前候选分布。
+- value 学习当前局面的 side-to-move return。
+- value-scaled advantage 学习 `Q(s,a) - V(s)`，并在 MCTS 中进入未访问动作的 `FPU + advantage`。
+
+反事实 Q 独立融合：
+
+```text
+Q_dueling(s,a) = clip(V_ref(s) + A_ref(s,a), -1, 1)
+Q_target(s,a) = eta * Q_expand(s,a) + (1-eta) * Q_dueling(s,a)
+A_target(s,a) = clip(Q_target(s,a) - V_TD(lambda)(s), -1, 1)
+```
+
+策略改进目标使用：
+
+```text
+pi_plus(a|s) proportional to
+pi_ref(a|s)^rho * exp(Q_target(s,a) / temperature)
+```
+
+冻结的 current target、policy KL 和 candidate/current arena 共同限制单轮变化。arena 与 acceptance 使用 paired-game 结果；Stockfish comment 负责监督初始模型，FCPI 的新增训练信号来自自对战终局、TD return 和模型反事实后继评价。
 
 ### 优先级
 
-长期方向。
-
-当前不是最优先。
+先用已有 `resnet_pv_linear` checkpoint 验证 P/V 路径；`resnet_pva_gad` 完成大规模 commented-PGN 监督训练后，再独立验证 P/V/A 路径。
 
 ## 方向九：Tactic 作为领域增强
 

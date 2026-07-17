@@ -220,8 +220,8 @@ def check_resnet_pv_linear(inspector: Inspector, h5, state_encoding: str, move_e
 def check_resnet_pva_gad(inspector: Inspector, h5, state_encoding: str, move_encoding: str, target_schema: str, has_cmt: int):
     print("schema:", RESNET_PVA_GAD)
     inspector.check(
-        target_schema == "pva_supervised",
-        f"target_schema={target_schema!r}, expected 'pva_supervised'",
+        target_schema == "pva_value_scaled_advantage",
+        f"target_schema={target_schema!r}, expected 'pva_value_scaled_advantage'",
     )
     require_dataset_set(
         inspector,
@@ -239,7 +239,7 @@ def check_resnet_pva_gad(inspector: Inspector, h5, state_encoding: str, move_enc
     check_index_dataset(inspector, h5, "moves", codec.action_size)
     check_index_dataset(inspector, h5, "adv_moves", codec.action_size)
     check_values(inspector, h5, "values", bounds=(-1.0, 1.0))
-    check_values(inspector, h5, "adv_values", bounds=(-1.0, 1.0))
+    check_values(inspector, h5, "adv_values", bounds=(-1.0, 0.0))
 
 
 INSPECTION_HANDLERS = {

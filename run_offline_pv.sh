@@ -89,11 +89,7 @@ EVAL_C_PUCT=0.5
 EVAL_C_PUCT_BASE=19652
 EVAL_C_PUCT_FACTOR=1.0
 EVAL_FPU_REDUCTION=0.15
-EVAL_UCI_DEPTH=16
-EVAL_UCI_MULTIPV=1
 EVAL_MIN_NET_WINS=0
-EVAL_MIN_ACPL_IMPROVEMENT=0.0
-EVAL_MIN_ACCURACY_IMPROVEMENT=0.0
 
 LOG_EVERY=50
 SEED=2026
@@ -110,7 +106,7 @@ echo "offline-pv targets: policy_weight=${TEACHER_POLICY_WEIGHT} rank_weight=${T
 echo "teacher: uci=${UCI} depth=${UCI_DEPTH} multipv=${UCI_MULTIPV} threads=${UCI_THREADS}"
 echo "train: epochs=${EPOCHS} train_max_steps=${TRAIN_MAX_STEPS} batch_size=${BATCH_SIZE} actor_weight=${ACTOR_WEIGHT} critic_weight=${CRITIC_WEIGHT} entropy_weight=${ENTROPY_WEIGHT}"
 echo "teacher validation: source=${VALIDATION_SOURCE} positions=${VALIDATION_POSITIONS} offset=${VALIDATION_OFFSET} topk=${VALIDATION_TOPK} uci_depth=${VALIDATION_UCI_DEPTH} uci_multipv=${VALIDATION_UCI_MULTIPV} top1_tol_cp=${VALIDATION_MAX_TOP1_REGRET_REGRESSION_CP} composite_tol_cp=${VALIDATION_MAX_COMPOSITE_REGRET_REGRESSION_CP}"
-echo "eval: games=${EVAL_GAMES} search_type=${EVAL_SEARCH_TYPE} sims=${EVAL_SIMS} movetime_ms=${EVAL_MOVETIME_MS} c_puct=${EVAL_C_PUCT} fpu_reduction=${EVAL_FPU_REDUCTION} min_net_wins=${EVAL_MIN_NET_WINS} min_acpl_improvement=${EVAL_MIN_ACPL_IMPROVEMENT} min_accuracy_improvement=${EVAL_MIN_ACCURACY_IMPROVEMENT} opening_book=${EVAL_OPENING_BOOK}"
+echo "eval: games=${EVAL_GAMES} search_type=${EVAL_SEARCH_TYPE} sims=${EVAL_SIMS} movetime_ms=${EVAL_MOVETIME_MS} c_puct=${EVAL_C_PUCT} fpu_reduction=${EVAL_FPU_REDUCTION} min_net_wins=${EVAL_MIN_NET_WINS} opening_book=${EVAL_OPENING_BOOK}"
 
 exec python src/offline_pv.py \
   --model "${MODEL}" \
@@ -177,10 +173,6 @@ exec python src/offline_pv.py \
   --eval-c-puct-base "${EVAL_C_PUCT_BASE}" \
   --eval-c-puct-factor "${EVAL_C_PUCT_FACTOR}" \
   --eval-fpu-reduction "${EVAL_FPU_REDUCTION}" \
-  --eval-uci-depth "${EVAL_UCI_DEPTH}" \
-  --eval-uci-multipv "${EVAL_UCI_MULTIPV}" \
   --eval-min-net-wins "${EVAL_MIN_NET_WINS}" \
-  --eval-min-acpl-improvement "${EVAL_MIN_ACPL_IMPROVEMENT}" \
-  --eval-min-accuracy-improvement "${EVAL_MIN_ACCURACY_IMPROVEMENT}" \
   --log-every "${LOG_EVERY}" \
   --seed "${SEED}"
