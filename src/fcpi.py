@@ -1218,6 +1218,16 @@ def validate_fcpi_model(evolution, model_path, data_path, args):
     }
 
 
+def validation_metric_delta(candidate_validation, current_validation):
+    candidate_metrics = dict(candidate_validation.get("metrics", {}))
+    current_metrics = dict(current_validation.get("metrics", {}))
+    keys = sorted(set(candidate_metrics) | set(current_metrics))
+    return {
+        key: float(candidate_metrics.get(key, 0.0) - current_metrics.get(key, 0.0))
+        for key in keys
+    }
+
+
 def run(args, evolution):
     paths = prepare_run_paths()
     shutil.copy2(args.model, paths["current_model"])
@@ -1238,6 +1248,10 @@ def run(args, evolution):
             paths["current_model"], data_path, candidate_path, args
         )
         validation = validate_fcpi_model(evolution, candidate_path, data_path, args)
+        current_validation = validate_fcpi_model(
+            evolution, paths["current_model"], data_path, args
+        )
+        delta = validation_metric_delta(validation, current_validation)
         arena = evaluate_models(
             candidate_path=candidate_path,
             baseline_path=paths["current_model"],
@@ -1275,6 +1289,7 @@ def run(args, evolution):
             "data": data_summary,
             "train": train_summary,
             "validation": validation,
+            "delta": delta,
             "arena": arena,
             "accepted": accepted,
         }

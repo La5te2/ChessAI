@@ -1,4 +1,4 @@
-"""GUI chessboard simulator with optional model-assisted play."""
+"""GUI chessboard simulator with optional model analysis."""
 
 from __future__ import annotations
 
@@ -24,6 +24,7 @@ except Exception:
     DEVICE = "cuda"
 
 from model import load_model
+from gui import ChessGUIBase
 from search import (
     SearchOptions,
     VALID_SEARCH_TYPES,
@@ -98,7 +99,7 @@ def search_options_from_parameters(parameters: Dict, root_topn: Optional[int] = 
     )
 
 
-def board_search_process(job: Dict, output_queue, cancel_event):
+def simulator_search_process(job: Dict, output_queue, cancel_event):
     try:
         board = chess.Board(str(job["fen"]))
         parameters = dict(job["parameters"])
@@ -132,7 +133,7 @@ def board_search_process(job: Dict, output_queue, cancel_event):
             progress_callback=progress,
         )
         output_queue.put((
-            str(job["finish_kind"]),
+            "finish_suggestions",
             ({
                 "ok": True,
                 "move": move.uci(),
@@ -144,7 +145,7 @@ def board_search_process(job: Dict, output_queue, cancel_event):
         ))
     except Exception as exc:
         output_queue.put((
-            str(job.get("finish_kind") or "finish_suggestions"),
+            "finish_suggestions",
             ({
                 "ok": False,
                 "move": None,
@@ -154,15 +155,6 @@ def board_search_process(job: Dict, output_queue, cancel_event):
                 "before_fen": str(job.get("before_fen", "")),
             },),
         ))
-
-
-def color_from_side(side: str) -> chess.Color:
-    value = str(side).strip().lower()
-    if value in {"white", "w", "白", "白棋"}:
-        return chess.WHITE
-    if value in {"black", "b", "黑", "黑棋"}:
-        return chess.BLACK
-    raise ValueError(f"unknown side: {side}")
 
 
 def side_name(color: chess.Color) -> str:
@@ -210,7 +202,7 @@ def resolve_model_path(model_path: Optional[str]) -> Optional[str]:
     return value
 
 
-class ChessEngine:
+class SimulatorState:
     def __init__(
         self,
         config: Optional[EngineConfig] = None,
@@ -218,9 +210,6 @@ class ChessEngine:
     ):
         self.config = config or EngineConfig()
         self.board = chess.Board()
-        self.mode = "simulator"
-        self.user_color = chess.WHITE
-        self.ai_color = chess.BLACK
         self.model = None
         self.model_path: Optional[str] = None
         self.last_ai_info: Optional[Dict] = None
@@ -233,10 +222,6 @@ class ChessEngine:
     @property
     def model_loaded(self) -> bool:
         return self.model is not None and bool(self.model_path)
-
-    @property
-    def playing_with_ai(self) -> bool:
-        return self.mode == "ai"
 
     def search_options(self) -> SearchOptions:
         return SearchOptions(
@@ -276,7 +261,6 @@ class ChessEngine:
         self.model = None
         self.model_path = None
         self.config.model_path = None
-        self.mode = "simulator"
         self.clear_analysis()
 
     def configure_model(self, model_path: str, parameters: Dict):
@@ -369,60 +353,15 @@ class ChessEngine:
         with open(path, "r", encoding="utf-8", errors="replace") as handle:
             return self.load_pgn_string(handle.read())
 
-    def start_ai_game(
-        self,
-        user_side: str,
-        from_current_position: bool,
-    ):
-        if not from_current_position:
-            self.reset("startpos")
-        self.user_color = color_from_side(user_side)
-        self.ai_color = not self.user_color
-        self.mode = "ai"
-        self.clear_analysis()
-        return self.state()
-
-    def enter_simulator(self):
-        self.mode = "simulator"
-        self.clear_analysis()
-        return self.state()
-
     def undo(self) -> int:
         if not self.board.move_stack:
             return 0
-
-        if self.playing_with_ai:
-            undone = 0
-            if self.board.turn == self.user_color:
-                self.board.pop()
-                undone += 1
-                if self.board.move_stack and self.board.turn == self.ai_color:
-                    self.board.pop()
-                    undone += 1
-            else:
-                self.board.pop()
-                undone += 1
-        else:
-            self.board.pop()
-            undone = 1
-
+        self.board.pop()
         self.clear_analysis()
-        return undone
+        return 1
 
     def last_move(self) -> Optional[chess.Move]:
         return self.board.move_stack[-1] if self.board.move_stack else None
-
-    def is_human_turn(self) -> bool:
-        return (
-            self.mode == "simulator"
-            or self.board.turn == self.user_color
-        )
-
-    def is_ai_turn(self) -> bool:
-        return (
-            self.playing_with_ai
-            and self.board.turn == self.ai_color
-        )
 
     def game_over(self) -> bool:
         return self.board.is_game_over(claim_draw=True)
@@ -483,91 +422,10 @@ class ChessEngine:
             "result": self.result() if self.game_over() else "*",
         }
 
-    def make_human_move(self, move_text: str) -> Dict:
+    def make_text_move(self, move_text: str) -> Dict:
         if self.game_over():
             raise RuntimeError("game is already over")
-        if not self.is_human_turn():
-            raise RuntimeError("the AI side is to move")
         return self.make_move(self.parse_move(move_text))
-
-    def choose_ai_move(
-        self,
-        cancel_event=None,
-        progress_callback: Optional[Callable[[Dict], None]] = None,
-        board_snapshot: Optional[chess.Board] = None,
-    ) -> Tuple[chess.Move, Dict]:
-        if not self.playing_with_ai:
-            raise RuntimeError("start Play first")
-        if not self.is_ai_turn():
-            raise RuntimeError("the AI side is not to move")
-        if self.game_over():
-            raise RuntimeError("game is already over")
-
-        search_board = (
-            board_snapshot.copy(stack=True)
-            if board_snapshot is not None
-            else self.board.copy(stack=True)
-        )
-        live_fen = search_board.fen()
-        move, info = select_move(
-            search_board,
-            self.model,
-            self.search_options(),
-            device=self.config.device,
-            cancel_event=cancel_event,
-            progress_callback=progress_callback,
-        )
-        if cancel_event is not None and cancel_event.is_set():
-            raise RuntimeError("AI search cancelled")
-        if self.board.fen() != live_fen:
-            raise RuntimeError("board changed during AI search")
-
-        legal = {candidate.uci(): candidate for candidate in self.board.legal_moves}
-        if move.uci() not in legal:
-            for row in info.get("root", []):
-                candidate = row.get("move")
-                if candidate in legal:
-                    return legal[candidate], info
-            raise RuntimeError(f"search returned illegal move: {move.uci()}")
-        return legal[move.uci()], info
-
-    def make_ai_move(self) -> Dict:
-        if not self.is_ai_turn():
-            raise RuntimeError("the AI side is not to move")
-
-        before_board = self.board.copy(stack=True)
-        before_fen = self.board.fen()
-        before_turn = self.board.turn
-        before_length = len(self.board.move_stack)
-
-        try:
-            move, info = self.choose_ai_move()
-
-            if self.board.fen() != before_fen:
-                raise RuntimeError("board changed before the AI move was applied")
-            if self.board.turn != before_turn:
-                raise RuntimeError("side to move changed during AI search")
-            if move not in self.board.legal_moves:
-                raise RuntimeError(f"AI selected illegal move: {move.uci()}")
-
-            result = self.make_move(move)
-
-            after_length = len(self.board.move_stack)
-            if after_length != before_length + 1:
-                raise RuntimeError(
-                    f"AI must play exactly one ply; got "
-                    f"{after_length - before_length}"
-                )
-            if not self.game_over() and self.board.turn != self.user_color:
-                raise RuntimeError("AI move did not return the turn to the user")
-
-            self.last_ai_info = info
-            self.last_suggestions = info.get("root", [])
-            return {"move": result, "info": info}
-        except Exception:
-            self.board = before_board
-            self.clear_analysis()
-            raise
 
     def suggestions(
         self,
@@ -605,22 +463,10 @@ class ChessEngine:
 
     def pgn(self) -> str:
         game = chess.pgn.Game.from_board(self.board)
-        game.headers["Event"] = (
-            "Human vs AI"
-            if self.playing_with_ai
-            else "Chessboard Simulation"
-        )
+        game.headers["Event"] = "Gadidae Simulator"
         game.headers["Date"] = time.strftime("%Y.%m.%d")
-        if self.playing_with_ai:
-            game.headers["White"] = (
-                "Human" if self.user_color == chess.WHITE else "ChessAI"
-            )
-            game.headers["Black"] = (
-                "Human" if self.user_color == chess.BLACK else "ChessAI"
-            )
-        else:
-            game.headers["White"] = "Player"
-            game.headers["Black"] = "Player"
+        game.headers["White"] = "Player"
+        game.headers["Black"] = "Player"
         game.headers["Result"] = self.result() if self.game_over() else "*"
         return str(game)
 
@@ -656,9 +502,6 @@ class ChessEngine:
         return {
             "fen": self.board.fen(),
             "turn": side_name(self.board.turn),
-            "mode": self.mode,
-            "user_side": side_name(self.user_color),
-            "ai_side": side_name(self.ai_color),
             "model_path": self.model_path,
             "model_loaded": self.model_loaded,
             "ai_suggest": "open" if self.ai_suggest_open else "closed",
@@ -670,24 +513,8 @@ class ChessEngine:
         }
 
 
-UNICODE_PIECES = {
-    chess.Piece(chess.PAWN, chess.WHITE): "♙",
-    chess.Piece(chess.KNIGHT, chess.WHITE): "♘",
-    chess.Piece(chess.BISHOP, chess.WHITE): "♗",
-    chess.Piece(chess.ROOK, chess.WHITE): "♖",
-    chess.Piece(chess.QUEEN, chess.WHITE): "♕",
-    chess.Piece(chess.KING, chess.WHITE): "♔",
-    chess.Piece(chess.PAWN, chess.BLACK): "♟",
-    chess.Piece(chess.KNIGHT, chess.BLACK): "♞",
-    chess.Piece(chess.BISHOP, chess.BLACK): "♝",
-    chess.Piece(chess.ROOK, chess.BLACK): "♜",
-    chess.Piece(chess.QUEEN, chess.BLACK): "♛",
-    chess.Piece(chess.KING, chess.BLACK): "♚",
-}
-
-
 class ModelSettingsDialog(tk.Toplevel):
-    def __init__(self, parent, engine: ChessEngine, on_applied):
+    def __init__(self, parent, engine: SimulatorState, on_applied):
         super().__init__(parent)
         self.engine = engine
         self.on_applied = on_applied
@@ -826,23 +653,17 @@ class ModelSettingsDialog(tk.Toplevel):
         self.destroy()
 
 
-class ChessBoardApp:
-    def __init__(self, root: tk.Tk, engine: ChessEngine):
+class SimulatorApp(ChessGUIBase):
+    def __init__(self, root: tk.Tk, engine: SimulatorState):
         self.root = root
         self.engine = engine
 
-        self.root.title("Chessboard Simulator")
+        self.root.title("Gadidae Simulator")
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.square_size = 72
-        self.board_size = self.square_size * 8
-        self.flipped = False
-        self.selected_square: Optional[chess.Square] = None
-        self.legal_targets: List[chess.Square] = []
-        self.last_move = self.engine.last_move()
+        self.initialize_board_gui()
 
         self.ai_thinking = False
         self.ai_process = None
-        self.ai_task: Optional[str] = None
         self.ai_context: Optional[Dict] = None
         self.ai_generation = 0
         self.ai_cancel_event = None
@@ -850,25 +671,11 @@ class ChessBoardApp:
         self.mp_context = mp.get_context("spawn" if os.name == "nt" else "fork")
         self.ui_queue = self.mp_context.Queue()
         self.ui_poll_interval_ms = 100
-        self.buttons: List[ttk.Button] = []
-
-        self.light = "#EEEED2"
-        self.dark = "#769656"
-        self.selected_color = "#F6F669"
-        self.target_color = "#BACA44"
-        self.lastmove_color = "#CDD26A"
-
         self._build_ui()
         self.draw_board()
         self.refresh_controls()
         self.root.after(self.ui_poll_interval_ms, self.process_ui_events)
         self.schedule_ai_reply()
-
-    def _add_button(self, parent, text, command, side=tk.LEFT):
-        button = ttk.Button(parent, text=text, command=command)
-        button.pack(side=side, padx=2)
-        self.buttons.append(button)
-        return button
 
     def _build_ui(self):
         container = ttk.Frame(self.root, padding=8)
@@ -897,17 +704,9 @@ class ChessBoardApp:
             "Settings",
             self.open_model_settings,
         )
-        self.play_ai_button = self._add_button(
-            main_bar,
-            "Play",
-            self.start_ai_game,
-        )
-        self.simulator_button = self._add_button(
-            main_bar,
-            "Simulator",
-            self.enter_simulator,
-        )
         self._add_button(main_bar, "Flip", self.flip_board)
+        self._add_button(main_bar, "Import PGN", self.import_pgn)
+        self._add_button(main_bar, "Save PGN", self.save_pgn)
         self.ai_suggest_button = self._add_button(
             main_bar,
             "Close",
@@ -974,8 +773,6 @@ class ChessBoardApp:
             lambda _event: self.submit_entry_move(),
         )
         self._add_button(move_bar, "Move", self.submit_entry_move)
-        self._add_button(move_bar, "Import PGN", self.import_pgn)
-        self._add_button(move_bar, "Save PGN", self.save_pgn)
 
     def refresh_controls(self):
         for button in self.buttons:
@@ -984,22 +781,8 @@ class ChessBoardApp:
             except Exception:
                 pass
 
-        self.play_ai_button.configure(state=tk.NORMAL)
-        self.simulator_button.configure(
-            state=(
-                tk.NORMAL
-                if self.engine.playing_with_ai
-                else tk.DISABLED
-            )
-        )
-
         label = "Close" if self.engine.ai_suggest_open else "Open"
-        state = (
-            tk.NORMAL
-            if self.engine.mode == "simulator"
-            else tk.DISABLED
-        )
-        self.ai_suggest_button.configure(text=label, state=state)
+        self.ai_suggest_button.configure(text=label, state=tk.NORMAL)
 
     def cancel_pending_ai(self, cancel_running: bool = True):
         if self.pending_ai_after_id is not None:
@@ -1015,17 +798,15 @@ class ChessBoardApp:
             self.stop_ai_process(terminate=True)
             self.ai_cancel_event = None
             self.ai_thinking = False
-            self.ai_task = None
             self.ai_context = None
             self.refresh_controls()
 
-    def begin_ai_task(self, task: str):
+    def begin_ai_task(self):
         self.cancel_pending_ai()
         self.ai_generation += 1
         cancel_event = self.mp_context.Event()
         self.ai_cancel_event = cancel_event
         self.ai_thinking = True
-        self.ai_task = task
         self.refresh_controls()
         return self.ai_generation, cancel_event
 
@@ -1063,27 +844,23 @@ class ChessBoardApp:
 
     def start_search_process(
         self,
-        task: str,
         board: chess.Board,
         generation: int,
         cancel_event,
-        finish_kind: str,
         context: Dict,
         root_topn: Optional[int] = None,
     ):
         self.ai_context = dict(context)
         job = {
-            "task": task,
             "generation": int(generation),
             "before_fen": str(context.get("before_fen") or board.fen()),
             "fen": board.fen(),
             "model_path": self.engine.model_path,
             "parameters": self.engine.parameter_dict(),
             "root_topn": int(root_topn or self.engine.config.root_topn),
-            "finish_kind": finish_kind,
         }
         process = self.mp_context.Process(
-            target=board_search_process,
+            target=simulator_search_process,
             args=(job, self.ui_queue, cancel_event),
             daemon=True,
         )
@@ -1117,9 +894,7 @@ class ChessBoardApp:
             self.apply_search_progress(*latest_progress)
 
         for kind, payload in events:
-            if kind == "finish_ai_move":
-                self.finish_ai_move(self.merge_ai_context(payload[0]))
-            elif kind == "finish_suggestions":
+            if kind == "finish_suggestions":
                 self.finish_suggestions(self.merge_ai_context(payload[0]))
 
         self.root.after(self.ui_poll_interval_ms, self.process_ui_events)
@@ -1131,127 +906,25 @@ class ChessBoardApp:
             or self.engine.game_over()
         ):
             return
-        if self.engine.is_ai_turn():
-            self.pending_ai_after_id = self.root.after(
-                200,
-                self._run_scheduled_ai_move,
-            )
-        elif (
-            self.engine.mode == "simulator"
-            and self.engine.ai_suggest_open
-        ):
+        if self.engine.ai_suggest_open:
             self.pending_ai_after_id = self.root.after(
                 200,
                 self._run_scheduled_simulator_suggestion,
             )
 
-    def _run_scheduled_ai_move(self):
-        self.pending_ai_after_id = None
-        self.ai_move_once()
-
     def _run_scheduled_simulator_suggestion(self):
         self.pending_ai_after_id = None
         self.start_simulator_suggestion()
 
-    def square_to_screen(self, square: chess.Square):
-        file_index = chess.square_file(square)
-        rank_index = chess.square_rank(square)
-        if self.flipped:
-            return 7 - file_index, rank_index
-        return file_index, 7 - rank_index
-
-    def screen_to_square(self, x: int, y: int):
-        column = x // self.square_size
-        row = y // self.square_size
-        if not (0 <= column < 8 and 0 <= row < 8):
-            return None
-        if self.flipped:
-            file_index = 7 - column
-            rank_index = row
-        else:
-            file_index = column
-            rank_index = 7 - row
-        return chess.square(file_index, rank_index)
-
-    def clear_selection(self):
-        self.selected_square = None
-        self.legal_targets = []
-
-    def sync_last_move(self):
-        self.last_move = self.engine.last_move()
-
-    def draw_board(self):
-        self.canvas.delete("all")
-        highlighted = set()
-        if self.last_move is not None:
-            highlighted = {
-                self.last_move.from_square,
-                self.last_move.to_square,
-            }
-
-        for square in chess.SQUARES:
-            column, row = self.square_to_screen(square)
-            x1 = column * self.square_size
-            y1 = row * self.square_size
-            x2 = x1 + self.square_size
-            y2 = y1 + self.square_size
-
-            file_index = chess.square_file(square)
-            rank_index = chess.square_rank(square)
-            color = (
-                self.light
-                if (file_index + rank_index) % 2 == 0
-                else self.dark
-            )
-            if square in highlighted:
-                color = self.lastmove_color
-            if square == self.selected_square:
-                color = self.selected_color
-            elif square in self.legal_targets:
-                color = self.target_color
-
-            self.canvas.create_rectangle(
-                x1,
-                y1,
-                x2,
-                y2,
-                fill=color,
-                outline=color,
-            )
-
-            piece = self.engine.board.piece_at(square)
-            if piece:
-                self.canvas.create_text(
-                    x1 + self.square_size / 2,
-                    y1 + self.square_size / 2 + 2,
-                    text=UNICODE_PIECES.get(piece, piece.symbol()),
-                    font=("Segoe UI Symbol", int(self.square_size * 0.62)),
-                    fill="#111111",
-                )
-
-        self.update_panels()
-
     def update_panels(self):
         turn = side_name(self.engine.board.turn)
-        mode = "Play" if self.engine.playing_with_ai else "Simulator"
-        status = f"Mode: {mode} | Turn: {turn}"
+        status = f"Turn: {turn}"
         if self.ai_thinking:
-            label = "AI move" if self.ai_task == "move" else "Analysis"
-            status = f"{status} | {label} running"
+            status = f"{status} | Analysis running"
 
         self.status_var.set(status)
         self.update_board_state()
         self.refresh_controls()
-
-    def update_board_state(self):
-        text = (
-            f"FEN:\n{self.engine.board.fen()}\n\n"
-            f"PGN:\n{self.engine.pgn_movetext()}"
-        )
-        self.board_state_text.configure(state=tk.NORMAL)
-        self.board_state_text.delete("1.0", tk.END)
-        self.board_state_text.insert(tk.END, text)
-        self.board_state_text.configure(state=tk.DISABLED)
 
     def update_analysis(self, info: Optional[Dict]):
         self.info_text.delete("1.0", tk.END)
@@ -1291,19 +964,10 @@ class ChessBoardApp:
 
     def selectable_piece(self, square: chess.Square) -> bool:
         piece = self.engine.board.piece_at(square)
-        if not piece or piece.color != self.engine.board.turn:
-            return False
-        if self.engine.playing_with_ai:
-            return (
-                self.engine.is_human_turn()
-                and piece.color == self.engine.user_color
-            )
-        return True
+        return bool(piece and piece.color == self.engine.board.turn)
 
     def on_click(self, event):
         if self.engine.game_over():
-            return
-        if not self.engine.is_human_turn():
             return
 
         square = self.screen_to_square(event.x, event.y)
@@ -1342,7 +1006,7 @@ class ChessBoardApp:
             return
 
         self.clear_selection()
-        self.play_human_move(move)
+        self.play_move(move)
 
     def make_move_from_squares(self, from_square, to_square):
         candidates = [
@@ -1377,10 +1041,10 @@ class ChessBoardApp:
                 return move
         return candidates[0]
 
-    def play_human_move(self, move: chess.Move):
+    def play_move(self, move: chess.Move):
         try:
             self.cancel_pending_ai()
-            self.engine.make_human_move(move.uci())
+            self.engine.make_text_move(move.uci())
             self.last_move = move
             self.update_analysis(None)
             self.draw_board()
@@ -1396,130 +1060,33 @@ class ChessBoardApp:
         try:
             move = self.engine.parse_move(text)
             self.move_entry.delete(0, tk.END)
-            self.play_human_move(move)
+            self.play_move(move)
         except Exception as exc:
             messagebox.showerror("Move", str(exc), parent=self.root)
-
-    def ai_move_once(self):
-        if self.ai_thinking:
-            self.cancel_pending_ai()
-        if not self.engine.is_ai_turn():
-            return
-
-        before_board = self.engine.board.copy(stack=True)
-        before_fen = self.engine.board.fen()
-        before_turn = self.engine.board.turn
-        before_length = len(self.engine.board.move_stack)
-        generation, cancel_event = self.begin_ai_task("move")
-        self.clear_selection()
-        self.draw_board()
-
-        self.start_search_process(
-            task="move",
-            board=before_board,
-            generation=generation,
-            cancel_event=cancel_event,
-            finish_kind="finish_ai_move",
-            context={
-                "generation": generation,
-                "cancel_event": cancel_event,
-                "before_board": before_board,
-                "before_fen": before_fen,
-                "before_turn": before_turn,
-                "before_length": before_length,
-            },
-        )
 
     def apply_search_progress(self, generation: int, before_fen: str, info: Dict):
         if not self.is_current_ai_task(generation, before_fen):
             return
         self.update_analysis(info)
 
-    def finish_ai_move(self, payload):
-        try:
-            generation = int(payload.get("generation", -1))
-            if not self.is_current_ai_task(generation, payload.get("before_fen")):
-                return
-            cancel_event = payload.get("cancel_event")
-            if cancel_event is not None and cancel_event.is_set():
-                return
-            if self.engine.board.fen() != payload.get("before_fen"):
-                return
-            if not payload.get("ok"):
-                raise RuntimeError(payload.get("error") or "AI search failed")
-
-            if self.engine.board.turn != payload.get("before_turn"):
-                raise RuntimeError("side to move changed during AI search")
-            if not self.engine.is_ai_turn():
-                raise RuntimeError("the AI side is no longer to move")
-
-            move = chess.Move.from_uci(payload["move"])
-            if move not in self.engine.board.legal_moves:
-                raise RuntimeError(f"AI selected illegal move: {move.uci()}")
-
-            self.engine.make_move(move)
-
-            before_length = int(payload.get("before_length", -1))
-            after_length = len(self.engine.board.move_stack)
-            if after_length != before_length + 1:
-                raise RuntimeError(
-                    f"AI must play exactly one ply; got {after_length - before_length}"
-                )
-            if (
-                not self.engine.game_over()
-                and self.engine.board.turn != self.engine.user_color
-            ):
-                raise RuntimeError("AI move did not return the turn to the user")
-
-            self.engine.last_ai_info = payload["info"]
-            self.last_move = move
-            self.update_analysis(payload["info"])
-        except Exception as exc:
-            generation = int(payload.get("generation", -1))
-            if generation != self.ai_generation:
-                return
-            before_board = payload.get("before_board")
-            if before_board is not None:
-                self.engine.board = before_board
-                self.engine.clear_analysis()
-                self.sync_last_move()
-            messagebox.showerror(
-                "AI move",
-                str(exc),
-                parent=self.root,
-            )
-        finally:
-            generation = int(payload.get("generation", -1))
-            if generation == self.ai_generation:
-                self.ai_thinking = False
-                self.ai_task = None
-                self.ai_cancel_event = None
-                self.ai_context = None
-                self.stop_ai_process(terminate=False)
-                self.draw_board()
-                self.schedule_ai_reply()
-
     def start_simulator_suggestion(self):
         if self.ai_thinking:
             self.cancel_pending_ai()
         if (
-            self.engine.mode != "simulator"
-            or self.engine.game_over()
+            self.engine.game_over()
             or not self.engine.ai_suggest_open
         ):
             return
 
         before_fen = self.engine.board.fen()
         board_snapshot = self.engine.board.copy(stack=True)
-        generation, cancel_event = self.begin_ai_task("suggestion")
+        generation, cancel_event = self.begin_ai_task()
         self.draw_board()
 
         self.start_search_process(
-            task="suggestion",
             board=board_snapshot,
             generation=generation,
             cancel_event=cancel_event,
-            finish_kind="finish_suggestions",
             context={
                 "generation": generation,
                 "cancel_event": cancel_event,
@@ -1536,8 +1103,6 @@ class ChessBoardApp:
                 return
             cancel_event = payload.get("cancel_event")
             if cancel_event is not None and cancel_event.is_set():
-                return
-            if self.engine.mode != "simulator":
                 return
             if self.engine.board.fen() != payload.get("before_fen"):
                 return
@@ -1558,7 +1123,6 @@ class ChessBoardApp:
             generation = int(payload.get("generation", -1))
             if generation == self.ai_generation:
                 self.ai_thinking = False
-                self.ai_task = None
                 self.ai_cancel_event = None
                 self.ai_context = None
                 self.stop_ai_process(terminate=False)
@@ -1568,8 +1132,6 @@ class ChessBoardApp:
                     self.info_text.insert(tk.END, error_message)
 
     def toggle_ai_suggest(self):
-        if self.engine.mode != "simulator" or self.ai_task == "move":
-            return
         if self.engine.ai_suggest_open:
             self.engine.close_ai_suggest()
             self.cancel_pending_ai()
@@ -1603,52 +1165,12 @@ class ChessBoardApp:
                 parent=self.root,
             )
         else:
-            self.enter_simulator()
+            self.schedule_ai_reply()
             messagebox.showinfo(
                 "Model",
                 "Model unloaded.",
                 parent=self.root,
             )
-
-    def start_ai_game(self):
-        side_answer = messagebox.askyesnocancel(
-            "Play",
-            "Choose your side.\n\nYes = White\nNo = Black",
-            parent=self.root,
-        )
-        if side_answer is None:
-            return
-        user_side = "white" if side_answer else "black"
-
-        position_answer = messagebox.askyesnocancel(
-            "Play",
-            "Choose the starting position.\n\n"
-            "Yes = Current position\n"
-            "No = Start position",
-            parent=self.root,
-        )
-        if position_answer is None:
-            return
-
-        self.cancel_pending_ai()
-        self.engine.start_ai_game(
-            user_side=user_side,
-            from_current_position=bool(position_answer),
-        )
-        self.flipped = self.engine.user_color == chess.BLACK
-        self.clear_selection()
-        self.sync_last_move()
-        self.update_analysis(None)
-        self.draw_board()
-        self.schedule_ai_reply()
-
-    def enter_simulator(self):
-        self.cancel_pending_ai()
-        self.engine.enter_simulator()
-        self.clear_selection()
-        self.update_analysis(None)
-        self.draw_board()
-        self.schedule_ai_reply()
 
     def reset_board(self):
         self.cancel_pending_ai()
@@ -1704,35 +1226,9 @@ class ChessBoardApp:
                 parent=self.root,
             )
 
-    def flip_board(self):
-        self.flipped = not self.flipped
-        self.draw_board()
-
-    def save_pgn(self):
-        path = filedialog.asksaveasfilename(
-            parent=self.root,
-            title="Save PGN",
-            defaultextension=".pgn",
-            filetypes=[
-                ("PGN files", "*.pgn"),
-                ("All files", "*.*"),
-            ],
-        )
-        if not path:
-            return
-        try:
-            self.engine.save_pgn(path)
-        except Exception as exc:
-            messagebox.showerror(
-                "Save PGN",
-                str(exc),
-                parent=self.root,
-            )
-
-
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Chessboard GUI with optional model assistance"
+        description="Chess position simulator with optional model analysis"
     )
     parser.add_argument("--model", default="none")
     parser.add_argument("--device", default=DEVICE)
@@ -1773,13 +1269,13 @@ def main():
         progress_interval_ms=args.progress_interval_ms,
         root_topn=args.root_topn,
     )
-    engine = ChessEngine(
+    engine = SimulatorState(
         config,
         load_weights=bool(model_path),
     )
 
     root = tk.Tk()
-    ChessBoardApp(root, engine)
+    SimulatorApp(root, engine)
     root.mainloop()
 
 

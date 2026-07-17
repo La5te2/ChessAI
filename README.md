@@ -37,13 +37,13 @@ ChessAI/
     analyze.py
     architectures.py
     arena.py
-    board.py
     checkpoint_io.py
     config.py
     data.py
     decision.py
     evaluator.py
     fcpi.py
+    gui.py
     inspection.py
     model.py
     move_codecs.py
@@ -51,15 +51,18 @@ ChessAI/
     opening_book.py
     preprocess.py
     search.py
+    simulator.py
     standardize.py
     state_codecs.py
+    stadium.py
     teacher.py
     train.py
     uci_engine.py
   run_opening.sh
   run_offline_pv.sh
   run_fcpi.sh
-  run_board.vbs
+  run_simulator.vbs
+  run_stadium.vbs
   setup_lichess_bot.sh
   run_lichess_bot.sh
   stop_lichess_bot.sh
@@ -88,13 +91,13 @@ ChessAI/
 - `analyze.py`：用 UCI 引擎分析 PGN，生成 `.cmt` 和带评价批注的 `_cmt.pgn`。
 - `architectures.py`：架构注册表，定义每个架构的 state encoding、move encoding 和 HDF5 schema。
 - `arena.py`：两个模型 paired games 对战，输出胜负统计、PGN 和 trace。
-- `board.py`：Tk GUI 棋盘，支持加载模型、下棋、翻转棋盘和实时搜索显示。
 - `checkpoint_io.py`：checkpoint 原子写回和备份工具。
 - `config.py`：默认路径、设备、训练参数、搜索参数和平台化 UCI 路径。
 - `data.py`：supervised HDF5 schema 校验和 PyTorch Dataset。
 - `decision.py`：模型到 search 的决策适配层；按 `arch_type` 选择 state codec、move codec、MCTS profile 和架构特有搜索信号。
 - `evaluator.py`：batched neural inference，供 MCTS 批量评估叶子局面。
 - `fcpi.py`：按 checkpoint 架构分派独立 FCPI 进化公式，执行 closed self-play、反事实目标训练与 arena gate。
+- `gui.py`：Simulator 与 Stadium 共用的 Tk 棋盘绘制、坐标映射、翻转、局面文本和 PGN 保存界面。
 - `inspection.py`：检查 `preprocess.py` 生成的 supervised HDF5 是否符合对应架构。
 - `model.py`：模型结构、架构识别、checkpoint 加载和保存。
 - `move_codecs.py`：招法编码、解码、合法招法概率映射和 action size。
@@ -102,8 +105,10 @@ ChessAI/
 - `opening_book.py`：从 PGN 生成开局书、验证开局书均势性、为 arena 生成 paired opening specs。
 - `preprocess.py`：从 PGN 生成指定架构的 supervised HDF5。
 - `search.py`：单局面模型直出和 MCTS 搜索。
+- `simulator.py`：局面模拟与模型分析 GUI，支持双方走子、实时候选、FEN 和 PGN 操作。
 - `standardize.py`：规范化 checkpoint 结构，并按权重结构识别架构。
 - `state_codecs.py`：棋盘状态编码，按架构注册。
+- `stadium.py`：单盘 UCI 引擎对战观察 GUI，支持任意两个标准 UCI 引擎。
 - `teacher.py`：UCI 教师机封装，提供走法评分、regret 计算和 sqlite cache。
 - `train.py`：指定架构的监督训练入口。
 - `uci_engine.py`：Gadidae 的 UCI 引擎外壳，供 lichess-bot 或 GUI 引擎前端调用。
@@ -634,18 +639,18 @@ FCPI 提供 policy/value/advantage 的可学习改进信号；实际棋力提升
 
 ---
 
-## 11. GUI Board
+## 11. Simulator 与 Stadium
 
-启动 GUI：
+启动 Simulator：
 
 ```bash
-python src/board.py
+python src/simulator.py
 ```
 
 带模型启动：
 
 ```bash
-python src/board.py \
+python src/simulator.py \
   --model models/champion.pth \
   --device cpu \
   --search-type only-mcts \
@@ -664,18 +669,36 @@ python src/board.py \
 Windows 一键启动：
 
 ```text
-run_board.vbs
+run_simulator.vbs
 ```
 
-GUI 功能：
+Simulator 功能：
 
 - `Settings`：选择模型、设备和 search 参数。
-- `Simulator`：双方轮流走子，自动显示当前局面候选。
+- 棋盘：双方轮流走子，自动显示当前局面候选。
 - `Close / Open`：暂停或恢复自动候选。
-- `Play`：选择人类执白或执黑，AI 自动回复。
 - `Reset FEN`：载入 FEN；空输入恢复 `startpos`。
 - `Import PGN` / `Save PGN`：导入或保存主线棋谱。
 - `Board state`：复制 FEN 和 PGN。
+
+启动 Stadium：
+
+```bash
+python src/stadium.py \
+  --white-uci "python src/uci_engine.py --model models/candidate0.pth --device cpu --search-type closed --mcts-sims 0" \
+  --black-uci "python src/uci_engine.py --model models/candidate0.pth --device cpu --search-type only-mcts --mcts-sims 1000 --mcts-min-sims 1000 --mcts-batch-size 32" \
+  --movetime-ms 10000 \
+  --delay-ms 300 \
+  --max-plies 240
+```
+
+Windows 一键启动：
+
+```text
+run_stadium.vbs
+```
+
+Stadium 的 `Settings` 配置双方 UCI 命令、每步思考时间、显示间隔和最大 ply；`Start FEN` 设置单盘起始局面。
 
 ---
 

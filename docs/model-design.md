@@ -164,10 +164,10 @@ child_initial_q = FPU(s) + advantage_head(s, a)
 
 ## 方向二：Dueling Policy-Value-Q Architecture
 
-可以把 `A(s, a)` 拆成：
+可以把 `Q(s, a)` 拆成：
 
 ```text
-A(s, a) = V(s) + A(s, a)
+Q(s, a) = V(s) + A(s, a)
 ```
 
 其中：
@@ -330,7 +330,79 @@ search_gain_head(s)
 
 中。
 
-它更像搜索预算控制层，最好在 policy/value/advantage 稳定后再做。
+它更像搜索预算控制层，应该在 policy/value/advantage 稳定后再做。
+
+### 4.1 Bayesian Epistemic Uncertainty / PVUA
+
+当前 `search.py` 里的 uncertainty 是搜索后的启发式根节点模糊度，主要来自 visits 熵、top2 visits 接近程度和 top2 Q 接近程度。它能帮助分配 MCTS 预算，但它不是模型自己输出的认知不确定性。
+
+一个更系统的方向是让模型显式输出：
+
+```text
+policy(s)
+value(s)
+advantage(s, a)
+uncertainty(s)
+```
+
+也就是可以称为 `PVUA` 的结构。其中 `U` 应该拆清楚：
+
+```text
+U_a(s): aleatoric uncertainty，局面评价本身的噪声或多解性
+U_e(s): epistemic uncertainty，模型因为数据不足、容量不足或分布外局面而产生的不确定
+```
+
+如果只用一个 `log_variance` 并通过 Gaussian NLL 训练 value：
+
+```text
+loss_value = 0.5 * exp(-log_sigma2) * (value - target)^2 + 0.5 * log_sigma2
+```
+
+它主要学到的是 `U_a`，也就是“这个 target 本身有多嘈杂”。这有用，但还不是严格意义上的认知不确定性。真正更接近 `U_e` 的实现可以考虑：
+
+- bootstrap value heads：共享 trunk，挂多个 value heads，用 heads 间方差表示认知不确定。
+- lightweight ensemble：多个小 evaluator 或多个 checkpoint 的预测方差。
+- MC dropout：推理时多次 dropout 采样，成本较低但稳定性需要验证。
+- Laplace / SWAG 类近似：在训练后估计权重后验，工程复杂度更高。
+
+对 Gadidae 来说，最现实的版本是：
+
+```text
+shared trunk
+  -> policy head
+  -> value heads: V_1 ... V_k
+  -> log_sigma2 head
+  -> advantage head
+
+value_mean = mean(V_i)
+U_e = variance(V_i)
+U_a = exp(log_sigma2)
+```
+
+这样它不是把国际象棋变成非完全信息游戏。棋盘仍然是完全信息的；“战争迷雾”来自模型自身看不见的计算空间：有限容量、有限训练数据、有限搜索预算让许多后继局面在模型内部近似不可见。因此 `U_e` 可以被看作模型对自己盲区的估计。
+
+### 对搜索的作用
+
+`U` 不应直接当作走法好坏。更合理的用法是：
+
+- 高 `U_e` 局面分配更多 MCTS 预算。
+- 高 `U_e` 时提高 FPU 保守性，避免 policy 自信地冲进盲区。
+- 训练时把高 `U_e` 且高 regret 的局面加入优先采样。
+- arena 或 simulator 中显示“模型对此局面不确定”，帮助人类理解模型输出。
+
+这能解释一个现实问题：小模型在棋盘上看到的是完整状态，但它未必真的“理解”完整后果。显式不确定性可以让搜索知道哪些地方需要多看，哪些地方可以快走。
+
+### 风险
+
+- 如果 value target 本身来自噪声很大的自对战，`U` 可能学成“哪里数据脏”。
+- 如果只训练 NLL 而没有多头或 ensemble，`U` 更像 aleatoric，不足以表达模型盲区。
+- 如果把 `U` 直接加进走法排序，可能让模型偏向保守或偏向怪招。
+
+### 优先级
+
+中高。
+
+它适合作为第三类架构候选，但应放在 `resnet_pva_gad` 跑通监督学习和基础 arena 后再做。推荐名称可以是 `resnet_pvua_gad`，表示 geometry attention + policy/value/uncertainty/advantage。
 
 ## 方向五：更强的 Board Network
 
@@ -789,6 +861,7 @@ Transformer 是通用方法，但在当前资源下不一定划算。
 - teacher best in top-k。
 - value MAE / RMSE / sign accuracy。
 - 如果有 advantage head，记录 advantage MAE、best-adv move regret、policy-adv disagreement。
+- 如果有 uncertainty head，记录 value NLL、校准曲线、U_e 与 regret / search gain 的相关性。
 - CPU 单步延迟。
 - GPU 训练吞吐。
 

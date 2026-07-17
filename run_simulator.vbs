@@ -4,7 +4,7 @@ Set fso = CreateObject("Scripting.FileSystemObject")
 baseDir = fso.GetParentFolderName(WScript.ScriptFullName)
 shell.CurrentDirectory = baseDir
 
-cmd = "pythonw.exe src\board.py" & _
+cmd = "pythonw.exe src\simulator.py" & _
   " --model models\candidate0.pth" & _
   " --device cpu" & _
   " --search-type only-mcts" & _

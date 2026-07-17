@@ -1,0 +1,691 @@
+{
+  "run_id": "fcpi_20260717_195559_2938",
+  "current_model": "models/runs/fcpi_20260717_195559_2938/current.pth",
+  "summaries": [
+    {
+      "iteration": 1,
+      "architecture": "resnet_pv_linear",
+      "formula": "pv_linear_adaptive_value_expansion_td_kl",
+      "data": {
+        "path": "data/runs/fcpi_20260717_195559_2938/fcpi_iter_001.h5",
+        "positions": 86959,
+        "train_positions": 78184,
+        "validation_positions": 8775,
+        "legal_width": 72,
+        "counterfactual_width": 6,
+        "formula": "pv_linear_adaptive_value_expansion_td_kl",
+        "sampling": {
+          "games": 1000,
+          "source_positions": 110005,
+          "unique_positions": 108996,
+          "selected_positions": 86959,
+          "positions_per_game": 100,
+          "capped_games": 529
+        },
+        "counterfactual": {
+          "branches": 493433,
+          "average_depth": 4.0,
+          "max_depth": 6,
+          "depth_histogram": {
+            "1": 2348,
+            "2": 194103,
+            "3": 38950,
+            "4": 29391,
+            "5": 23082,
+            "6": 205559
+          },
+          "terminal_branches": 6918,
+          "mean_residual": 0.2096418695750916,
+          "p90_residual": 0.504607655107975,
+          "mean_change": 0.2096418695750916,
+          "p90_change": 0.504607655107975,
+          "min_plies": 2,
+          "max_plies": 6,
+          "target_average_plies": 4.0,
+          "requested_branch_plies": 1973732,
+          "actual_branch_plies": 1973732,
+          "budget_utilization": 1.0,
+          "trace_lambda": 0.8
+        }
+      },
+      "train": {
+        "steps": 2500,
+        "epochs_requested": 30,
+        "metrics": {
+          "loss": 1.4918247534275055,
+          "policy": 1.4671526773452759,
+          "value": 0.025233840104937552,
+          "kl": 0.018281760327890514,
+          "entropy": 1.475851228094101
+        },
+        "candidate": "models/runs/fcpi_20260717_195559_2938/candidate_iter_001.pth"
+      },
+      "validation": {
+        "positions": 8775,
+        "metrics": {
+          "loss": 1.4766957453319005,
+          "policy": 1.4553664990833828,
+          "value": 0.022259415074118546,
+          "kl": 0.010611076959009681,
+          "entropy": 1.4607203960418702
+        }
+      },
+      "arena": {
+        "candidate": "models/runs/fcpi_20260717_195559_2938/candidate_iter_001.pth",
+        "candidate_sha256": "959f837b36f48b6b5b89ff92782c4601fd15e203e15a167e8cfd9227ea1ca7dd",
+        "candidate_arch": {
+          "type": "resnet_pv_linear",
+          "backbone": "resnet",
+          "policy_head": "linear",
+          "value_head": "mlp",
+          "state_encoding": "resnet_pv_linear_18_planes",
+          "move_encoding": "alphazero_64x73",
+          "input_channels": 18,
+          "channels": 128,
+          "blocks": 10,
+          "action_size": 4672
+        },
+        "candidate_decision_profile": "resnet_pv_linear_mcts",
+        "baseline": "models/runs/fcpi_20260717_195559_2938/current.pth",
+        "baseline_sha256": "2b215f3949fb60636580d0ef3e962406fa93f580c281a2f0530aa6544523ce1b",
+        "baseline_arch": {
+          "type": "resnet_pv_linear",
+          "backbone": "resnet",
+          "policy_head": "linear",
+          "value_head": "mlp",
+          "state_encoding": "resnet_pv_linear_18_planes",
+          "move_encoding": "alphazero_64x73",
+          "input_channels": 18,
+          "channels": 128,
+          "blocks": 10,
+          "action_size": 4672
+        },
+        "baseline_decision_profile": "resnet_pv_linear_mcts",
+        "games": 200,
+        "wins": 31,
+        "draws": 138,
+        "losses": 31,
+        "net_wins": 0,
+        "score": 0.5,
+        "score_ci_low": 0.46132054159489094,
+        "score_ci_high": 0.5386794584051091,
+        "elo_diff": 0.0,
+        "elo_ci_low": -26.93104863286259,
+        "elo_ci_high": 26.93104863286261,
+        "raw_results": {
+          "1/2-1/2": 138,
+          "0-1": 21,
+          "1-0": 41
+        },
+        "avg_plies": 90.94,
+        "search_type": "closed",
+        "sims_soft_cap": 0,
+        "mcts_batch_size": 64,
+        "movetime_ms": 0,
+        "c_puct_initial": 1.5,
+        "c_puct_base": 19652.0,
+        "c_puct_factor": 1.0,
+        "fpu_reduction": 0.15,
+        "claim_draws": false,
+        "opening_book": "data/openings.gen.bin",
+        "book_plies": 8,
+        "paired_openings": true,
+        "unique_start_positions": 100,
+        "trace_output": null,
+        "result_ok": false,
+        "accepted": false,
+        "min_net_wins": 4
+      },
+      "accepted": false
+    },
+    {
+      "iteration": 2,
+      "architecture": "resnet_pv_linear",
+      "formula": "pv_linear_adaptive_value_expansion_td_kl",
+      "data": {
+        "path": "data/runs/fcpi_20260717_195559_2938/fcpi_iter_002.h5",
+        "positions": 88620,
+        "train_positions": 79403,
+        "validation_positions": 9217,
+        "legal_width": 81,
+        "counterfactual_width": 6,
+        "formula": "pv_linear_adaptive_value_expansion_td_kl",
+        "sampling": {
+          "games": 1000,
+          "source_positions": 112918,
+          "unique_positions": 111887,
+          "selected_positions": 88620,
+          "positions_per_game": 100,
+          "capped_games": 566
+        },
+        "counterfactual": {
+          "branches": 502815,
+          "average_depth": 4.0,
+          "max_depth": 6,
+          "depth_histogram": {
+            "1": 2482,
+            "2": 197478,
+            "3": 39773,
+            "4": 30206,
+            "5": 23577,
+            "6": 209299
+          },
+          "terminal_branches": 7177,
+          "mean_residual": 0.2102538844446165,
+          "p90_residual": 0.506418514251709,
+          "mean_change": 0.2102538844446165,
+          "p90_change": 0.506418514251709,
+          "min_plies": 2,
+          "max_plies": 6,
+          "target_average_plies": 4.0,
+          "requested_branch_plies": 2011260,
+          "actual_branch_plies": 2011260,
+          "budget_utilization": 1.0,
+          "trace_lambda": 0.8
+        }
+      },
+      "train": {
+        "steps": 2500,
+        "epochs_requested": 30,
+        "metrics": {
+          "loss": 1.4859370487689971,
+          "policy": 1.4615581477165223,
+          "value": 0.024905469335988164,
+          "kl": 0.0188627984482795,
+          "entropy": 1.469708390378952
+        },
+        "candidate": "models/runs/fcpi_20260717_195559_2938/candidate_iter_002.pth"
+      },
+      "validation": {
+        "positions": 9217,
+        "metrics": {
+          "loss": 1.4777755962835777,
+          "policy": 1.4581295767345943,
+          "value": 0.02052016687151548,
+          "kl": 0.011753911467118038,
+          "entropy": 1.4618536652745426
+        }
+      },
+      "arena": {
+        "candidate": "models/runs/fcpi_20260717_195559_2938/candidate_iter_002.pth",
+        "candidate_sha256": "0148c1740a0abd32f8791c2a96b158d424244b6f7629c8c08d24b7622f6cdd29",
+        "candidate_arch": {
+          "type": "resnet_pv_linear",
+          "backbone": "resnet",
+          "policy_head": "linear",
+          "value_head": "mlp",
+          "state_encoding": "resnet_pv_linear_18_planes",
+          "move_encoding": "alphazero_64x73",
+          "input_channels": 18,
+          "channels": 128,
+          "blocks": 10,
+          "action_size": 4672
+        },
+        "candidate_decision_profile": "resnet_pv_linear_mcts",
+        "baseline": "models/runs/fcpi_20260717_195559_2938/current.pth",
+        "baseline_sha256": "2b215f3949fb60636580d0ef3e962406fa93f580c281a2f0530aa6544523ce1b",
+        "baseline_arch": {
+          "type": "resnet_pv_linear",
+          "backbone": "resnet",
+          "policy_head": "linear",
+          "value_head": "mlp",
+          "state_encoding": "resnet_pv_linear_18_planes",
+          "move_encoding": "alphazero_64x73",
+          "input_channels": 18,
+          "channels": 128,
+          "blocks": 10,
+          "action_size": 4672
+        },
+        "baseline_decision_profile": "resnet_pv_linear_mcts",
+        "games": 200,
+        "wins": 36,
+        "draws": 136,
+        "losses": 28,
+        "net_wins": 8,
+        "score": 0.52,
+        "score_ci_low": 0.4808,
+        "score_ci_high": 0.5592,
+        "elo_diff": 13.904842503684801,
+        "elo_ci_low": -13.348089919051876,
+        "elo_ci_high": 41.33023075755855,
+        "raw_results": {
+          "1/2-1/2": 136,
+          "1-0": 35,
+          "0-1": 29
+        },
+        "avg_plies": 87.425,
+        "search_type": "closed",
+        "sims_soft_cap": 0,
+        "mcts_batch_size": 64,
+        "movetime_ms": 0,
+        "c_puct_initial": 1.5,
+        "c_puct_base": 19652.0,
+        "c_puct_factor": 1.0,
+        "fpu_reduction": 0.15,
+        "claim_draws": false,
+        "opening_book": "data/openings.gen.bin",
+        "book_plies": 8,
+        "paired_openings": true,
+        "unique_start_positions": 100,
+        "trace_output": null,
+        "result_ok": true,
+        "accepted": true,
+        "min_net_wins": 4,
+        "promotion": {
+          "dst": "models/runs/fcpi_20260717_195559_2938/current.pth",
+          "backup": null,
+          "skipped": false
+        }
+      },
+      "accepted": true
+    },
+    {
+      "iteration": 3,
+      "architecture": "resnet_pv_linear",
+      "formula": "pv_linear_adaptive_value_expansion_td_kl",
+      "data": {
+        "path": "data/runs/fcpi_20260717_195559_2938/fcpi_iter_003.h5",
+        "positions": 87124,
+        "train_positions": 78949,
+        "validation_positions": 8175,
+        "legal_width": 77,
+        "counterfactual_width": 6,
+        "formula": "pv_linear_adaptive_value_expansion_td_kl",
+        "sampling": {
+          "games": 1000,
+          "source_positions": 108638,
+          "unique_positions": 107615,
+          "selected_positions": 87124,
+          "positions_per_game": 100,
+          "capped_games": 529
+        },
+        "counterfactual": {
+          "branches": 493070,
+          "average_depth": 4.0,
+          "max_depth": 6,
+          "depth_histogram": {
+            "1": 2473,
+            "2": 177310,
+            "3": 50960,
+            "4": 40345,
+            "5": 30965,
+            "6": 191017
+          },
+          "terminal_branches": 7717,
+          "mean_residual": 0.12523137843048956,
+          "p90_residual": 0.31399188041687015,
+          "mean_change": 0.12523137843048956,
+          "p90_change": 0.31399188041687015,
+          "min_plies": 2,
+          "max_plies": 6,
+          "target_average_plies": 4.0,
+          "requested_branch_plies": 1972280,
+          "actual_branch_plies": 1972280,
+          "budget_utilization": 1.0,
+          "trace_lambda": 0.8
+        }
+      },
+      "train": {
+        "steps": 2500,
+        "epochs_requested": 30,
+        "metrics": {
+          "loss": 1.46691619887352,
+          "policy": 1.4460519809246064,
+          "value": 0.021965921172127128,
+          "kl": 0.006936208710912615,
+          "entropy": 1.448513068962097
+        },
+        "candidate": "models/runs/fcpi_20260717_195559_2938/candidate_iter_003.pth"
+      },
+      "validation": {
+        "positions": 8175,
+        "metrics": {
+          "loss": 1.454894781112671,
+          "policy": 1.435964122414589,
+          "value": 0.020264071761630476,
+          "kl": 0.0020270203131076414,
+          "entropy": 1.4347584620118141
+        }
+      },
+      "arena": {
+        "candidate": "models/runs/fcpi_20260717_195559_2938/candidate_iter_003.pth",
+        "candidate_sha256": "d4c5cb7251b6a2135bfb4860134eb472af4c4e4062d831c63528fc6d8904ed2a",
+        "candidate_arch": {
+          "type": "resnet_pv_linear",
+          "backbone": "resnet",
+          "policy_head": "linear",
+          "value_head": "mlp",
+          "state_encoding": "resnet_pv_linear_18_planes",
+          "move_encoding": "alphazero_64x73",
+          "input_channels": 18,
+          "channels": 128,
+          "blocks": 10,
+          "action_size": 4672
+        },
+        "candidate_decision_profile": "resnet_pv_linear_mcts",
+        "baseline": "models/runs/fcpi_20260717_195559_2938/current.pth",
+        "baseline_sha256": "0148c1740a0abd32f8791c2a96b158d424244b6f7629c8c08d24b7622f6cdd29",
+        "baseline_arch": {
+          "type": "resnet_pv_linear",
+          "backbone": "resnet",
+          "policy_head": "linear",
+          "value_head": "mlp",
+          "state_encoding": "resnet_pv_linear_18_planes",
+          "move_encoding": "alphazero_64x73",
+          "input_channels": 18,
+          "channels": 128,
+          "blocks": 10,
+          "action_size": 4672
+        },
+        "baseline_decision_profile": "resnet_pv_linear_mcts",
+        "games": 200,
+        "wins": 34,
+        "draws": 135,
+        "losses": 31,
+        "net_wins": 3,
+        "score": 0.5075,
+        "score_ci_low": 0.4679095139848653,
+        "score_ci_high": 0.5470904860151347,
+        "elo_diff": 5.211924700647974,
+        "elo_ci_low": -22.329447146446032,
+        "elo_ci_high": 32.81908746726305,
+        "raw_results": {
+          "1/2-1/2": 135,
+          "1-0": 34,
+          "0-1": 31
+        },
+        "avg_plies": 92.6,
+        "search_type": "closed",
+        "sims_soft_cap": 0,
+        "mcts_batch_size": 64,
+        "movetime_ms": 0,
+        "c_puct_initial": 1.5,
+        "c_puct_base": 19652.0,
+        "c_puct_factor": 1.0,
+        "fpu_reduction": 0.15,
+        "claim_draws": false,
+        "opening_book": "data/openings.gen.bin",
+        "book_plies": 8,
+        "paired_openings": true,
+        "unique_start_positions": 100,
+        "trace_output": null,
+        "result_ok": false,
+        "accepted": false,
+        "min_net_wins": 4
+      },
+      "accepted": false
+    },
+    {
+      "iteration": 4,
+      "architecture": "resnet_pv_linear",
+      "formula": "pv_linear_adaptive_value_expansion_td_kl",
+      "data": {
+        "path": "data/runs/fcpi_20260717_195559_2938/fcpi_iter_004.h5",
+        "positions": 86872,
+        "train_positions": 78411,
+        "validation_positions": 8461,
+        "legal_width": 70,
+        "counterfactual_width": 6,
+        "formula": "pv_linear_adaptive_value_expansion_td_kl",
+        "sampling": {
+          "games": 1000,
+          "source_positions": 110571,
+          "unique_positions": 109546,
+          "selected_positions": 86872,
+          "positions_per_game": 100,
+          "capped_games": 529
+        },
+        "counterfactual": {
+          "branches": 492781,
+          "average_depth": 4.0,
+          "max_depth": 6,
+          "depth_histogram": {
+            "1": 2382,
+            "2": 178145,
+            "3": 50182,
+            "4": 39941,
+            "5": 30644,
+            "6": 191487
+          },
+          "terminal_branches": 7657,
+          "mean_residual": 0.12451884216786417,
+          "p90_residual": 0.3120571367442609,
+          "mean_change": 0.12451884216786417,
+          "p90_change": 0.3120571367442609,
+          "min_plies": 2,
+          "max_plies": 6,
+          "target_average_plies": 4.0,
+          "requested_branch_plies": 1971124,
+          "actual_branch_plies": 1971124,
+          "budget_utilization": 1.0,
+          "trace_lambda": 0.8
+        }
+      },
+      "train": {
+        "steps": 2500,
+        "epochs_requested": 30,
+        "metrics": {
+          "loss": 1.4691494739532471,
+          "policy": 1.4476873785972595,
+          "value": 0.022572988663986326,
+          "kl": 0.006790386115061119,
+          "entropy": 1.45041175198555
+        },
+        "candidate": "models/runs/fcpi_20260717_195559_2938/candidate_iter_004.pth"
+      },
+      "validation": {
+        "positions": 8461,
+        "metrics": {
+          "loss": 1.4391949071603662,
+          "policy": 1.4189159028670366,
+          "value": 0.02162317749025533,
+          "kl": 0.0017682709149084985,
+          "entropy": 1.4326064726885628
+        }
+      },
+      "arena": {
+        "candidate": "models/runs/fcpi_20260717_195559_2938/candidate_iter_004.pth",
+        "candidate_sha256": "aa60aec737df5e19e4546a1fbe57138b3608e4970dabb694485ab7830af0de20",
+        "candidate_arch": {
+          "type": "resnet_pv_linear",
+          "backbone": "resnet",
+          "policy_head": "linear",
+          "value_head": "mlp",
+          "state_encoding": "resnet_pv_linear_18_planes",
+          "move_encoding": "alphazero_64x73",
+          "input_channels": 18,
+          "channels": 128,
+          "blocks": 10,
+          "action_size": 4672
+        },
+        "candidate_decision_profile": "resnet_pv_linear_mcts",
+        "baseline": "models/runs/fcpi_20260717_195559_2938/current.pth",
+        "baseline_sha256": "0148c1740a0abd32f8791c2a96b158d424244b6f7629c8c08d24b7622f6cdd29",
+        "baseline_arch": {
+          "type": "resnet_pv_linear",
+          "backbone": "resnet",
+          "policy_head": "linear",
+          "value_head": "mlp",
+          "state_encoding": "resnet_pv_linear_18_planes",
+          "move_encoding": "alphazero_64x73",
+          "input_channels": 18,
+          "channels": 128,
+          "blocks": 10,
+          "action_size": 4672
+        },
+        "baseline_decision_profile": "resnet_pv_linear_mcts",
+        "games": 200,
+        "wins": 32,
+        "draws": 129,
+        "losses": 39,
+        "net_wins": -7,
+        "score": 0.4825,
+        "score_ci_low": 0.44117973412646894,
+        "score_ci_high": 0.523820265873531,
+        "elo_diff": -12.165214579657631,
+        "elo_ci_low": -41.06263719410483,
+        "elo_ci_high": 16.564555385991664,
+        "raw_results": {
+          "1/2-1/2": 129,
+          "1-0": 38,
+          "0-1": 33
+        },
+        "avg_plies": 88.97,
+        "search_type": "closed",
+        "sims_soft_cap": 0,
+        "mcts_batch_size": 64,
+        "movetime_ms": 0,
+        "c_puct_initial": 1.5,
+        "c_puct_base": 19652.0,
+        "c_puct_factor": 1.0,
+        "fpu_reduction": 0.15,
+        "claim_draws": false,
+        "opening_book": "data/openings.gen.bin",
+        "book_plies": 8,
+        "paired_openings": true,
+        "unique_start_positions": 100,
+        "trace_output": null,
+        "result_ok": false,
+        "accepted": false,
+        "min_net_wins": 4
+      },
+      "accepted": false
+    },
+    {
+      "iteration": 5,
+      "architecture": "resnet_pv_linear",
+      "formula": "pv_linear_adaptive_value_expansion_td_kl",
+      "data": {
+        "path": "data/runs/fcpi_20260717_195559_2938/fcpi_iter_005.h5",
+        "positions": 87610,
+        "train_positions": 78828,
+        "validation_positions": 8782,
+        "legal_width": 70,
+        "counterfactual_width": 6,
+        "formula": "pv_linear_adaptive_value_expansion_td_kl",
+        "sampling": {
+          "games": 1000,
+          "source_positions": 110500,
+          "unique_positions": 109437,
+          "selected_positions": 87610,
+          "positions_per_game": 100,
+          "capped_games": 548
+        },
+        "counterfactual": {
+          "branches": 496862,
+          "average_depth": 4.0,
+          "max_depth": 6,
+          "depth_histogram": {
+            "1": 2424,
+            "2": 179355,
+            "3": 50689,
+            "4": 40573,
+            "5": 30971,
+            "6": 192850
+          },
+          "terminal_branches": 7411,
+          "mean_residual": 0.12434662308219449,
+          "p90_residual": 0.31334910616278633,
+          "mean_change": 0.12434662308219449,
+          "p90_change": 0.31334910616278633,
+          "min_plies": 2,
+          "max_plies": 6,
+          "target_average_plies": 4.0,
+          "requested_branch_plies": 1987448,
+          "actual_branch_plies": 1987448,
+          "budget_utilization": 1.0,
+          "trace_lambda": 0.8
+        }
+      },
+      "train": {
+        "steps": 2500,
+        "epochs_requested": 30,
+        "metrics": {
+          "loss": 1.4722940502643584,
+          "policy": 1.451379921388626,
+          "value": 0.02202763532809913,
+          "kl": 0.006813592122169212,
+          "entropy": 1.454185322189331
+        },
+        "candidate": "models/runs/fcpi_20260717_195559_2938/candidate_iter_005.pth"
+      },
+      "validation": {
+        "positions": 8782,
+        "metrics": {
+          "loss": 1.4529839209147861,
+          "policy": 1.4324087142944335,
+          "value": 0.021933457707720143,
+          "kl": 0.0016514670935326389,
+          "entropy": 1.4408166238239832
+        }
+      },
+      "arena": {
+        "candidate": "models/runs/fcpi_20260717_195559_2938/candidate_iter_005.pth",
+        "candidate_sha256": "1bf01e20c8bbceb11e272b75d2f55201244d60da9076dfd6eefea7edf7784155",
+        "candidate_arch": {
+          "type": "resnet_pv_linear",
+          "backbone": "resnet",
+          "policy_head": "linear",
+          "value_head": "mlp",
+          "state_encoding": "resnet_pv_linear_18_planes",
+          "move_encoding": "alphazero_64x73",
+          "input_channels": 18,
+          "channels": 128,
+          "blocks": 10,
+          "action_size": 4672
+        },
+        "candidate_decision_profile": "resnet_pv_linear_mcts",
+        "baseline": "models/runs/fcpi_20260717_195559_2938/current.pth",
+        "baseline_sha256": "0148c1740a0abd32f8791c2a96b158d424244b6f7629c8c08d24b7622f6cdd29",
+        "baseline_arch": {
+          "type": "resnet_pv_linear",
+          "backbone": "resnet",
+          "policy_head": "linear",
+          "value_head": "mlp",
+          "state_encoding": "resnet_pv_linear_18_planes",
+          "move_encoding": "alphazero_64x73",
+          "input_channels": 18,
+          "channels": 128,
+          "blocks": 10,
+          "action_size": 4672
+        },
+        "baseline_decision_profile": "resnet_pv_linear_mcts",
+        "games": 200,
+        "wins": 31,
+        "draws": 140,
+        "losses": 29,
+        "net_wins": 2,
+        "score": 0.505,
+        "score_ci_low": 0.46695586007129913,
+        "score_ci_high": 0.5430441399287009,
+        "elo_diff": 3.4744716740370483,
+        "elo_ci_low": -22.99493731834974,
+        "elo_ci_high": 29.98435214511958,
+        "raw_results": {
+          "1/2-1/2": 140,
+          "1-0": 28,
+          "0-1": 32
+        },
+        "avg_plies": 92.89,
+        "search_type": "closed",
+        "sims_soft_cap": 0,
+        "mcts_batch_size": 64,
+        "movetime_ms": 0,
+        "c_puct_initial": 1.5,
+        "c_puct_base": 19652.0,
+        "c_puct_factor": 1.0,
+        "fpu_reduction": 0.15,
+        "claim_draws": false,
+        "opening_book": "data/openings.gen.bin",
+        "book_plies": 8,
+        "paired_openings": true,
+        "unique_start_positions": 100,
+        "trace_output": null,
+        "result_ok": false,
+        "accepted": false,
+        "min_net_wins": 4
+      },
+      "accepted": false
+    }
+  ]
+}
