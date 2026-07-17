@@ -207,6 +207,20 @@ def adaptive_successor_q_batches(
         )
     )
     trace_lambda = float(evolution.counterfactual_lambda(args))
+    total_records = len(records)
+    estimated_branches = sum(len(record.candidate_indices) for record in records)
+    estimated_branch_plies = int(round(estimated_branches * target_average_plies))
+    progress_started = time.perf_counter()
+    last_logged_records = 0
+    log_every = max(1, int(args.log_every))
+    print(
+        "fcpi counterfactual start:",
+        f"positions={total_records}",
+        f"branches={estimated_branches}",
+        f"target_average_plies={target_average_plies:.2f}",
+        f"estimated_branch_plies={estimated_branch_plies}",
+        flush=True,
+    )
 
     for start in range(0, len(records), records_per_batch):
         subset = records[start:start + records_per_batch]
@@ -348,6 +362,22 @@ def adaptive_successor_q_batches(
             )
             all_depths.append(branch.depth)
         output.extend(subset_q)
+
+        processed_records = min(start + len(subset), total_records)
+        if (
+            processed_records == total_records
+            or processed_records - last_logged_records >= log_every
+        ):
+            elapsed = max(1e-9, time.perf_counter() - progress_started)
+            print(
+                "fcpi counterfactual:",
+                f"positions={processed_records}/{total_records}",
+                f"branches={len(all_depths)}/{estimated_branches}",
+                f"branch_plies={sum(all_depths)}/{estimated_branch_plies}",
+                f"positions_per_sec={processed_records / elapsed:.2f}",
+                flush=True,
+            )
+            last_logged_records = processed_records
 
     summary = {
         "branches": len(all_depths),
@@ -495,7 +525,9 @@ def collect_selfplay(
                 if board.is_game_over(claim_draw=True) or len(trajectory.positions) >= args.max_plies:
                     trajectories.append(trajectory)
                     print(
-                        f"fcpi game {trajectory.game_id}/{len(specs)}:",
+                        "fcpi game:",
+                        f"completed={len(trajectories)}/{len(specs)}",
+                        f"game_id={trajectory.game_id}",
                         f"plies={len(trajectory.positions)}",
                         f"result={result_label(board, len(trajectory.positions) >= args.max_plies)}",
                         flush=True,
@@ -659,7 +691,8 @@ class PVAGadDataset(FCPIH5Dataset):
 
 
 def masked_policy_terms(logits, indices, priors, targets, counts):
-    selected = logits.gather(1, indices)
+    # Policy masking and normalization stay in float32 under CUDA autocast.
+    selected = logits.gather(1, indices).float()
     width = selected.shape[1]
     mask = torch.arange(width, device=selected.device).unsqueeze(0) < counts.unsqueeze(1)
     selected = selected.masked_fill(~mask, -1e9)
