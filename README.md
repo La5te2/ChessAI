@@ -587,17 +587,231 @@ tail -f "data/runs/$RUN_ID/info.log"
 
 FCPI 一次只训练一个 checkpoint。入口先识别 `arch.type`，再由对应架构注册同一组用户参数、提供自己的默认值，并把例如 `--counterfactual-topk` 映射为该架构内部的独立参数变量。`resnet_pva_gad` 还会注册仅供其 Advantage 路径使用的参数；这些参数不会出现在 `resnet_pv_linear` 命令中。
 
-`run_fcpi.sh` 默认参数适合先对 `models/candidate.pth` 做一轮实验。常用参数：
+### 10.1 共同目标
+
+记本轮开始时冻结的 `current.pth` 参数为 `theta_0`，从它初始化并接受梯度更新的 candidate 参数为 `theta`。`pi_0`、`V_0`、`A_0` 均来自冻结模型；Value、Q 和 Advantage 使用 side-to-move 视角。
+
+完整轨迹的终点目标为：
+
+$$
+G_T =
+\begin{cases}
+z_T, & \text{正式终局} \\
+V_0(s_T), & \text{达到 max-plies}
+\end{cases}
+$$
+
+其中 `z_T` 取值为 `-1`、`0` 或 `1`。TD(lambda) 从轨迹末端反向计算：
+
+$$
+G_t = \operatorname{clip}\left(
+-\left[(1-\lambda_{TD})V_0(s_{t+1})+\lambda_{TD}G_{t+1}\right],
+-1,1
+\right)
+$$
+
+Value 监督目标为：
+
+$$
+V^*(s_t)=G_t
+$$
+
+对根局面 `s` 的候选招法 `a`，先走出该招法，再沿冻结模型在后续局面的确定性 top1 继续 rollout。深度 `d` 的 Value 转换回根节点行棋方视角：
+
+$$
+e_d(s,a)=(-1)^dV_0(s_d)
+$$
+
+若 `s_d` 已经终局，则使用真实终局值。不同深度的结果按 `counterfactual-lambda` 混合：
+
+$$
+Q_{CF}(s,a)=
+(1-\lambda_{CF})
+\sum_{d=1}^{D-1}\lambda_{CF}^{d-1}e_d(s,a)
++\lambda_{CF}^{D-1}e_D(s,a)
+$$
+
+得到架构对应的改进值 `Q_hat` 后，Policy 目标统一为：
+
+$$
+\pi^*(a\mid s)=
+\frac{
+\pi_0(a\mid s)^\rho
+\exp\left((\widehat Q(s,a)-V_0(s))/\tau_\pi\right)
+}{
+\sum_b \pi_0(b\mid s)^\rho
+\exp\left((\widehat Q(s,b)-V_0(s))/\tau_\pi\right)
+}
+$$
+
+`prior-power` 对应 `rho`，`policy-temperature` 对应 `tau_pi`。当前脚本中二者分别为 `1.0` 和 `0.25`。
+
+### 10.2 resnet_pv_linear
+
+该架构输出 Policy 与 Value：
+
+$$
+f_\theta(s)=\left(\pi_\theta(s),V_\theta(s)\right)
+$$
+
+自对局 behavior 覆盖全部合法招法：
+
+$$
+\mu(a\mid s)=
+(1-\epsilon)
+\frac{\pi_0(a\mid s)^{1/T_b}}
+{\sum_b\pi_0(b\mid s)^{1/T_b}}
++\frac{\epsilon}{|\mathcal A(s)|}
+$$
+
+当前脚本使用 `T_b=1.0`、`epsilon=0.03`。反事实候选取 Policy 排名前 `K=6` 的招法，并始终包含实际走出的招法。候选初值为：
+
+$$
+Q_c(s,a)=Q_{CF}(s,a)
+$$
+
+实际走出的招法再混入整盘 TD 回报：
+
+$$
+Q'_c(s,a_t)=(1-w_p)Q_c(s,a_t)+w_pG_t
+$$
+
+当前 `played-return-weight` 为 `w_p=0.5`。最终改进值为：
+
+$$
+\widehat Q(s,a)=
+\begin{cases}
+Q'_c(s,a), & a\text{ 是反事实候选} \\
+V_0(s), & a\text{ 未展开}
+\end{cases}
+$$
+
+令 `p_theta` 为 candidate 在合法招法上的 Policy softmax：
+
+$$
+L_{policy}=-\mathbb E_s\sum_a\pi^*(a\mid s)\log p_\theta(a\mid s)
+$$
+
+$$
+L_V=\operatorname{SmoothL1}\left(V_\theta(s),G_t\right)
+$$
+
+代码使用反向 KL，约束 candidate 不要一次偏离冻结 Policy 过远：
+
+$$
+L_{KL}=D_{KL}\left(p_\theta(\cdot\mid s)\parallel\pi_0(\cdot\mid s)\right)
+$$
+
+$$
+H(p_\theta)=-\sum_a p_\theta(a\mid s)\log p_\theta(a\mid s)
+$$
+
+总损失为：
+
+$$
+L_{PV}=L_{policy}+L_V+0.05L_{KL}-0.001H(p_\theta)
+$$
+
+### 10.3 resnet_pva_gad
+
+该架构输出 Policy、Value 与 Advantage：
+
+$$
+f_\theta(s)=\left(\pi_\theta(s),V_\theta(s),A_\theta(s,a)\right)
+$$
+
+当前 dueling 组合直接使用 `V+A`，不执行 Advantage 均值中心化：
+
+$$
+Q_0(s,a)=\operatorname{clip}\left(V_0(s)+A_0(s,a),-1,1\right)
+$$
+
+自对局排序分数与 behavior 为：
+
+$$
+R_0(s,a)=\log\pi_0(a\mid s)+\beta A_0(s,a)
+$$
+
+$$
+\mu(a\mid s)=
+(1-\epsilon)\operatorname{softmax}\left(R_0(s,a)/T_b\right)
++\frac{\epsilon}{|\mathcal A(s)|}
+$$
+
+当前脚本使用 `beta=0.5`、`T_b=1.0`、`epsilon=0.03`。反事实候选取 `R_0` 排名前 `K=8` 的招法，并包含实际走法；后续 rollout 同样选择 `R_0` 的 top1。
+
+反事实展开结果与冻结模型的 dueling Q 混合：
+
+$$
+Q_c(s,a)=\eta Q_{CF}(s,a)+(1-\eta)Q_0(s,a)
+$$
+
+当前 `successor-weight` 为 `eta=0.75`。实际走法继续混入 TD 回报：
+
+$$
+Q'_c(s,a_t)=(1-w_p)Q_c(s,a_t)+w_pG_t
+$$
+
+最终改进值为：
+
+$$
+\widehat Q(s,a)=
+\begin{cases}
+Q'_c(s,a), & a\text{ 是反事实候选} \\
+Q_0(s,a), & a\text{ 未展开}
+\end{cases}
+$$
+
+候选招法的 Advantage 目标为：
+
+$$
+A^*(s,a)=\operatorname{clip}\left(Q'_c(s,a)-G_t,-1,1\right)
+$$
+
+$$
+L_A=\operatorname{SmoothL1}\left(A_\theta(s,a),A^*(s,a)\right)
+$$
+
+总损失为：
+
+$$
+L_{PVA}=L_{policy}+L_V+0.5L_A+0.05L_{KL}-0.001H(p_\theta)
+$$
+
+`L_A` 只在反事实候选上计算。Policy 目标、Value 目标和 Advantage 目标由冻结的 `theta_0` 预先生成，训练时作为常量；三个 loss 分别更新对应 head，并共同更新共享 trunk。
+
+### 10.4 参数更新与重复 state 聚合
+
+两个架构都使用 AdamW，当前脚本学习率为 `1e-5`、weight decay 为 `1e-4`，梯度范数裁剪为 `1.0`：
+
+$$
+\theta\leftarrow\operatorname{AdamW}\left(\theta,\nabla_\theta L,10^{-5},10^{-4}\right)
+$$
+
+反事实目标生成后，相同编码 state 在训练 split 与验证 split 内分别聚合。Value 与 Policy 目标取平均：
+
+$$
+\overline G(s)=\frac{1}{N_s}\sum_{i=1}^{N_s}G_i(s)
+$$
+
+$$
+\overline\pi^*(a\mid s)=\frac{1}{N_s}\sum_{i=1}^{N_s}\pi_i^*(a\mid s)
+$$
+
+同一候选招法的 Q 与 Advantage 只在实际展开过该候选的记录之间取平均。聚合不会跨越训练/验证 split。Arena、acceptance 与 validation delta 均不进入梯度方程；arena 只负责 candidate 晋升 gate。
+
+`run_fcpi.sh` 默认使用 20% startpos 与 80% 均势开局书起点。开局书数量不足时，每轮完整洗牌后循环使用全部开局，使复用次数均匀；arena 继续使用唯一 paired openings。常用参数：
 
 ```text
 MODEL=models/candidate.pth
-ITERATIONS=1
-GAMES_PER_ITER=500
-GAMES_IN_FLIGHT=64
+ITERATIONS=5
+GAMES_PER_ITER=1000
+GAMES_IN_FLIGHT=100
 MAX_PLIES=240
-POSITIONS_PER_GAME=64
-EPOCHS=4
-TRAIN_MAX_STEPS=2000
+POSITIONS_PER_GAME=100
+STARTPOS_FRACTION=0.20
+EPOCHS=6
+TRAIN_MAX_STEPS=2300
 EVAL_GAMES=200
 EVAL_SEARCH_TYPE=closed
 EVAL_SIMS=0
@@ -618,7 +832,7 @@ COUNTERFACTUAL_LAMBDA=0.80
 
 `info.log` 中的 `counterfactual summary` 会输出 `average_depth`、`depth_histogram`、`target_average_plies` 和 `budget_utilization`，用于确认实际计算量与目标预算。
 
-自对战先在完整轨迹上计算 TD(lambda)，再按局处理训练 position：同一局中编码后完全相同的模型 state 只保留一次；超过 `POSITIONS_PER_GAME` 时均匀无放回采样，并保持选中 position 的时间顺序。不同棋局之间保留自然重复频率。日志与 `summary.json` 会记录原始、去重后和最终选中的 position 数量。
+自对战先在完整轨迹上计算 TD(lambda)，再按局处理训练 position：同一局中编码后完全相同的模型 state 只保留一次；超过 `POSITIONS_PER_GAME` 时均匀无放回采样，并保持选中 position 的时间顺序。生成反事实目标后，训练集与验证集分别聚合跨对局重复 state，平均 policy/value 及对应候选目标，避免常见开局前缀按重复次数主导 loss，也避免 split 之间的数据泄漏。日志与 `summary.json` 会记录采样、起点复用和聚合数量。
 
 达到 `MAX_PLIES` 时，正式规则已经判定的将死、逼和、子力不足、重复或五十回合结果照常使用；仍未终局的轨迹使用当前模型对尾部局面的连续 Value bootstrap，不强制改写为和棋。
 

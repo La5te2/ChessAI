@@ -31,7 +31,7 @@ from config import DEVICE
 from decision import profile_for_model
 from evaluator import BatchedEvaluator
 from model import checkpoint_metadata, load_model, save_model
-from opening_book import make_arena_specs
+from opening_book import make_sampling_specs
 
 
 DATA_RUNS_DIR = os.path.join("data", "runs")
@@ -485,13 +485,13 @@ def collect_selfplay(
     model = load_model(model_path, device=args.device)
     evaluator = BatchedEvaluator(model, device=args.device, batch_size=args.inference_batch_size)
     profile = profile_for_model(model)
-    specs = make_arena_specs(
+    specs, opening_summary = make_sampling_specs(
         games=args.games_per_iter,
         seed=args.seed + iteration,
         opening_book=args.opening_book,
         book_plies=args.book_plies,
         max_positions=args.max_book_positions,
-        paired=False,
+        startpos_fraction=args.startpos_fraction,
     )
     rng = np.random.default_rng(args.seed + iteration)
     trajectories: List[Trajectory] = []
@@ -503,6 +503,11 @@ def collect_selfplay(
         f"games={len(specs)}",
         f"max_plies={args.max_plies}",
         f"device={args.device}",
+        flush=True,
+    )
+    print(
+        "fcpi starts:",
+        json.dumps(opening_summary, ensure_ascii=False),
         flush=True,
     )
 
@@ -587,6 +592,7 @@ def collect_selfplay(
         args.positions_per_game,
         sample_rng,
     )
+    sampling_summary["starts"] = opening_summary
     evolution.last_sampling_summary = sampling_summary
     print(
         "fcpi position sampling:",
@@ -611,11 +617,81 @@ def padded_rows(records, field: str, dtype, width: int):
     return output
 
 
+def merge_target_record_group(group: Sequence[RawPosition]) -> RawPosition:
+    merged = group[0]
+    if len(group) == 1:
+        return merged
+
+    for record in group[1:]:
+        if not np.array_equal(record.legal_indices, merged.legal_indices):
+            raise RuntimeError("identical encoded states produced different legal actions")
+
+    merged.legal_prior = normalize(
+        np.mean(np.stack([record.legal_prior for record in group]), axis=0)
+    ).astype(np.float32)
+    merged.policy_target = normalize(
+        np.mean(np.stack([record.policy_target for record in group]), axis=0)
+    ).astype(np.float32)
+    merged.value_target = float(np.mean([record.value_target for record in group]))
+
+    candidate_q = {}
+    advantage = {}
+    for record in group:
+        for action, value in zip(record.candidate_indices, record.candidate_q):
+            candidate_q.setdefault(int(action), []).append(float(value))
+        if record.advantage_target is not None:
+            for action, value in zip(record.candidate_indices, record.advantage_target):
+                advantage.setdefault(int(action), []).append(float(value))
+
+    candidate_set = set(candidate_q)
+    candidate_indices = [
+        int(action) for action in merged.legal_indices if int(action) in candidate_set
+    ]
+    merged.candidate_indices = np.asarray(candidate_indices, dtype=np.int64)
+    merged.candidate_q = np.asarray(
+        [np.mean(candidate_q[action]) for action in candidate_indices],
+        dtype=np.float32,
+    )
+    if advantage:
+        merged.advantage_target = np.asarray(
+            [np.mean(advantage[action]) for action in candidate_indices],
+            dtype=np.float32,
+        )
+    return merged
+
+
+def aggregate_target_records(
+    records: Sequence[RawPosition],
+    split_game: int,
+) -> Tuple[List[RawPosition], Dict[str, int]]:
+    groups = {}
+    for record in records:
+        split = 1 if record.game_id > split_game else 0
+        state_key = np.ascontiguousarray(record.state).tobytes()
+        groups.setdefault((split, state_key), []).append(record)
+
+    merged = [merge_target_record_group(group) for group in groups.values()]
+    multiplicities = [len(group) for group in groups.values()]
+    return merged, {
+        "source_positions": len(records),
+        "aggregated_positions": len(merged),
+        "merged_positions": len(records) - len(merged),
+        "duplicate_groups": sum(size > 1 for size in multiplicities),
+        "max_group_size": max(multiplicities, default=0),
+    }
+
+
 def write_base_fcpi_h5(path: str, records: Sequence[RawPosition], evolution, args):
     if not records:
         raise RuntimeError("FCPI generated no positions")
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     split_game = max(1, int(args.games_per_iter * (1.0 - args.validation_fraction)))
+    records, aggregation_summary = aggregate_target_records(records, split_game)
+    print(
+        "fcpi position aggregation:",
+        json.dumps(aggregation_summary, ensure_ascii=False),
+        flush=True,
+    )
     legal_width = max(len(record.legal_indices) for record in records)
     candidate_width = max(len(record.candidate_indices) for record in records)
     with h5py.File(path, "w") as h5:
@@ -677,6 +753,7 @@ def write_base_fcpi_h5(path: str, records: Sequence[RawPosition], evolution, arg
         "counterfactual_width": candidate_width,
         "formula": evolution.formula_name,
         "sampling": dict(getattr(evolution, "last_sampling_summary", {})),
+        "aggregation": aggregation_summary,
         "counterfactual": dict(getattr(evolution, "last_target_summary", {})),
     }
 
@@ -1321,6 +1398,7 @@ def common_parser(add_help=True):
     parser.add_argument("--max-plies", type=int, default=240)
     parser.add_argument("--positions-per-game", type=int, default=64)
     parser.add_argument("--opening-book", default="data/openings.gen.bin")
+    parser.add_argument("--startpos-fraction", type=float, default=0.20)
     parser.add_argument("--book-plies", type=int, default=8)
     parser.add_argument("--max-book-positions", type=int, default=50000)
     parser.add_argument("--inference-batch-size", type=int, default=64)
@@ -1374,6 +1452,7 @@ def parse_args():
     args.games_per_iter = max(1, int(args.games_per_iter))
     args.max_plies = max(1, int(args.max_plies))
     args.positions_per_game = max(1, int(args.positions_per_game))
+    args.startpos_fraction = float(np.clip(args.startpos_fraction, 0.0, 1.0))
     args.validation_fraction = float(np.clip(args.validation_fraction, 0.0, 0.9))
     return args, evolution
 

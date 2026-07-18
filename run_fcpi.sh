@@ -28,14 +28,15 @@ GAMES_IN_FLIGHT=100
 MAX_PLIES=240
 POSITIONS_PER_GAME=100
 OPENING_BOOK="data/openings.gen.bin"
+STARTPOS_FRACTION=0.20
 BOOK_PLIES=8
 MAX_BOOK_POSITIONS=50000
 INFERENCE_BATCH_SIZE=64
 TARGET_RECORDS_PER_BATCH=256
 VALIDATION_FRACTION=0.10
 
-EPOCHS=30
-TRAIN_MAX_STEPS=2500
+EPOCHS=6
+TRAIN_MAX_STEPS=2300
 BATCH_SIZE=256
 TRAIN_WORKERS=4
 LR=0.00001
@@ -75,8 +76,8 @@ case "${ARCH_TYPE}" in
     COUNTERFACTUAL_MAX_PLIES=6
     COUNTERFACTUAL_TARGET_AVERAGE_PLIES=4.0
     COUNTERFACTUAL_LAMBDA=0.80
-    BEHAVIOR_TEMPERATURE=0.80
-    UNIFORM_MIX=0.02
+    BEHAVIOR_TEMPERATURE=1.00
+    UNIFORM_MIX=0.03
     POLICY_TEMPERATURE=0.25
     PRIOR_POWER=1.0
     PLAYED_RETURN_WEIGHT=0.50
@@ -92,8 +93,8 @@ case "${ARCH_TYPE}" in
     COUNTERFACTUAL_MAX_PLIES=6
     COUNTERFACTUAL_TARGET_AVERAGE_PLIES=4.0
     COUNTERFACTUAL_LAMBDA=0.85
-    BEHAVIOR_TEMPERATURE=0.85
-    UNIFORM_MIX=0.02
+    BEHAVIOR_TEMPERATURE=1.00
+    UNIFORM_MIX=0.03
     POLICY_TEMPERATURE=0.25
     PRIOR_POWER=1.0
     PLAYED_RETURN_WEIGHT=0.50
@@ -140,7 +141,7 @@ echo "run_id=${RUN_ID}"
 echo "model=${MODEL}"
 echo "arch_type=${ARCH_TYPE}"
 echo "device=${DEVICE}"
-echo "self-play: games=${GAMES_PER_ITER} in_flight=${GAMES_IN_FLIGHT} max_plies=${MAX_PLIES} positions_per_game=${POSITIONS_PER_GAME} opening_book=${OPENING_BOOK}"
+echo "self-play: games=${GAMES_PER_ITER} in_flight=${GAMES_IN_FLIGHT} max_plies=${MAX_PLIES} positions_per_game=${POSITIONS_PER_GAME} opening_book=${OPENING_BOOK} startpos_fraction=${STARTPOS_FRACTION}"
 echo "counterfactual: topk=${COUNTERFACTUAL_TOPK} plies=${COUNTERFACTUAL_MIN_PLIES}-${COUNTERFACTUAL_MAX_PLIES} target_average_plies=${COUNTERFACTUAL_TARGET_AVERAGE_PLIES} lambda=${COUNTERFACTUAL_LAMBDA}"
 echo "train: epochs=${EPOCHS} max_steps=${TRAIN_MAX_STEPS} batch_size=${BATCH_SIZE} lr=${LR}"
 echo "eval: games=${EVAL_GAMES} search_type=${EVAL_SEARCH_TYPE} sims=${EVAL_SIMS} min_net_wins=${EVAL_MIN_NET_WINS}"
@@ -154,6 +155,7 @@ exec python src/fcpi.py \
   --max-plies "${MAX_PLIES}" \
   --positions-per-game "${POSITIONS_PER_GAME}" \
   --opening-book "${OPENING_BOOK}" \
+  --startpos-fraction "${STARTPOS_FRACTION}" \
   --book-plies "${BOOK_PLIES}" \
   --max-book-positions "${MAX_BOOK_POSITIONS}" \
   --inference-batch-size "${INFERENCE_BATCH_SIZE}" \

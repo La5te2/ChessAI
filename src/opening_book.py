@@ -293,6 +293,72 @@ def make_arena_specs(
     return specs[:games]
 
 
+def make_sampling_specs(
+    games: int,
+    seed: int = 2026,
+    opening_book: str = "data/openings.bin",
+    book_plies: int = 8,
+    max_positions: int = 50000,
+    startpos_fraction: float = 0.20,
+) -> Tuple[List[Tuple[str, chess.Color]], Dict[str, int]]:
+    games = int(games)
+    if games <= 0:
+        return [], {
+            "games": 0,
+            "startpos_games": 0,
+            "book_games": 0,
+            "book_positions": 0,
+            "book_cycles": 0,
+            "reused_book_starts": 0,
+        }
+
+    rng = random.Random(int(seed))
+    start_fen = chess.Board().fen()
+    fraction = min(1.0, max(0.0, float(startpos_fraction)))
+    startpos_games = games if not opening_book else int(round(games * fraction))
+    startpos_games = min(games, max(0, startpos_games))
+    book_games = games - startpos_games
+
+    specs: List[Tuple[str, chess.Color]] = [
+        (start_fen, chess.WHITE if index % 2 == 0 else chess.BLACK)
+        for index in range(startpos_games)
+    ]
+    book_positions: List[str] = []
+    book_cycles = 0
+
+    if book_games:
+        book = OpeningBook(
+            path=opening_book,
+            book_plies=book_plies,
+            max_positions=max_positions,
+            seed=seed,
+        )
+        book_positions = unique_position_fens(list(book.positions))
+        if not book_positions:
+            raise ValueError(f"opening book contains no sampling positions: {opening_book}")
+
+        selected: List[str] = []
+        while len(selected) < book_games:
+            cycle = list(book_positions)
+            rng.shuffle(cycle)
+            selected.extend(cycle[:book_games - len(selected)])
+            book_cycles += 1
+        specs.extend(
+            (fen, chess.Board(fen).turn)
+            for fen in selected
+        )
+
+    rng.shuffle(specs)
+    return specs, {
+        "games": games,
+        "startpos_games": startpos_games,
+        "book_games": book_games,
+        "book_positions": len(book_positions),
+        "book_cycles": book_cycles,
+        "reused_book_starts": max(0, book_games - len(book_positions)),
+    }
+
+
 def default_balanced_output(path: str) -> str:
     book_path = Path(path)
     return str(book_path.with_name(f"{book_path.stem}.balanced{book_path.suffix}"))
