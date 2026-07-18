@@ -4,36 +4,36 @@ Set fso = CreateObject("Scripting.FileSystemObject")
 baseDir = fso.GetParentFolderName(WScript.ScriptFullName)
 shell.CurrentDirectory = baseDir
 
-whiteMovetimeMs = 30000
-blackMovetimeMs = 30000
+whiteMovetimeMs = 60000
+blackMovetimeMs = 60000
 
 whiteUci = "python.exe src\uci_engine.py" & _
-  " --model models\candidate1.pth" & _
+  " --model models\candidate2.pth" & _
   " --device cpu" & _
   " --search-type only-mcts" & _
-  " --mcts-sims 2000" & _
+  " --mcts-sims 3000" & _
   " --mcts-min-sims 0" & _
   " --mcts-batch-size 32" & _
-  " --c-puct 0.5" & _
+  " --c-puct 1.0" & _
   " --c-puct-base 19652" & _
   " --c-puct-factor 1.0" & _
   " --fpu-reduction 0.15" & _
-  " --repetition-policy-penalty 0.2" & _
+  " --repetition-policy-penalty 0.5" & _
   " --instant-mate-first" & _
   " --progress-interval-ms 750"
 
 blackUci = "python.exe src\uci_engine.py" & _
-  " --model models\current5.pth" & _
+  " --model models\candidate1.pth" & _
   " --device cpu" & _
   " --search-type only-mcts" & _
-  " --mcts-sims 2000" & _
+  " --mcts-sims 3000" & _
   " --mcts-min-sims 0" & _
   " --mcts-batch-size 32" & _
-  " --c-puct 0.5" & _
+  " --c-puct 1.0" & _
   " --c-puct-base 19652" & _
   " --c-puct-factor 1.0" & _
   " --fpu-reduction 0.15" & _
-  " --repetition-policy-penalty 0.2" & _
+  " --repetition-policy-penalty 0.5" & _
   " --instant-mate-first" & _
   " --progress-interval-ms 750"
 
