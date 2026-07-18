@@ -77,7 +77,7 @@ SEARCH_PARAMETER_TYPES = {
     "c_puct_factor": float,
     "fpu_reduction": float,
     "repetition_policy_penalty": float,
-    "instant_mate_first": parse_bool,
+    "instant_mate_first": bool_from_text,
     "progress_interval_ms": int,
     "root_topn": int,
 }
@@ -98,7 +98,7 @@ def search_options_from_parameters(parameters: Dict, root_topn: Optional[int] = 
         repetition_policy_penalty=float(
             parameters.get("repetition_policy_penalty", 0.0) or 0.0
         ),
-        instant_mate_first=parse_bool(
+        instant_mate_first=bool_from_text(
             parameters.get("instant_mate_first", False)
         ),
         progress_interval_sec=max(
@@ -109,18 +109,28 @@ def search_options_from_parameters(parameters: Dict, root_topn: Optional[int] = 
     )
 
 
-def simulator_search_process(job: Dict, output_queue, cancel_event):
+class SimulatorSearchCancellation:
+    def __init__(self, active_generation, generation: int, stop_event):
+        self.active_generation = active_generation
+        self.generation = int(generation)
+        self.stop_event = stop_event
+
+    def is_set(self) -> bool:
+        return bool(
+            self.stop_event.is_set()
+            or int(self.active_generation.value) != self.generation
+        )
+
+
+def run_simulator_search_job(
+    job: Dict,
+    output_queue,
+    cancel_event,
+    model,
+):
     try:
         board = chess.Board(str(job["fen"]))
         parameters = dict(job["parameters"])
-        model_path = str(job.get("model_path") or "").strip()
-        if model_path.lower() == "none":
-            model_path = ""
-        model = (
-            load_model(model_path, device=str(parameters.get("device", DEVICE)))
-            if model_path
-            else None
-        )
         options = search_options_from_parameters(
             parameters,
             root_topn=int(job.get("root_topn") or parameters.get("root_topn", 8) or 8),
@@ -165,6 +175,68 @@ def simulator_search_process(job: Dict, output_queue, cancel_event):
                 "before_fen": str(job.get("before_fen", "")),
             },),
         ))
+
+
+def simulator_search_worker(
+    job_queue,
+    output_queue,
+    active_generation,
+    stop_event,
+):
+    model = None
+    model_key = None
+
+    while not stop_event.is_set():
+        job = job_queue.get()
+        if job is None:
+            return
+
+        # A burst of board edits only needs analysis for the newest position.
+        while True:
+            try:
+                newer_job = job_queue.get_nowait()
+            except queue.Empty:
+                break
+            if newer_job is None:
+                return
+            job = newer_job
+
+        generation = int(job["generation"])
+        cancel_event = SimulatorSearchCancellation(
+            active_generation,
+            generation,
+            stop_event,
+        )
+        if cancel_event.is_set():
+            continue
+
+        parameters = dict(job["parameters"])
+        model_path = str(job.get("model_path") or "").strip()
+        if model_path.lower() == "none":
+            model_path = ""
+        device = str(parameters.get("device", DEVICE))
+        model_revision = int(job.get("model_revision", 0))
+        next_model_key = (model_path, device, model_revision)
+
+        try:
+            if next_model_key != model_key:
+                model = load_model(model_path, device=device) if model_path else None
+                model_key = next_model_key
+            if cancel_event.is_set():
+                continue
+            run_simulator_search_job(job, output_queue, cancel_event, model)
+        except Exception as exc:
+            output_queue.put((
+                "finish_suggestions",
+                ({
+                    "ok": False,
+                    "move": None,
+                    "info": None,
+                    "error": str(exc),
+                    "generation": generation,
+                    "before_fen": str(job.get("before_fen", "")),
+                },),
+            ))
 
 
 def side_name(color: chess.Color) -> str:
@@ -222,6 +294,7 @@ class SimulatorState:
         self.board = chess.Board()
         self.model = None
         self.model_path: Optional[str] = None
+        self.model_revision = 0
         self.last_ai_info: Optional[Dict] = None
         self.last_suggestions: List[Dict] = []
         self.ai_suggest_open = True
@@ -266,6 +339,7 @@ class SimulatorState:
         self.model = model
         self.model_path = resolved
         self.config.model_path = resolved
+        self.model_revision += 1
         self.clear_analysis()
         return resolved
 
@@ -273,6 +347,7 @@ class SimulatorState:
         self.model = None
         self.model_path = None
         self.config.model_path = None
+        self.model_revision += 1
         self.clear_analysis()
 
     def configure_model(self, model_path: str, parameters: Dict):
@@ -589,7 +664,7 @@ class ModelSettingsDialog(tk.Toplevel):
                 padx=8,
                 pady=3,
             )
-            if converter is parse_bool:
+            if converter is bool_from_text:
                 variable = tk.BooleanVar(value=bool(current[name]))
                 control = ttk.Checkbutton(self, variable=variable)
             else:
@@ -685,13 +760,15 @@ class SimulatorApp(ChessGUIBase):
         self.initialize_board_gui()
 
         self.ai_thinking = False
-        self.ai_process = None
+        self.ai_worker_process = None
         self.ai_context: Optional[Dict] = None
         self.ai_generation = 0
-        self.ai_cancel_event = None
         self.pending_ai_after_id = None
         self.mp_context = mp.get_context("spawn" if os.name == "nt" else "fork")
         self.ui_queue = self.mp_context.Queue()
+        self.ai_job_queue = self.mp_context.Queue()
+        self.ai_active_generation = self.mp_context.Value("q", 0)
+        self.ai_stop_event = self.mp_context.Event()
         self.ui_poll_interval_ms = 100
         self._build_ui()
         self.draw_board()
@@ -815,10 +892,7 @@ class SimulatorApp(ChessGUIBase):
             self.pending_ai_after_id = None
         if cancel_running and self.ai_thinking:
             self.ai_generation += 1
-            if self.ai_cancel_event is not None:
-                self.ai_cancel_event.set()
-            self.stop_ai_process(terminate=True)
-            self.ai_cancel_event = None
+            self.ai_active_generation.value = self.ai_generation
             self.ai_thinking = False
             self.ai_context = None
             self.refresh_controls()
@@ -826,21 +900,49 @@ class SimulatorApp(ChessGUIBase):
     def begin_ai_task(self):
         self.cancel_pending_ai()
         self.ai_generation += 1
-        cancel_event = self.mp_context.Event()
-        self.ai_cancel_event = cancel_event
+        self.ai_active_generation.value = self.ai_generation
         self.ai_thinking = True
         self.refresh_controls()
-        return self.ai_generation, cancel_event
+        return self.ai_generation
 
-    def stop_ai_process(self, terminate: bool = False):
-        process = self.ai_process
-        self.ai_process = None
+    def ensure_ai_worker(self):
+        process = self.ai_worker_process
+        if process is not None and process.is_alive():
+            return
+        if process is not None:
+            try:
+                process.join(timeout=0.1)
+                process.close()
+            except Exception:
+                pass
+        process = self.mp_context.Process(
+            target=simulator_search_worker,
+            args=(
+                self.ai_job_queue,
+                self.ui_queue,
+                self.ai_active_generation,
+                self.ai_stop_event,
+            ),
+            daemon=True,
+        )
+        self.ai_worker_process = process
+        process.start()
+
+    def stop_ai_worker(self):
+        process = self.ai_worker_process
+        self.ai_worker_process = None
         if process is None:
             return
+        self.ai_stop_event.set()
         try:
-            if terminate and process.is_alive():
+            self.ai_job_queue.put_nowait(None)
+        except Exception:
+            pass
+        try:
+            process.join(timeout=1.0)
+            if process.is_alive():
                 process.terminate()
-            process.join(timeout=0.2)
+                process.join(timeout=0.5)
         except Exception:
             pass
         try:
@@ -850,6 +952,7 @@ class SimulatorApp(ChessGUIBase):
 
     def on_close(self):
         self.cancel_pending_ai()
+        self.stop_ai_worker()
         self.root.destroy()
 
     def merge_ai_context(self, payload: Dict) -> Dict:
@@ -868,7 +971,6 @@ class SimulatorApp(ChessGUIBase):
         self,
         board: chess.Board,
         generation: int,
-        cancel_event,
         context: Dict,
         root_topn: Optional[int] = None,
     ):
@@ -878,16 +980,12 @@ class SimulatorApp(ChessGUIBase):
             "before_fen": str(context.get("before_fen") or board.fen()),
             "fen": board.fen(),
             "model_path": self.engine.model_path,
+            "model_revision": self.engine.model_revision,
             "parameters": self.engine.parameter_dict(),
             "root_topn": int(root_topn or self.engine.config.root_topn),
         }
-        process = self.mp_context.Process(
-            target=simulator_search_process,
-            args=(job, self.ui_queue, cancel_event),
-            daemon=True,
-        )
-        self.ai_process = process
-        process.start()
+        self.ensure_ai_worker()
+        self.ai_job_queue.put(job)
 
     def is_current_ai_task(self, generation: int, before_fen: Optional[str] = None) -> bool:
         if generation != self.ai_generation:
@@ -1103,16 +1201,14 @@ class SimulatorApp(ChessGUIBase):
 
         before_fen = self.engine.board.fen()
         board_snapshot = self.engine.board.copy(stack=True)
-        generation, cancel_event = self.begin_ai_task()
+        generation = self.begin_ai_task()
         self.draw_board()
 
         self.start_search_process(
             board=board_snapshot,
             generation=generation,
-            cancel_event=cancel_event,
             context={
                 "generation": generation,
-                "cancel_event": cancel_event,
                 "before_fen": before_fen,
             },
             root_topn=self.engine.config.root_topn,
@@ -1123,9 +1219,6 @@ class SimulatorApp(ChessGUIBase):
         try:
             generation = int(payload.get("generation", -1))
             if not self.is_current_ai_task(generation, payload.get("before_fen")):
-                return
-            cancel_event = payload.get("cancel_event")
-            if cancel_event is not None and cancel_event.is_set():
                 return
             if self.engine.board.fen() != payload.get("before_fen"):
                 return
@@ -1146,9 +1239,7 @@ class SimulatorApp(ChessGUIBase):
             generation = int(payload.get("generation", -1))
             if generation == self.ai_generation:
                 self.ai_thinking = False
-                self.ai_cancel_event = None
                 self.ai_context = None
-                self.stop_ai_process(terminate=False)
                 self.draw_board()
                 if error_message:
                     self.update_analysis(None)
