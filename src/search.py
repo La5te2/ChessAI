@@ -41,7 +41,7 @@ def model_device(model: torch.nn.Module):
 
 
 def terminal_value_side_to_move(board: chess.Board):
-    outcome = board.outcome(claim_draw=True)
+    outcome = board.outcome(claim_draw=False)
     if outcome is None:
         return None
     if outcome.winner is None:
@@ -930,7 +930,7 @@ class UnifiedSearch:
         cancel_event=None,
         progress_callback: Optional[Callable[[SearchResult], None]] = None,
     ) -> SearchResult:
-        if board.is_game_over(claim_draw=True):
+        if board.is_game_over(claim_draw=False):
             raise RuntimeError("game is already over")
 
         search_type = normalize_search_type(self.options.search_type)
@@ -1014,7 +1014,7 @@ class UnifiedSearch:
         if not boards:
             return []
         for board in boards:
-            if board.is_game_over(claim_draw=True):
+            if board.is_game_over(claim_draw=False):
                 raise RuntimeError("game is already over")
 
         search_type = normalize_search_type(self.options.search_type)

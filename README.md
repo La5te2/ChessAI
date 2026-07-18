@@ -460,6 +460,7 @@ arena 行为：
 - arena 与 acceptance 使用模型对战结果作为独立比较与 gate 信号。
 - `--pgn-output` 保存棋谱。
 - `--trace-output` 保存逐手 search 细节。
+- `--claim-draws` 允许 arena 主动申请三次重复与五十回合和棋；省略时只按规则自动终局结束对局。
 - 从标准初始局面开始时使用 `--opening-book ""`。
 - 查看逐手 search 时加入 `--trace-output data/runs/arena.trace.jsonl --pgn-comments --trace-root-topn 12`。
 
@@ -917,7 +918,7 @@ Windows 一键启动：
 run_stadium.vbs
 ```
 
-Stadium 的 `Settings` 分别配置白方与黑方的 UCI command、UCI options JSON 和每步思考时间，也可配置显示间隔与最大 ply；`Start FEN` 设置单盘起始局面。双方资源可以不同，例如为 Gadidae 分配更长思考时间、为 Stockfish 设置独立的 `Threads` 与 `Hash`。Stadium 始终运行一盘可视化对局，并保留人工启动、暂停和停止。
+Stadium 的 `Settings` 分别配置白方与黑方的 UCI command、UCI options JSON 和每步思考时间，也可配置显示间隔与最大 ply；`Start FEN` 设置单盘起始局面。双方资源可以不同，例如为 Gadidae 分配更长思考时间、为 Stockfish 设置独立的 `Threads` 与 `Hash`。`Moves` 显示当前行棋引擎返回的完整 MultiPV 集合，并以 `*` 标记最终 `bestmove`；`UCI analysis` 显示与该走法对应的 score 和 PV。Stadium 始终运行一盘可视化对局，并保留人工启动、暂停和停止。
 
 ---
 

@@ -6,6 +6,7 @@ import json
 import os
 import queue
 import shlex
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -69,6 +70,13 @@ def command_from_text(text: str) -> List[str]:
         ctypes.windll.kernel32.LocalFree(ctypes.cast(argv, ctypes.c_void_p))
 
 
+def popen_uci_engine(command: Sequence[str]):
+    popen_args = {}
+    if os.name == "nt":
+        popen_args["creationflags"] = subprocess.CREATE_NO_WINDOW
+    return chess.engine.SimpleEngine.popen_uci(list(command), **popen_args)
+
+
 def score_text(score, turn: chess.Color) -> str:
     if score is None:
         return "?"
@@ -89,6 +97,79 @@ def pv_text(board: chess.Board, pv: Sequence[chess.Move], limit: int = 8) -> str
         sans.append(line.san(move))
         line.push(move)
     return " ".join(sans)
+
+
+def engine_multipv_count(
+    engine: chess.engine.SimpleEngine,
+    configured_options: Dict[str, object],
+) -> int:
+    option = engine.options.get("MultiPV")
+    if option is None:
+        return 1
+    value = option.default
+    for name, configured_value in configured_options.items():
+        if str(name).lower() == "multipv":
+            value = configured_value
+            break
+    count = int(value)
+    if option.min is not None:
+        count = max(int(option.min), count)
+    if option.max is not None:
+        count = min(int(option.max), count)
+    return max(1, count)
+
+
+def primary_info_for_move(infos: Sequence[Dict], move: chess.Move) -> Dict:
+    for info in infos:
+        pv = list(info.get("pv") or [])
+        if pv and pv[0] == move:
+            return dict(info)
+    for info in infos:
+        if int(info.get("multipv", 1) or 1) == 1:
+            return dict(info)
+    return dict(infos[0]) if infos else {}
+
+
+def multipv_move_rows(
+    board: chess.Board,
+    infos: Sequence[Dict],
+    selected_move: chess.Move,
+) -> List[str]:
+    rows = []
+    ordered = sorted(
+        infos,
+        key=lambda info: int(info.get("multipv", 1) or 1),
+    )
+    for fallback_rank, info in enumerate(ordered, 1):
+        pv = list(info.get("pv") or [])
+        if not pv or pv[0] not in board.legal_moves:
+            continue
+        move = pv[0]
+        rank = int(info.get("multipv", fallback_rank) or fallback_rank)
+        marker = "*" if move == selected_move else " "
+        score = score_text(info.get("score"), board.turn)
+        line = pv_text(board, pv)
+        text = f"{marker}{rank}. {safe_san(board, move)} ({move.uci()})  score={score}"
+        if line:
+            text += f"  pv={line}"
+        rows.append(text)
+    return rows
+
+
+def analyse_uci_turn(
+    engine: chess.engine.SimpleEngine,
+    board: chess.Board,
+    movetime_ms: int,
+    multipv: int,
+):
+    analysis = engine.analysis(
+        board,
+        chess.engine.Limit(time=movetime_ms / 1000.0),
+        multipv=max(1, int(multipv)),
+        info=chess.engine.INFO_ALL,
+    )
+    best = analysis.wait()
+    return best.move, [dict(info) for info in analysis.multipv]
 
 
 def engine_info_text(
@@ -339,11 +420,20 @@ class StadiumApp(ChessGUIBase):
             wraplength=500,
         ).pack(anchor="w")
 
-        ttk.Label(right, text="Move", font=("Arial", 10, "bold")).pack(
+        ttk.Label(right, text="Moves", font=("Arial", 10, "bold")).pack(
             anchor="w", pady=(8, 0)
         )
-        self.moves_list = tk.Listbox(right, width=64, height=4)
-        self.moves_list.pack(fill=tk.X, pady=(4, 8))
+        moves_frame = ttk.Frame(right)
+        moves_frame.pack(fill=tk.X, pady=(4, 8))
+        self.moves_list = tk.Listbox(moves_frame, width=64, height=8)
+        self.moves_list.pack(fill=tk.X)
+        moves_scroll = ttk.Scrollbar(
+            moves_frame,
+            orient=tk.HORIZONTAL,
+            command=self.moves_list.xview,
+        )
+        moves_scroll.pack(fill=tk.X)
+        self.moves_list.configure(xscrollcommand=moves_scroll.set)
 
         ttk.Label(
             right,
@@ -516,14 +606,16 @@ class StadiumApp(ChessGUIBase):
             {"result": "*", "termination": "unfinished"},
         )
         try:
-            white = chess.engine.SimpleEngine.popen_uci(list(white_command))
+            white = popen_uci_engine(white_command)
             engines.append(white)
-            black = chess.engine.SimpleEngine.popen_uci(list(black_command))
+            black = popen_uci_engine(black_command)
             engines.append(black)
             if white_options:
                 white.configure(white_options)
             if black_options:
                 black.configure(black_options)
+            white_multipv = engine_multipv_count(white, white_options)
+            black_multipv = engine_multipv_count(black, black_options)
             with self.uci_lock:
                 self.uci_engines = list(engines)
 
@@ -551,22 +643,25 @@ class StadiumApp(ChessGUIBase):
                 movetime_ms = (
                     white_movetime_ms if board.turn == chess.WHITE else black_movetime_ms
                 )
+                multipv = white_multipv if board.turn == chess.WHITE else black_multipv
                 before_fen = board.fen()
                 started = time.monotonic()
-                result = uci.play(
+                move, multipv_infos = analyse_uci_turn(
+                    uci,
                     board,
-                    chess.engine.Limit(time=movetime_ms / 1000.0),
-                    info=chess.engine.INFO_ALL,
+                    movetime_ms=movetime_ms,
+                    multipv=multipv,
                 )
                 elapsed_ms = (time.monotonic() - started) * 1000.0
-                move = result.move
                 if move is None or move not in board.legal_moves:
                     raise RuntimeError(
                         f"{name} returned an illegal move: "
                         f"{move.uci() if move is not None else 'none'}"
                     )
                 san = safe_san(board, move)
-                detail = engine_info_text(name, board, move, result.info, elapsed_ms)
+                primary_info = primary_info_for_move(multipv_infos, move)
+                detail = engine_info_text(name, board, move, primary_info, elapsed_ms)
+                move_rows = multipv_move_rows(board, multipv_infos, move)
                 board.push(move)
                 ply += 1
                 self.ui_queue.put((
@@ -579,6 +674,7 @@ class StadiumApp(ChessGUIBase):
                         "ply": ply,
                         "engine": name,
                         "detail": detail,
+                        "multipv": move_rows,
                     },
                 ))
                 if delay_ms > 0 and self.stop_event.wait(delay_ms / 1000.0):
@@ -634,10 +730,13 @@ class StadiumApp(ChessGUIBase):
         move_number = (int(payload["ply"]) + 1) // 2
         side = "White" if int(payload["ply"]) % 2 else "Black"
         self.moves_list.delete(0, tk.END)
-        self.moves_list.insert(
-            tk.END,
-            f"{move_number}. {side}: {payload['san']} ({move.uci()})",
-        )
+        move_rows = list(payload.get("multipv") or [])
+        if not move_rows:
+            move_rows = [
+                f"*1. {payload['san']} ({move.uci()})  {side} move {move_number}"
+            ]
+        for row in move_rows:
+            self.moves_list.insert(tk.END, row)
         self.moves_list.see(tk.END)
         self.info_text.delete("1.0", tk.END)
         self.info_text.insert(tk.END, payload["detail"])
