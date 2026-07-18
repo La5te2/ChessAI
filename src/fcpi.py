@@ -30,6 +30,7 @@ from checkpoint_io import atomic_copy_with_backup
 from config import DEVICE
 from decision import profile_for_model
 from evaluator import BatchedEvaluator
+from game_rules import game_is_over, game_result
 from model import checkpoint_metadata, load_model, save_model
 from opening_book import make_sampling_specs
 
@@ -127,16 +128,16 @@ def sample_local_index(probabilities: np.ndarray, rng: np.random.Generator) -> i
 
 
 def terminal_value(board: chess.Board) -> float:
-    outcome = board.outcome(claim_draw=True)
+    outcome = board.outcome(claim_draw=False)
     if outcome is None or outcome.winner is None:
         return 0.0
     return 1.0 if outcome.winner == board.turn else -1.0
 
 
 def result_label(board: chess.Board, truncated: bool) -> str:
-    if truncated and not board.is_game_over(claim_draw=True):
+    if truncated and not game_is_over(board):
         return "bootstrap"
-    return board.result(claim_draw=True)
+    return game_result(board)
 
 
 def choose_top_actions(
@@ -243,7 +244,7 @@ def adaptive_successor_q_batches(
                     depth=1,
                     estimates=[],
                 )
-                if child.is_game_over(claim_draw=True):
+                if game_is_over(child):
                     value = terminal_value(child)
                     branch.estimates.append(-float(value))
                     branch.current_value = float(value)
@@ -333,7 +334,7 @@ def adaptive_successor_q_batches(
                 branch.depth += 1
                 branch.current_policy = None
                 branch.current_payload = None
-                if branch.board.is_game_over(claim_draw=True):
+                if game_is_over(branch.board):
                     value = terminal_value(branch.board)
                     branch.current_value = float(value)
                     branch.estimates.append(float(((-1.0) ** branch.depth) * value))
@@ -415,14 +416,14 @@ def assign_td_lambda_returns(
     truncated = [
         trajectory.board
         for trajectory in trajectories
-        if not trajectory.board.is_game_over(claim_draw=True)
+        if not game_is_over(trajectory.board)
     ]
     truncated_values = iter(
         evaluator.evaluate_boards_full(truncated).values.tolist() if truncated else []
     )
     lam = float(np.clip(td_lambda, 0.0, 1.0))
     for trajectory in trajectories:
-        if trajectory.board.is_game_over(claim_draw=True):
+        if game_is_over(trajectory.board):
             next_return = terminal_value(trajectory.board)
         else:
             next_return = float(next(truncated_values))
@@ -563,7 +564,7 @@ def collect_selfplay(
                     )
                 )
                 board.push(move)
-                game_over = board.is_game_over(claim_draw=True)
+                game_over = game_is_over(board)
                 reached_limit = len(trajectory.positions) >= args.max_plies
                 if game_over or reached_limit:
                     trajectories.append(trajectory)

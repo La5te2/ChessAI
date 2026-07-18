@@ -45,9 +45,126 @@ resnet_pva_gad
 
 - `Search-Consistency Training` 需要额外采样 closed / low-sim / high-sim 输出，成本高，并且当前无法证明高 sims 决策稳定更好。
 - `Search-Aware Model` 与 `search-gain-head` 很理想，但训练信号难定义，先不作为近期目标。
-- `Piece-Token Transformer` 作为第三类模型路线，等输入、mask、policy head 重新设计后再做。
+- `Piece-Token Transformer` 作为独立模型路线，等输入、mask、policy head 重新设计后再做。
 - `NNUE-inspired` 作为独立 CPU 模型路线，目标是 CPU 高速评估和增量更新。
 - 基于高 sims 选择的训练目标暂不推进。
+
+## 第三架构候选：History-Aware Model
+
+当前两个架构都把单个 `chess.Board` 编码为无历史状态：
+
+- `resnet_pv_linear` 的 18 planes 包含棋子、行棋方、王车易位权和吃过路兵。
+- `resnet_pva_gad` 的 square tokens 包含同类当前局面信息。
+- 两者都不编码 `move_stack`、重复次数、halfmove clock 或过去局面。
+
+因此，棋盘、行棋方、王车易位权和吃过路兵状态完全相同时，第一次、第二次和第三次出现的局面对当前模型是同一个输入。模型可以学习“胜势时通常应减少循环”，但无法严格判断某个候选是否正在接受或完成三次重复。
+
+IMF 与 RPP 在这里具有不同性质：
+
+- 一步将死完全由当前棋盘决定。Policy/Value、终局回报、反事实评价和 MCTS 都有可能逐步学会它；IMF 是确定性的决策层保障。
+- 三次重复依赖历史。当前模型缺少区分这些状态的信息，RPP 补充的是不可观测状态，而不只是棋力不足。
+
+逼和也需要进一步区分：
+
+- 三次重复、五十回合和依赖既往循环次数的长将属于历史问题。
+- 无合法着法导致的逼和由当前棋盘即可确定；“唯一序列获胜，否则逼和”主要属于多步推演和 Value 判断问题。
+
+第三架构的目标不是把手写 RPP 换成一个更不可靠的近似，而是让模型获得当前架构缺失的时间状态，并学习历史如何影响 Policy 和 Value。
+
+### 将棋局恢复为完整状态
+
+最直接的输入可以写成：
+
+```text
+current board
++ side to move
++ castling rights
++ en-passant state
++ halfmove clock
++ reversible history
+```
+
+这使模型看到的状态更接近 Markov 状态。显式规则状态负责准确表达规则条件，历史编码器负责学习循环、长将、节奏和历史战术模式。
+
+### 固定历史窗口
+
+最简单的实现是堆叠最近 `N` 个棋盘或走法：
+
+```text
+position(t), position(t-1), ..., position(t-N+1)
+```
+
+模型仍可以是普通 CNN、ResNet 或 attention 网络，不需要保存外部隐藏状态。该方案容易批处理，但窗口之外的长周期重复不可见，因此属于近似记忆。
+
+### 可逆历史序列
+
+与重复和五十回合有关的历史可以从最近一次不可逆变化之后开始记录。不可逆变化包括兵移动、吃子、王车易位权变化及其他使旧状态无法重新出现的变化。
+
+在项目采用实际达到五十回合条件后判和的规则下，序列可以限制在约 100 ply。这个规模远小于语言模型上下文，可以由较小的时间编码器处理：
+
+- 一层 GRU；
+- 少量 temporal attention blocks；
+- 小型 move-token Transformer。
+
+Move token 可以包含：
+
+```text
+from square
+to square
+moving piece
+captured piece
+promotion
+check
+castling
+```
+
+候选结构为：
+
+```text
+current-board encoder
+        +
+reversible-history encoder
+        -> gated fusion / cross attention
+        -> policy / value / optional uncertainty heads
+```
+
+该结构把当前棋盘保持为主要信息源，历史只提供当前状态无法表达的时间信息。
+
+### 不采用隐式持久隐藏状态作为起点
+
+让 RNN 隐藏状态跟随整盘棋持续存在，会增加以下复杂度：
+
+- Undo 必须恢复对应隐藏状态。
+- 只给 FEN 时无法恢复隐藏状态。
+- MCTS 每条分支必须复制并更新独立隐藏状态。
+- 同一棋盘经不同历史到达时具有不同隐藏状态。
+- Arena 的批量局面更难合批。
+
+因此，第三架构应该优先接收显式历史并在每次推理时生成 history embedding。它具备记忆能力，同时没有脱离输入数据的隐式状态。
+
+### 数据与运行链路
+
+第三架构需要独立的 per-arch 数据 schema：
+
+- `preprocess` 输出当前状态、历史序列、有效长度和 mask，不能把历史关系完全打散。
+- `train` 对当前局面目标和对应历史窗口联合训练。
+- FCPI 从每条 trajectory 构造历史输入，反事实分支继承并追加各自的历史。
+- Arena、Stadium 和 UCI 从完整 move stack 构造输入。
+- PGN 可以提供完整历史。
+- 只有 FEN 时必须使用 `history unknown` 标记或空历史，不能伪造重复次数。
+- 从开局书 FEN 启动时应明确把该位置视作新的历史起点。
+
+### 与 RPP/IMF 的关系
+
+当前 FCPI 采样保持不接入 RPP/IMF。验收时启用它们评估的是“模型 + 决策层组件”的完整引擎行为。
+
+第三架构跑通后，可以分别测试：
+
+- 无 RPP 时，模型能否依据历史降低主动重复概率。
+- 有 RPP 时，规则组件还能带来多少额外收益。
+- IMF 关闭时，模型对一步杀的 Top1 命中率是否随训练提高。
+
+RPP 在任何阶段都可以继续作为严格规则保障；模型记忆能力的价值在于理解历史，而不是要求概率模型取代所有确定性规则。
 
 ## 当前基线
 
@@ -402,7 +519,7 @@ U_a = exp(log_sigma2)
 
 中高。
 
-它适合作为第三类架构候选，但应放在 `resnet_pva_gad` 跑通监督学习和基础 arena 后再做。推荐名称可以是 `resnet_pvua_gad`，表示 geometry attention + policy/value/uncertainty/advantage。
+它适合作为后续架构候选，但应放在 `resnet_pva_gad` 跑通监督学习和基础 arena 后再做。推荐名称可以是 `resnet_pvua_gad`，表示 geometry attention + policy/value/uncertainty/advantage。
 
 ## 方向五：更强的 Board Network
 

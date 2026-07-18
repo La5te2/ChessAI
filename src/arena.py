@@ -17,6 +17,7 @@ import chess.pgn
 import numpy as np
 
 from config import CONFIDENCE_Z, DEVICE
+from game_rules import game_is_over, game_result, game_termination_text
 from model import load_model
 from opening_book import make_arena_specs
 from search import SearchOptions, UnifiedSearch, VALID_SEARCH_TYPES
@@ -114,24 +115,13 @@ def pgn_result_and_termination(
     board: chess.Board,
     ply: int,
     max_plies: int,
-    claim_draws: bool,
 ):
-    outcome = board.outcome(claim_draw=claim_draws)
-    result = board.result(claim_draw=claim_draws)
-    if result == "*":
-        result = "1/2-1/2"
-
-    if outcome is None:
-        if int(max_plies) > 0 and int(ply) >= int(max_plies):
-            return result, "max plies"
-        return result, "unfinished"
-
-    termination = outcome.termination.name.lower().replace("_", " ")
-    if outcome.termination == chess.Termination.THREEFOLD_REPETITION and claim_draws:
-        termination = "claimed threefold repetition"
-    elif outcome.termination == chess.Termination.FIFTY_MOVES and claim_draws:
-        termination = "claimed fifty-move rule"
-    return result, termination
+    termination = game_termination_text(board)
+    if termination is not None:
+        return game_result(board), termination
+    if int(max_plies) > 0 and int(ply) >= int(max_plies):
+        return "1/2-1/2", "max plies"
+    return "*", "unfinished"
 
 
 def render_pgn(game: chess.pgn.Game, columns: int = 88) -> str:
@@ -297,14 +287,12 @@ def apply_game_move(
 def finish_game_state(
     state: ArenaGameState,
     max_plies: int,
-    claim_draws: bool,
     pgn_columns: int,
 ):
     result, termination = pgn_result_and_termination(
         state.board,
         ply=state.ply,
         max_plies=max_plies,
-        claim_draws=bool(claim_draws),
     )
     if state.game is not None:
         state.game.headers["Result"] = result
@@ -332,7 +320,6 @@ def play_batched_games(
     max_plies,
     pgn_comments=False,
     pgn_columns=88,
-    claim_draws=False,
     trace_root_topn=12,
     collect_trace=True,
     collect_pgn=True,
@@ -359,13 +346,13 @@ def play_batched_games(
         finished_before_search = [
             state
             for state in active
-            if state.board.is_game_over(claim_draw=bool(claim_draws))
+            if game_is_over(state.board)
             or state.ply >= int(max_plies)
         ]
         if finished_before_search:
             for state in finished_before_search:
                 record = finish_game_state(
-                    state, max_plies, claim_draws, pgn_columns
+                    state, max_plies, pgn_columns
                 )
                 completed.append(record)
                 progress_print(
@@ -415,11 +402,11 @@ def play_batched_games(
         just_finished = [
             state
             for state in active
-            if state.board.is_game_over(claim_draw=bool(claim_draws))
+            if game_is_over(state.board)
             or state.ply >= int(max_plies)
         ]
         for state in just_finished:
-            record = finish_game_state(state, max_plies, claim_draws, pgn_columns)
+            record = finish_game_state(state, max_plies, pgn_columns)
             completed.append(record)
             progress_print(
                 progress,
@@ -461,7 +448,6 @@ def evaluate_models(
     trace_output=None,
     pgn_comments=False,
     pgn_columns=88,
-    claim_draws=False,
     trace_root_topn=12,
     log_every=1000,
     progress=True,
@@ -536,7 +522,6 @@ def evaluate_models(
         max_plies=max_plies,
         pgn_comments=pgn_comments,
         pgn_columns=pgn_columns,
-        claim_draws=claim_draws,
         trace_root_topn=trace_root_topn,
         collect_trace=bool(trace_output),
         collect_pgn=bool(pgn_output),
@@ -628,7 +613,6 @@ def evaluate_models(
         "fpu_reduction": float(fpu_reduction),
         "repetition_policy_penalty": float(repetition_policy_penalty),
         "instant_mate_first": bool(instant_mate_first),
-        "claim_draws": bool(claim_draws),
         "opening_book": opening_book,
         "book_plies": int(book_plies),
         "paired_openings": True,
@@ -674,7 +658,6 @@ def parse_args():
     parser.add_argument("--trace-output", default=None)
     parser.add_argument("--pgn-comments", action="store_true", default=False)
     parser.add_argument("--pgn-columns", type=int, default=88)
-    parser.add_argument("--claim-draws", action="store_true", default=False)
     parser.add_argument("--trace-root-topn", type=int, default=12)
     parser.add_argument("--log-every", type=int, default=1000)
     return parser.parse_args()
@@ -707,7 +690,6 @@ def main():
         trace_output=args.trace_output,
         pgn_comments=args.pgn_comments,
         pgn_columns=args.pgn_columns,
-        claim_draws=args.claim_draws,
         trace_root_topn=args.trace_root_topn,
         log_every=args.log_every,
         progress=True,

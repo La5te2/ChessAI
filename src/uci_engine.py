@@ -12,6 +12,7 @@ import chess
 
 from config import CPUCT, DEFAULT_SIMS, DEVICE
 from decision import profile_for_model
+from game_rules import game_is_over
 from model import load_model
 from search import (
     SearchOptions,
@@ -418,7 +419,7 @@ class UCIEngine:
         return max(legal, key=lambda move: move.uci()).uci()
 
     def handle_go(self, line: str):
-        if self.board.is_game_over(claim_draw=True):
+        if game_is_over(self.board):
             uci_print("bestmove 0000")
             return
 
@@ -439,11 +440,8 @@ class UCIEngine:
                 self.search_options(movetime_ms, sims_override=sims_override),
                 device=self.config.device,
             )
-            progress_emitted = False
 
             def emit_progress(result):
-                nonlocal progress_emitted
-                progress_emitted = True
                 self.emit_standard_info(result, result.move)
 
             result = searcher.search(
@@ -491,8 +489,9 @@ class UCIEngine:
                         f"q={float(row.get('q', 0.0)):+.4f}"
                     )
 
-            if not progress_emitted or allowed is not None:
-                self.emit_standard_info(result, move)
+            # UCI consumers must see the completed search state after any
+            # partial updates and immediately before the final bestmove.
+            self.emit_standard_info(result, move)
             uci_print(f"bestmove {move.uci() if move is not None else self.fallback_move(allowed)}")
         except Exception as exc:
             uci_print(f"info string search error: {exc}")

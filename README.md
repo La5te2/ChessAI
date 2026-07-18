@@ -466,7 +466,7 @@ arena 行为：
 - arena 与 acceptance 使用模型对战结果作为独立比较与 gate 信号。
 - `--pgn-output` 保存棋谱。
 - `--trace-output` 保存逐手 search 细节。
-- `--claim-draws` 允许 arena 主动申请三次重复与五十回合和棋；省略时只按规则自动终局结束对局。
+- Arena 在当前位置实际达到三次重复或五十回合条件后判和；仅存在下一手可申请和棋的走法时继续对局，使 RPP 能在决策层处理该候选。
 - 从标准初始局面开始时使用 `--opening-book ""`。
 - 查看逐手 search 时加入 `--trace-output data/runs/arena.trace.jsonl --pgn-comments --trace-root-topn 12`。
 

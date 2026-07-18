@@ -18,6 +18,7 @@ import chess.pgn
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+from game_rules import game_is_over, game_result, game_termination_text
 from gui import ChessGUIBase
 
 
@@ -653,7 +654,7 @@ class StadiumApp(ChessGUIBase):
 
             board = chess.Board(fen)
             ply = 0
-            while not board.is_game_over(claim_draw=True) and ply < max_plies:
+            while not game_is_over(board) and ply < max_plies:
                 if self.stop_event.is_set():
                     break
                 while not self.resume_event.wait(timeout=0.1):
@@ -751,10 +752,10 @@ class StadiumApp(ChessGUIBase):
             if self.stop_event.is_set():
                 result_text, termination = "*", "stopped"
             else:
-                outcome = board.outcome(claim_draw=True)
-                if outcome is not None:
-                    result_text = board.result(claim_draw=True)
-                    termination = outcome.termination.name.lower().replace("_", " ")
+                termination_text = game_termination_text(board)
+                if termination_text is not None:
+                    result_text = game_result(board)
+                    termination = termination_text
                 elif ply >= max_plies:
                     result_text, termination = "1/2-1/2", "max plies"
                 else:

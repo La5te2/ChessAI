@@ -25,6 +25,7 @@ except Exception:
 
 from model import load_model
 from gui import ChessGUIBase
+from game_rules import game_is_over, game_result, game_termination
 from search import (
     SearchOptions,
     VALID_SEARCH_TYPES,
@@ -454,30 +455,20 @@ class SimulatorState:
         return self.board.move_stack[-1] if self.board.move_stack else None
 
     def game_over(self) -> bool:
-        return bool(
-            self.board.is_game_over(claim_draw=False)
-            or self.board.is_repetition(3)
-            or self.board.is_fifty_moves()
-        )
+        return game_is_over(self.board)
 
     def result(self) -> str:
-        if self.board.is_game_over(claim_draw=False):
-            return self.board.result(claim_draw=False)
-        if self.board.is_repetition(3) or self.board.is_fifty_moves():
-            return "1/2-1/2"
-        return "*"
+        return game_result(self.board)
 
     def outcome_text(self) -> str:
         if not self.game_over():
             return "Game in progress"
-        outcome = self.board.outcome(claim_draw=False)
-        if outcome is not None:
-            return f"{self.result()} - {outcome.termination.name}"
-        if self.board.is_repetition(3):
-            return "1/2-1/2 - THREEFOLD_REPETITION"
-        if self.board.is_fifty_moves():
-            return "1/2-1/2 - FIFTY_MOVES"
-        return self.result()
+        termination = game_termination(self.board)
+        return (
+            self.result()
+            if termination is None
+            else f"{self.result()} - {termination.name}"
+        )
 
     def legal_moves_from(self, square: chess.Square) -> List[chess.Move]:
         return [
