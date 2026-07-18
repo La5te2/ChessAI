@@ -454,20 +454,30 @@ class SimulatorState:
         return self.board.move_stack[-1] if self.board.move_stack else None
 
     def game_over(self) -> bool:
-        return self.board.is_game_over(claim_draw=True)
+        return bool(
+            self.board.is_game_over(claim_draw=False)
+            or self.board.is_repetition(3)
+            or self.board.is_fifty_moves()
+        )
 
     def result(self) -> str:
-        return self.board.result(claim_draw=True)
+        if self.board.is_game_over(claim_draw=False):
+            return self.board.result(claim_draw=False)
+        if self.board.is_repetition(3) or self.board.is_fifty_moves():
+            return "1/2-1/2"
+        return "*"
 
     def outcome_text(self) -> str:
         if not self.game_over():
             return "Game in progress"
-        outcome = self.board.outcome(claim_draw=True)
-        return (
-            self.result()
-            if outcome is None
-            else f"{self.result()} - {outcome.termination.name}"
-        )
+        outcome = self.board.outcome(claim_draw=False)
+        if outcome is not None:
+            return f"{self.result()} - {outcome.termination.name}"
+        if self.board.is_repetition(3):
+            return "1/2-1/2 - THREEFOLD_REPETITION"
+        if self.board.is_fifty_moves():
+            return "1/2-1/2 - FIFTY_MOVES"
+        return self.result()
 
     def legal_moves_from(self, square: chess.Square) -> List[chess.Move]:
         return [
