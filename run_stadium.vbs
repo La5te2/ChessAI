@@ -18,7 +18,8 @@ whiteUci = "python.exe src\uci_engine.py" & _
   " --c-puct-base 19652" & _
   " --c-puct-factor 1.0" & _
   " --fpu-reduction 0.15" & _
-  " --repetition-policy-penalty 0.15"
+  " --repetition-policy-penalty 0.15" & _
+  " --instant-mate-first"
 
 blackUci = "python.exe src\uci_engine.py" & _
   " --model models\candidate1.pth" & _
@@ -31,7 +32,8 @@ blackUci = "python.exe src\uci_engine.py" & _
   " --c-puct-base 19652" & _
   " --c-puct-factor 1.0" & _
   " --fpu-reduction 0.15" & _
-  " --repetition-policy-penalty 0.15"
+  " --repetition-policy-penalty 0.15" & _
+  " --instant-mate-first"
 
 cmd = "pythonw.exe src\stadium.py" & _
   " --white-uci """ & whiteUci & """" & _

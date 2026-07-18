@@ -78,7 +78,7 @@ def apply_repetition_policy_penalty(
     codec,
     configured_penalty: float,
 ):
-    """Softly discourage giving an opponent a repetition claim while ahead."""
+    """RPP: while ahead, avoid completing or allowing a threefold repetition."""
     penalty = float(np.clip(float(configured_penalty), 0.0, 1.0))
     advantage = float(np.clip(float(root_value), 0.0, 1.0))
     effective_penalty = penalty * advantage
@@ -87,19 +87,30 @@ def apply_repetition_policy_penalty(
 
     adjusted = np.asarray(policy, dtype=np.float32).copy()
     penalized_moves = []
+    accepted_repetition_moves = []
+    opponent_repetition_replies = {}
     factor = 1.0 - effective_penalty
     for move in board.legal_moves:
         probe = board.copy(stack=True)
         probe.push(move)
-        if not (
-            probe.is_fivefold_repetition()
-            or probe.can_claim_threefold_repetition()
-        ):
+        accepts_repetition = probe.is_repetition(3)
+        completing_replies = []
+        if not accepts_repetition:
+            for reply in probe.legal_moves:
+                response = probe.copy(stack=True)
+                response.push(reply)
+                if response.is_repetition(3):
+                    completing_replies.append(reply.uci())
+        if not accepts_repetition and not completing_replies:
             continue
         index = codec.move_to_index(move)
         if index < len(adjusted):
             adjusted[index] *= factor
             penalized_moves.append(move.uci())
+            if accepts_repetition:
+                accepted_repetition_moves.append(move.uci())
+            if completing_replies:
+                opponent_repetition_replies[move.uci()] = completing_replies
 
     if not penalized_moves:
         return policy, None
@@ -109,7 +120,74 @@ def apply_repetition_policy_penalty(
         "factor": factor,
         "root_value": float(root_value),
         "moves": penalized_moves,
+        "accepted_repetition_moves": accepted_repetition_moves,
+        "opponent_repetition_replies": opponent_repetition_replies,
     }
+
+
+def apply_instant_mate_first(
+    board: chess.Board,
+    policy: np.ndarray,
+    codec,
+    enabled: bool,
+):
+    """IMF: force the model-preferred mate-in-one move to policy probability 1."""
+    if not enabled or codec is None:
+        return policy, None
+
+    mating_moves = []
+    for move in board.legal_moves:
+        probe = board.copy(stack=False)
+        probe.push(move)
+        if probe.is_checkmate():
+            mating_moves.append(move)
+    if not mating_moves:
+        return policy, None
+
+    source = np.asarray(policy, dtype=np.float32)
+    selected = max(
+        mating_moves,
+        key=lambda move: (
+            float(source[codec.move_to_index(move)]),
+            move.uci(),
+        ),
+    )
+    adjusted = np.zeros_like(source)
+    adjusted[codec.move_to_index(selected)] = 1.0
+    return adjusted, {
+        "selected_move": selected.uci(),
+        "moves": [move.uci() for move in mating_moves],
+    }
+
+
+def apply_root_policy_components(
+    board: chess.Board,
+    policy: np.ndarray,
+    root_value: float,
+    codec,
+    *,
+    repetition_policy_penalty: float,
+    instant_mate_first: bool,
+):
+    adjusted, instant_mate = apply_instant_mate_first(
+        board,
+        policy,
+        codec,
+        instant_mate_first,
+    )
+    adjusted, repetition_policy = apply_repetition_policy_penalty(
+        board,
+        adjusted,
+        root_value,
+        codec,
+        repetition_policy_penalty,
+    )
+    diagnostics = {}
+    if instant_mate is not None:
+        diagnostics["instant_mate_first"] = instant_mate
+    if repetition_policy is not None:
+        diagnostics["repetition_policy"] = repetition_policy
+    return adjusted, diagnostics
 
 
 def normalize_virtual_loss(value: float) -> float:
@@ -133,9 +211,11 @@ class SearchOptions:
     root_topn: int = 10
     virtual_loss: float = 0.0
     repetition_policy_penalty: float = 0.0
+    instant_mate_first: bool = False
 
     def __post_init__(self):
         self.virtual_loss = normalize_virtual_loss(self.virtual_loss)
+        self.instant_mate_first = bool(self.instant_mate_first)
 
 
 VALID_SEARCH_TYPES = {"closed", "only-mcts"}
@@ -382,12 +462,13 @@ class MCTS:
             return np.zeros(self.action_size, dtype=np.float32), terminal, stats
 
         root_policy, root_value, root_payload = self.evaluator.evaluate_one_full(board)
-        root_policy, repetition_policy = apply_repetition_policy_penalty(
+        root_policy, policy_components = apply_root_policy_components(
             board,
             root_policy,
             root_value,
             self.codec,
-            self.options.repetition_policy_penalty,
+            repetition_policy_penalty=self.options.repetition_policy_penalty,
+            instant_mate_first=self.options.instant_mate_first,
         )
         self.nn_batches += 1
         self._expand_from_policy(root, board, root_policy, root_payload)
@@ -409,8 +490,7 @@ class MCTS:
                 "root_c_puct": self._scheduled_c_puct(root),
                 "root_fpu": self._fpu_value(root),
             }
-            if repetition_policy is not None:
-                stats["repetition_policy"] = repetition_policy
+            stats.update(policy_components)
             stats.update(self._depth_stats())
             if progress_callback is not None:
                 progress_callback(policy, float(root_value), dict(stats))
@@ -460,8 +540,7 @@ class MCTS:
                 "root_c_puct": float(self._scheduled_c_puct(root)),
                 "root_fpu": float(self._fpu_value(root)),
             }
-            if repetition_policy is not None:
-                stats["repetition_policy"] = repetition_policy
+            stats.update(policy_components)
             stats.update(self._depth_stats())
             last_progress_time = now
             last_progress_sims = sims_completed
@@ -562,8 +641,7 @@ class MCTS:
             "root_c_puct": float(self._scheduled_c_puct(root)),
             "root_fpu": float(self._fpu_value(root)),
         }
-        if repetition_policy is not None:
-            stats["repetition_policy"] = repetition_policy
+        stats.update(policy_components)
         stats.update(self._depth_stats())
         emit_progress(force=progress_callback is not None)
         return policy, float(root.q if root.visit_count else root_value), stats
@@ -611,7 +689,7 @@ class MCTS:
                 "max_leaf_depth": 0,
                 "terminal": terminal is not None,
                 "deadline": deadlines[index],
-                "repetition_policy": None,
+                "policy_components": {},
             }
             states.append(state)
             if terminal is None:
@@ -624,12 +702,13 @@ class MCTS:
                 state = states[state_index]
                 policy = evaluation.policies[batch_index]
                 value = float(evaluation.values[batch_index])
-                policy, repetition_policy = apply_repetition_policy_penalty(
+                policy, policy_components = apply_root_policy_components(
                     state["board"],
                     policy,
                     value,
                     self.codec,
-                    self.options.repetition_policy_penalty,
+                    repetition_policy_penalty=self.options.repetition_policy_penalty,
+                    instant_mate_first=self.options.instant_mate_first,
                 )
                 payload = self.profile.payload_for_index(
                     evaluation.expansion_payload,
@@ -643,7 +722,7 @@ class MCTS:
                 )
                 state["root_policy"] = policy
                 state["root_value"] = value
-                state["repetition_policy"] = repetition_policy
+                state["policy_components"] = policy_components
                 state["expanded_nodes"] = 1
                 state["nn_batches"] = 1
 
@@ -792,8 +871,7 @@ class MCTS:
                 ),
                 "max_leaf_depth": int(state["max_leaf_depth"]),
             }
-            if state["repetition_policy"] is not None:
-                stats["repetition_policy"] = state["repetition_policy"]
+            stats.update(state["policy_components"])
             value = float(root.q if root.visit_count else state["root_value"])
             outputs.append((policy, value, stats))
         return outputs
@@ -907,6 +985,12 @@ class UnifiedSearch:
             if isinstance(repetition_policy, dict)
             else []
         )
+        instant_mate = stats.get("instant_mate_first")
+        instant_mate_moves = set(
+            instant_mate.get("moves", [])
+            if isinstance(instant_mate, dict)
+            else []
+        )
         mcts_move = self._select_top_move(root_board, policy)
         move = mcts_move
         if move is None or move not in legal:
@@ -938,6 +1022,8 @@ class UnifiedSearch:
             }
             if candidate.uci() in repetition_moves:
                 row["repetition_penalized"] = True
+            if candidate.uci() in instant_mate_moves:
+                row["instant_mate"] = True
             row.update(self.profile.root_row_fields(child) if self.profile is not None else {})
             root_lines.append(row)
         root_lines.sort(
@@ -999,6 +1085,8 @@ class UnifiedSearch:
         }
         if isinstance(repetition_policy, dict):
             info["repetition_policy"] = dict(repetition_policy)
+        if isinstance(instant_mate, dict):
+            info["instant_mate_first"] = dict(instant_mate)
 
         return SearchResult(
             move=move,
@@ -1033,12 +1121,13 @@ class UnifiedSearch:
             or int(self.options.mcts_sims) <= 0
         ):
             mcts_policy, value = self._policy_only(root_board)
-            mcts_policy, repetition_policy = apply_repetition_policy_penalty(
+            mcts_policy, policy_components = apply_root_policy_components(
                 root_board,
                 mcts_policy,
                 value,
                 self.codec,
-                self.options.repetition_policy_penalty,
+                repetition_policy_penalty=self.options.repetition_policy_penalty,
+                instant_mate_first=self.options.instant_mate_first,
             )
             stats = {
                 "sims_completed": 0,
@@ -1051,8 +1140,7 @@ class UnifiedSearch:
                 "cancelled": bool(cancel_event is not None and cancel_event.is_set()),
                 "root_node": None,
             }
-            if repetition_policy is not None:
-                stats["repetition_policy"] = repetition_policy
+            stats.update(policy_components)
         else:
             mcts = MCTS(
                 self.model,
@@ -1151,12 +1239,13 @@ class UnifiedSearch:
                     self.codec,
                 )
                 value = float(evaluation.values[index])
-                policy, repetition_policy = apply_repetition_policy_penalty(
+                policy, policy_components = apply_root_policy_components(
                     board,
                     policy,
                     value,
                     self.codec,
-                    self.options.repetition_policy_penalty,
+                    repetition_policy_penalty=self.options.repetition_policy_penalty,
+                    instant_mate_first=self.options.instant_mate_first,
                 )
                 stats = {
                     "sims_completed": 0,
@@ -1169,8 +1258,7 @@ class UnifiedSearch:
                     "cancelled": False,
                     "root_node": None,
                 }
-                if repetition_policy is not None:
-                    stats["repetition_policy"] = repetition_policy
+                stats.update(policy_components)
                 raw_results.append((
                     policy,
                     value,
@@ -1266,6 +1354,11 @@ def parse_args():
     parser.add_argument("--fpu-reduction", type=float, default=0.15)
     parser.add_argument("--virtual-loss", type=float, default=0.0)
     parser.add_argument("--repetition-policy-penalty", type=float, default=0.0)
+    parser.add_argument(
+        "--instant-mate-first",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument("--root-topn", type=int, default=10)
     return parser.parse_args()
 
@@ -1289,6 +1382,7 @@ def main():
         fpu_reduction=args.fpu_reduction,
         virtual_loss=args.virtual_loss,
         repetition_policy_penalty=args.repetition_policy_penalty,
+        instant_mate_first=args.instant_mate_first,
         root_topn=args.root_topn,
     )
     result = UnifiedSearch(model, options, device=args.device).search(board)
@@ -1310,6 +1404,8 @@ def main():
     print("virtual_loss:", result.info["virtual_loss"])
     if "repetition_policy" in result.info:
         print("repetition_policy:", result.info["repetition_policy"])
+    if "instant_mate_first" in result.info:
+        print("instant_mate_first:", result.info["instant_mate_first"])
     print("leaf_depth_avg:", result.info["avg_leaf_depth"])
     print("leaf_depth_max:", result.info["max_leaf_depth"])
     print("elapsed_ms:", result.info["elapsed_ms"])

@@ -59,6 +59,8 @@ EVAL_C_PUCT=0.5
 EVAL_C_PUCT_BASE=19652
 EVAL_C_PUCT_FACTOR=1.0
 EVAL_FPU_REDUCTION=0.15
+EVAL_REPETITION_POLICY_PENALTY=0.15
+EVAL_INSTANT_MATE_FIRST=true
 EVAL_MIN_NET_WINS=4
 EVAL_HISTORY_GAMES=100
 EVAL_HISTORY_POOL_SIZE=3
@@ -145,6 +147,11 @@ ARCH_ARGS=(
   "${ARCH_EXTRA_ARGS[@]}"
 )
 
+EVAL_IMF_ARG="--no-eval-instant-mate-first"
+if [[ "${EVAL_INSTANT_MATE_FIRST}" == "true" ]]; then
+  EVAL_IMF_ARG="--eval-instant-mate-first"
+fi
+
 echo "fcpi foreground start"
 echo "run_id=${RUN_ID}"
 echo "model=${MODEL}"
@@ -154,6 +161,7 @@ echo "self-play: games=${GAMES_PER_ITER} in_flight=${GAMES_IN_FLIGHT} max_plies=
 echo "counterfactual: topk=${COUNTERFACTUAL_TOPK} plies=${COUNTERFACTUAL_MIN_PLIES}-${COUNTERFACTUAL_MAX_PLIES} target_average_plies=${COUNTERFACTUAL_TARGET_AVERAGE_PLIES} lambda=${COUNTERFACTUAL_LAMBDA}"
 echo "train: epochs=${EPOCHS} max_steps=${TRAIN_MAX_STEPS} batch_size=${BATCH_SIZE} lr=${LR}"
 echo "eval: games=${EVAL_GAMES} in_flight=${EVAL_GAMES_IN_FLIGHT} search_type=${EVAL_SEARCH_TYPE} sims=${EVAL_SIMS} mcts_batch_size=${EVAL_MCTS_BATCH_SIZE} movetime_ms=${EVAL_MOVETIME_MS} c_puct=${EVAL_C_PUCT} fpu_reduction=${EVAL_FPU_REDUCTION} min_net_wins=${EVAL_MIN_NET_WINS}"
+echo "eval components: rpp=${EVAL_REPETITION_POLICY_PENALTY} imf=${EVAL_INSTANT_MATE_FIRST}"
 echo "history eval: games=${EVAL_HISTORY_GAMES} pool_size=${EVAL_HISTORY_POOL_SIZE} score_tolerance=${EVAL_HISTORY_SCORE_TOLERANCE}"
 
 exec python src/fcpi.py \
@@ -192,6 +200,8 @@ exec python src/fcpi.py \
   --eval-c-puct-base "${EVAL_C_PUCT_BASE}" \
   --eval-c-puct-factor "${EVAL_C_PUCT_FACTOR}" \
   --eval-fpu-reduction "${EVAL_FPU_REDUCTION}" \
+  --eval-repetition-policy-penalty "${EVAL_REPETITION_POLICY_PENALTY}" \
+  "${EVAL_IMF_ARG}" \
   --eval-min-net-wins "${EVAL_MIN_NET_WINS}" \
   --eval-history-games "${EVAL_HISTORY_GAMES}" \
   --eval-history-pool-size "${EVAL_HISTORY_POOL_SIZE}" \

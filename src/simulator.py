@@ -49,6 +49,7 @@ class EngineConfig:
     c_puct_factor: float = 1.0
     fpu_reduction: float = 0.15
     repetition_policy_penalty: float = 0.0
+    instant_mate_first: bool = False
     progress_interval_ms: int = 750
     root_topn: int = 8
 
@@ -76,6 +77,7 @@ SEARCH_PARAMETER_TYPES = {
     "c_puct_factor": float,
     "fpu_reduction": float,
     "repetition_policy_penalty": float,
+    "instant_mate_first": parse_bool,
     "progress_interval_ms": int,
     "root_topn": int,
 }
@@ -95,6 +97,9 @@ def search_options_from_parameters(parameters: Dict, root_topn: Optional[int] = 
         fpu_reduction=float(parameters.get("fpu_reduction", 0.15) or 0.15),
         repetition_policy_penalty=float(
             parameters.get("repetition_policy_penalty", 0.0) or 0.0
+        ),
+        instant_mate_first=parse_bool(
+            parameters.get("instant_mate_first", False)
         ),
         progress_interval_sec=max(
             0.0,
@@ -244,6 +249,7 @@ class SimulatorState:
             c_puct_factor=self.config.c_puct_factor,
             fpu_reduction=self.config.fpu_reduction,
             repetition_policy_penalty=self.config.repetition_policy_penalty,
+            instant_mate_first=self.config.instant_mate_first,
             progress_interval_sec=max(0.0, self.config.progress_interval_ms / 1000.0),
             root_topn=self.config.root_topn,
         )
@@ -570,11 +576,12 @@ class ModelSettingsDialog(tk.Toplevel):
             "c_puct_factor": "C-PUCT schedule factor",
             "fpu_reduction": "FPU reduction",
             "repetition_policy_penalty": "Repetition policy penalty",
+            "instant_mate_first": "Instant Mate First",
             "progress_interval_ms": "Progress interval (ms)",
             "root_topn": "Suggestion count",
         }
         current = engine.parameter_dict()
-        for name in SEARCH_PARAMETER_TYPES:
+        for name, converter in SEARCH_PARAMETER_TYPES.items():
             ttk.Label(self, text=labels[name]).grid(
                 row=row,
                 column=0,
@@ -582,9 +589,14 @@ class ModelSettingsDialog(tk.Toplevel):
                 padx=8,
                 pady=3,
             )
-            variable = tk.StringVar(value=str(current[name]))
+            if converter is parse_bool:
+                variable = tk.BooleanVar(value=bool(current[name]))
+                control = ttk.Checkbutton(self, variable=variable)
+            else:
+                variable = tk.StringVar(value=str(current[name]))
+                control = ttk.Entry(self, textvariable=variable, width=24)
             self.variables[name] = variable
-            ttk.Entry(self, textvariable=variable, width=24).grid(
+            control.grid(
                 row=row,
                 column=1,
                 sticky="ew",
@@ -641,10 +653,10 @@ class ModelSettingsDialog(tk.Toplevel):
                 parent=self,
             )
             return
-        parameters = {
-            name: variable.get().strip()
-            for name, variable in self.variables.items()
-        }
+        parameters = {}
+        for name, variable in self.variables.items():
+            value = variable.get()
+            parameters[name] = value.strip() if isinstance(value, str) else value
         try:
             loaded = self.engine.configure_model(path, parameters)
         except Exception as exc:
@@ -1256,6 +1268,11 @@ def parse_args():
     parser.add_argument("--c-puct-factor", type=float, default=1.0)
     parser.add_argument("--fpu-reduction", type=float, default=0.15)
     parser.add_argument("--repetition-policy-penalty", type=float, default=0.0)
+    parser.add_argument(
+        "--instant-mate-first",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument("--progress-interval-ms", type=int, default=750)
     parser.add_argument("--root-topn", type=int, default=8)
     return parser.parse_args()
@@ -1278,6 +1295,7 @@ def main():
         c_puct_factor=args.c_puct_factor,
         fpu_reduction=args.fpu_reduction,
         repetition_policy_penalty=args.repetition_policy_penalty,
+        instant_mate_first=args.instant_mate_first,
         progress_interval_ms=args.progress_interval_ms,
         root_topn=args.root_topn,
     )

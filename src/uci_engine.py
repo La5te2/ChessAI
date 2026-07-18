@@ -72,6 +72,7 @@ class EngineConfig:
     fpu_reduction: float = 0.15
     virtual_loss: float = 0.0
     repetition_policy_penalty: float = 0.0
+    instant_mate_first: bool = False
     multipv: int = 5
     root_topn: int = 5
     score_scale: int = 1000
@@ -79,6 +80,7 @@ class EngineConfig:
 
     def __post_init__(self):
         self.virtual_loss = normalize_virtual_loss(self.virtual_loss)
+        self.instant_mate_first = bool(self.instant_mate_first)
 
 
 class UCIEngine:
@@ -113,6 +115,8 @@ class UCIEngine:
             f"option name VirtualLoss type string default {cfg.virtual_loss}",
             "option name RepetitionPolicyPenalty type string "
             f"default {cfg.repetition_policy_penalty}",
+            "option name InstantMateFirst type check "
+            f"default {str(cfg.instant_mate_first).lower()}",
             f"option name MultiPV type spin default {cfg.multipv} min 1 max 256",
             f"option name RootTopN type spin default {cfg.root_topn} min 1 max 256",
             f"option name ScoreScale type spin default {cfg.score_scale} min 1 max 100000",
@@ -181,6 +185,8 @@ class UCIEngine:
                 1.0,
                 max(0.0, as_float(value, cfg.repetition_policy_penalty)),
             )
+        elif key == "instantmatefirst":
+            cfg.instant_mate_first = as_bool(value, cfg.instant_mate_first)
         elif key == "multipv":
             cfg.multipv = max(1, as_int(value, cfg.multipv))
         elif key == "roottopn":
@@ -275,6 +281,7 @@ class UCIEngine:
             fpu_reduction=cfg.fpu_reduction,
             virtual_loss=cfg.virtual_loss,
             repetition_policy_penalty=cfg.repetition_policy_penalty,
+            instant_mate_first=cfg.instant_mate_first,
             root_topn=max(cfg.root_topn, cfg.multipv),
         )
 
@@ -524,6 +531,11 @@ def parse_args():
     parser.add_argument("--fpu-reduction", type=float, default=0.15)
     parser.add_argument("--virtual-loss", type=float, default=0.0)
     parser.add_argument("--repetition-policy-penalty", type=float, default=0.0)
+    parser.add_argument(
+        "--instant-mate-first",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument("--multipv", type=int, default=5)
     parser.add_argument("--root-topn", type=int, default=5)
     parser.add_argument("--score-scale", type=int, default=1000)
@@ -551,6 +563,7 @@ def config_from_args(args) -> EngineConfig:
         fpu_reduction=float(args.fpu_reduction),
         virtual_loss=float(args.virtual_loss),
         repetition_policy_penalty=float(args.repetition_policy_penalty),
+        instant_mate_first=bool(args.instant_mate_first),
         multipv=int(args.multipv),
         root_topn=int(args.root_topn),
         score_scale=int(args.score_scale),

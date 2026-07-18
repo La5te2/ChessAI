@@ -1350,6 +1350,8 @@ def evaluate_fcpi_arena(candidate_path, baseline_path, args, *, games, seed):
         c_puct_base=args.eval_c_puct_base,
         c_puct_factor=args.eval_c_puct_factor,
         fpu_reduction=args.eval_fpu_reduction,
+        repetition_policy_penalty=args.eval_repetition_policy_penalty,
+        instant_mate_first=args.eval_instant_mate_first,
         progress=True,
     )
 
@@ -1626,6 +1628,16 @@ def common_parser(add_help=True):
     parser.add_argument("--eval-c-puct-base", type=float, default=19652.0)
     parser.add_argument("--eval-c-puct-factor", type=float, default=1.0)
     parser.add_argument("--eval-fpu-reduction", type=float, default=0.15)
+    parser.add_argument(
+        "--eval-repetition-policy-penalty",
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument(
+        "--eval-instant-mate-first",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument("--eval-min-net-wins", type=int, default=4)
     parser.add_argument("--eval-history-games", type=int, default=100)
     parser.add_argument("--eval-history-pool-size", type=int, default=3)
@@ -1661,6 +1673,9 @@ def parse_args():
     args.eval_history_pool_size = max(0, int(args.eval_history_pool_size))
     args.eval_history_score_tolerance = max(
         0.0, float(args.eval_history_score_tolerance)
+    )
+    args.eval_repetition_policy_penalty = float(
+        np.clip(args.eval_repetition_policy_penalty, 0.0, 1.0)
     )
     return args, evolution
 
