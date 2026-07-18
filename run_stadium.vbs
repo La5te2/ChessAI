@@ -25,7 +25,8 @@ blackUci = "python.exe src\uci_engine.py" & _
 cmd = "pythonw.exe src\stadium.py" & _
   " --white-uci """ & whiteUci & """" & _
   " --black-uci """ & blackUci & """" & _
-  " --movetime-ms 10000" & _
+  " --white-movetime-ms 1000" & _
+  " --black-movetime-ms 10000" & _
   " --delay-ms 300" & _
   " --max-plies 240"
 

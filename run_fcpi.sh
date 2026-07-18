@@ -22,21 +22,23 @@ export FCPI_RUN_ID="${RUN_ID}"
 MODEL="models/chessnet.pth"
 DEVICE="cuda"
 
-ITERATIONS=1
+ITERATIONS=10
 GAMES_PER_ITER=1000
 GAMES_IN_FLIGHT=100
 MAX_PLIES=240
 POSITIONS_PER_GAME=200
 OPENING_BOOK="data/openings.gen.bin"
-STARTPOS_FRACTION=0.20
+STARTPOS_FRACTION=1.0 
+# fraction of games that start from a random position in the opening book 
+# 0.0 = all games start from the initial position, 1.0 = all games start from a random position in the opening book
 BOOK_PLIES=8
 MAX_BOOK_POSITIONS=50000
 INFERENCE_BATCH_SIZE=64
 TARGET_RECORDS_PER_BATCH=256
 VALIDATION_FRACTION=0.10
 
-EPOCHS=6
-TRAIN_MAX_STEPS=2400
+EPOCHS=5
+TRAIN_MAX_STEPS=2000
 BATCH_SIZE=256
 TRAIN_WORKERS=4
 LR=0.00001
@@ -44,15 +46,19 @@ WEIGHT_DECAY=0.0001
 GRAD_CLIP=1.0
 
 EVAL_GAMES=400
-EVAL_SIMS=0
-EVAL_WORKERS=10
+EVAL_SIMS=64
+EVAL_GAMES_IN_FLIGHT=32
 EVAL_MAX_PLIES=240
 EVAL_OPENING_BOOK="data/openings.gen.bin"
 EVAL_BOOK_PLIES=8
 EVAL_MAX_BOOK_POSITIONS=50000
-EVAL_MCTS_BATCH_SIZE=64
+EVAL_MCTS_BATCH_SIZE=32
 EVAL_MOVETIME_MS=0
-EVAL_SEARCH_TYPE=closed
+EVAL_SEARCH_TYPE=only-mcts
+EVAL_C_PUCT=0.5
+EVAL_C_PUCT_BASE=19652
+EVAL_C_PUCT_FACTOR=1.0
+EVAL_FPU_REDUCTION=0.15
 EVAL_MIN_NET_WINS=4
 
 LOG_EVERY=50
@@ -144,7 +150,7 @@ echo "device=${DEVICE}"
 echo "self-play: games=${GAMES_PER_ITER} in_flight=${GAMES_IN_FLIGHT} max_plies=${MAX_PLIES} positions_per_game=${POSITIONS_PER_GAME} opening_book=${OPENING_BOOK} startpos_fraction=${STARTPOS_FRACTION}"
 echo "counterfactual: topk=${COUNTERFACTUAL_TOPK} plies=${COUNTERFACTUAL_MIN_PLIES}-${COUNTERFACTUAL_MAX_PLIES} target_average_plies=${COUNTERFACTUAL_TARGET_AVERAGE_PLIES} lambda=${COUNTERFACTUAL_LAMBDA}"
 echo "train: epochs=${EPOCHS} max_steps=${TRAIN_MAX_STEPS} batch_size=${BATCH_SIZE} lr=${LR}"
-echo "eval: games=${EVAL_GAMES} search_type=${EVAL_SEARCH_TYPE} sims=${EVAL_SIMS} min_net_wins=${EVAL_MIN_NET_WINS}"
+echo "eval: games=${EVAL_GAMES} in_flight=${EVAL_GAMES_IN_FLIGHT} search_type=${EVAL_SEARCH_TYPE} sims=${EVAL_SIMS} mcts_batch_size=${EVAL_MCTS_BATCH_SIZE} movetime_ms=${EVAL_MOVETIME_MS} c_puct=${EVAL_C_PUCT} fpu_reduction=${EVAL_FPU_REDUCTION} min_net_wins=${EVAL_MIN_NET_WINS}"
 
 exec python src/fcpi.py \
   --model "${MODEL}" \
@@ -170,7 +176,7 @@ exec python src/fcpi.py \
   --grad-clip "${GRAD_CLIP}" \
   --eval-games "${EVAL_GAMES}" \
   --eval-sims "${EVAL_SIMS}" \
-  --eval-workers "${EVAL_WORKERS}" \
+  --eval-games-in-flight "${EVAL_GAMES_IN_FLIGHT}" \
   --eval-max-plies "${EVAL_MAX_PLIES}" \
   --eval-opening-book "${EVAL_OPENING_BOOK}" \
   --eval-book-plies "${EVAL_BOOK_PLIES}" \
@@ -178,6 +184,10 @@ exec python src/fcpi.py \
   --eval-mcts-batch-size "${EVAL_MCTS_BATCH_SIZE}" \
   --eval-movetime-ms "${EVAL_MOVETIME_MS}" \
   --eval-search-type "${EVAL_SEARCH_TYPE}" \
+  --eval-c-puct "${EVAL_C_PUCT}" \
+  --eval-c-puct-base "${EVAL_C_PUCT_BASE}" \
+  --eval-c-puct-factor "${EVAL_C_PUCT_FACTOR}" \
+  --eval-fpu-reduction "${EVAL_FPU_REDUCTION}" \
   --eval-min-net-wins "${EVAL_MIN_NET_WINS}" \
   --log-every "${LOG_EVERY}" \
   --seed "${SEED}" \

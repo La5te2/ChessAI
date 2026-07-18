@@ -1316,7 +1316,7 @@ def evaluate_candidate(
         baseline_path=baseline_path,
         games=args.eval_games,
         sims=args.eval_sims,
-        workers=args.eval_workers or args.parallel,
+        games_in_flight=args.eval_games_in_flight,
         max_plies=args.eval_max_plies,
         device=args.device,
         opening_book=args.eval_opening_book,
@@ -1553,7 +1553,7 @@ def build_parser():
 
     parser.add_argument("--eval-games", type=int, default=100)
     parser.add_argument("--eval-sims", type=int, default=0)
-    parser.add_argument("--eval-workers", type=int, default=None)
+    parser.add_argument("--eval-games-in-flight", type=int, default=32)
     parser.add_argument("--eval-max-plies", type=int, default=180)
     parser.add_argument("--eval-opening-book", default="data/openings.gen.bin")
     parser.add_argument("--eval-book-plies", type=int, default=8)

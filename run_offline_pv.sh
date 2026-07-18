@@ -79,12 +79,13 @@ VALIDATION_MIN_VALUE_SIGN_ACC_DELTA=-0.02
 VALIDATION_MIN_TEACHER_BEST_TOPK_DELTA=-0.02
 
 EVAL_GAMES=200
-EVAL_SIMS=0
-EVAL_WORKERS=10
+EVAL_SIMS=64
+EVAL_GAMES_IN_FLIGHT=32
 EVAL_MAX_PLIES=160
 EVAL_OPENING_BOOK="data/openings.gen.bin"
+EVAL_MCTS_BATCH_SIZE=32
 EVAL_MOVETIME_MS=0
-EVAL_SEARCH_TYPE=closed
+EVAL_SEARCH_TYPE=only-mcts
 EVAL_C_PUCT=0.5
 EVAL_C_PUCT_BASE=19652
 EVAL_C_PUCT_FACTOR=1.0
@@ -106,7 +107,7 @@ echo "offline-pv targets: policy_weight=${TEACHER_POLICY_WEIGHT} rank_weight=${T
 echo "teacher: uci=${UCI} depth=${UCI_DEPTH} multipv=${UCI_MULTIPV} threads=${UCI_THREADS}"
 echo "train: epochs=${EPOCHS} train_max_steps=${TRAIN_MAX_STEPS} batch_size=${BATCH_SIZE} actor_weight=${ACTOR_WEIGHT} critic_weight=${CRITIC_WEIGHT} entropy_weight=${ENTROPY_WEIGHT}"
 echo "teacher validation: source=${VALIDATION_SOURCE} positions=${VALIDATION_POSITIONS} offset=${VALIDATION_OFFSET} topk=${VALIDATION_TOPK} uci_depth=${VALIDATION_UCI_DEPTH} uci_multipv=${VALIDATION_UCI_MULTIPV} top1_tol_cp=${VALIDATION_MAX_TOP1_REGRET_REGRESSION_CP} composite_tol_cp=${VALIDATION_MAX_COMPOSITE_REGRET_REGRESSION_CP}"
-echo "eval: games=${EVAL_GAMES} search_type=${EVAL_SEARCH_TYPE} sims=${EVAL_SIMS} movetime_ms=${EVAL_MOVETIME_MS} c_puct=${EVAL_C_PUCT} fpu_reduction=${EVAL_FPU_REDUCTION} min_net_wins=${EVAL_MIN_NET_WINS} opening_book=${EVAL_OPENING_BOOK}"
+echo "eval: games=${EVAL_GAMES} in_flight=${EVAL_GAMES_IN_FLIGHT} search_type=${EVAL_SEARCH_TYPE} sims=${EVAL_SIMS} mcts_batch_size=${EVAL_MCTS_BATCH_SIZE} movetime_ms=${EVAL_MOVETIME_MS} c_puct=${EVAL_C_PUCT} fpu_reduction=${EVAL_FPU_REDUCTION} min_net_wins=${EVAL_MIN_NET_WINS} opening_book=${EVAL_OPENING_BOOK}"
 
 exec python src/offline_pv.py \
   --model "${MODEL}" \
@@ -164,9 +165,10 @@ exec python src/offline_pv.py \
   --validation-min-teacher-best-topk-delta "${VALIDATION_MIN_TEACHER_BEST_TOPK_DELTA}" \
   --eval-games "${EVAL_GAMES}" \
   --eval-sims "${EVAL_SIMS}" \
-  --eval-workers "${EVAL_WORKERS}" \
+  --eval-games-in-flight "${EVAL_GAMES_IN_FLIGHT}" \
   --eval-max-plies "${EVAL_MAX_PLIES}" \
   --eval-opening-book "${EVAL_OPENING_BOOK}" \
+  --eval-mcts-batch-size "${EVAL_MCTS_BATCH_SIZE}" \
   --eval-movetime-ms "${EVAL_MOVETIME_MS}" \
   --eval-search-type "${EVAL_SEARCH_TYPE}" \
   --eval-c-puct "${EVAL_C_PUCT}" \

@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import math
-import multiprocessing as mp
 import os
 import re
 import textwrap
-from typing import Dict
+from typing import Dict, List
 
 import chess
 import chess.pgn
@@ -216,194 +215,225 @@ def elo_from_score(score):
     return 400.0 * math.log10(score / (1.0 - score))
 
 
-def play_arena_game(
+@dataclass
+class ArenaGameState:
+    game_id: int
+    candidate_color: chess.Color
+    board: chess.Board
+    game: object
+    node: object
+    trace: List[Dict]
+    ply: int = 0
+
+
+def make_game_state(game_id, start_fen, candidate_color, collect_pgn):
+    board = chess.Board(start_fen)
+    game = chess.pgn.Game() if collect_pgn else None
+    if game is not None:
+        game.headers["Event"] = "ChessAI Arena"
+        game.headers["Round"] = str(game_id)
+        game.headers["White"] = (
+            "candidate" if candidate_color == chess.WHITE else "baseline"
+        )
+        game.headers["Black"] = (
+            "baseline" if candidate_color == chess.WHITE else "candidate"
+        )
+        if start_fen != chess.Board().fen():
+            game.headers["SetUp"] = "1"
+            game.headers["FEN"] = start_fen
+    return ArenaGameState(
+        game_id=int(game_id),
+        candidate_color=candidate_color,
+        board=board,
+        game=game,
+        node=game,
+        trace=[],
+    )
+
+
+def apply_game_move(
+    state: ArenaGameState,
+    search_result,
+    owner: str,
+    pgn_comments: bool,
+    trace_root_topn: int,
+    collect_trace: bool,
+):
+    board = state.board
+    info = dict(search_result.info or {})
+    move = search_result.move
+    if move not in board.legal_moves:
+        raise RuntimeError(
+            "arena search returned illegal move: "
+            f"game={state.game_id} ply={state.ply + 1} owner={owner} "
+            f"move={move.uci() if move is not None else None} "
+            f"fen={board.fen()} best={info.get('best_move')} "
+            f"root={json.dumps(trace_search_info(info, trace_root_topn), ensure_ascii=False)}"
+        )
+
+    san = safe_san(board, move)
+    if collect_trace:
+        state.trace.append({
+            "game_id": state.game_id,
+            "ply": state.ply + 1,
+            "fen": board.fen(),
+            "move": move.uci(),
+            "san": san,
+            "owner": owner,
+            "candidate_color": (
+                "white" if state.candidate_color == chess.WHITE else "black"
+            ),
+            "decision_profile": info.get("decision_profile"),
+            "search": trace_search_info(info, trace_root_topn),
+        })
+    if state.node is not None:
+        state.node = state.node.add_variation(move)
+        if pgn_comments:
+            state.node.comment = pgn_search_comment(owner, info)
+    board.push(move)
+    state.ply += 1
+
+
+def finish_game_state(
+    state: ArenaGameState,
+    max_plies: int,
+    claim_draws: bool,
+    pgn_columns: int,
+):
+    result, termination = pgn_result_and_termination(
+        state.board,
+        ply=state.ply,
+        max_plies=max_plies,
+        claim_draws=bool(claim_draws),
+    )
+    if state.game is not None:
+        state.game.headers["Result"] = result
+        state.game.headers["Termination"] = termination
+    return {
+        "game_id": state.game_id,
+        "candidate_color": state.candidate_color,
+        "result": result,
+        "score": score_from_result(result, state.candidate_color),
+        "plies": state.ply,
+        "trace": state.trace,
+        "pgn": (
+            render_pgn(state.game, columns=pgn_columns)
+            if state.game is not None
+            else None
+        ),
+    }
+
+
+def play_batched_games(
     candidate_searcher,
     baseline_searcher,
-    candidate_color,
+    specs,
+    games_in_flight,
     max_plies,
-    start_fen,
-    game_id=None,
     pgn_comments=False,
     pgn_columns=88,
     claim_draws=False,
     trace_root_topn=12,
     collect_trace=True,
     collect_pgn=True,
+    progress=True,
 ):
-    board = chess.Board(start_fen)
-    game = chess.pgn.Game() if collect_pgn else None
-    if game is not None:
-        game.headers["Event"] = "ChessAI Arena"
-        if game_id is not None:
-            game.headers["Round"] = str(game_id)
-        game.headers["White"] = "candidate" if candidate_color == chess.WHITE else "baseline"
-        game.headers["Black"] = "baseline" if candidate_color == chess.WHITE else "candidate"
-        if start_fen != chess.Board().fen():
-            game.headers["SetUp"] = "1"
-            game.headers["FEN"] = start_fen
-    node = game
-    trace = []
-    ply = 0
+    completed = []
+    total_games = len(specs)
+    next_spec = 0
+    active: List[ArenaGameState] = []
 
-    while not board.is_game_over(claim_draw=bool(claim_draws)) and ply < int(max_plies):
-        candidate_turn = board.turn == candidate_color
-        owner = "candidate" if candidate_turn else "baseline"
-        searcher = candidate_searcher if candidate_turn else baseline_searcher
-        result = searcher.search(board.copy(stack=False))
-        info = dict(result.info or {})
-        move = result.move
-        if move not in board.legal_moves:
-            raise RuntimeError(
-                "arena search returned illegal move: "
-                f"game={game_id} ply={ply + 1} owner={owner} "
-                f"move={move.uci() if move is not None else None} "
-                f"fen={board.fen()} best={info.get('best_move')} "
-                f"root={json.dumps(trace_search_info(info, trace_root_topn), ensure_ascii=False)}"
+    while next_spec < total_games or active:
+        while next_spec < total_games and len(active) < games_in_flight:
+            start_fen, candidate_color = specs[next_spec]
+            active.append(
+                make_game_state(
+                    next_spec + 1,
+                    start_fen,
+                    candidate_color,
+                    collect_pgn=collect_pgn,
+                )
             )
+            next_spec += 1
 
-        san = safe_san(board, move)
-        if collect_trace:
-            trace.append({
-                "game_id": game_id,
-                "ply": ply + 1,
-                "fen": board.fen(),
-                "move": move.uci(),
-                "san": san,
-                "owner": owner,
-                "candidate_color": "white" if candidate_color == chess.WHITE else "black",
-                "decision_profile": info.get("decision_profile"),
-                "search": trace_search_info(info, trace_root_topn),
-            })
-        if node is not None:
-            node = node.add_variation(move)
-            if pgn_comments:
-                node.comment = pgn_search_comment(owner, info)
-        board.push(move)
-        ply += 1
+        finished_before_search = [
+            state
+            for state in active
+            if state.board.is_game_over(claim_draw=bool(claim_draws))
+            or state.ply >= int(max_plies)
+        ]
+        if finished_before_search:
+            for state in finished_before_search:
+                record = finish_game_state(
+                    state, max_plies, claim_draws, pgn_columns
+                )
+                completed.append(record)
+                progress_print(
+                    progress,
+                    f"arena game {state.game_id}/{total_games}: "
+                    f"candidate_color={'white' if state.candidate_color == chess.WHITE else 'black'} "
+                    f"result={record['result']} candidate_score={record['score']:.1f} "
+                    f"plies={record['plies']}",
+                )
+            finished_ids = {state.game_id for state in finished_before_search}
+            active = [state for state in active if state.game_id not in finished_ids]
+            continue
 
-    result_string, termination = pgn_result_and_termination(
-        board,
-        ply=ply,
-        max_plies=max_plies,
-        claim_draws=bool(claim_draws),
-    )
-    if game is not None:
-        game.headers["Result"] = result_string
-        game.headers["Termination"] = termination
-    return (
-        result_string,
-        score_from_result(result_string, candidate_color),
-        ply,
-        trace,
-        render_pgn(game, columns=pgn_columns) if game is not None else None,
-    )
+        candidate_states = [
+            state for state in active if state.board.turn == state.candidate_color
+        ]
+        baseline_states = [
+            state for state in active if state.board.turn != state.candidate_color
+        ]
+        if candidate_states:
+            results = candidate_searcher.search_many(
+                [state.board for state in candidate_states]
+            )
+            for state, result in zip(candidate_states, results):
+                apply_game_move(
+                    state,
+                    result,
+                    owner="candidate",
+                    pgn_comments=pgn_comments,
+                    trace_root_topn=trace_root_topn,
+                    collect_trace=collect_trace,
+                )
+        if baseline_states:
+            results = baseline_searcher.search_many(
+                [state.board for state in baseline_states]
+            )
+            for state, result in zip(baseline_states, results):
+                apply_game_move(
+                    state,
+                    result,
+                    owner="baseline",
+                    pgn_comments=pgn_comments,
+                    trace_root_topn=trace_root_topn,
+                    collect_trace=collect_trace,
+                )
 
+        just_finished = [
+            state
+            for state in active
+            if state.board.is_game_over(claim_draw=bool(claim_draws))
+            or state.ply >= int(max_plies)
+        ]
+        for state in just_finished:
+            record = finish_game_state(state, max_plies, claim_draws, pgn_columns)
+            completed.append(record)
+            progress_print(
+                progress,
+                f"arena game {state.game_id}/{total_games}: "
+                f"candidate_color={'white' if state.candidate_color == chess.WHITE else 'black'} "
+                f"result={record['result']} candidate_score={record['score']:.1f} "
+                f"plies={record['plies']}",
+            )
+        if just_finished:
+            finished_ids = {state.game_id for state in just_finished}
+            active = [state for state in active if state.game_id not in finished_ids]
 
-def _worker(job):
-    (
-        worker_index,
-        candidate_path,
-        baseline_path,
-        specs,
-        game_id_offset,
-        sims,
-        device,
-        max_plies,
-        mcts_batch_size,
-        movetime_ms,
-        search_type,
-        c_puct,
-        c_puct_base,
-        c_puct_factor,
-        fpu_reduction,
-        pgn_comments,
-        pgn_columns,
-        claim_draws,
-        trace_root_topn,
-        collect_trace,
-        collect_pgn,
-        progress,
-    ) = job
-
-    progress_print(
-        progress,
-        f"arena worker {worker_index}: loading models on {device}",
-    )
-    candidate = load_model(candidate_path, device=device)
-    baseline = load_model(baseline_path, device=device)
-    candidate_arch = candidate.arch() if hasattr(candidate, "arch") else {}
-    baseline_arch = baseline.arch() if hasattr(baseline, "arch") else {}
-    options = SearchOptions(
-        search_type=search_type,
-        mcts_sims=sims,
-        mcts_batch_size=mcts_batch_size,
-        time_limit=(movetime_ms / 1000.0) if movetime_ms > 0 else None,
-        c_puct=c_puct,
-        c_puct_base=c_puct_base,
-        c_puct_factor=c_puct_factor,
-        fpu_reduction=fpu_reduction,
-    )
-    candidate_searcher = UnifiedSearch(candidate, replace(options), device=device)
-    baseline_searcher = UnifiedSearch(baseline, replace(options), device=device)
-    progress_print(
-        progress,
-        f"arena worker {worker_index}: candidate_arch={candidate_arch.get('type')} "
-        f"candidate_profile={candidate_searcher.profile.name} "
-        f"baseline_arch={baseline_arch.get('type')} "
-        f"baseline_profile={baseline_searcher.profile.name}",
-    )
-
-    scores = []
-    counts = {"win": 0, "draw": 0, "loss": 0}
-    raw_results = {}
-    plies_total = 0
-    traces = []
-    pgns = []
-
-    total_specs = len(specs)
-    for local_index, (fen, candidate_color) in enumerate(specs, 1):
-        game_id = int(game_id_offset) + local_index
-        result, score, plies, trace, pgn = play_arena_game(
-            candidate_searcher,
-            baseline_searcher,
-            candidate_color,
-            max_plies,
-            fen,
-            game_id,
-            pgn_comments=pgn_comments,
-            pgn_columns=pgn_columns,
-            claim_draws=claim_draws,
-            trace_root_topn=trace_root_topn,
-            collect_trace=collect_trace,
-            collect_pgn=collect_pgn,
-        )
-        scores.append(score)
-        counts[outcome_from_score(score)] += 1
-        raw_results[result] = raw_results.get(result, 0) + 1
-        plies_total += plies
-        traces.extend(trace)
-        if pgn is not None:
-            pgns.append(pgn)
-        progress_print(
-            progress,
-            f"arena worker {worker_index}: game {local_index}/{total_specs} "
-            f"global_game={game_id} "
-            f"candidate_color={'white' if candidate_color == chess.WHITE else 'black'} "
-            f"result={result} candidate_score={score:.1f} plies={plies}",
-        )
-
-    return {
-        "scores": scores,
-        "counts": counts,
-        "raw_results": raw_results,
-        "plies_total": plies_total,
-        "traces": traces,
-        "pgns": pgns,
-        "candidate_arch": candidate_arch,
-        "baseline_arch": baseline_arch,
-        "candidate_decision_profile": candidate_searcher.profile.name,
-        "baseline_decision_profile": baseline_searcher.profile.name,
-    }
+    completed.sort(key=lambda row: row["game_id"])
+    return completed
 
 
 def evaluate_models(
@@ -411,7 +441,7 @@ def evaluate_models(
     baseline_path,
     games=100,
     sims=80,
-    workers=1,
+    games_in_flight=32,
     device=DEVICE,
     max_plies=240,
     seed=2026,
@@ -446,7 +476,7 @@ def evaluate_models(
         f"games={games}",
         f"sims={sims}",
         f"device={device}",
-        f"workers={workers}",
+        f"games_in_flight={games_in_flight}",
     )
     specs = make_arena_specs(
         games=games,
@@ -464,83 +494,64 @@ def evaluate_models(
         f"from {len({fen for fen, _ in specs})} unique start positions",
     )
 
-    workers = max(1, int(workers))
-    splits = [len(specs) // workers] * workers
-    for index in range(len(specs) % workers):
-        splits[index] += 1
+    games_in_flight = max(1, min(len(specs), int(games_in_flight)))
+    progress_print(progress, f"arena: loading candidate model on {device}")
+    candidate = load_model(candidate_path, device=device)
+    progress_print(progress, f"arena: loading baseline model on {device}")
+    baseline = load_model(baseline_path, device=device)
+    candidate_arch = candidate.arch() if hasattr(candidate, "arch") else {}
+    baseline_arch = baseline.arch() if hasattr(baseline, "arch") else {}
+    options = SearchOptions(
+        search_type=search_type,
+        mcts_sims=sims,
+        mcts_batch_size=mcts_batch_size,
+        time_limit=(movetime_ms / 1000.0) if movetime_ms > 0 else None,
+        c_puct=c_puct,
+        c_puct_base=c_puct_base,
+        c_puct_factor=c_puct_factor,
+        fpu_reduction=fpu_reduction,
+    )
+    candidate_searcher = UnifiedSearch(candidate, replace(options), device=device)
+    baseline_searcher = UnifiedSearch(baseline, replace(options), device=device)
+    candidate_decision_profile = candidate_searcher.profile.name
+    baseline_decision_profile = baseline_searcher.profile.name
+    progress_print(
+        progress,
+        "arena: models ready",
+        f"candidate_arch={candidate_arch.get('type')}",
+        f"candidate_profile={candidate_decision_profile}",
+        f"baseline_arch={baseline_arch.get('type')}",
+        f"baseline_profile={baseline_decision_profile}",
+    )
 
-    jobs = []
-    offset = 0
-    for count in splits:
-        if count <= 0:
-            continue
-        game_id_offset = offset
-        subset = specs[offset:offset + count]
-        offset += count
-        jobs.append((
-            len(jobs) + 1,
-            candidate_path,
-            baseline_path,
-            subset,
-            game_id_offset,
-            sims,
-            device,
-            max_plies,
-            mcts_batch_size,
-            movetime_ms,
-            search_type,
-            c_puct,
-            c_puct_base,
-            c_puct_factor,
-            fpu_reduction,
-            pgn_comments,
-            pgn_columns,
-            claim_draws,
-            trace_root_topn,
-            bool(trace_output),
-            bool(pgn_output),
-            progress,
-        ))
+    records = play_batched_games(
+        candidate_searcher=candidate_searcher,
+        baseline_searcher=baseline_searcher,
+        specs=specs,
+        games_in_flight=games_in_flight,
+        max_plies=max_plies,
+        pgn_comments=pgn_comments,
+        pgn_columns=pgn_columns,
+        claim_draws=claim_draws,
+        trace_root_topn=trace_root_topn,
+        collect_trace=bool(trace_output),
+        collect_pgn=bool(pgn_output),
+        progress=progress,
+    )
 
-    if len(jobs) == 1:
-        outputs = [_worker(jobs[0])]
-    else:
-        with mp.get_context("spawn").Pool(processes=len(jobs)) as pool:
-            outputs = pool.map(_worker, jobs)
-
-    scores = []
+    scores = [float(record["score"]) for record in records]
     counts = {"win": 0, "draw": 0, "loss": 0}
     raw_results = {}
-    plies_total = 0
+    plies_total = sum(int(record["plies"]) for record in records)
     traces = []
     pgns = []
-    for output in outputs:
-        scores.extend(output["scores"])
-        plies_total += int(output["plies_total"])
-        traces.extend(output["traces"])
-        pgns.extend(output.get("pgns", []))
-        for key, value in output["counts"].items():
-            counts[key] += int(value)
-        for key, value in output["raw_results"].items():
-            raw_results[key] = raw_results.get(key, 0) + int(value)
-    candidate_arch = next((output.get("candidate_arch") for output in outputs if output.get("candidate_arch")), {})
-    baseline_arch = next((output.get("baseline_arch") for output in outputs if output.get("baseline_arch")), {})
-    candidate_decision_profile = next(
-        (
-            output.get("candidate_decision_profile")
-            for output in outputs
-            if output.get("candidate_decision_profile")
-        ),
-        None,
-    )
-    baseline_decision_profile = next(
-        (
-            output.get("baseline_decision_profile")
-            for output in outputs
-            if output.get("baseline_decision_profile")
-        ),
-        None,
-    )
+    for record in records:
+        counts[outcome_from_score(record["score"])] += 1
+        result = str(record["result"])
+        raw_results[result] = raw_results.get(result, 0) + 1
+        traces.extend(record["trace"])
+        if record["pgn"] is not None:
+            pgns.append(record["pgn"])
 
     score, ci_low, ci_high = normal_ci(scores)
 
@@ -605,6 +616,7 @@ def evaluate_models(
         "search_type": str(search_type),
         "sims_soft_cap": int(effective_sims),
         "mcts_batch_size": int(mcts_batch_size),
+        "games_in_flight": int(games_in_flight),
         "movetime_ms": int(movetime_ms),
         "c_puct_initial": float(c_puct),
         "c_puct_base": float(c_puct_base),
@@ -627,7 +639,7 @@ def parse_args():
     parser.add_argument("--baseline", required=True)
     parser.add_argument("--games", type=int, default=100)
     parser.add_argument("--sims", type=int, default=80)
-    parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--games-in-flight", type=int, default=32)
     parser.add_argument("--device", default=DEVICE)
     parser.add_argument("--max-plies", type=int, default=240)
     parser.add_argument("--seed", type=int, default=2026)
@@ -663,7 +675,7 @@ def main():
         baseline_path=args.baseline,
         games=args.games,
         sims=args.sims,
-        workers=args.workers,
+        games_in_flight=args.games_in_flight,
         device=args.device,
         max_plies=args.max_plies,
         seed=args.seed,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import json
 import os
 import queue
 import shlex
@@ -17,6 +18,21 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from gui import ChessGUIBase
+
+
+def uci_options_from_text(text: str) -> Dict[str, object]:
+    value = str(text or "").strip()
+    if not value:
+        return {}
+    options = json.loads(value)
+    if not isinstance(options, dict):
+        raise ValueError("UCI options must be a JSON object")
+    for name, option_value in options.items():
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("UCI option names must be non-empty strings")
+        if option_value is None or isinstance(option_value, (dict, list)):
+            raise ValueError(f"unsupported UCI option value for {name!r}")
+    return options
 
 
 def strip_wrapping_quotes(text: str) -> str:
@@ -169,8 +185,11 @@ class StadiumSettingsDialog(tk.Toplevel):
         self.values = {}
         fields = (
             ("white_uci", "White UCI command"),
+            ("white_options", "White UCI options (JSON)"),
+            ("white_movetime_ms", "White move time (ms)"),
             ("black_uci", "Black UCI command"),
-            ("movetime_ms", "Move time (ms)"),
+            ("black_options", "Black UCI options (JSON)"),
+            ("black_movetime_ms", "Black move time (ms)"),
             ("delay_ms", "Display delay (ms)"),
             ("max_plies", "Max plies"),
         )
@@ -203,15 +222,22 @@ class StadiumSettingsDialog(tk.Toplevel):
         try:
             settings = {
                 "white_uci": self.values["white_uci"].get().strip(),
+                "white_options": self.values["white_options"].get().strip(),
+                "white_movetime_ms": int(self.values["white_movetime_ms"].get()),
                 "black_uci": self.values["black_uci"].get().strip(),
-                "movetime_ms": int(self.values["movetime_ms"].get()),
+                "black_options": self.values["black_options"].get().strip(),
+                "black_movetime_ms": int(self.values["black_movetime_ms"].get()),
                 "delay_ms": int(self.values["delay_ms"].get()),
                 "max_plies": int(self.values["max_plies"].get()),
             }
             command_from_text(settings["white_uci"])
             command_from_text(settings["black_uci"])
-            if settings["movetime_ms"] <= 0:
-                raise ValueError("move time must be positive")
+            uci_options_from_text(settings["white_options"])
+            uci_options_from_text(settings["black_options"])
+            if settings["white_movetime_ms"] <= 0:
+                raise ValueError("white move time must be positive")
+            if settings["black_movetime_ms"] <= 0:
+                raise ValueError("black move time must be positive")
             if settings["delay_ms"] < 0:
                 raise ValueError("display delay must be non-negative")
             if settings["max_plies"] <= 0:
@@ -236,8 +262,11 @@ class StadiumApp(ChessGUIBase):
         self.initialize_board_gui()
         self.settings = {
             "white_uci": str(defaults.get("white_uci") or ""),
+            "white_options": str(defaults.get("white_options") or "{}"),
+            "white_movetime_ms": int(defaults.get("white_movetime_ms", 1000)),
             "black_uci": str(defaults.get("black_uci") or ""),
-            "movetime_ms": int(defaults.get("movetime_ms", 1000)),
+            "black_options": str(defaults.get("black_options") or "{}"),
+            "black_movetime_ms": int(defaults.get("black_movetime_ms", 1000)),
             "delay_ms": int(defaults.get("delay_ms", 250)),
             "max_plies": int(defaults.get("max_plies", 240)),
         }
@@ -387,24 +416,49 @@ class StadiumApp(ChessGUIBase):
         black_text = str(self.settings["black_uci"]).strip()
         white = command_from_text(white_text)
         black = command_from_text(black_text)
+        white_options = uci_options_from_text(self.settings["white_options"])
+        black_options = uci_options_from_text(self.settings["black_options"])
         fen_text = strip_wrapping_quotes(self.fen_entry.get())
         board = chess.Board() if not fen_text or fen_text == "startpos" else chess.Board(fen_text)
-        movetime_ms = int(self.settings["movetime_ms"])
+        white_movetime_ms = int(self.settings["white_movetime_ms"])
+        black_movetime_ms = int(self.settings["black_movetime_ms"])
         delay_ms = int(self.settings["delay_ms"])
         max_plies = int(self.settings["max_plies"])
-        if movetime_ms <= 0:
-            raise ValueError("move time must be positive")
+        if white_movetime_ms <= 0:
+            raise ValueError("white move time must be positive")
+        if black_movetime_ms <= 0:
+            raise ValueError("black move time must be positive")
         if delay_ms < 0:
             raise ValueError("display delay must be non-negative")
         if max_plies <= 0:
             raise ValueError("max plies must be positive")
-        return white, black, board.fen(), movetime_ms, delay_ms, max_plies
+        return (
+            white,
+            white_options,
+            white_movetime_ms,
+            black,
+            black_options,
+            black_movetime_ms,
+            board.fen(),
+            delay_ms,
+            max_plies,
+        )
 
     def start_game(self):
         if self.running:
             return
         try:
-            white, black, fen, movetime_ms, delay_ms, max_plies = self.read_settings()
+            (
+                white,
+                white_options,
+                white_movetime_ms,
+                black,
+                black_options,
+                black_movetime_ms,
+                fen,
+                delay_ms,
+                max_plies,
+            ) = self.read_settings()
         except Exception as exc:
             messagebox.showerror("Stadium", str(exc), parent=self.root)
             return
@@ -429,9 +483,12 @@ class StadiumApp(ChessGUIBase):
             args=(
                 generation,
                 white,
+                white_options,
+                white_movetime_ms,
                 black,
+                black_options,
+                black_movetime_ms,
                 fen,
-                movetime_ms,
                 delay_ms,
                 max_plies,
             ),
@@ -444,9 +501,12 @@ class StadiumApp(ChessGUIBase):
         self,
         generation: int,
         white_command: Sequence[str],
+        white_options: Dict[str, object],
+        white_movetime_ms: int,
         black_command: Sequence[str],
+        black_options: Dict[str, object],
+        black_movetime_ms: int,
         fen: str,
-        movetime_ms: int,
         delay_ms: int,
         max_plies: int,
     ):
@@ -460,6 +520,10 @@ class StadiumApp(ChessGUIBase):
             engines.append(white)
             black = chess.engine.SimpleEngine.popen_uci(list(black_command))
             engines.append(black)
+            if white_options:
+                white.configure(white_options)
+            if black_options:
+                black.configure(black_options)
             with self.uci_lock:
                 self.uci_engines = list(engines)
 
@@ -484,6 +548,9 @@ class StadiumApp(ChessGUIBase):
 
                 uci = white if board.turn == chess.WHITE else black
                 name = white_name if board.turn == chess.WHITE else black_name
+                movetime_ms = (
+                    white_movetime_ms if board.turn == chess.WHITE else black_movetime_ms
+                )
                 before_fen = board.fen()
                 started = time.monotonic()
                 result = uci.play(
@@ -648,9 +715,12 @@ def parse_args():
         description="Watch one game between any two UCI engines"
     )
     parser.add_argument("--white-uci", default="")
+    parser.add_argument("--white-options", default="{}")
+    parser.add_argument("--white-movetime-ms", type=int, default=1000)
     parser.add_argument("--black-uci", default="")
+    parser.add_argument("--black-options", default="{}")
+    parser.add_argument("--black-movetime-ms", type=int, default=1000)
     parser.add_argument("--fen", default="startpos")
-    parser.add_argument("--movetime-ms", type=int, default=1000)
     parser.add_argument("--delay-ms", type=int, default=250)
     parser.add_argument("--max-plies", type=int, default=240)
     return parser.parse_args()
@@ -664,9 +734,12 @@ def main():
         StadiumBoardState(),
         {
             "white_uci": args.white_uci,
+            "white_options": args.white_options,
+            "white_movetime_ms": args.white_movetime_ms,
             "black_uci": args.black_uci,
+            "black_options": args.black_options,
+            "black_movetime_ms": args.black_movetime_ms,
             "fen": args.fen,
-            "movetime_ms": args.movetime_ms,
             "delay_ms": args.delay_ms,
             "max_plies": args.max_plies,
         },

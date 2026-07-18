@@ -505,6 +505,249 @@ class MCTS:
         emit_progress(force=progress_callback is not None)
         return policy, float(root.q if root.visit_count else root_value), stats
 
+    def run_many(self, boards: List[chess.Board], deadline=None):
+        """Run independent MCTS trees while batching leaves across root positions."""
+        if not boards:
+            return []
+
+        batch_size = max(1, int(self.options.mcts_batch_size))
+        soft_cap = max(0, int(self.options.mcts_sims))
+        configured_minimum = int(self.options.mcts_min_sims)
+        minimum = (
+            configured_minimum
+            if configured_minimum > 0
+            else max(batch_size, soft_cap // 4)
+        )
+        minimum = max(1, min(soft_cap, minimum)) if soft_cap > 0 else 0
+        deadlines = (
+            list(deadline)
+            if isinstance(deadline, (list, tuple))
+            else [deadline] * len(boards)
+        )
+        if len(deadlines) != len(boards):
+            raise ValueError("deadline count must match board count")
+
+        states = []
+        root_eval_indices = []
+        root_eval_boards = []
+        for index, source_board in enumerate(boards):
+            board = source_board.copy(stack=False)
+            root = MCTSNode(0.0)
+            terminal = terminal_value_side_to_move(board)
+            state = {
+                "board": board,
+                "root": root,
+                "root_policy": np.zeros(self.action_size, dtype=np.float32),
+                "root_value": float(terminal or 0.0),
+                "sims_completed": 0,
+                "dynamic_target": minimum,
+                "expanded_nodes": 0,
+                "nn_batches": 0,
+                "total_leaf_depth": 0,
+                "leaf_samples": 0,
+                "max_leaf_depth": 0,
+                "terminal": terminal is not None,
+                "deadline": deadlines[index],
+            }
+            states.append(state)
+            if terminal is None:
+                root_eval_indices.append(index)
+                root_eval_boards.append(board)
+
+        if root_eval_boards:
+            evaluation = self.evaluator.evaluate_boards_full(root_eval_boards)
+            for batch_index, state_index in enumerate(root_eval_indices):
+                state = states[state_index]
+                policy = evaluation.policies[batch_index]
+                value = float(evaluation.values[batch_index])
+                payload = self.profile.payload_for_index(
+                    evaluation.expansion_payload,
+                    batch_index,
+                )
+                self._expand_from_policy_without_counters(
+                    state["root"],
+                    state["board"],
+                    policy,
+                    payload,
+                )
+                state["root_policy"] = policy
+                state["root_value"] = value
+                state["expanded_nodes"] = 1
+                state["nn_batches"] = 1
+
+        if soft_cap > 0:
+            while True:
+                selected = []
+                active = False
+                now = time.monotonic()
+                for state_index, state in enumerate(states):
+                    if state["terminal"]:
+                        continue
+                    if state["sims_completed"] >= soft_cap:
+                        continue
+                    if state["sims_completed"] >= state["dynamic_target"]:
+                        continue
+                    if state["deadline"] is not None and now >= state["deadline"]:
+                        continue
+                    active = True
+
+                    wanted = min(
+                        batch_size,
+                        soft_cap - state["sims_completed"],
+                        max(1, state["dynamic_target"] - state["sims_completed"]),
+                    )
+                    selected_nodes = set()
+                    local_selected = 0
+                    attempts = 0
+                    max_attempts = max(wanted * 5, wanted + 8)
+                    while (
+                        local_selected < wanted
+                        and attempts < max_attempts
+                        and state["sims_completed"] + local_selected < soft_cap
+                        and state["sims_completed"] + local_selected
+                        < state["dynamic_target"]
+                    ):
+                        attempts += 1
+                        if (
+                            state["deadline"] is not None
+                            and time.monotonic() >= state["deadline"]
+                        ):
+                            break
+                        leaf, leaf_board, path, terminal = self._select_leaf(
+                            state["root"],
+                            state["board"],
+                        )
+                        depth = max(0, len(path) - 1)
+                        state["max_leaf_depth"] = max(
+                            state["max_leaf_depth"], depth
+                        )
+                        state["total_leaf_depth"] += depth
+                        state["leaf_samples"] += 1
+                        if terminal is not None:
+                            self._clear_virtual(path)
+                            self._backpropagate(path, terminal)
+                            state["sims_completed"] += 1
+                            continue
+                        leaf_identity = id(leaf)
+                        if leaf_identity in selected_nodes:
+                            self._clear_virtual(path)
+                            continue
+                        selected_nodes.add(leaf_identity)
+                        selected.append(
+                            (local_selected, state_index, leaf, leaf_board, path)
+                        )
+                        local_selected += 1
+
+                if selected:
+                    selected.sort(key=lambda item: (item[0], item[1]))
+                    for start in range(0, len(selected), batch_size):
+                        chunk = selected[start:start + batch_size]
+                        ready = []
+                        for item in chunk:
+                            state = states[item[1]]
+                            if (
+                                state["deadline"] is not None
+                                and time.monotonic() >= state["deadline"]
+                            ):
+                                self._clear_virtual(item[4])
+                            else:
+                                ready.append(item)
+                        if not ready:
+                            continue
+                        evaluation = self.evaluator.evaluate_boards_full(
+                            [item[3] for item in ready]
+                        )
+                        evaluated_states = set()
+                        for batch_index, (_, state_index, leaf, leaf_board, path) in enumerate(ready):
+                            state = states[state_index]
+                            policy = evaluation.policies[batch_index]
+                            value = float(evaluation.values[batch_index])
+                            payload = self.profile.payload_for_index(
+                                evaluation.expansion_payload,
+                                batch_index,
+                            )
+                            was_expanded = leaf.expanded()
+                            self._expand_from_policy_without_counters(
+                                leaf,
+                                leaf_board,
+                                policy,
+                                payload,
+                            )
+                            if not was_expanded:
+                                state["expanded_nodes"] += 1
+                            evaluated_states.add(state_index)
+                            self._clear_virtual(path)
+                            self._backpropagate(path, value)
+                            state["sims_completed"] += 1
+                        for state_index in evaluated_states:
+                            states[state_index]["nn_batches"] += 1
+
+                for state in states:
+                    if not state["terminal"]:
+                        self._update_batch_dynamic_target(state, minimum, soft_cap)
+
+                if not active:
+                    break
+
+        outputs = []
+        now = time.monotonic()
+        for state in states:
+            root = state["root"]
+            board = state["board"]
+            policy = (
+                normalize_policy(state["root_policy"], board, self.codec)
+                if soft_cap <= 0
+                else self._policy_from_root(root, board, state["root_policy"])
+            )
+            leaf_samples = int(state["leaf_samples"])
+            stats = {
+                "sims_completed": int(state["sims_completed"]),
+                "dynamic_target": int(state["dynamic_target"] if soft_cap > 0 else 0),
+                "decision_profile": self.profile.name,
+                "uncertainty": float(root_uncertainty(root)),
+                "expanded_nodes": int(state["expanded_nodes"]),
+                "nn_batches": int(state["nn_batches"]),
+                "timeout": bool(
+                    state["deadline"] is not None and now >= state["deadline"]
+                ),
+                "cancelled": False,
+                "root_node": root,
+                "root_c_puct": float(self._scheduled_c_puct(root)),
+                "root_fpu": float(self._fpu_value(root)),
+                "leaf_samples": leaf_samples,
+                "avg_leaf_depth": float(
+                    state["total_leaf_depth"] / leaf_samples if leaf_samples else 0.0
+                ),
+                "max_leaf_depth": int(state["max_leaf_depth"]),
+            }
+            value = float(root.q if root.visit_count else state["root_value"])
+            outputs.append((policy, value, stats))
+        return outputs
+
+    def _expand_from_policy_without_counters(
+        self,
+        node: MCTSNode,
+        board: chess.Board,
+        policy,
+        expansion_payload=None,
+    ):
+        priors = self.codec.policy_to_legal_distribution(policy, board, normalize=True)
+        if node.expanded():
+            return
+        for move, prior in priors.items():
+            profile_state = self.profile.child_profile_state(expansion_payload, move)
+            node.children[move] = MCTSNode(prior=prior, profile_state=profile_state)
+
+    @staticmethod
+    def _update_batch_dynamic_target(state, minimum: int, soft_cap: int):
+        if state["sims_completed"] < minimum:
+            return
+        uncertainty = root_uncertainty(state["root"])
+        desired = minimum + int(
+            math.ceil(uncertainty * max(0, soft_cap - minimum))
+        )
+        state["dynamic_target"] = max(minimum, min(soft_cap, desired))
+
 
 class UnifiedSearch:
     """Neural policy and MCTS search."""
@@ -765,6 +1008,93 @@ class UnifiedSearch:
             final_deadline,
             partial=False,
         )
+
+    def search_many(self, boards: List[chess.Board]) -> List[SearchResult]:
+        """Search several independent positions with shared neural batches."""
+        if not boards:
+            return []
+        for board in boards:
+            if board.is_game_over(claim_draw=True):
+                raise RuntimeError("game is already over")
+
+        search_type = normalize_search_type(self.options.search_type)
+        root_boards = [board.copy(stack=False) for board in boards]
+        start_times = [time.monotonic()] * len(root_boards)
+        deadlines = [None] * len(root_boards)
+        if self.options.time_limit is not None and float(self.options.time_limit) > 0:
+            deadline = time.monotonic() + float(self.options.time_limit)
+            deadlines = [deadline] * len(root_boards)
+
+        if self.model is None:
+            raw_results = []
+            for board in root_boards:
+                raw_results.append((
+                    np.zeros(0, dtype=np.float32),
+                    0.0,
+                    {
+                        "sims_completed": 0,
+                        "dynamic_target": 0,
+                        "decision_profile": "uniform_legal",
+                        "uncertainty": 0.0,
+                        "expanded_nodes": 0,
+                        "nn_batches": 0,
+                        "timeout": False,
+                        "cancelled": False,
+                        "root_node": None,
+                    },
+                ))
+        elif search_type == "closed" or int(self.options.mcts_sims) <= 0:
+            evaluator = BatchedEvaluator(
+                self.model,
+                device=str(model_device(self.model)),
+                batch_size=max(1, int(self.options.mcts_batch_size)),
+            )
+            evaluation = evaluator.evaluate_boards_full(root_boards)
+            raw_results = []
+            for index, board in enumerate(root_boards):
+                policy = normalize_policy(
+                    evaluation.policies[index],
+                    board,
+                    self.codec,
+                )
+                raw_results.append((
+                    policy,
+                    float(evaluation.values[index]),
+                    {
+                        "sims_completed": 0,
+                        "dynamic_target": 0,
+                        "decision_profile": self.profile.name,
+                        "uncertainty": 0.0,
+                        "expanded_nodes": 0,
+                        "nn_batches": 1,
+                        "timeout": False,
+                        "cancelled": False,
+                        "root_node": None,
+                    },
+                ))
+        else:
+            mcts = MCTS(
+                self.model,
+                self.options,
+                device=str(model_device(self.model)),
+            )
+            raw_results = mcts.run_many(root_boards, deadline=deadlines)
+
+        return [
+            self._make_result(
+                board,
+                search_type,
+                policy,
+                value,
+                stats,
+                start_times[index],
+                deadlines[index],
+                partial=False,
+            )
+            for index, (board, (policy, value, stats)) in enumerate(
+                zip(root_boards, raw_results)
+            )
+        ]
 
 
 def select_move(

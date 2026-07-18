@@ -1334,7 +1334,7 @@ def run(args, evolution):
             baseline_path=paths["current_model"],
             games=args.eval_games,
             sims=args.eval_sims,
-            workers=args.eval_workers,
+            games_in_flight=args.eval_games_in_flight,
             device=args.device,
             max_plies=args.eval_max_plies,
             seed=args.seed + iteration,
@@ -1414,7 +1414,7 @@ def common_parser(add_help=True):
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--eval-games", type=int, default=100)
     parser.add_argument("--eval-sims", type=int, default=0)
-    parser.add_argument("--eval-workers", type=int, default=1)
+    parser.add_argument("--eval-games-in-flight", type=int, default=32)
     parser.add_argument("--eval-max-plies", type=int, default=240)
     parser.add_argument("--eval-opening-book", default="data/openings.gen.bin")
     parser.add_argument("--eval-book-plies", type=int, default=8)

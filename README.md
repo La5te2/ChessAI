@@ -434,7 +434,7 @@ python src/arena.py \
   --baseline models/champion.pth \
   --device cuda \
   --games 100 \
-  --workers 10 \
+  --games-in-flight 100 \
   --max-plies 240 \
   --opening-book data/openings.gen.bin \
   --book-plies 8 \
@@ -453,7 +453,9 @@ arena 行为：
 - `--search-type closed` 使用模型直出的 policy/value。
 - `--search-type only-mcts` 使用模型 policy/value 加 MCTS。
 - `--games 100` 使用 50 个 unique start positions。
-- `--workers` 控制并行对局。
+- `--games-in-flight` 控制同时驻留的棋局数。arena 只加载一份 candidate 和一份 baseline，并按当前行棋模型合并多个棋局的神经网络推理。
+- 每盘棋保有独立的棋盘、MCTS tree、visits、Q、dynamic target 和时间预算；`--mcts-batch-size` 仍表示每盘 MCTS 单轮选择的叶子数量，随后再跨棋局合并推理。
+- candidate 与 baseline 始终使用相同的 search type、sims、movetime、C-PUCT、FPU 和 MCTS batch 参数。
 - 输出 W/D/L、net wins、score、score confidence interval 和 Elo diff。
 - arena 与 acceptance 使用模型对战结果作为独立比较与 gate 信号。
 - `--pgn-output` 保存棋谱。
@@ -464,7 +466,7 @@ arena 行为：
 Windows CPU smoke test：
 
 ```powershell
-python src/arena.py --candidate models/candidate.pth --baseline models/champion.pth --device cpu --games 1 --workers 1 --max-plies 20 --opening-book "" --search-type closed --sims 0 --movetime-ms 0 --pgn-output data/user-pgn/arena_smoke.pgn --log-every 1
+python src/arena.py --candidate models/candidate.pth --baseline models/champion.pth --device cpu --games 2 --games-in-flight 2 --max-plies 20 --opening-book "" --search-type closed --sims 0 --movetime-ms 0 --pgn-output data/user-pgn/arena_smoke.pgn --log-every 1
 ```
 
 ---
@@ -899,9 +901,12 @@ Simulator 功能：
 
 ```bash
 python src/stadium.py \
-  --white-uci "python src/uci_engine.py --model models/candidate0.pth --device cpu --search-type closed --mcts-sims 0" \
-  --black-uci "python src/uci_engine.py --model models/candidate0.pth --device cpu --search-type only-mcts --mcts-sims 1000 --mcts-min-sims 1000 --mcts-batch-size 32" \
-  --movetime-ms 10000 \
+  --white-uci "python src/uci_engine.py --model models/candidate0.pth --device cpu --search-type only-mcts --mcts-sims 1000 --mcts-min-sims 1000 --mcts-batch-size 32" \
+  --white-options '{}' \
+  --white-movetime-ms 10000 \
+  --black-uci "models/stockfish/stockfish" \
+  --black-options '{"Threads": 4, "Hash": 512}' \
+  --black-movetime-ms 1000 \
   --delay-ms 300 \
   --max-plies 240
 ```
@@ -912,7 +917,7 @@ Windows 一键启动：
 run_stadium.vbs
 ```
 
-Stadium 的 `Settings` 配置双方 UCI 命令、每步思考时间、显示间隔和最大 ply；`Start FEN` 设置单盘起始局面。
+Stadium 的 `Settings` 分别配置白方与黑方的 UCI command、UCI options JSON 和每步思考时间，也可配置显示间隔与最大 ply；`Start FEN` 设置单盘起始局面。双方资源可以不同，例如为 Gadidae 分配更长思考时间、为 Stockfish 设置独立的 `Threads` 与 `Hash`。Stadium 始终运行一盘可视化对局，并保留人工启动、暂停和停止。
 
 ---
 
@@ -1135,7 +1140,7 @@ offline-pv train step: ...
 fcpi self-play start: ...
 fcpi game ...
 fcpi train: ...
-arena worker ... game ...
+arena game ...
 ```
 
 阶段汇总使用 JSON：
