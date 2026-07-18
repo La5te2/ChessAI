@@ -419,8 +419,10 @@ python src/search.py \
 - `--c-puct-base` / `--c-puct-factor`：随访问数增长的 C-PUCT schedule。
 - `--fpu-reduction`：未访问节点的 FPU 折减。
 - `--virtual-loss`：batched MCTS 中对同批已选路径施加的额外临时分数惩罚。搜索始终使用 virtual visits 做路径占位；设为 `0` 只关闭额外惩罚，负数与非有限值统一归一化为 `0`。
-- `--repetition-policy-penalty`：RPP（Repetition Policy Penalty）。己方优势时，软惩罚己方当前招法直接完成第三次重复的候选，以及会让对手存在一手合法回复完成第三次重复的候选；对手是否申请和棋不属于 RPP。取值范围为 `0..1`，默认 `0`，实际削弱强度为 `penalty * max(value, 0)`。该构件只调整根节点 policy/prior，依赖完整走棋历史，只有 FEN 时无法识别此前重复次数。
-- `--instant-mate-first`：IMF（Instant Mate First）。根节点存在一步将杀时，在所有一步杀中采用模型原始 policy 最高的一手，并把该手 policy 设为 `1`。默认关闭，可用 `--no-instant-mate-first` 显式关闭。IMF 与 RPP 独立执行；合法对局中的一步将杀既不会完成历史重复，也不会留下对手回复，因此两者自然不会冲突。
+- `--repetition-policy-penalty`：RPP（Repetition Policy Penalty）。己方优势时，软惩罚己方当前招法直接完成第三次重复的候选，以及会让对手存在一手合法回复完成第三次重复的候选；对手是否申请和棋不属于 RPP。取值范围为 `0..1`，默认 `0`。搜索结束后，决策层复制搜索 policy 作为排序分数，从目标招法的分数中直接减去 `penalty * max(value, 0)` 并钳到 `0`；其他招法保持原值，决策层不重新归一化，也不修改搜索 policy。该构件依赖完整走棋历史，只有 FEN 时无法识别此前重复次数。
+- `--instant-mate-first`：IMF（Instant Mate First）。搜索结束后若根节点存在一步将杀，在所有一步杀中采用搜索 policy 最高的一手，并把该手的决策排序分数设为 `1`；其他招法保持原值，决策层不重新归一化，也不修改搜索 policy。默认关闭，可用 `--no-instant-mate-first` 显式关闭。IMF 与 RPP 独立执行；合法对局中的一步将杀既不会完成历史重复，也不会留下对手回复，因此两者自然不会冲突。
+
+搜索输出中的 `p`/`mcts_p` 始终表示组件介入前的搜索概率，`decision_score` 表示 IMF/RPP 处理后的临时排序分数；实际走法按 `decision_score` 选择。
 
 动态 C-PUCT：
 
@@ -918,7 +920,7 @@ Simulator 功能：
 
 ```bash
 python src/stadium.py \
-  --white-uci "python src/uci_engine.py --model models/candidate0.pth --device cpu --search-type only-mcts --mcts-sims 1000 --mcts-min-sims 1000 --mcts-batch-size 32" \
+  --white-uci "python src/uci_engine.py --model models/candidate0.pth --device cpu --search-type only-mcts --mcts-sims 1000 --mcts-min-sims 1000 --mcts-batch-size 32 --progress-interval-ms 750" \
   --white-options '{}' \
   --white-movetime-ms 10000 \
   --black-uci "models/stockfish/stockfish" \
@@ -934,7 +936,7 @@ Windows 一键启动：
 run_stadium.vbs
 ```
 
-Stadium 的 `Settings` 分别配置白方与黑方的 UCI command、UCI options JSON 和每步思考时间，也可配置显示间隔与最大 ply；`Start FEN` 设置单盘起始局面。双方资源可以不同，例如为 Gadidae 分配更长思考时间、为 Stockfish 设置独立的 `Threads` 与 `Hash`。`Moves` 显示当前行棋引擎返回的完整 MultiPV 集合，并以 `*` 标记最终 `bestmove`；`UCI analysis` 显示与该走法对应的 score 和 PV。Stadium 始终运行一盘可视化对局，并保留人工启动、暂停和停止。
+Stadium 的 `Settings` 分别配置白方与黑方的 UCI command、UCI options JSON 和每步思考时间，也可配置显示间隔与最大 ply；`Start FEN` 设置单盘起始局面。双方资源可以不同，例如为 Gadidae 分配更长思考时间、为 Stockfish 设置独立的 `Threads` 与 `Hash`。`Moves` 在当前行棋方尚未落子时实时显示其最新 MultiPV，`*` 标记当前暂定首选；`UCI analysis` 同步显示该候选的 score、深度、nodes 和 PV。收到 `bestmove` 后棋盘落子并清空旧分析，面板随后切换到下一行棋方。Stadium 始终运行一盘可视化对局，并保留人工启动、暂停和停止。
 
 ---
 
@@ -956,6 +958,7 @@ python src/uci_engine.py \
   --fpu-reduction 0.15 \
   --repetition-policy-penalty 0.15 \
   --instant-mate-first \
+  --progress-interval-ms 750 \
   --multipv 1 \
   --score-scale 1000
 ```
@@ -992,13 +995,14 @@ FPUReduction
 VirtualLoss
 RepetitionPolicyPenalty
 InstantMateFirst
+ProgressIntervalMS
 MultiPV
 RootTopN
 ScoreScale
 LogSearch
 ```
 
-UCI 输出使用标准 `info ... score cp ... multipv ... pv ...` 与 `bestmove ...`。`nodes` 表示 MCTS simulations，`depth` 表示本次搜索使用的 NN batch 数。
+UCI 输出使用标准 `info ... score cp ... multipv ... pv ...` 与 `bestmove ...`。`nodes` 表示 MCTS simulations，`depth` 表示本次搜索使用的 NN batch 数。`ProgressIntervalMS` 控制 Gadidae 搜索期间发送实时 MultiPV `info` 的最小时间间隔。
 
 ---
 

@@ -161,15 +161,35 @@ def analyse_uci_turn(
     board: chess.Board,
     movetime_ms: int,
     multipv: int,
+    progress_callback=None,
+    stop_event=None,
+    update_interval_ms: int = 100,
 ):
-    analysis = engine.analysis(
+    last_update = 0.0
+    with engine.analysis(
         board,
         chess.engine.Limit(time=movetime_ms / 1000.0),
         multipv=max(1, int(multipv)),
         info=chess.engine.INFO_ALL,
-    )
-    best = analysis.wait()
-    return best.move, [dict(info) for info in analysis.multipv]
+    ) as analysis:
+        for _ in analysis:
+            if stop_event is not None and stop_event.is_set():
+                analysis.stop()
+                break
+            now = time.monotonic()
+            if (
+                progress_callback is not None
+                and (now - last_update) * 1000.0 >= max(1, update_interval_ms)
+            ):
+                infos = [dict(info) for info in analysis.multipv]
+                if infos:
+                    progress_callback(infos)
+                    last_update = now
+        best = analysis.wait()
+        infos = [dict(info) for info in analysis.multipv]
+        if progress_callback is not None and infos:
+            progress_callback(infos)
+        return best.move, infos
 
 
 def engine_info_text(
@@ -466,6 +486,10 @@ class StadiumApp(ChessGUIBase):
                 self.arena_engine.black_name = payload["black"]
                 self.game_status = "Game running"
                 self.draw_board()
+            elif kind == "thinking":
+                self.begin_uci_thinking(payload)
+            elif kind == "analysis":
+                self.apply_uci_analysis(payload)
             elif kind == "move":
                 self.apply_uci_move(payload)
             elif kind == "finished":
@@ -646,22 +670,68 @@ class StadiumApp(ChessGUIBase):
                 multipv = white_multipv if board.turn == chess.WHITE else black_multipv
                 before_fen = board.fen()
                 started = time.monotonic()
+                self.ui_queue.put((
+                    "thinking",
+                    generation,
+                    {
+                        "before_fen": before_fen,
+                        "engine": name,
+                        "turn": "White" if board.turn == chess.WHITE else "Black",
+                    },
+                ))
+
+                def publish_analysis(infos, selected_move=None):
+                    ordered = sorted(
+                        infos,
+                        key=lambda info: int(info.get("multipv", 1) or 1),
+                    )
+                    displayed_move = selected_move
+                    if displayed_move is None:
+                        for info in ordered:
+                            pv = list(info.get("pv") or [])
+                            if pv and pv[0] in board.legal_moves:
+                                displayed_move = pv[0]
+                                break
+                    if displayed_move is None:
+                        return
+                    elapsed_ms = (time.monotonic() - started) * 1000.0
+                    primary_info = primary_info_for_move(ordered, displayed_move)
+                    self.ui_queue.put((
+                        "analysis",
+                        generation,
+                        {
+                            "before_fen": before_fen,
+                            "engine": name,
+                            "detail": engine_info_text(
+                                name,
+                                board,
+                                displayed_move,
+                                primary_info,
+                                elapsed_ms,
+                            ),
+                            "multipv": multipv_move_rows(
+                                board,
+                                ordered,
+                                displayed_move,
+                            ),
+                        },
+                    ))
+
                 move, multipv_infos = analyse_uci_turn(
                     uci,
                     board,
                     movetime_ms=movetime_ms,
                     multipv=multipv,
+                    progress_callback=publish_analysis,
+                    stop_event=self.stop_event,
                 )
-                elapsed_ms = (time.monotonic() - started) * 1000.0
                 if move is None or move not in board.legal_moves:
                     raise RuntimeError(
                         f"{name} returned an illegal move: "
                         f"{move.uci() if move is not None else 'none'}"
-                    )
+                )
                 san = safe_san(board, move)
-                primary_info = primary_info_for_move(multipv_infos, move)
-                detail = engine_info_text(name, board, move, primary_info, elapsed_ms)
-                move_rows = multipv_move_rows(board, multipv_infos, move)
+                publish_analysis(multipv_infos, selected_move=move)
                 board.push(move)
                 ply += 1
                 self.ui_queue.put((
@@ -673,8 +743,6 @@ class StadiumApp(ChessGUIBase):
                         "san": san,
                         "ply": ply,
                         "engine": name,
-                        "detail": detail,
-                        "multipv": move_rows,
                     },
                 ))
                 if delay_ms > 0 and self.stop_event.wait(delay_ms / 1000.0):
@@ -717,6 +785,25 @@ class StadiumApp(ChessGUIBase):
                     self.uci_engines = []
         self.ui_queue.put((terminal_event[0], generation, terminal_event[1]))
 
+    def begin_uci_thinking(self, payload: Dict):
+        if self.engine.board.fen() != payload["before_fen"]:
+            return
+        self.game_status = f"{payload['turn']} thinking: {payload['engine']}"
+        self.moves_list.delete(0, tk.END)
+        self.info_text.delete("1.0", tk.END)
+        self.update_panels()
+
+    def apply_uci_analysis(self, payload: Dict):
+        if self.engine.board.fen() != payload["before_fen"]:
+            return
+        self.moves_list.delete(0, tk.END)
+        for row in payload.get("multipv") or []:
+            self.moves_list.insert(tk.END, row)
+        if self.moves_list.size() > 0:
+            self.moves_list.see(0)
+        self.info_text.delete("1.0", tk.END)
+        self.info_text.insert(tk.END, payload["detail"])
+
     def apply_uci_move(self, payload: Dict):
         if self.engine.board.fen() != payload["before_fen"]:
             self.fail_game("GUI board and UCI game became unsynchronized")
@@ -727,19 +814,9 @@ class StadiumApp(ChessGUIBase):
             return
         self.engine.board.push(move)
         self.last_move = move
-        move_number = (int(payload["ply"]) + 1) // 2
-        side = "White" if int(payload["ply"]) % 2 else "Black"
         self.moves_list.delete(0, tk.END)
-        move_rows = list(payload.get("multipv") or [])
-        if not move_rows:
-            move_rows = [
-                f"*1. {payload['san']} ({move.uci()})  {side} move {move_number}"
-            ]
-        for row in move_rows:
-            self.moves_list.insert(tk.END, row)
-        self.moves_list.see(tk.END)
         self.info_text.delete("1.0", tk.END)
-        self.info_text.insert(tk.END, payload["detail"])
+        self.game_status = "Waiting for next engine"
         self.draw_board()
 
     def toggle_pause(self):

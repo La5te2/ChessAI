@@ -73,6 +73,7 @@ class EngineConfig:
     virtual_loss: float = 0.0
     repetition_policy_penalty: float = 0.0
     instant_mate_first: bool = False
+    progress_interval_ms: int = 750
     multipv: int = 5
     root_topn: int = 5
     score_scale: int = 1000
@@ -117,6 +118,8 @@ class UCIEngine:
             f"default {cfg.repetition_policy_penalty}",
             "option name InstantMateFirst type check "
             f"default {str(cfg.instant_mate_first).lower()}",
+            "option name ProgressIntervalMS type spin "
+            f"default {cfg.progress_interval_ms} min 0 max 60000",
             f"option name MultiPV type spin default {cfg.multipv} min 1 max 256",
             f"option name RootTopN type spin default {cfg.root_topn} min 1 max 256",
             f"option name ScoreScale type spin default {cfg.score_scale} min 1 max 100000",
@@ -187,6 +190,11 @@ class UCIEngine:
             )
         elif key == "instantmatefirst":
             cfg.instant_mate_first = as_bool(value, cfg.instant_mate_first)
+        elif key == "progressintervalms":
+            cfg.progress_interval_ms = max(
+                0,
+                as_int(value, cfg.progress_interval_ms),
+            )
         elif key == "multipv":
             cfg.multipv = max(1, as_int(value, cfg.multipv))
         elif key == "roottopn":
@@ -282,6 +290,7 @@ class UCIEngine:
             virtual_loss=cfg.virtual_loss,
             repetition_policy_penalty=cfg.repetition_policy_penalty,
             instant_mate_first=cfg.instant_mate_first,
+            progress_interval_sec=max(0.0, cfg.progress_interval_ms / 1000.0),
             root_topn=max(cfg.root_topn, cfg.multipv),
         )
 
@@ -425,11 +434,22 @@ class UCIEngine:
             if model is None and self.config.model_path.strip().lower() != "none":
                 uci_print("info string model is not loaded; set ModelPath or pass --model")
 
-            result = UnifiedSearch(
+            searcher = UnifiedSearch(
                 model,
                 self.search_options(movetime_ms, sims_override=sims_override),
                 device=self.config.device,
-            ).search(self.board)
+            )
+            progress_emitted = False
+
+            def emit_progress(result):
+                nonlocal progress_emitted
+                progress_emitted = True
+                self.emit_standard_info(result, result.move)
+
+            result = searcher.search(
+                self.board,
+                progress_callback=emit_progress,
+            )
             move = result.move
 
             if allowed is not None and move not in allowed:
@@ -440,7 +460,11 @@ class UCIEngine:
                     candidates = sorted(
                         candidates,
                         key=lambda candidate: (
-                            float(result.policy[self.codec.move_to_index(candidate)]),
+                            float(
+                                result.decision_scores[
+                                    self.codec.move_to_index(candidate)
+                                ]
+                            ),
                             candidate.uci(),
                         ),
                         reverse=True,
@@ -462,11 +486,13 @@ class UCIEngine:
                         "info string "
                         f"{row.get('san')} {row.get('move')} "
                         f"p={float(row.get('p', 0.0)):.5f} "
+                        f"decision={float(row.get('decision_score', 0.0)):.5f} "
                         f"visits={int(row.get('visits', 0))} "
                         f"q={float(row.get('q', 0.0)):+.4f}"
                     )
 
-            self.emit_standard_info(result, move)
+            if not progress_emitted or allowed is not None:
+                self.emit_standard_info(result, move)
             uci_print(f"bestmove {move.uci() if move is not None else self.fallback_move(allowed)}")
         except Exception as exc:
             uci_print(f"info string search error: {exc}")
@@ -536,6 +562,7 @@ def parse_args():
         action=argparse.BooleanOptionalAction,
         default=False,
     )
+    parser.add_argument("--progress-interval-ms", type=int, default=750)
     parser.add_argument("--multipv", type=int, default=5)
     parser.add_argument("--root-topn", type=int, default=5)
     parser.add_argument("--score-scale", type=int, default=1000)
@@ -564,6 +591,7 @@ def config_from_args(args) -> EngineConfig:
         virtual_loss=float(args.virtual_loss),
         repetition_policy_penalty=float(args.repetition_policy_penalty),
         instant_mate_first=bool(args.instant_mate_first),
+        progress_interval_ms=max(0, int(args.progress_interval_ms)),
         multipv=int(args.multipv),
         root_topn=int(args.root_topn),
         score_scale=int(args.score_scale),

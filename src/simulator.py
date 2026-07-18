@@ -980,6 +980,7 @@ class SimulatorApp(ChessGUIBase):
                 tk.END,
                 f"{marker}{index}. {row.get('san')} ({row.get('move')})  "
                 f"p={row.get('p', 0.0):.4f}  "
+                f"score={row.get('decision_score', row.get('p', 0.0)):.4f}  "
                 f"visits={row.get('visits', 0)}  "
                 f"q={row.get('q', 0.0):+.3f}",
             )
