@@ -16,6 +16,7 @@ cmd = "pythonw.exe src\simulator.py" & _
   " --c-puct-base 19652" & _
   " --c-puct-factor 1.0" & _
   " --fpu-reduction 0.15" & _
+  " --repetition-policy-penalty 0.15" & _
   " --progress-interval-ms 750" & _
   " --root-topn 8"
 

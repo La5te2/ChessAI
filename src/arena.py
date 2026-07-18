@@ -455,6 +455,7 @@ def evaluate_models(
     c_puct_base=19652.0,
     c_puct_factor=1.0,
     fpu_reduction=0.15,
+    repetition_policy_penalty=0.0,
     pgn_output=None,
     trace_output=None,
     pgn_comments=False,
@@ -510,6 +511,7 @@ def evaluate_models(
         c_puct_base=c_puct_base,
         c_puct_factor=c_puct_factor,
         fpu_reduction=fpu_reduction,
+        repetition_policy_penalty=repetition_policy_penalty,
     )
     candidate_searcher = UnifiedSearch(candidate, replace(options), device=device)
     baseline_searcher = UnifiedSearch(baseline, replace(options), device=device)
@@ -622,6 +624,7 @@ def evaluate_models(
         "c_puct_base": float(c_puct_base),
         "c_puct_factor": float(c_puct_factor),
         "fpu_reduction": float(fpu_reduction),
+        "repetition_policy_penalty": float(repetition_policy_penalty),
         "claim_draws": bool(claim_draws),
         "opening_book": opening_book,
         "book_plies": int(book_plies),
@@ -657,6 +660,7 @@ def parse_args():
     parser.add_argument("--c-puct-base", type=float, default=19652.0)
     parser.add_argument("--c-puct-factor", type=float, default=1.0)
     parser.add_argument("--fpu-reduction", type=float, default=0.15)
+    parser.add_argument("--repetition-policy-penalty", type=float, default=0.0)
 
     parser.add_argument("--pgn-output", default=None)
     parser.add_argument("--trace-output", default=None)
@@ -689,6 +693,7 @@ def main():
         c_puct_base=args.c_puct_base,
         c_puct_factor=args.c_puct_factor,
         fpu_reduction=args.fpu_reduction,
+        repetition_policy_penalty=args.repetition_policy_penalty,
         pgn_output=args.pgn_output,
         trace_output=args.trace_output,
         pgn_comments=args.pgn_comments,

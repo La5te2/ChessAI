@@ -28,7 +28,7 @@ GAMES_IN_FLIGHT=100
 MAX_PLIES=240
 POSITIONS_PER_GAME=200
 OPENING_BOOK="data/openings.gen.bin"
-STARTPOS_FRACTION=1.0 
+STARTPOS_FRACTION=0.50
 # fraction of games that start from a random position in the opening book 
 # 0.0 = all games start from the initial position, 1.0 = all games start from a random position in the opening book
 BOOK_PLIES=8
@@ -37,7 +37,7 @@ INFERENCE_BATCH_SIZE=64
 TARGET_RECORDS_PER_BATCH=256
 VALIDATION_FRACTION=0.0
 
-EPOCHS=5
+EPOCHS=15
 TRAIN_MAX_STEPS=2000
 BATCH_SIZE=256
 TRAIN_WORKERS=4
@@ -60,6 +60,9 @@ EVAL_C_PUCT_BASE=19652
 EVAL_C_PUCT_FACTOR=1.0
 EVAL_FPU_REDUCTION=0.15
 EVAL_MIN_NET_WINS=4
+EVAL_HISTORY_GAMES=100
+EVAL_HISTORY_POOL_SIZE=3
+EVAL_HISTORY_SCORE_TOLERANCE=0.02
 
 LOG_EVERY=50
 SEED=2026
@@ -151,6 +154,7 @@ echo "self-play: games=${GAMES_PER_ITER} in_flight=${GAMES_IN_FLIGHT} max_plies=
 echo "counterfactual: topk=${COUNTERFACTUAL_TOPK} plies=${COUNTERFACTUAL_MIN_PLIES}-${COUNTERFACTUAL_MAX_PLIES} target_average_plies=${COUNTERFACTUAL_TARGET_AVERAGE_PLIES} lambda=${COUNTERFACTUAL_LAMBDA}"
 echo "train: epochs=${EPOCHS} max_steps=${TRAIN_MAX_STEPS} batch_size=${BATCH_SIZE} lr=${LR}"
 echo "eval: games=${EVAL_GAMES} in_flight=${EVAL_GAMES_IN_FLIGHT} search_type=${EVAL_SEARCH_TYPE} sims=${EVAL_SIMS} mcts_batch_size=${EVAL_MCTS_BATCH_SIZE} movetime_ms=${EVAL_MOVETIME_MS} c_puct=${EVAL_C_PUCT} fpu_reduction=${EVAL_FPU_REDUCTION} min_net_wins=${EVAL_MIN_NET_WINS}"
+echo "history eval: games=${EVAL_HISTORY_GAMES} pool_size=${EVAL_HISTORY_POOL_SIZE} score_tolerance=${EVAL_HISTORY_SCORE_TOLERANCE}"
 
 exec python src/fcpi.py \
   --model "${MODEL}" \
@@ -189,6 +193,9 @@ exec python src/fcpi.py \
   --eval-c-puct-factor "${EVAL_C_PUCT_FACTOR}" \
   --eval-fpu-reduction "${EVAL_FPU_REDUCTION}" \
   --eval-min-net-wins "${EVAL_MIN_NET_WINS}" \
+  --eval-history-games "${EVAL_HISTORY_GAMES}" \
+  --eval-history-pool-size "${EVAL_HISTORY_POOL_SIZE}" \
+  --eval-history-score-tolerance "${EVAL_HISTORY_SCORE_TOLERANCE}" \
   --log-every "${LOG_EVERY}" \
   --seed "${SEED}" \
   "${ARCH_ARGS[@]}"

@@ -71,6 +71,52 @@ def normalize_policy(policy: np.ndarray, board: chess.Board, codec) -> np.ndarra
     return output
 
 
+def apply_repetition_policy_penalty(
+    board: chess.Board,
+    policy: np.ndarray,
+    root_value: float,
+    codec,
+    configured_penalty: float,
+):
+    """Softly discourage giving an opponent a repetition claim while ahead."""
+    penalty = float(np.clip(float(configured_penalty), 0.0, 1.0))
+    advantage = float(np.clip(float(root_value), 0.0, 1.0))
+    effective_penalty = penalty * advantage
+    if codec is None or effective_penalty <= 0.0 or not board.move_stack:
+        return policy, None
+
+    adjusted = np.asarray(policy, dtype=np.float32).copy()
+    penalized_moves = []
+    factor = 1.0 - effective_penalty
+    for move in board.legal_moves:
+        probe = board.copy(stack=True)
+        probe.push(move)
+        if not (
+            probe.is_fivefold_repetition()
+            or probe.can_claim_threefold_repetition()
+        ):
+            continue
+        index = codec.move_to_index(move)
+        if index < len(adjusted):
+            adjusted[index] *= factor
+            penalized_moves.append(move.uci())
+
+    if not penalized_moves:
+        return policy, None
+    return normalize_policy(adjusted, board, codec), {
+        "configured_penalty": penalty,
+        "effective_penalty": effective_penalty,
+        "factor": factor,
+        "root_value": float(root_value),
+        "moves": penalized_moves,
+    }
+
+
+def normalize_virtual_loss(value: float) -> float:
+    value = float(value)
+    return value if math.isfinite(value) and value > 0.0 else 0.0
+
+
 @dataclass
 class SearchOptions:
     search_type: str = "only-mcts"
@@ -86,6 +132,10 @@ class SearchOptions:
     progress_interval_sec: float = 0.75
     root_topn: int = 10
     virtual_loss: float = 0.0
+    repetition_policy_penalty: float = 0.0
+
+    def __post_init__(self):
+        self.virtual_loss = normalize_virtual_loss(self.virtual_loss)
 
 
 VALID_SEARCH_TYPES = {"closed", "only-mcts"}
@@ -215,7 +265,7 @@ class MCTS:
             * np.sqrt(parent.visit_count + parent.virtual_visits + 1.0)
             / (1.0 + visits)
         )
-        penalty = float(self.options.virtual_loss) * child.virtual_visits
+        penalty = normalize_virtual_loss(self.options.virtual_loss) * child.virtual_visits
         return q_from_parent + exploration - penalty
 
     def _select_child(self, node: MCTSNode):
@@ -332,6 +382,13 @@ class MCTS:
             return np.zeros(self.action_size, dtype=np.float32), terminal, stats
 
         root_policy, root_value, root_payload = self.evaluator.evaluate_one_full(board)
+        root_policy, repetition_policy = apply_repetition_policy_penalty(
+            board,
+            root_policy,
+            root_value,
+            self.codec,
+            self.options.repetition_policy_penalty,
+        )
         self.nn_batches += 1
         self._expand_from_policy(root, board, root_policy, root_payload)
 
@@ -352,6 +409,8 @@ class MCTS:
                 "root_c_puct": self._scheduled_c_puct(root),
                 "root_fpu": self._fpu_value(root),
             }
+            if repetition_policy is not None:
+                stats["repetition_policy"] = repetition_policy
             stats.update(self._depth_stats())
             if progress_callback is not None:
                 progress_callback(policy, float(root_value), dict(stats))
@@ -401,6 +460,8 @@ class MCTS:
                 "root_c_puct": float(self._scheduled_c_puct(root)),
                 "root_fpu": float(self._fpu_value(root)),
             }
+            if repetition_policy is not None:
+                stats["repetition_policy"] = repetition_policy
             stats.update(self._depth_stats())
             last_progress_time = now
             last_progress_sims = sims_completed
@@ -501,6 +562,8 @@ class MCTS:
             "root_c_puct": float(self._scheduled_c_puct(root)),
             "root_fpu": float(self._fpu_value(root)),
         }
+        if repetition_policy is not None:
+            stats["repetition_policy"] = repetition_policy
         stats.update(self._depth_stats())
         emit_progress(force=progress_callback is not None)
         return policy, float(root.q if root.visit_count else root_value), stats
@@ -531,7 +594,7 @@ class MCTS:
         root_eval_indices = []
         root_eval_boards = []
         for index, source_board in enumerate(boards):
-            board = source_board.copy(stack=False)
+            board = source_board.copy(stack=True)
             root = MCTSNode(0.0)
             terminal = terminal_value_side_to_move(board)
             state = {
@@ -548,6 +611,7 @@ class MCTS:
                 "max_leaf_depth": 0,
                 "terminal": terminal is not None,
                 "deadline": deadlines[index],
+                "repetition_policy": None,
             }
             states.append(state)
             if terminal is None:
@@ -560,6 +624,13 @@ class MCTS:
                 state = states[state_index]
                 policy = evaluation.policies[batch_index]
                 value = float(evaluation.values[batch_index])
+                policy, repetition_policy = apply_repetition_policy_penalty(
+                    state["board"],
+                    policy,
+                    value,
+                    self.codec,
+                    self.options.repetition_policy_penalty,
+                )
                 payload = self.profile.payload_for_index(
                     evaluation.expansion_payload,
                     batch_index,
@@ -572,6 +643,7 @@ class MCTS:
                 )
                 state["root_policy"] = policy
                 state["root_value"] = value
+                state["repetition_policy"] = repetition_policy
                 state["expanded_nodes"] = 1
                 state["nn_batches"] = 1
 
@@ -720,6 +792,8 @@ class MCTS:
                 ),
                 "max_leaf_depth": int(state["max_leaf_depth"]),
             }
+            if state["repetition_policy"] is not None:
+                stats["repetition_policy"] = state["repetition_policy"]
             value = float(root.q if root.visit_count else state["root_value"])
             outputs.append((policy, value, stats))
         return outputs
@@ -827,6 +901,12 @@ class UnifiedSearch:
             raise RuntimeError("no legal moves")
 
         root_node = stats.get("root_node")
+        repetition_policy = stats.get("repetition_policy")
+        repetition_moves = set(
+            repetition_policy.get("moves", [])
+            if isinstance(repetition_policy, dict)
+            else []
+        )
         mcts_move = self._select_top_move(root_board, policy)
         move = mcts_move
         if move is None or move not in legal:
@@ -856,6 +936,8 @@ class UnifiedSearch:
                 "prior": float(child.prior) if child is not None else float(policy_value),
                 "q": float(-child.q) if child is not None else 0.0,
             }
+            if candidate.uci() in repetition_moves:
+                row["repetition_penalized"] = True
             row.update(self.profile.root_row_fields(child) if self.profile is not None else {})
             root_lines.append(row)
         root_lines.sort(
@@ -902,7 +984,7 @@ class UnifiedSearch:
             "c_puct_root": float(stats.get("root_c_puct", self.options.c_puct)),
             "fpu_reduction": float(self.options.fpu_reduction),
             "fpu_root": float(stats.get("root_fpu", 0.0)),
-            "virtual_loss": float(self.options.virtual_loss),
+            "virtual_loss": normalize_virtual_loss(self.options.virtual_loss),
             "mcts_move": mcts_move.uci() if mcts_move else None,
             "piece_count": count_pieces(root_board),
             "best_move": move.uci(),
@@ -915,6 +997,8 @@ class UnifiedSearch:
             },
             "root": root_lines[: max(1, int(self.options.root_topn))],
         }
+        if isinstance(repetition_policy, dict):
+            info["repetition_policy"] = dict(repetition_policy)
 
         return SearchResult(
             move=move,
@@ -934,7 +1018,7 @@ class UnifiedSearch:
             raise RuntimeError("game is already over")
 
         search_type = normalize_search_type(self.options.search_type)
-        root_board = board.copy(stack=False)
+        root_board = board.copy(stack=True)
         start = time.monotonic()
         final_deadline = None
         mcts_deadline = None
@@ -949,6 +1033,13 @@ class UnifiedSearch:
             or int(self.options.mcts_sims) <= 0
         ):
             mcts_policy, value = self._policy_only(root_board)
+            mcts_policy, repetition_policy = apply_repetition_policy_penalty(
+                root_board,
+                mcts_policy,
+                value,
+                self.codec,
+                self.options.repetition_policy_penalty,
+            )
             stats = {
                 "sims_completed": 0,
                 "dynamic_target": 0,
@@ -960,6 +1051,8 @@ class UnifiedSearch:
                 "cancelled": bool(cancel_event is not None and cancel_event.is_set()),
                 "root_node": None,
             }
+            if repetition_policy is not None:
+                stats["repetition_policy"] = repetition_policy
         else:
             mcts = MCTS(
                 self.model,
@@ -1018,7 +1111,7 @@ class UnifiedSearch:
                 raise RuntimeError("game is already over")
 
         search_type = normalize_search_type(self.options.search_type)
-        root_boards = [board.copy(stack=False) for board in boards]
+        root_boards = [board.copy(stack=True) for board in boards]
         start_times = [time.monotonic()] * len(root_boards)
         deadlines = [None] * len(root_boards)
         if self.options.time_limit is not None and float(self.options.time_limit) > 0:
@@ -1057,20 +1150,31 @@ class UnifiedSearch:
                     board,
                     self.codec,
                 )
+                value = float(evaluation.values[index])
+                policy, repetition_policy = apply_repetition_policy_penalty(
+                    board,
+                    policy,
+                    value,
+                    self.codec,
+                    self.options.repetition_policy_penalty,
+                )
+                stats = {
+                    "sims_completed": 0,
+                    "dynamic_target": 0,
+                    "decision_profile": self.profile.name,
+                    "uncertainty": 0.0,
+                    "expanded_nodes": 0,
+                    "nn_batches": 1,
+                    "timeout": False,
+                    "cancelled": False,
+                    "root_node": None,
+                }
+                if repetition_policy is not None:
+                    stats["repetition_policy"] = repetition_policy
                 raw_results.append((
                     policy,
-                    float(evaluation.values[index]),
-                    {
-                        "sims_completed": 0,
-                        "dynamic_target": 0,
-                        "decision_profile": self.profile.name,
-                        "uncertainty": 0.0,
-                        "expanded_nodes": 0,
-                        "nn_batches": 1,
-                        "timeout": False,
-                        "cancelled": False,
-                        "root_node": None,
-                    },
+                    value,
+                    stats,
                 ))
         else:
             mcts = MCTS(
@@ -1161,6 +1265,7 @@ def parse_args():
     parser.add_argument("--c-puct-factor", type=float, default=1.0)
     parser.add_argument("--fpu-reduction", type=float, default=0.15)
     parser.add_argument("--virtual-loss", type=float, default=0.0)
+    parser.add_argument("--repetition-policy-penalty", type=float, default=0.0)
     parser.add_argument("--root-topn", type=int, default=10)
     return parser.parse_args()
 
@@ -1183,6 +1288,7 @@ def main():
         c_puct_factor=args.c_puct_factor,
         fpu_reduction=args.fpu_reduction,
         virtual_loss=args.virtual_loss,
+        repetition_policy_penalty=args.repetition_policy_penalty,
         root_topn=args.root_topn,
     )
     result = UnifiedSearch(model, options, device=args.device).search(board)
@@ -1202,6 +1308,8 @@ def main():
     print("c_puct_root:", result.info["c_puct_root"])
     print("fpu_root:", result.info["fpu_root"])
     print("virtual_loss:", result.info["virtual_loss"])
+    if "repetition_policy" in result.info:
+        print("repetition_policy:", result.info["repetition_policy"])
     print("leaf_depth_avg:", result.info["avg_leaf_depth"])
     print("leaf_depth_max:", result.info["max_leaf_depth"])
     print("elapsed_ms:", result.info["elapsed_ms"])

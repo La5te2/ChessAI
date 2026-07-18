@@ -48,6 +48,7 @@ class EngineConfig:
     c_puct_base: float = 19652.0
     c_puct_factor: float = 1.0
     fpu_reduction: float = 0.15
+    repetition_policy_penalty: float = 0.0
     progress_interval_ms: int = 750
     root_topn: int = 8
 
@@ -74,6 +75,7 @@ SEARCH_PARAMETER_TYPES = {
     "c_puct_base": float,
     "c_puct_factor": float,
     "fpu_reduction": float,
+    "repetition_policy_penalty": float,
     "progress_interval_ms": int,
     "root_topn": int,
 }
@@ -91,6 +93,9 @@ def search_options_from_parameters(parameters: Dict, root_topn: Optional[int] = 
         c_puct_base=float(parameters.get("c_puct_base", 19652.0) or 19652.0),
         c_puct_factor=float(parameters.get("c_puct_factor", 1.0) or 1.0),
         fpu_reduction=float(parameters.get("fpu_reduction", 0.15) or 0.15),
+        repetition_policy_penalty=float(
+            parameters.get("repetition_policy_penalty", 0.0) or 0.0
+        ),
         progress_interval_sec=max(
             0.0,
             float(parameters.get("progress_interval_ms", 750) or 0) / 1000.0,
@@ -238,6 +243,7 @@ class SimulatorState:
             c_puct_base=self.config.c_puct_base,
             c_puct_factor=self.config.c_puct_factor,
             fpu_reduction=self.config.fpu_reduction,
+            repetition_policy_penalty=self.config.repetition_policy_penalty,
             progress_interval_sec=max(0.0, self.config.progress_interval_ms / 1000.0),
             root_topn=self.config.root_topn,
         )
@@ -294,10 +300,13 @@ class SimulatorState:
                     "c_puct_base",
                     "c_puct_factor",
                     "fpu_reduction",
+                    "repetition_policy_penalty",
                 } and value < 0:
                     raise ValueError(f"{name} must be non-negative")
                 if name == "c_puct_base" and value < 1:
                     raise ValueError("c_puct_base must be at least 1")
+                if name == "repetition_policy_penalty" and value > 1:
+                    raise ValueError("repetition_policy_penalty must not exceed 1")
                 if name == "mcts_batch_size" and value < 1:
                     raise ValueError("mcts_batch_size must be at least 1")
                 if name == "root_topn" and value < 1:
@@ -560,6 +569,7 @@ class ModelSettingsDialog(tk.Toplevel):
             "c_puct_base": "C-PUCT schedule base",
             "c_puct_factor": "C-PUCT schedule factor",
             "fpu_reduction": "FPU reduction",
+            "repetition_policy_penalty": "Repetition policy penalty",
             "progress_interval_ms": "Progress interval (ms)",
             "root_topn": "Suggestion count",
         }
@@ -1245,6 +1255,7 @@ def parse_args():
     parser.add_argument("--c-puct-base", type=float, default=19652.0)
     parser.add_argument("--c-puct-factor", type=float, default=1.0)
     parser.add_argument("--fpu-reduction", type=float, default=0.15)
+    parser.add_argument("--repetition-policy-penalty", type=float, default=0.0)
     parser.add_argument("--progress-interval-ms", type=int, default=750)
     parser.add_argument("--root-topn", type=int, default=8)
     return parser.parse_args()
@@ -1266,6 +1277,7 @@ def main():
         c_puct_base=args.c_puct_base,
         c_puct_factor=args.c_puct_factor,
         fpu_reduction=args.fpu_reduction,
+        repetition_policy_penalty=args.repetition_policy_penalty,
         progress_interval_ms=args.progress_interval_ms,
         root_topn=args.root_topn,
     )

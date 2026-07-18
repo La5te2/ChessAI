@@ -25,7 +25,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from acceptance import attach_arena_acceptance
 from architectures import RESNET_PVA_GAD, RESNET_PV_LINEAR
-from arena import evaluate_models
+from arena import evaluate_models, file_sha256
 from checkpoint_io import atomic_copy_with_backup
 from config import DEVICE
 from decision import profile_for_model
@@ -1305,14 +1305,188 @@ def validation_metric_delta(candidate_validation, current_validation):
     }
 
 
+def select_history_pool(history, current_sha256, pool_size):
+    limit = max(0, int(pool_size))
+    if limit <= 0:
+        return []
+
+    eligible = []
+    seen = set()
+    for entry in history:
+        sha256 = str(entry["sha256"])
+        if sha256 == current_sha256 or sha256 in seen:
+            continue
+        seen.add(sha256)
+        eligible.append(entry)
+    if len(eligible) <= limit:
+        return eligible
+    if limit == 1:
+        return [eligible[0]]
+
+    selected_indices = {
+        int(round(index * (len(eligible) - 1) / (limit - 1)))
+        for index in range(limit)
+    }
+    return [eligible[index] for index in sorted(selected_indices)]
+
+
+def evaluate_fcpi_arena(candidate_path, baseline_path, args, *, games, seed):
+    return evaluate_models(
+        candidate_path=candidate_path,
+        baseline_path=baseline_path,
+        games=games,
+        sims=args.eval_sims,
+        games_in_flight=args.eval_games_in_flight,
+        device=args.device,
+        max_plies=args.eval_max_plies,
+        seed=seed,
+        opening_book=args.eval_opening_book,
+        book_plies=args.eval_book_plies,
+        max_book_positions=args.eval_max_book_positions,
+        mcts_batch_size=args.eval_mcts_batch_size,
+        movetime_ms=args.eval_movetime_ms,
+        search_type=args.eval_search_type,
+        c_puct=args.eval_c_puct,
+        c_puct_base=args.eval_c_puct_base,
+        c_puct_factor=args.eval_c_puct_factor,
+        fpu_reduction=args.eval_fpu_reduction,
+        progress=True,
+    )
+
+
+def evaluate_history_stability(
+    candidate_path,
+    current_path,
+    current_sha256,
+    history,
+    reference_cache,
+    args,
+):
+    enabled = args.eval_history_games > 0 and args.eval_history_pool_size > 0
+    result = {
+        "enabled": bool(enabled),
+        "evaluated": False,
+        "passed": True,
+        "games_per_matchup": int(args.eval_history_games),
+        "pool_size_limit": int(args.eval_history_pool_size),
+        "score_tolerance": float(args.eval_history_score_tolerance),
+        "matches": [],
+    }
+    if not enabled:
+        result["reason"] = "disabled"
+        return result
+
+    pool = select_history_pool(
+        history,
+        current_sha256=current_sha256,
+        pool_size=args.eval_history_pool_size,
+    )
+    result["selected_models"] = [
+        {
+            "iteration": int(entry["iteration"]),
+            "path": entry["path"],
+            "sha256": entry["sha256"],
+        }
+        for entry in pool
+    ]
+    if not pool:
+        result["reason"] = "no_distinct_history"
+        return result
+
+    result["evaluated"] = True
+    tolerance = max(0.0, float(args.eval_history_score_tolerance))
+    for entry in pool:
+        history_iteration = int(entry["iteration"])
+        history_seed = int(args.seed) + 100000 + history_iteration * 1009
+        cache_key = (
+            str(current_sha256),
+            str(entry["sha256"]),
+            int(args.eval_history_games),
+            history_seed,
+        )
+        reference = reference_cache.get(cache_key)
+        reference_cached = reference is not None
+        if reference is None:
+            print(
+                "fcpi history reference:",
+                f"current={current_path}",
+                f"history={entry['path']}",
+                flush=True,
+            )
+            reference = evaluate_fcpi_arena(
+                current_path,
+                entry["path"],
+                args,
+                games=args.eval_history_games,
+                seed=history_seed,
+            )
+            reference_cache[cache_key] = reference
+
+        print(
+            "fcpi history candidate:",
+            f"candidate={candidate_path}",
+            f"history={entry['path']}",
+            flush=True,
+        )
+        candidate = evaluate_fcpi_arena(
+            candidate_path,
+            entry["path"],
+            args,
+            games=args.eval_history_games,
+            seed=history_seed,
+        )
+        current_score = float(reference["score"])
+        candidate_score = float(candidate["score"])
+        score_delta = candidate_score - current_score
+        passed = score_delta >= -tolerance
+        result["matches"].append(
+            {
+                "history_iteration": history_iteration,
+                "history_model": entry["path"],
+                "history_sha256": entry["sha256"],
+                "seed": history_seed,
+                "reference_cached": bool(reference_cached),
+                "current_score": current_score,
+                "candidate_score": candidate_score,
+                "score_delta": score_delta,
+                "passed": bool(passed),
+                "current_arena": reference,
+                "candidate_arena": candidate,
+            }
+        )
+        print(
+            "fcpi history result:",
+            f"history_iter={history_iteration}",
+            f"current_score={current_score:.4f}",
+            f"candidate_score={candidate_score:.4f}",
+            f"delta={score_delta:+.4f}",
+            f"passed={passed}",
+            flush=True,
+        )
+
+    result["passed"] = all(match["passed"] for match in result["matches"])
+    return result
+
+
 def run(args, evolution):
     paths = prepare_run_paths()
-    shutil.copy2(args.model, paths["current_model"])
+    initial_model = os.path.join(paths["model_dir"], "initial.pth")
+    shutil.copy2(args.model, initial_model)
+    shutil.copy2(initial_model, paths["current_model"])
     print("fcpi run id:", paths["run_id"], flush=True)
     print("fcpi architecture:", evolution.arch_type, flush=True)
     print("fcpi formula:", evolution.formula_name, flush=True)
+    print("fcpi initial model:", initial_model, flush=True)
     print("fcpi current model:", paths["current_model"], flush=True)
     summaries = []
+    history = [
+        {
+            "iteration": 0,
+            "path": initial_model,
+            "sha256": file_sha256(initial_model),
+        }
+    ]
+    history_reference_cache = {}
     for iteration in range(1, args.iterations + 1):
         print(f"fcpi iteration {iteration}", flush=True)
         records = collect_selfplay(evolution, paths["current_model"], args, iteration)
@@ -1329,32 +1503,50 @@ def run(args, evolution):
             evolution, paths["current_model"], data_path, args
         )
         delta = validation_metric_delta(validation, current_validation)
-        arena = evaluate_models(
-            candidate_path=candidate_path,
-            baseline_path=paths["current_model"],
+        arena = evaluate_fcpi_arena(
+            candidate_path,
+            paths["current_model"],
+            args,
             games=args.eval_games,
-            sims=args.eval_sims,
-            games_in_flight=args.eval_games_in_flight,
-            device=args.device,
-            max_plies=args.eval_max_plies,
             seed=args.seed + iteration,
-            opening_book=args.eval_opening_book,
-            book_plies=args.eval_book_plies,
-            max_book_positions=args.eval_max_book_positions,
-            mcts_batch_size=args.eval_mcts_batch_size,
-            movetime_ms=args.eval_movetime_ms,
-            search_type=args.eval_search_type,
-            c_puct=args.eval_c_puct,
-            c_puct_base=args.eval_c_puct_base,
-            c_puct_factor=args.eval_c_puct_factor,
-            fpu_reduction=args.eval_fpu_reduction,
-            progress=True,
         )
         arena = attach_arena_acceptance(arena, args.eval_min_net_wins)
-        accepted = bool(arena["accepted"])
+        main_gate_passed = bool(arena["accepted"])
+        current_sha256 = str(arena["baseline_sha256"])
+        if main_gate_passed:
+            history_stability = evaluate_history_stability(
+                candidate_path,
+                paths["current_model"],
+                current_sha256,
+                history,
+                history_reference_cache,
+                args,
+            )
+        else:
+            history_stability = {
+                "enabled": bool(
+                    args.eval_history_games > 0
+                    and args.eval_history_pool_size > 0
+                ),
+                "evaluated": False,
+                "passed": True,
+                "reason": "main_gate_failed",
+                "games_per_matchup": int(args.eval_history_games),
+                "pool_size_limit": int(args.eval_history_pool_size),
+                "score_tolerance": float(args.eval_history_score_tolerance),
+                "matches": [],
+            }
+        accepted = main_gate_passed and bool(history_stability["passed"])
         if accepted:
             arena["promotion"] = atomic_copy_with_backup(
                 candidate_path, paths["current_model"], make_backup=False
+            )
+            history.append(
+                {
+                    "iteration": iteration,
+                    "path": candidate_path,
+                    "sha256": str(arena["candidate_sha256"]),
+                }
             )
             print("fcpi promoted:", paths["current_model"], flush=True)
         else:
@@ -1368,6 +1560,12 @@ def run(args, evolution):
             "validation": validation,
             "delta": delta,
             "arena": arena,
+            "history_stability": history_stability,
+            "gate": {
+                "arena_passed": main_gate_passed,
+                "history_passed": bool(history_stability["passed"]),
+                "accepted": bool(accepted),
+            },
             "accepted": accepted,
         }
         summaries.append(summary)
@@ -1375,7 +1573,9 @@ def run(args, evolution):
             json.dump(
                 {
                     "run_id": paths["run_id"],
+                    "initial_model": initial_model,
                     "current_model": paths["current_model"],
+                    "accepted_history": history,
                     "summaries": summaries,
                 },
                 handle,
@@ -1427,6 +1627,9 @@ def common_parser(add_help=True):
     parser.add_argument("--eval-c-puct-factor", type=float, default=1.0)
     parser.add_argument("--eval-fpu-reduction", type=float, default=0.15)
     parser.add_argument("--eval-min-net-wins", type=int, default=4)
+    parser.add_argument("--eval-history-games", type=int, default=100)
+    parser.add_argument("--eval-history-pool-size", type=int, default=3)
+    parser.add_argument("--eval-history-score-tolerance", type=float, default=0.02)
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--seed", type=int, default=2026)
     return parser
@@ -1454,6 +1657,11 @@ def parse_args():
     args.positions_per_game = max(1, int(args.positions_per_game))
     args.startpos_fraction = float(np.clip(args.startpos_fraction, 0.0, 1.0))
     args.validation_fraction = float(np.clip(args.validation_fraction, 0.0, 0.9))
+    args.eval_history_games = max(0, int(args.eval_history_games))
+    args.eval_history_pool_size = max(0, int(args.eval_history_pool_size))
+    args.eval_history_score_tolerance = max(
+        0.0, float(args.eval_history_score_tolerance)
+    )
     return args, evolution
 
 

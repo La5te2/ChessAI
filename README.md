@@ -401,6 +401,7 @@ python src/search.py \
   --c-puct-factor 1.0 \
   --fpu-reduction 0.15 \
   --virtual-loss 0.0 \
+  --repetition-policy-penalty 0.15 \
   --root-topn 16
 ```
 
@@ -416,7 +417,8 @@ python src/search.py \
 - `--c-puct`：PUCT 初始探索常数。
 - `--c-puct-base` / `--c-puct-factor`：随访问数增长的 C-PUCT schedule。
 - `--fpu-reduction`：未访问节点的 FPU 折减。
-- `--virtual-loss`：batched MCTS 中同批路径的临时占位。
+- `--virtual-loss`：batched MCTS 中对同批已选路径施加的额外临时分数惩罚。搜索始终使用 virtual visits 做路径占位；设为 `0` 只关闭额外惩罚，负数与非有限值统一归一化为 `0`。
+- `--repetition-policy-penalty`：取值范围为 `0..1`，默认 `0`。当前局面占优时，根节点会软削弱走完后让对手可以按三次重复申和的候选；实际削弱强度为 `penalty * max(value, 0)`。该策略依赖完整走棋历史，只有 FEN 时无法识别此前重复次数。
 
 动态 C-PUCT：
 
@@ -819,6 +821,9 @@ EVAL_GAMES=200
 EVAL_SEARCH_TYPE=closed
 EVAL_SIMS=0
 EVAL_MIN_NET_WINS=4
+EVAL_HISTORY_GAMES=100
+EVAL_HISTORY_POOL_SIZE=3
+EVAL_HISTORY_SCORE_TOLERANCE=0.02
 ```
 
 自适应多步参数只输入一次。以下为 `resnet_pv_linear` 默认值；加载 `resnet_pva_gad` 时，同名参数会采用该架构在脚本中定义的默认值：
@@ -847,10 +852,13 @@ data/runs/<run-id>/pid
 data/runs/<run-id>/fcpi_iter_*.h5
 data/runs/<run-id>/summary.json
 models/runs/<run-id>/current.pth
+models/runs/<run-id>/initial.pth
 models/runs/<run-id>/candidate_iter_*.pth
 ```
 
-每轮 candidate 先执行架构对应的目标验证，再与本 run 的 `current.pth` 进行 paired arena。`net_wins` 达到 `EVAL_MIN_NET_WINS` 后，candidate 原子写入本 run 的 `current.pth`。
+每轮 candidate 先执行架构对应的目标验证，再与本 run 的 `current.pth` 进行 paired arena。主赛达到 `EVAL_MIN_NET_WINS` 后才运行历史稳定赛；主赛失败时跳过历史赛。
+
+`initial.pth` 保存本 run 的输入模型。历史池只收录 `initial.pth` 和真正晋升过的 `candidate_iter_*.pth`，并排除当前模型与重复 checkpoint。池超过 `EVAL_HISTORY_POOL_SIZE` 时，在时间轴上均匀保留里程碑。对每个历史模型，candidate 与 current 使用相同 seed、成对开局和搜索参数分别比赛；candidate 得分率相对 current 的下降不超过 `EVAL_HISTORY_SCORE_TOLERANCE` 才通过该项。所有历史项通过后，candidate 原子写入本 run 的 `current.pth`。`EVAL_HISTORY_GAMES=0` 或 `EVAL_HISTORY_POOL_SIZE=0` 可关闭历史稳定赛。
 
 FCPI 提供 policy/value/advantage 的可学习改进信号；实际棋力提升仍由 arena 结果确认。目标网络误差、自对战分布偏移和有限反事实候选都会影响结果，因此单轮 loss 下降不等价于 Elo 上升。
 
@@ -879,6 +887,7 @@ python src/simulator.py \
   --c-puct-base 19652 \
   --c-puct-factor 1.0 \
   --fpu-reduction 0.15 \
+  --repetition-policy-penalty 0.15 \
   --progress-interval-ms 750 \
   --root-topn 8
 ```
@@ -938,6 +947,7 @@ python src/uci_engine.py \
   --c-puct-base 19652 \
   --c-puct-factor 1.0 \
   --fpu-reduction 0.15 \
+  --repetition-policy-penalty 0.15 \
   --multipv 1 \
   --score-scale 1000
 ```
@@ -972,6 +982,7 @@ CPuctBase
 CPuctFactor
 FPUReduction
 VirtualLoss
+RepetitionPolicyPenalty
 MultiPV
 RootTopN
 ScoreScale

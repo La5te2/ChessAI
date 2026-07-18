@@ -13,7 +13,12 @@ import chess
 from config import CPUCT, DEFAULT_SIMS, DEVICE
 from decision import profile_for_model
 from model import load_model
-from search import SearchOptions, UnifiedSearch, VALID_SEARCH_TYPES
+from search import (
+    SearchOptions,
+    UnifiedSearch,
+    VALID_SEARCH_TYPES,
+    normalize_virtual_loss,
+)
 
 
 def uci_print(text: str):
@@ -66,10 +71,14 @@ class EngineConfig:
     c_puct_factor: float = 1.0
     fpu_reduction: float = 0.15
     virtual_loss: float = 0.0
+    repetition_policy_penalty: float = 0.0
     multipv: int = 5
     root_topn: int = 5
     score_scale: int = 1000
     log_search: bool = False
+
+    def __post_init__(self):
+        self.virtual_loss = normalize_virtual_loss(self.virtual_loss)
 
 
 class UCIEngine:
@@ -102,6 +111,8 @@ class UCIEngine:
             f"option name CPuctFactor type string default {cfg.c_puct_factor}",
             f"option name FPUReduction type string default {cfg.fpu_reduction}",
             f"option name VirtualLoss type string default {cfg.virtual_loss}",
+            "option name RepetitionPolicyPenalty type string "
+            f"default {cfg.repetition_policy_penalty}",
             f"option name MultiPV type spin default {cfg.multipv} min 1 max 256",
             f"option name RootTopN type spin default {cfg.root_topn} min 1 max 256",
             f"option name ScoreScale type spin default {cfg.score_scale} min 1 max 100000",
@@ -162,7 +173,14 @@ class UCIEngine:
         elif key == "fpureduction":
             cfg.fpu_reduction = max(0.0, as_float(value, cfg.fpu_reduction))
         elif key == "virtualloss":
-            cfg.virtual_loss = max(0.0, as_float(value, cfg.virtual_loss))
+            cfg.virtual_loss = normalize_virtual_loss(
+                as_float(value, cfg.virtual_loss)
+            )
+        elif key == "repetitionpolicypenalty":
+            cfg.repetition_policy_penalty = min(
+                1.0,
+                max(0.0, as_float(value, cfg.repetition_policy_penalty)),
+            )
         elif key == "multipv":
             cfg.multipv = max(1, as_int(value, cfg.multipv))
         elif key == "roottopn":
@@ -256,6 +274,7 @@ class UCIEngine:
             c_puct_factor=cfg.c_puct_factor,
             fpu_reduction=cfg.fpu_reduction,
             virtual_loss=cfg.virtual_loss,
+            repetition_policy_penalty=cfg.repetition_policy_penalty,
             root_topn=max(cfg.root_topn, cfg.multipv),
         )
 
@@ -504,6 +523,7 @@ def parse_args():
     parser.add_argument("--c-puct-factor", type=float, default=1.0)
     parser.add_argument("--fpu-reduction", type=float, default=0.15)
     parser.add_argument("--virtual-loss", type=float, default=0.0)
+    parser.add_argument("--repetition-policy-penalty", type=float, default=0.0)
     parser.add_argument("--multipv", type=int, default=5)
     parser.add_argument("--root-topn", type=int, default=5)
     parser.add_argument("--score-scale", type=int, default=1000)
@@ -530,6 +550,7 @@ def config_from_args(args) -> EngineConfig:
         c_puct_factor=float(args.c_puct_factor),
         fpu_reduction=float(args.fpu_reduction),
         virtual_loss=float(args.virtual_loss),
+        repetition_policy_penalty=float(args.repetition_policy_penalty),
         multipv=int(args.multipv),
         root_topn=int(args.root_topn),
         score_scale=int(args.score_scale),
