@@ -319,23 +319,27 @@ class MCTS:
         return max(0.0, float(self.options.c_puct) + growth)
 
     def _fpu_value(self, parent: MCTSNode) -> float:
+        parent_q = float(parent.q) if parent.visit_count > 0 else 0.0
+        reduction = self._fpu_penalty(parent)
+        return float(
+            max(-1.0, min(1.0, parent_q - reduction))
+        )
+
+    def _fpu_penalty(self, parent: MCTSNode) -> float:
         visited_policy_mass = sum(
             max(0.0, float(child.prior))
             for child in parent.children.values()
             if child.visit_count > 0
         )
-        parent_q = float(parent.q) if parent.visit_count > 0 else 0.0
         reduction = max(0.0, float(self.options.fpu_reduction))
-        return float(
-            max(-1.0, min(1.0, parent_q - reduction * math.sqrt(visited_policy_mass)))
-        )
+        return float(reduction * math.sqrt(visited_policy_mass))
 
     def _ucb_score(self, parent: MCTSNode, child: MCTSNode):
         fpu = self._fpu_value(parent)
-        q_from_parent = (
-            -child.q
-            if child.visit_count > 0
-            else self.profile.unvisited_q_from_parent(fpu, child)
+        q_from_parent = self.profile.selection_q_from_parent(
+            child,
+            parent_fpu=fpu,
+            fpu_penalty=self._fpu_penalty(parent),
         )
         visits = child.visit_count + child.virtual_visits
         exploration = (
@@ -362,12 +366,17 @@ class MCTS:
         node: MCTSNode,
         board: chess.Board,
         policy,
+        node_value: float,
         expansion_payload=None,
     ):
         priors = self.codec.policy_to_legal_distribution(policy, board, normalize=True)
         if not node.expanded():
             for move, prior in priors.items():
-                profile_state = self.profile.child_profile_state(expansion_payload, move)
+                profile_state = self.profile.child_profile_state(
+                    expansion_payload,
+                    move,
+                    parent_value=node_value,
+                )
                 node.children[move] = MCTSNode(prior=prior, profile_state=profile_state)
             self.expanded_nodes += 1
 
@@ -462,7 +471,7 @@ class MCTS:
 
         root_policy, root_value, root_payload = self.evaluator.evaluate_one_full(board)
         self.nn_batches += 1
-        self._expand_from_policy(root, board, root_policy, root_payload)
+        self._expand_from_policy(root, board, root_policy, root_value, root_payload)
 
         soft_cap = max(0, int(self.options.mcts_sims))
         batch_size = max(1, int(self.options.mcts_batch_size))
@@ -598,7 +607,7 @@ class MCTS:
                         evaluation.expansion_payload,
                         index,
                     )
-                    self._expand_from_policy(leaf, leaf_board, policy, payload)
+                    self._expand_from_policy(leaf, leaf_board, policy, value, payload)
                     self._clear_virtual(path)
                     self._backpropagate(path, float(value))
                     sims_completed += 1
@@ -697,6 +706,7 @@ class MCTS:
                     state["root"],
                     state["board"],
                     policy,
+                    value,
                     payload,
                 )
                 state["root_policy"] = policy
@@ -800,6 +810,7 @@ class MCTS:
                                 leaf,
                                 leaf_board,
                                 policy,
+                                value,
                                 payload,
                             )
                             if not was_expanded:
@@ -858,13 +869,18 @@ class MCTS:
         node: MCTSNode,
         board: chess.Board,
         policy,
+        node_value: float,
         expansion_payload=None,
     ):
         priors = self.codec.policy_to_legal_distribution(policy, board, normalize=True)
         if node.expanded():
             return
         for move, prior in priors.items():
-            profile_state = self.profile.child_profile_state(expansion_payload, move)
+            profile_state = self.profile.child_profile_state(
+                expansion_payload,
+                move,
+                parent_value=node_value,
+            )
             node.children[move] = MCTSNode(prior=prior, profile_state=profile_state)
 
     @staticmethod

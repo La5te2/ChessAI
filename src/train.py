@@ -53,21 +53,24 @@ def _resnet_pva_gad_loss(model, batch, losses, args, device, pin_memory):
     )
     heads = model.forward_heads(state)
     policy_loss = losses["policy"](heads["policy_logits"], move)
-    value_loss = losses["value"](heads["value"].squeeze(1), value_target)
+    predicted_value = heads["value"].squeeze(1)
+    value_loss = losses["value"](predicted_value, value_target)
     chosen_advantage = heads["advantages"].gather(1, adv_move.unsqueeze(1)).squeeze(1)
     if int(getattr(args, "has_cmt", 0)):
-        advantage_loss = losses["value"](chosen_advantage, adv_target)
+        predicted_q = torch.clamp(predicted_value + chosen_advantage, -1.0, 1.0)
+        q_target = torch.clamp(value_target + adv_target, -1.0, 1.0)
+        q_loss = losses["value"](predicted_q, q_target)
     else:
-        advantage_loss = chosen_advantage.sum() * 0.0
+        q_loss = chosen_advantage.sum() * 0.0
     loss = (
         policy_loss
         + args.value_weight * value_loss
-        + args.advantage_weight * advantage_loss
+        + args.dueling_q_weight * q_loss
     )
     return loss, {
         "policy": float(policy_loss.item()),
         "value": float(value_loss.item()),
-        "advantage": float(advantage_loss.item()),
+        "dueling_q": float(q_loss.item()),
         "loss": float(loss.item()),
     }
 
@@ -80,8 +83,8 @@ TRAIN_HANDLERS = {
     },
     RESNET_PVA_GAD: {
         "loss": _resnet_pva_gad_loss,
-        "metrics": ("policy", "value", "advantage"),
-        "start_fields": ("advantage_weight",),
+        "metrics": ("policy", "value", "dueling_q"),
+        "start_fields": ("dueling_q_weight",),
     },
 }
 
@@ -141,15 +144,12 @@ def train(args):
         blocks=args.blocks,
         device=device,
     )
-    model_arch = model.arch()
     model_parts = [
         "created model:",
         f"arch_type={args.arch_type}",
         f"channels={args.channels}",
         f"blocks={args.blocks}",
     ]
-    if "attention_blocks" in model_arch:
-        model_parts.append(f"attention_blocks={model_arch['attention_blocks']}")
     print(*model_parts, flush=True)
 
     optimizer = torch.optim.AdamW(
@@ -249,6 +249,14 @@ def train(args):
 
 
 def parse_args():
+    probe = argparse.ArgumentParser(add_help=False)
+    probe.add_argument(
+        "--arch-type",
+        choices=sorted(SUPPORTED_ARCH_TYPES),
+        default=DEFAULT_ARCH_TYPE,
+    )
+    probe_args, _ = probe.parse_known_args()
+
     parser = argparse.ArgumentParser(description="ChessAI supervised trainer")
     parser.add_argument("--data", default=H5_PATH)
     parser.add_argument("--out", default=None)
@@ -259,12 +267,17 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=LR)
     parser.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY)
     parser.add_argument("--value-weight", type=float, default=VALUE_LOSS_WEIGHT)
-    parser.add_argument("--advantage-weight", type=float, default=VALUE_LOSS_WEIGHT)
     parser.add_argument(
         "--arch-type",
         choices=sorted(SUPPORTED_ARCH_TYPES),
         default=DEFAULT_ARCH_TYPE,
     )
+    if probe_args.arch_type == RESNET_PVA_GAD:
+        parser.add_argument(
+            "--dueling-q-weight",
+            type=float,
+            default=VALUE_LOSS_WEIGHT,
+        )
     parser.add_argument("--channels", type=int, default=128)
     parser.add_argument("--blocks", type=int, default=10)
     parser.add_argument("--amp", action="store_true", default=True)

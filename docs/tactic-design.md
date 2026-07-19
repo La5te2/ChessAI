@@ -180,7 +180,7 @@ stable_material_delta = +500cp。
 - 独自覆盖最终走法
 - 充当 Stockfish 或外部教师机
 - 生成 regret 标签
-- 在当前阶段参与 offline RL 训练
+- 在当前阶段参与模型训练
 - 在使用 top-k 剪枝时声称自己给出了绝对证明
 - 假设对手会故意下让自己变劣的招法
 

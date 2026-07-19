@@ -1,7 +1,7 @@
 """Architecture-dispatched Folded Counterfactual Policy Iteration.
 
-FCPI is teacher-free.  Each registered architecture owns its behavior policy,
-counterfactual target construction, training loss, and validation metrics.
+FCPI is teacher-free. Each registered architecture owns its behavior policy,
+counterfactual target construction, training loss, and Arena evaluation profile.
 """
 
 from __future__ import annotations
@@ -636,13 +636,9 @@ def merge_target_record_group(group: Sequence[RawPosition]) -> RawPosition:
     merged.value_target = float(np.mean([record.value_target for record in group]))
 
     candidate_q = {}
-    advantage = {}
     for record in group:
         for action, value in zip(record.candidate_indices, record.candidate_q):
             candidate_q.setdefault(int(action), []).append(float(value))
-        if record.advantage_target is not None:
-            for action, value in zip(record.candidate_indices, record.advantage_target):
-                advantage.setdefault(int(action), []).append(float(value))
 
     candidate_set = set(candidate_q)
     candidate_indices = [
@@ -653,23 +649,22 @@ def merge_target_record_group(group: Sequence[RawPosition]) -> RawPosition:
         [np.mean(candidate_q[action]) for action in candidate_indices],
         dtype=np.float32,
     )
-    if advantage:
-        merged.advantage_target = np.asarray(
-            [np.mean(advantage[action]) for action in candidate_indices],
-            dtype=np.float32,
-        )
+    if merged.advantage_target is not None:
+        merged.advantage_target = np.clip(
+            merged.candidate_q - merged.value_target,
+            -2.0,
+            0.0,
+        ).astype(np.float32)
     return merged
 
 
 def aggregate_target_records(
     records: Sequence[RawPosition],
-    split_game: int,
 ) -> Tuple[List[RawPosition], Dict[str, int]]:
     groups = {}
     for record in records:
-        split = 1 if record.game_id > split_game else 0
         state_key = np.ascontiguousarray(record.state).tobytes()
-        groups.setdefault((split, state_key), []).append(record)
+        groups.setdefault(state_key, []).append(record)
 
     merged = [merge_target_record_group(group) for group in groups.values()]
     multiplicities = [len(group) for group in groups.values()]
@@ -682,12 +677,11 @@ def aggregate_target_records(
     }
 
 
-def write_base_fcpi_h5(path: str, records: Sequence[RawPosition], evolution, args):
+def write_base_fcpi_h5(path: str, records: Sequence[RawPosition], evolution):
     if not records:
         raise RuntimeError("FCPI generated no positions")
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    split_game = max(1, int(args.games_per_iter * (1.0 - args.validation_fraction)))
-    records, aggregation_summary = aggregate_target_records(records, split_game)
+    records, aggregation_summary = aggregate_target_records(records)
     print(
         "fcpi position aggregation:",
         json.dumps(aggregation_summary, ensure_ascii=False),
@@ -740,16 +734,11 @@ def write_base_fcpi_h5(path: str, records: Sequence[RawPosition], evolution, arg
             "candidate_counts",
             data=np.asarray([len(record.candidate_indices) for record in records], dtype=np.uint8),
         )
-        h5.create_dataset(
-            "split",
-            data=np.asarray([1 if record.game_id > split_game else 0 for record in records], dtype=np.uint8),
-        )
         evolution.write_architecture_targets(h5, records, candidate_width)
     return {
         "path": path,
         "positions": len(records),
-        "train_positions": sum(record.game_id <= split_game for record in records),
-        "validation_positions": sum(record.game_id > split_game for record in records),
+        "train_positions": len(records),
         "legal_width": legal_width,
         "counterfactual_width": candidate_width,
         "formula": evolution.formula_name,
@@ -760,14 +749,14 @@ def write_base_fcpi_h5(path: str, records: Sequence[RawPosition], evolution, arg
 
 
 class FCPIH5Dataset(Dataset):
-    def __init__(self, path: str, split: int, arch_type: str):
+    def __init__(self, path: str, arch_type: str):
         self.path = path
         self.arch_type = arch_type
         with h5py.File(path, "r") as h5:
             stored_arch = str(h5.attrs["arch_type"])
             if stored_arch != arch_type:
                 raise ValueError(f"FCPI H5 arch mismatch: expected {arch_type}, got {stored_arch}")
-            self.indices = np.flatnonzero(np.asarray(h5["split"]) == int(split)).astype(np.int64)
+            self.length = int(h5["states"].shape[0])
         self._file = None
 
     def __getstate__(self):
@@ -781,10 +770,10 @@ class FCPIH5Dataset(Dataset):
         return self._file
 
     def __len__(self):
-        return len(self.indices)
+        return self.length
 
     def __getitem__(self, item):
-        return self.read_row(self._open(), int(self.indices[item]))
+        return self.read_row(self._open(), int(item))
 
     def read_row(self, h5, index: int):
         raise NotImplementedError
@@ -982,7 +971,7 @@ class ResNetPVLinearFCPI:
 
 class ResNetPVAGadFCPI:
     arch_type = RESNET_PVA_GAD
-    formula_name = "pva_gad_adaptive_dueling_value_expansion_td_kl"
+    formula_name = "pva_gad_minimax_dueling_value_expansion_td_kl"
     dataset_type = PVAGadDataset
 
     @staticmethod
@@ -1008,7 +997,7 @@ class ResNetPVAGadFCPI:
         group.add_argument("--played-return-weight", dest="resnet_pva_gad_played_return_weight", type=float, default=0.50)
         group.add_argument("--policy-weight", dest="resnet_pva_gad_policy_weight", type=float, default=1.0)
         group.add_argument("--value-weight", dest="resnet_pva_gad_value_weight", type=float, default=1.0)
-        group.add_argument("--advantage-weight", dest="resnet_pva_gad_advantage_weight", type=float, default=0.50)
+        group.add_argument("--dueling-q-weight", dest="resnet_pva_gad_dueling_q_weight", type=float, default=0.50)
         group.add_argument("--kl-weight", dest="resnet_pva_gad_kl_weight", type=float, default=0.05)
         group.add_argument("--entropy-weight", dest="resnet_pva_gad_entropy_weight", type=float, default=0.001)
 
@@ -1060,7 +1049,11 @@ class ResNetPVAGadFCPI:
     def behavior_distribution(self, legal_indices, legal_prior, payload, args):
         if payload is None:
             raise RuntimeError("resnet_pva_gad FCPI requires advantage output")
-        legal_advantages = np.asarray(payload[legal_indices], dtype=np.float32)
+        legal_advantages = np.clip(
+            np.asarray(payload[legal_indices], dtype=np.float32),
+            -2.0,
+            0.0,
+        )
         temperature = max(1e-4, float(args.resnet_pva_gad_behavior_temperature))
         ranking = (
             np.log(np.clip(legal_prior, 1e-12, 1.0))
@@ -1081,7 +1074,11 @@ class ResNetPVAGadFCPI:
             dtype=np.int64,
         )
         legal_prior = normalize(policy[legal_indices])
-        legal_advantage = np.asarray(payload[legal_indices], dtype=np.float32)
+        legal_advantage = np.clip(
+            np.asarray(payload[legal_indices], dtype=np.float32),
+            -2.0,
+            0.0,
+        )
         ranking = (
             np.log(np.clip(legal_prior, 1e-12, 1.0))
             + float(args.resnet_pva_gad_behavior_advantage_weight) * legal_advantage
@@ -1131,10 +1128,12 @@ class ResNetPVAGadFCPI:
                     (1.0 - played_weight) * candidate_q[index]
                     + played_weight * record.value_target
                 )
-            q_all = np.clip(
-                record.root_value + record.model_advantages,
-                -1.0,
-                1.0,
+            # Restricted Bellman backup over the counterfactual candidates.
+            value_target = float(np.clip(np.max(candidate_q), -1.0, 1.0))
+            model_advantages = np.clip(record.model_advantages, -2.0, 0.0)
+            q_all = np.minimum(
+                np.clip(record.root_value + model_advantages, -1.0, 1.0),
+                value_target,
             ).astype(np.float32)
             q_all[candidate_local] = candidate_q
             logits = (
@@ -1143,11 +1142,12 @@ class ResNetPVAGadFCPI:
                 + (q_all - record.root_value) / temperature
             )
             record.policy_target = stable_softmax(logits).astype(np.float32)
+            record.value_target = value_target
             record.candidate_q = candidate_q.astype(np.float32)
             record.advantage_target = np.clip(
                 candidate_q - record.value_target,
-                -1.0,
-                1.0,
+                -2.0,
+                0.0,
             ).astype(np.float32)
 
     @staticmethod
@@ -1186,20 +1186,30 @@ class ResNetPVAGadFCPI:
             torch.arange(width, device=device).unsqueeze(0)
             < candidate_counts.unsqueeze(1)
         )
-        advantage = torch.nn.functional.smooth_l1_loss(
-            selected_advantage[mask], advantage_target[mask]
+        selected_q = torch.clamp(
+            heads["value"] + selected_advantage,
+            -1.0,
+            1.0,
+        )
+        q_target = torch.clamp(
+            value_target.unsqueeze(1) + advantage_target,
+            -1.0,
+            1.0,
+        )
+        dueling_q = torch.nn.functional.smooth_l1_loss(
+            selected_q[mask], q_target[mask]
         )
         loss = (
             args.resnet_pva_gad_policy_weight * policy
             + args.resnet_pva_gad_value_weight * value
-            + args.resnet_pva_gad_advantage_weight * advantage
+            + args.resnet_pva_gad_dueling_q_weight * dueling_q
             + args.resnet_pva_gad_kl_weight * kl
             - args.resnet_pva_gad_entropy_weight * entropy
         )
         return loss, {
             "policy": policy,
             "value": value,
-            "advantage": advantage,
+            "dueling_q": dueling_q,
             "kl": kl,
             "entropy": entropy,
         }
@@ -1212,9 +1222,9 @@ EVOLUTIONS = {
 
 
 def train_fcpi_model(evolution, source_model, data_path, candidate_path, args):
-    dataset = evolution.dataset_type(data_path, split=0, arch_type=evolution.arch_type)
+    dataset = evolution.dataset_type(data_path, arch_type=evolution.arch_type)
     if len(dataset) == 0:
-        raise RuntimeError("FCPI training split is empty")
+        raise RuntimeError("FCPI training dataset is empty")
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -1274,38 +1284,6 @@ def train_fcpi_model(evolution, source_model, data_path, candidate_path, args):
     }
 
 
-@torch.no_grad()
-def validate_fcpi_model(evolution, model_path, data_path, args):
-    dataset = evolution.dataset_type(data_path, split=1, arch_type=evolution.arch_type)
-    if len(dataset) == 0:
-        return {"positions": 0, "metrics": {}}
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
-    model = load_model(model_path, device=args.device)
-    model.eval()
-    totals: Dict[str, float] = {}
-    batches = 0
-    for batch in loader:
-        loss, metrics = evolution.batch_loss(model, batch, args, args.device)
-        totals["loss"] = totals.get("loss", 0.0) + float(loss.item())
-        for name, value in metrics.items():
-            totals[name] = totals.get(name, 0.0) + float(value.item())
-        batches += 1
-    return {
-        "positions": len(dataset),
-        "metrics": {name: value / max(1, batches) for name, value in totals.items()},
-    }
-
-
-def validation_metric_delta(candidate_validation, current_validation):
-    candidate_metrics = dict(candidate_validation.get("metrics", {}))
-    current_metrics = dict(current_validation.get("metrics", {}))
-    keys = sorted(set(candidate_metrics) | set(current_metrics))
-    return {
-        key: float(candidate_metrics.get(key, 0.0) - current_metrics.get(key, 0.0))
-        for key in keys
-    }
-
-
 def select_history_pool(history, current_sha256, pool_size):
     limit = max(0, int(pool_size))
     if limit <= 0:
@@ -1359,10 +1337,8 @@ def evaluate_fcpi_arena(candidate_path, baseline_path, args, *, games, seed):
 
 def evaluate_history_stability(
     candidate_path,
-    current_path,
     current_sha256,
     history,
-    reference_cache,
     args,
 ):
     enabled = args.eval_history_games > 0 and args.eval_history_pool_size > 0
@@ -1372,7 +1348,7 @@ def evaluate_history_stability(
         "passed": True,
         "games_per_matchup": int(args.eval_history_games),
         "pool_size_limit": int(args.eval_history_pool_size),
-        "score_tolerance": float(args.eval_history_score_tolerance),
+        "min_net_wins": int(args.eval_min_net_wins),
         "matches": [],
     }
     if not enabled:
@@ -1397,34 +1373,9 @@ def evaluate_history_stability(
         return result
 
     result["evaluated"] = True
-    tolerance = max(0.0, float(args.eval_history_score_tolerance))
     for entry in pool:
         history_iteration = int(entry["iteration"])
         history_seed = int(args.seed) + 100000 + history_iteration * 1009
-        cache_key = (
-            str(current_sha256),
-            str(entry["sha256"]),
-            int(args.eval_history_games),
-            history_seed,
-        )
-        reference = reference_cache.get(cache_key)
-        reference_cached = reference is not None
-        if reference is None:
-            print(
-                "fcpi history reference:",
-                f"current={current_path}",
-                f"history={entry['path']}",
-                flush=True,
-            )
-            reference = evaluate_fcpi_arena(
-                current_path,
-                entry["path"],
-                args,
-                games=args.eval_history_games,
-                seed=history_seed,
-            )
-            reference_cache[cache_key] = reference
-
         print(
             "fcpi history candidate:",
             f"candidate={candidate_path}",
@@ -1438,31 +1389,25 @@ def evaluate_history_stability(
             games=args.eval_history_games,
             seed=history_seed,
         )
-        current_score = float(reference["score"])
-        candidate_score = float(candidate["score"])
-        score_delta = candidate_score - current_score
-        passed = score_delta >= -tolerance
+        candidate = attach_arena_acceptance(candidate, args.eval_min_net_wins)
+        passed = bool(candidate["accepted"])
         result["matches"].append(
             {
                 "history_iteration": history_iteration,
                 "history_model": entry["path"],
                 "history_sha256": entry["sha256"],
                 "seed": history_seed,
-                "reference_cached": bool(reference_cached),
-                "current_score": current_score,
-                "candidate_score": candidate_score,
-                "score_delta": score_delta,
+                "net_wins": int(candidate["net_wins"]),
+                "min_net_wins": int(args.eval_min_net_wins),
                 "passed": bool(passed),
-                "current_arena": reference,
                 "candidate_arena": candidate,
             }
         )
         print(
             "fcpi history result:",
             f"history_iter={history_iteration}",
-            f"current_score={current_score:.4f}",
-            f"candidate_score={candidate_score:.4f}",
-            f"delta={score_delta:+.4f}",
+            f"net_wins={int(candidate['net_wins'])}",
+            f"min_net_wins={int(args.eval_min_net_wins)}",
             f"passed={passed}",
             flush=True,
         )
@@ -1489,23 +1434,17 @@ def run(args, evolution):
             "sha256": file_sha256(initial_model),
         }
     ]
-    history_reference_cache = {}
     for iteration in range(1, args.iterations + 1):
         print(f"fcpi iteration {iteration}", flush=True)
         records = collect_selfplay(evolution, paths["current_model"], args, iteration)
         data_path = os.path.join(paths["data_dir"], f"fcpi_iter_{iteration:03d}.h5")
-        data_summary = write_base_fcpi_h5(data_path, records, evolution, args)
+        data_summary = write_base_fcpi_h5(data_path, records, evolution)
         candidate_path = os.path.join(
             paths["model_dir"], f"candidate_iter_{iteration:03d}.pth"
         )
         train_summary = evolution.train(
             paths["current_model"], data_path, candidate_path, args
         )
-        validation = validate_fcpi_model(evolution, candidate_path, data_path, args)
-        current_validation = validate_fcpi_model(
-            evolution, paths["current_model"], data_path, args
-        )
-        delta = validation_metric_delta(validation, current_validation)
         arena = evaluate_fcpi_arena(
             candidate_path,
             paths["current_model"],
@@ -1519,10 +1458,8 @@ def run(args, evolution):
         if main_gate_passed:
             history_stability = evaluate_history_stability(
                 candidate_path,
-                paths["current_model"],
                 current_sha256,
                 history,
-                history_reference_cache,
                 args,
             )
         else:
@@ -1536,7 +1473,7 @@ def run(args, evolution):
                 "reason": "main_gate_failed",
                 "games_per_matchup": int(args.eval_history_games),
                 "pool_size_limit": int(args.eval_history_pool_size),
-                "score_tolerance": float(args.eval_history_score_tolerance),
+                "min_net_wins": int(args.eval_min_net_wins),
                 "matches": [],
             }
         accepted = main_gate_passed and bool(history_stability["passed"])
@@ -1560,8 +1497,6 @@ def run(args, evolution):
             "formula": evolution.formula_name,
             "data": data_summary,
             "train": train_summary,
-            "validation": validation,
-            "delta": delta,
             "arena": arena,
             "history_stability": history_stability,
             "gate": {
@@ -1606,7 +1541,6 @@ def common_parser(add_help=True):
     parser.add_argument("--max-book-positions", type=int, default=50000)
     parser.add_argument("--inference-batch-size", type=int, default=64)
     parser.add_argument("--target-records-per-batch", type=int, default=256)
-    parser.add_argument("--validation-fraction", type=float, default=0.10)
     parser.add_argument("--epochs", type=int, default=4)
     parser.add_argument("--train-max-steps", type=int, default=1000)
     parser.add_argument("--batch-size", type=int, default=256)
@@ -1642,7 +1576,6 @@ def common_parser(add_help=True):
     parser.add_argument("--eval-min-net-wins", type=int, default=4)
     parser.add_argument("--eval-history-games", type=int, default=100)
     parser.add_argument("--eval-history-pool-size", type=int, default=3)
-    parser.add_argument("--eval-history-score-tolerance", type=float, default=0.02)
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--seed", type=int, default=2026)
     return parser
@@ -1669,12 +1602,8 @@ def parse_args():
     args.max_plies = max(1, int(args.max_plies))
     args.positions_per_game = max(1, int(args.positions_per_game))
     args.startpos_fraction = float(np.clip(args.startpos_fraction, 0.0, 1.0))
-    args.validation_fraction = float(np.clip(args.validation_fraction, 0.0, 0.9))
     args.eval_history_games = max(0, int(args.eval_history_games))
     args.eval_history_pool_size = max(0, int(args.eval_history_pool_size))
-    args.eval_history_score_tolerance = max(
-        0.0, float(args.eval_history_score_tolerance)
-    )
     args.eval_repetition_policy_penalty = float(
         np.clip(args.eval_repetition_policy_penalty, 0.0, 1.0)
     )

@@ -100,8 +100,44 @@ def comment_value_side_to_move(comment: str, turn: chess.Color) -> float:
 
 def comment_advantage_target(before_comment: str, after_comment: str, turn: chess.Color):
     before_value = comment_value_side_to_move(before_comment, turn)
-    after_value = comment_value_side_to_move(after_comment, turn)
-    return float(np.clip(min(0.0, after_value - before_value), -1.0, 0.0))
+    action_q = comment_value_side_to_move(after_comment, turn)
+    return float(np.clip(min(0.0, action_q - before_value), -2.0, 0.0))
+
+
+def pv_linear_metadata(has_cmt: int):
+    if not int(has_cmt):
+        return {}
+    return {
+        "comment_eval_perspective": "white",
+        "comment_value_source": "pgn_node_comment",
+        "comment_value_transform": (
+            f"tanh(side_to_move_pawn_score/{COMMENT_VALUE_SCALE_PAWNS:g})"
+        ),
+    }
+
+
+def pva_gad_metadata(has_cmt: int):
+    if not int(has_cmt):
+        return {}
+    return {
+        "comment_eval_perspective": "white",
+        "comment_value_source": "pgn_node_comment",
+        "comment_value_transform": (
+            f"tanh(side_to_move_pawn_score/{COMMENT_VALUE_SCALE_PAWNS:g})"
+        ),
+        "advantage_perspective": "side_to_move",
+        "advantage_source": "comment_value_after_minus_before",
+        "advantage_transform": (
+            "clip(min(side_to_move_value_after-side_to_move_value_before,0),-2,0)"
+        ),
+        "dueling_relation": "Q(s,a)=clip(V(s)+A(s,a),-1,1)",
+    }
+
+
+SUPERVISED_METADATA_BUILDERS = {
+    RESNET_PV_LINEAR: pv_linear_metadata,
+    RESNET_PVA_GAD: pva_gad_metadata,
+}
 
 def create_h5(
     path: str,
@@ -139,19 +175,8 @@ def create_h5(
     h5.attrs["has_cmt"] = int(has_cmt)
     h5.attrs["arch_type"] = spec.name
     h5.attrs["target_schema"] = spec.target_schema
-    if int(has_cmt):
-        h5.attrs["comment_eval_perspective"] = "white"
-        h5.attrs["comment_value_source"] = "pgn_node_comment"
-        h5.attrs["comment_value_transform"] = (
-            f"tanh(side_to_move_pawn_score/{COMMENT_VALUE_SCALE_PAWNS:g})"
-        )
-    if spec.name == RESNET_PVA_GAD:
-        h5.attrs["comment_eval_perspective"] = "white"
-        h5.attrs["advantage_perspective"] = "side_to_move"
-        h5.attrs["advantage_source"] = "comment_value_after_minus_before"
-        h5.attrs["advantage_transform"] = (
-            "clip(min(side_to_move_value_after-side_to_move_value_before,0),-1,0)"
-        )
+    for name, value in SUPERVISED_METADATA_BUILDERS[spec.name](has_cmt).items():
+        h5.attrs[name] = value
     return h5, datasets
 
 def append_chunk(
@@ -179,7 +204,7 @@ def pv_linear_row(board, node, child, action, white_value, state_codec, has_cmt)
         "states": state_codec.encode_board(board),
         "moves": action,
         "values": value,
-    }, None
+    }
 
 
 def pva_gad_row(board, node, child, action, white_value, state_codec, has_cmt):
@@ -199,7 +224,7 @@ def pva_gad_row(board, node, child, action, white_value, state_codec, has_cmt):
         "values": value,
         "adv_moves": action,
         "adv_values": adv_target,
-    }, None
+    }
 
 
 PREPROCESS_ROW_BUILDERS = {
@@ -345,7 +370,7 @@ def preprocess(args):
             move = child.move
             try:
                 action = move_codec.move_to_index(move)
-                row, skip_reason = row_builder(
+                row = row_builder(
                     board,
                     node,
                     child,
@@ -354,11 +379,6 @@ def preprocess(args):
                     state_codec,
                     has_cmt,
                 )
-                if row is None:
-                    skipped_moves += 1
-                    board.push(move)
-                    node = child
-                    continue
                 for name, item in row.items():
                     buffers[name].append(item)
             except Exception:

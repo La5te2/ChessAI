@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LICHESS_HOME="${LICHESS_HOME:-"$ROOT_DIR/data/lichess"}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+LICHESS_HOME="${LICHESS_HOME:-"$SCRIPT_DIR"}"
 LICHESS_BOT_DIR="${LICHESS_BOT_DIR:-"$LICHESS_HOME/lichess-bot"}"
 LICHESS_BOT_REPO="${LICHESS_BOT_REPO:-https://github.com/lichess-bot-devs/lichess-bot.git}"
 
@@ -27,6 +28,6 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 
 echo "lichess-bot setup done"
-echo "next: source $ROOT_DIR/.venv/bin/activate"
+echo "next: source $PROJECT_ROOT/.venv/bin/activate"
 echo "next: read -rsp \"LICHESS_TOKEN: \" LICHESS_TOKEN && echo && export LICHESS_TOKEN"
-echo "next: bash $ROOT_DIR/run_lichess_bot.sh"
+echo "next: bash $SCRIPT_DIR/run_lichess_bot.sh"

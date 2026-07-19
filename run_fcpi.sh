@@ -35,7 +35,6 @@ BOOK_PLIES=8
 MAX_BOOK_POSITIONS=50000
 INFERENCE_BATCH_SIZE=64
 TARGET_RECORDS_PER_BATCH=256
-VALIDATION_FRACTION=0.0
 
 EPOCHS=15
 TRAIN_MAX_STEPS=2000
@@ -46,7 +45,7 @@ WEIGHT_DECAY=0.0001
 GRAD_CLIP=1.0
 
 EVAL_GAMES=400
-EVAL_SIMS=64
+EVAL_SIMS=0
 EVAL_GAMES_IN_FLIGHT=32
 EVAL_MAX_PLIES=240
 EVAL_OPENING_BOOK="data/openings.gen.bin"
@@ -64,7 +63,6 @@ EVAL_INSTANT_MATE_FIRST=true
 EVAL_MIN_NET_WINS=4
 EVAL_HISTORY_GAMES=100
 EVAL_HISTORY_POOL_SIZE=3
-EVAL_HISTORY_SCORE_TOLERANCE=0.02
 
 LOG_EVERY=50
 SEED=2026
@@ -115,11 +113,11 @@ case "${ARCH_TYPE}" in
     ENTROPY_WEIGHT=0.001
     BEHAVIOR_ADVANTAGE_WEIGHT=0.50
     SUCCESSOR_WEIGHT=0.75
-    ADVANTAGE_WEIGHT=0.50
+    DUELING_Q_WEIGHT=0.50
     ARCH_EXTRA_ARGS=(
       --behavior-advantage-weight "${BEHAVIOR_ADVANTAGE_WEIGHT}"
       --successor-weight "${SUCCESSOR_WEIGHT}"
-      --advantage-weight "${ADVANTAGE_WEIGHT}"
+      --dueling-q-weight "${DUELING_Q_WEIGHT}"
     )
     ;;
   *)
@@ -162,7 +160,7 @@ echo "counterfactual: topk=${COUNTERFACTUAL_TOPK} plies=${COUNTERFACTUAL_MIN_PLI
 echo "train: epochs=${EPOCHS} max_steps=${TRAIN_MAX_STEPS} batch_size=${BATCH_SIZE} lr=${LR}"
 echo "eval: games=${EVAL_GAMES} in_flight=${EVAL_GAMES_IN_FLIGHT} search_type=${EVAL_SEARCH_TYPE} sims=${EVAL_SIMS} mcts_batch_size=${EVAL_MCTS_BATCH_SIZE} movetime_ms=${EVAL_MOVETIME_MS} c_puct=${EVAL_C_PUCT} fpu_reduction=${EVAL_FPU_REDUCTION} min_net_wins=${EVAL_MIN_NET_WINS}"
 echo "eval components: rpp=${EVAL_REPETITION_POLICY_PENALTY} imf=${EVAL_INSTANT_MATE_FIRST}"
-echo "history eval: games=${EVAL_HISTORY_GAMES} pool_size=${EVAL_HISTORY_POOL_SIZE} score_tolerance=${EVAL_HISTORY_SCORE_TOLERANCE}"
+echo "history eval: games=${EVAL_HISTORY_GAMES} pool_size=${EVAL_HISTORY_POOL_SIZE} min_net_wins=${EVAL_MIN_NET_WINS}"
 
 exec python src/fcpi.py \
   --model "${MODEL}" \
@@ -178,7 +176,6 @@ exec python src/fcpi.py \
   --max-book-positions "${MAX_BOOK_POSITIONS}" \
   --inference-batch-size "${INFERENCE_BATCH_SIZE}" \
   --target-records-per-batch "${TARGET_RECORDS_PER_BATCH}" \
-  --validation-fraction "${VALIDATION_FRACTION}" \
   --epochs "${EPOCHS}" \
   --train-max-steps "${TRAIN_MAX_STEPS}" \
   --batch-size "${BATCH_SIZE}" \
@@ -205,7 +202,6 @@ exec python src/fcpi.py \
   --eval-min-net-wins "${EVAL_MIN_NET_WINS}" \
   --eval-history-games "${EVAL_HISTORY_GAMES}" \
   --eval-history-pool-size "${EVAL_HISTORY_POOL_SIZE}" \
-  --eval-history-score-tolerance "${EVAL_HISTORY_SCORE_TOLERANCE}" \
   --log-every "${LOG_EVERY}" \
   --seed "${SEED}" \
   "${ARCH_ARGS[@]}"

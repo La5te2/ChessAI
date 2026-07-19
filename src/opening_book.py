@@ -1,4 +1,4 @@
-"""Polyglot opening book sampling for arena and offline-pv evaluation."""
+"""Polyglot opening book generation, verification, and sampling."""
 
 from __future__ import annotations
 

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LICHESS_HOME="${LICHESS_HOME:-"$ROOT_DIR/data/lichess"}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LICHESS_HOME="${LICHESS_HOME:-"$SCRIPT_DIR"}"
 RUN_ID="${1:-${RUN_ID:-}}"
 
 if [ -z "$RUN_ID" ]; then
-  echo "Usage: bash stop_lichess_bot.sh <run-id>"
+  echo "Usage: bash $SCRIPT_DIR/stop_lichess_bot.sh <run-id>"
   echo "Known runs:"
   find "$LICHESS_HOME/runs" -maxdepth 1 -mindepth 1 -type d -printf "%f\n" 2>/dev/null | sort || true
   exit 1

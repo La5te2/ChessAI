@@ -48,10 +48,22 @@ class DecisionProfile:
     def payload_for_index(self, payloads, index: int):
         return None
 
-    def child_profile_state(self, expansion_payload, move: chess.Move) -> Dict[str, Any]:
+    def child_profile_state(
+        self,
+        expansion_payload,
+        move: chess.Move,
+        parent_value: float,
+    ) -> Dict[str, Any]:
         return {}
 
-    def unvisited_q_from_parent(self, parent_fpu: float, child) -> float:
+    def selection_q_from_parent(
+        self,
+        child,
+        parent_fpu: float,
+        fpu_penalty: float,
+    ) -> float:
+        if child.visit_count > 0:
+            return float(-child.q)
         return float(parent_fpu)
 
     def root_row_fields(self, child) -> Dict[str, Any]:
@@ -66,6 +78,9 @@ class ResNetPVLinearDecision(DecisionProfile):
 class ResNetPVAGadDecision(DecisionProfile):
     name = "resnet_pva_gad_mcts"
     arch_type = RESNET_PVA_GAD
+    # Project term: one pseudo-visit is a statistical prior weight of one,
+    # not a traversed MCTS edge or a value observation.
+    q_prior_visits = 1.0
 
     def evaluate_tensor(self, model, tensor: torch.Tensor) -> NetworkOutput:
         heads = model.forward_heads(tensor)
@@ -93,24 +108,49 @@ class ResNetPVAGadDecision(DecisionProfile):
             raise RuntimeError("resnet_pva_gad decision profile received no batch payload")
         return payloads[index]
 
-    def child_profile_state(self, expansion_payload, move: chess.Move) -> Dict[str, Any]:
+    def child_profile_state(
+        self,
+        expansion_payload,
+        move: chess.Move,
+        parent_value: float,
+    ) -> Dict[str, Any]:
         if expansion_payload is None:
             raise RuntimeError("resnet_pva_gad decision profile received no action payload")
         index = self.move_codec.move_to_index(move)
         if index >= len(expansion_payload):
             raise RuntimeError(f"resnet_pva_gad payload missing action index {index}")
-        return {"adv": float(np.clip(float(expansion_payload[index]), -1.0, 1.0))}
+        advantage = float(np.clip(float(expansion_payload[index]), -2.0, 0.0))
+        return {
+            "adv": advantage,
+            "q_prior": float(np.clip(float(parent_value) + advantage, -1.0, 1.0)),
+        }
 
-    def unvisited_q_from_parent(self, parent_fpu: float, child) -> float:
+    def selection_q_from_parent(
+        self,
+        child,
+        parent_fpu: float,
+        fpu_penalty: float,
+    ) -> float:
         try:
-            return float(parent_fpu + child.profile_state["adv"])
+            q_prior = float(child.profile_state["q_prior"])
         except KeyError as exc:
-            raise RuntimeError("resnet_pva_gad child missing adv") from exc
+            raise RuntimeError("resnet_pva_gad child missing q_prior") from exc
+        if child.visit_count <= 0:
+            return float(np.clip(q_prior - float(fpu_penalty), -1.0, 1.0))
+        visits = float(child.visit_count)
+        empirical_q = float(-child.q)
+        return float(
+            (visits * empirical_q + self.q_prior_visits * q_prior)
+            / (visits + self.q_prior_visits)
+        )
 
     def root_row_fields(self, child) -> Dict[str, Any]:
         if child is None or "adv" not in child.profile_state:
             return {}
-        return {"adv": float(child.profile_state["adv"])}
+        return {
+            "adv": float(child.profile_state["adv"]),
+            "q_prior": float(child.profile_state["q_prior"]),
+        }
 
 
 PROFILES_BY_ARCH: Dict[str, DecisionProfile] = {

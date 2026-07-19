@@ -6,3 +6,6 @@ backup/
 .env
 /lichess*.yml
 /lichess*.yaml
+/.bot/lichess-bot/
+/.bot/runs/
+/.bot/*.lock

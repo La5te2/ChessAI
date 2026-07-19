@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LICHESS_HOME="${LICHESS_HOME:-"$ROOT_DIR/data/lichess"}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+LICHESS_HOME="${LICHESS_HOME:-"$SCRIPT_DIR"}"
 LICHESS_BOT_DIR="${LICHESS_BOT_DIR:-"$LICHESS_HOME/lichess-bot"}"
 RUN_ID="${RUN_ID:-lichess_$(date +%Y%m%d_%H%M%S)_$$}"
 RUN_DIR="$LICHESS_HOME/runs/$RUN_ID"
+LOCK_FILE="$LICHESS_HOME/lichess-bot.lock"
 
 MODEL="${MODEL:-models/champion.pth}"
 DEVICE="${DEVICE:-cuda}"
@@ -28,6 +30,7 @@ MULTIPV="${MULTIPV:-1}"
 ROOT_TOPN="${ROOT_TOPN:-5}"
 SCORE_SCALE="${SCORE_SCALE:-1000}"
 LOG_SEARCH="${LOG_SEARCH:-false}"
+RATE_LIMITING_DELAY_MS="${RATE_LIMITING_DELAY_MS:-1000}"
 
 CHALLENGE_CONCURRENCY="${CHALLENGE_CONCURRENCY:-1}"
 CHALLENGE_VARIANTS="${CHALLENGE_VARIANTS:-standard}"
@@ -52,30 +55,45 @@ fi
 
 if [ ! -x "$BOT_PYTHON" ] || [ ! -f "$DEFAULT_CONFIG" ]; then
   echo "lichess-bot is not installed in $LICHESS_BOT_DIR"
-  echo "Run: bash setup_lichess_bot.sh"
+  echo "Run: bash $SCRIPT_DIR/setup_lichess_bot.sh"
   exit 1
 fi
 
+mkdir -p "$LICHESS_HOME"
+if ! command -v flock >/dev/null 2>&1; then
+  echo "flock is required to prevent duplicate bot instances."
+  exit 1
+fi
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+  echo "another lichess-bot instance already holds $LOCK_FILE"
+  echo "inspect: ps -ef | grep -E 'lichess-bot.py|uci_engine.py' | grep -v grep"
+  exit 1
+fi
 mkdir -p "$RUN_DIR"
 
 if [[ "$MODEL" = /* ]]; then
   MODEL_ABS="$MODEL"
 else
-  MODEL_ABS="$ROOT_DIR/$MODEL"
+  MODEL_ABS="$PROJECT_ROOT/$MODEL"
+fi
+if [ ! -f "$MODEL_ABS" ]; then
+  echo "model not found: $MODEL_ABS"
+  exit 1
 fi
 
 cat > "$ENGINE_WRAPPER" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-cd "$ROOT_DIR"
-exec "$ENGINE_PYTHON" "$ROOT_DIR/src/uci_engine.py"
+cd "$PROJECT_ROOT"
+exec "$ENGINE_PYTHON" "$PROJECT_ROOT/src/uci_engine.py"
 EOF
 chmod +x "$ENGINE_WRAPPER"
 
 export LICHESS_URL
 export ENGINE_DIR="$RUN_DIR"
 export ENGINE_NAME="$(basename "$ENGINE_WRAPPER")"
-export ENGINE_WORKING_DIR="$ROOT_DIR"
+export ENGINE_WORKING_DIR="$PROJECT_ROOT"
 export MODEL_ABS
 export DEVICE
 export SEARCH_TYPE
@@ -97,6 +115,7 @@ export MULTIPV
 export ROOT_TOPN
 export SCORE_SCALE
 export LOG_SEARCH
+export RATE_LIMITING_DELAY_MS
 export CHALLENGE_CONCURRENCY
 export CHALLENGE_VARIANTS
 export CHALLENGE_TIME_CONTROLS
@@ -142,6 +161,7 @@ engine["working_dir"] = os.environ["ENGINE_WORKING_DIR"]
 engine["protocol"] = "uci"
 engine["ponder"] = False
 engine["silence_stderr"] = False
+engine["rate_limiting_delay"] = env_int("RATE_LIMITING_DELAY_MS")
 engine["uci_options"] = {
     "ModelPath": os.environ["MODEL_ABS"],
     "Device": os.environ["DEVICE"],
@@ -201,6 +221,7 @@ echo "model: $MODEL_ABS"
 echo "device: $DEVICE"
 echo "search_type: $SEARCH_TYPE"
 echo "mcts_sims: $MCTS_SIMS"
+echo "rate_limiting_delay_ms: $RATE_LIMITING_DELAY_MS"
 echo "uci info: multipv=${MULTIPV} score_scale=${SCORE_SCALE} log_search=${LOG_SEARCH}"
 
 if [ "${UPGRADE_BOT:-0}" = "1" ]; then

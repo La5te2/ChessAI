@@ -37,7 +37,7 @@ class BatchedEvaluator:
         payloads = []
         for start in range(0, len(boards), self.batch_size):
             batch = boards[start:start + self.batch_size]
-            x = np.stack([self.state_codec.tensor_from_board(board) for board in batch]).astype(np.float32)
+            x = np.stack([self.state_codec.tensor_from_board(board) for board in batch])
             tensor = torch.from_numpy(x).to(self.device, non_blocking=True)
             output = self.profile.evaluate_tensor(self.model, tensor)
             policies.append(torch.softmax(output.policy_logits, dim=1).cpu().numpy())

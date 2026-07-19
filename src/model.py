@@ -146,7 +146,7 @@ class GeometryAttentionBlock(nn.Module):
 
 
 class SourceDestinationActionHead(nn.Module):
-    def __init__(self, channels: int, action_size: int, zero_to_projection: bool = False):
+    def __init__(self, channels: int, action_size: int):
         super().__init__()
         if int(action_size) != SD_64X64_UP9_ACTION_SIZE:
             raise ValueError(
@@ -157,11 +157,6 @@ class SourceDestinationActionHead(nn.Module):
         self.from_proj = nn.Linear(channels, channels)
         self.to_proj = nn.Linear(channels, channels)
         self.underpromotion = nn.Linear(channels, 9)
-        if zero_to_projection:
-            nn.init.zeros_(self.to_proj.weight)
-            nn.init.zeros_(self.to_proj.bias)
-            nn.init.zeros_(self.underpromotion.weight)
-            nn.init.zeros_(self.underpromotion.bias)
 
     def forward(self, x):
         tokens = x
@@ -181,17 +176,22 @@ class SourceDestinationActionHead(nn.Module):
         )
 
 
-class ValueScaledAdvantageHead(nn.Module):
+class MinimaxAdvantageHead(nn.Module):
     def __init__(self, channels: int, action_size: int):
         super().__init__()
         self.action_head = SourceDestinationActionHead(
             channels,
             action_size,
-            zero_to_projection=True,
         )
+        nn.init.normal_(self.action_head.to_proj.weight, mean=0.0, std=0.01)
+        nn.init.zeros_(self.action_head.to_proj.bias)
+        nn.init.normal_(self.action_head.underpromotion.weight, mean=0.0, std=0.01)
+        nn.init.zeros_(self.action_head.underpromotion.bias)
 
     def forward(self, x):
-        return torch.tanh(self.action_head(x))
+        raw = torch.tanh(self.action_head(x))
+        # Minimax A=Q-V is non-positive; the square keeps zero reachable.
+        return -2.0 * raw.square()
 
 
 class TokenValueHead(nn.Module):
@@ -333,13 +333,12 @@ class ResNetPVAGadModel(nn.Module):
         channels=128,
         blocks=10,
         action_size=None,
-        attention_blocks=None,
     ):
         super().__init__()
         self.arch_type = RESNET_PVA_GAD
         self.state_encoding = state_encoding_for_arch(self.arch_type)
         self.channels = int(channels)
-        self.blocks = max(1, int(blocks if attention_blocks is None else attention_blocks))
+        self.blocks = max(1, int(blocks))
         self.action_size = int(
             action_size_for_arch(self.arch_type)
             if action_size is None
@@ -356,8 +355,8 @@ class ResNetPVAGadModel(nn.Module):
         self.policy_head_type = "source_destination"
         self.value_head = TokenValueHead(self.channels)
         self.value_head_type = "global_token_mlp"
-        self.advantage_head = ValueScaledAdvantageHead(self.channels, self.action_size)
-        self.advantage_head_type = "value_scaled_source_destination"
+        self.advantage_head = MinimaxAdvantageHead(self.channels, self.action_size)
+        self.advantage_head_type = "minimax_source_destination"
 
     def arch(self) -> Dict[str, Any]:
         return {
@@ -393,7 +392,6 @@ def make_resnet_pv_linear(
     channels=128,
     blocks=10,
     action_size=None,
-    attention_blocks=None,
 ):
     return ResNetPVLinearModel(
         channels=channels,
@@ -406,13 +404,11 @@ def make_resnet_pva_gad(
     channels=128,
     blocks=10,
     action_size=None,
-    attention_blocks=None,
 ):
     return ResNetPVAGadModel(
         channels=channels,
         blocks=blocks,
         action_size=action_size,
-        attention_blocks=attention_blocks,
     )
 
 
@@ -497,7 +493,6 @@ def create_model(
     channels=128,
     blocks=10,
     action_size=None,
-    attention_blocks=None,
     device=None,
 ):
     arch_type = normalize_arch_type(arch_type)
@@ -506,7 +501,6 @@ def create_model(
         channels=int(channels),
         blocks=int(blocks),
         action_size=None if action_size is None else int(action_size),
-        attention_blocks=attention_blocks,
     )
     if device is not None:
         model = model.to(device)
@@ -530,14 +524,9 @@ def make_model_from_checkpoint(
         channels=int(arch.get("channels", 128)),
         blocks=int(arch.get("blocks", 10)),
         action_size=int(arch["action_size"]) if "action_size" in arch else None,
-        attention_blocks=arch.get("attention_blocks"),
         device=device,
     )
-    incompatible = model.load_state_dict(state, strict=False)
-    if incompatible.unexpected_keys:
-        print("warning: unexpected checkpoint keys ignored:", list(incompatible.unexpected_keys)[:10])
-    if incompatible.missing_keys:
-        print("warning: missing checkpoint keys:", list(incompatible.missing_keys)[:10])
+    model.load_state_dict(state, strict=True)
     return model
 
 
