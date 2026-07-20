@@ -625,7 +625,7 @@ python src/arena.py --candidate models/candidate.pth --baseline models/champion.
 
 ## 9. FCPI
 
-FCPI（Folded Counterfactual Policy Iteration，折叠式反事实策略迭代）在采样和验收时均可使用 `closed` 模型。它通过自对战回报与少量自适应多步反事实评价生成训练信号，运行过程不调用 UCI 教师机。
+FCPI（Folded Counterfactual Policy Iteration），折叠式反事实策略迭代，它通过自对战与少量自适应多步反事实评价生成训练信号，运行过程不调用 UCI 教师机。
 
 ### 9.1 resnet_pv_linear
 
