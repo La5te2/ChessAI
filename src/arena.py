@@ -59,7 +59,7 @@ def trace_search_info(info: Dict, root_topn: int) -> Dict:
     root_topn = max(0, int(root_topn))
     keys = (
         "search_type",
-        "decision_profile",
+        "search_backend",
         "best_move",
         "best_san",
         "value",
@@ -74,6 +74,8 @@ def trace_search_info(info: Dict, root_topn: int) -> Dict:
         "c_puct_factor",
         "fpu_reduction",
         "fpu_root",
+        "q_prior_penalty_reduction",
+        "q_prior_penalty_root",
         "virtual_loss",
         "nodes",
         "expanded_nodes",
@@ -90,7 +92,7 @@ def trace_search_info(info: Dict, root_topn: int) -> Dict:
 def pgn_search_comment(owner: str, info: Dict) -> str:
     parts = [
         f"owner={owner}",
-        f"profile={info.get('decision_profile', '?')}",
+        f"backend={info.get('search_backend', '?')}",
         f"best={info.get('best_san', info.get('best_move', '?'))}",
     ]
     if "mcts_completed" in info and "mcts_soft_cap" in info:
@@ -273,7 +275,7 @@ def apply_game_move(
             "candidate_color": (
                 "white" if state.candidate_color == chess.WHITE else "black"
             ),
-            "decision_profile": info.get("decision_profile"),
+            "search_backend": info.get("search_backend"),
             "search": trace_search_info(info, trace_root_topn),
         })
     if state.node is not None:
@@ -503,15 +505,15 @@ def evaluate_models(
     )
     candidate_searcher = UnifiedSearch(candidate, replace(options), device=device)
     baseline_searcher = UnifiedSearch(baseline, replace(options), device=device)
-    candidate_decision_profile = candidate_searcher.profile.name
-    baseline_decision_profile = baseline_searcher.profile.name
+    candidate_search_backend = candidate_searcher.backend.name
+    baseline_search_backend = baseline_searcher.backend.name
     progress_print(
         progress,
         "arena: models ready",
         f"candidate_arch={candidate_arch.get('type')}",
-        f"candidate_profile={candidate_decision_profile}",
+        f"candidate_backend={candidate_search_backend}",
         f"baseline_arch={baseline_arch.get('type')}",
-        f"baseline_profile={baseline_decision_profile}",
+        f"baseline_backend={baseline_search_backend}",
     )
 
     records = play_batched_games(
@@ -596,11 +598,11 @@ def evaluate_models(
         "candidate": candidate_path,
         "candidate_sha256": candidate_hash,
         "candidate_arch": candidate_arch,
-        "candidate_decision_profile": candidate_decision_profile,
+        "candidate_search_backend": candidate_search_backend,
         "baseline": baseline_path,
         "baseline_sha256": baseline_hash,
         "baseline_arch": baseline_arch,
-        "baseline_decision_profile": baseline_decision_profile,
+        "baseline_search_backend": baseline_search_backend,
         **game_summary,
         "search_type": str(search_type),
         "sims_soft_cap": int(effective_sims),

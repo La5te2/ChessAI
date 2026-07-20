@@ -1,7 +1,7 @@
 """Architecture-dispatched Folded Counterfactual Policy Iteration.
 
 FCPI is teacher-free. Each registered architecture owns its behavior policy,
-counterfactual target construction, training loss, and Arena evaluation profile.
+counterfactual target construction and training loss.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import random
 import shutil
 import time
 import uuid
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import chess
 import h5py
@@ -28,7 +28,7 @@ from architectures import RESNET_PVA_GAD, RESNET_PV_LINEAR
 from arena import evaluate_models, file_sha256
 from checkpoint_io import atomic_copy_with_backup
 from config import DEVICE
-from decision import profile_for_model
+from decision import inference_profile_for_model
 from evaluator import BatchedEvaluator
 from game_rules import game_is_over, game_result
 from model import checkpoint_metadata, load_model, save_model
@@ -49,10 +49,15 @@ class RawPosition:
     legal_prior: np.ndarray
     played_index: int
     candidate_indices: np.ndarray
-    model_advantages: Optional[np.ndarray] = None
+    architecture_data: Any = None
     value_target: float = 0.0
     policy_target: Optional[np.ndarray] = None
     candidate_q: Optional[np.ndarray] = None
+
+
+@dataclass
+class PVAGadPositionData:
+    model_advantages: np.ndarray
     advantage_target: Optional[np.ndarray] = None
 
 
@@ -176,12 +181,12 @@ def evaluate_branch_frontier(
         return
     boards = [branch.board for branch in pending]
     batch = evaluator.evaluate_boards_full(boards)
-    profile = evaluator.profile
+    inference = evaluator.inference
     for index, branch in enumerate(pending):
         value = float(batch.values[index])
         branch.current_value = value
         branch.current_policy = batch.policies[index]
-        branch.current_payload = profile.payload_for_index(batch.expansion_payload, index)
+        branch.current_payload = inference.payload_for_index(batch.expansion_payload, index)
         branch.estimates.append(float(((-1.0) ** branch.depth) * value))
 
 
@@ -226,11 +231,11 @@ def adaptive_successor_q_batches(
     for start in range(0, len(records), records_per_batch):
         subset = records[start:start + records_per_batch]
         branches: List[CounterfactualBranch] = []
-        profile = evaluator.profile
+        inference = evaluator.inference
         for record_index, row in enumerate(subset):
             board = chess.Board(row.fen)
             for candidate_index, encoded_move in enumerate(row.candidate_indices):
-                move = profile.move_codec.index_to_move(int(encoded_move), board)
+                move = inference.move_codec.index_to_move(int(encoded_move), board)
                 if move is None:
                     raise RuntimeError(
                         f"FCPI candidate action is illegal: action={encoded_move} fen={row.fen}"
@@ -324,7 +329,7 @@ def adaptive_successor_q_batches(
                     branch.current_policy,
                     branch.current_payload,
                     args,
-                    profile,
+                    inference,
                 )
                 if move not in branch.board.legal_moves:
                     raise RuntimeError(
@@ -408,38 +413,6 @@ def adaptive_successor_q_batches(
     return output, summary
 
 
-def assign_td_lambda_returns(
-    trajectories: Sequence[Trajectory],
-    evaluator: BatchedEvaluator,
-    td_lambda: float,
-):
-    truncated = [
-        trajectory.board
-        for trajectory in trajectories
-        if not game_is_over(trajectory.board)
-    ]
-    truncated_values = iter(
-        evaluator.evaluate_boards_full(truncated).values.tolist() if truncated else []
-    )
-    lam = float(np.clip(td_lambda, 0.0, 1.0))
-    for trajectory in trajectories:
-        if game_is_over(trajectory.board):
-            next_return = terminal_value(trajectory.board)
-        else:
-            next_return = float(next(truncated_values))
-        final_value = next_return
-        positions = trajectory.positions
-        for index in range(len(positions) - 1, -1, -1):
-            next_value = (
-                final_value
-                if index + 1 == len(positions)
-                else float(positions[index + 1].root_value)
-            )
-            current_return = -((1.0 - lam) * next_value + lam * next_return)
-            positions[index].value_target = float(np.clip(current_return, -1.0, 1.0))
-            next_return = current_return
-
-
 def sample_trajectory_positions(
     trajectories: Sequence[Trajectory],
     positions_per_game: int,
@@ -485,7 +458,7 @@ def collect_selfplay(
 ) -> List[RawPosition]:
     model = load_model(model_path, device=args.device)
     evaluator = BatchedEvaluator(model, device=args.device, batch_size=args.inference_batch_size)
-    profile = profile_for_model(model)
+    inference = inference_profile_for_model(model)
     specs, opening_summary = make_sampling_specs(
         games=args.games_per_iter,
         seed=args.seed + iteration,
@@ -528,14 +501,14 @@ def collect_selfplay(
                 board = trajectory.board
                 full_policy = batch.policies[batch_index]
                 root_value = float(batch.values[batch_index])
-                payload = profile.payload_for_index(batch.expansion_payload, batch_index)
+                payload = inference.payload_for_index(batch.expansion_payload, batch_index)
                 legal_moves = list(board.legal_moves)
                 legal_indices = np.asarray(
-                    [profile.move_codec.move_to_index(move) for move in legal_moves],
+                    [inference.move_codec.move_to_index(move) for move in legal_moves],
                     dtype=np.int64,
                 )
                 legal_prior = normalize(full_policy[legal_indices]).astype(np.float32)
-                behavior, model_advantages, ranking_scores = evolution.behavior_distribution(
+                behavior, architecture_data, ranking_scores = evolution.behavior_distribution(
                     legal_indices,
                     legal_prior,
                     payload,
@@ -553,14 +526,14 @@ def collect_selfplay(
                 trajectory.positions.append(
                     RawPosition(
                         game_id=trajectory.game_id,
-                        state=profile.state_codec.encode_board(board),
+                        state=inference.state_codec.encode_board(board),
                         fen=board.fen(),
                         root_value=root_value,
                         legal_indices=legal_indices,
                         legal_prior=legal_prior,
                         played_index=played_index,
                         candidate_indices=candidate_indices,
-                        model_advantages=model_advantages,
+                        architecture_data=architecture_data,
                     )
                 )
                 board.push(move)
@@ -582,11 +555,7 @@ def collect_selfplay(
                     next_active.append(trajectory)
             active = next_active
 
-    assign_td_lambda_returns(
-        trajectories,
-        evaluator,
-        evolution.td_lambda(args),
-    )
+    evolution.assign_returns(trajectories, evaluator, args)
     sample_rng = np.random.default_rng(args.seed + iteration + 1_000_003)
     records, sampling_summary = sample_trajectory_positions(
         trajectories,
@@ -618,7 +587,7 @@ def padded_rows(records, field: str, dtype, width: int):
     return output
 
 
-def merge_target_record_group(group: Sequence[RawPosition]) -> RawPosition:
+def merge_target_record_group(group: Sequence[RawPosition], evolution) -> RawPosition:
     merged = group[0]
     if len(group) == 1:
         return merged
@@ -649,24 +618,20 @@ def merge_target_record_group(group: Sequence[RawPosition]) -> RawPosition:
         [np.mean(candidate_q[action]) for action in candidate_indices],
         dtype=np.float32,
     )
-    if merged.advantage_target is not None:
-        merged.advantage_target = np.clip(
-            merged.candidate_q - merged.value_target,
-            -2.0,
-            0.0,
-        ).astype(np.float32)
+    evolution.finalize_aggregated_record(merged)
     return merged
 
 
 def aggregate_target_records(
     records: Sequence[RawPosition],
+    evolution,
 ) -> Tuple[List[RawPosition], Dict[str, int]]:
     groups = {}
     for record in records:
         state_key = np.ascontiguousarray(record.state).tobytes()
         groups.setdefault(state_key, []).append(record)
 
-    merged = [merge_target_record_group(group) for group in groups.values()]
+    merged = [merge_target_record_group(group, evolution) for group in groups.values()]
     multiplicities = [len(group) for group in groups.values()]
     return merged, {
         "source_positions": len(records),
@@ -681,7 +646,7 @@ def write_base_fcpi_h5(path: str, records: Sequence[RawPosition], evolution):
     if not records:
         raise RuntimeError("FCPI generated no positions")
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    records, aggregation_summary = aggregate_target_records(records)
+    records, aggregation_summary = aggregate_target_records(records, evolution)
     print(
         "fcpi position aggregation:",
         json.dumps(aggregation_summary, ensure_ascii=False),
@@ -859,6 +824,37 @@ class ResNetPVLinearFCPI:
     def td_lambda(args):
         return args.resnet_pv_linear_td_lambda
 
+    def assign_returns(self, trajectories, evaluator, args):
+        truncated = [
+            trajectory.board
+            for trajectory in trajectories
+            if not game_is_over(trajectory.board)
+        ]
+        truncated_values = iter(
+            evaluator.evaluate_boards_full(truncated).values.tolist()
+            if truncated
+            else []
+        )
+        lam = float(np.clip(self.td_lambda(args), 0.0, 1.0))
+        for trajectory in trajectories:
+            if game_is_over(trajectory.board):
+                next_return = terminal_value(trajectory.board)
+            else:
+                next_return = float(next(truncated_values))
+            final_value = next_return
+            positions = trajectory.positions
+            for index in range(len(positions) - 1, -1, -1):
+                next_value = (
+                    final_value
+                    if index + 1 == len(positions)
+                    else float(positions[index + 1].root_value)
+                )
+                current_return = -((1.0 - lam) * next_value + lam * next_return)
+                positions[index].value_target = float(
+                    np.clip(current_return, -1.0, 1.0)
+                )
+                next_return = current_return
+
     @staticmethod
     def counterfactual_topk(args):
         return args.resnet_pv_linear_counterfactual_topk
@@ -898,11 +894,11 @@ class ResNetPVLinearFCPI:
         return behavior, None, legal_prior
 
     @staticmethod
-    def rollout_move(board, policy, payload, args, profile):
+    def rollout_move(board, policy, payload, args, inference):
         del payload, args
         legal_moves = list(board.legal_moves)
         legal_indices = np.asarray(
-            [profile.move_codec.move_to_index(move) for move in legal_moves],
+            [inference.move_codec.move_to_index(move) for move in legal_moves],
             dtype=np.int64,
         )
         return legal_moves[int(np.argmax(policy[legal_indices]))]
@@ -947,6 +943,10 @@ class ResNetPVLinearFCPI:
     @staticmethod
     def write_architecture_targets(h5, records, candidate_width):
         del h5, records, candidate_width
+
+    @staticmethod
+    def finalize_aggregated_record(record):
+        del record
 
     def train(self, source_model, data_path, candidate_path, args):
         return train_fcpi_model(self, source_model, data_path, candidate_path, args)
@@ -1005,6 +1005,37 @@ class ResNetPVAGadFCPI:
     def td_lambda(args):
         return args.resnet_pva_gad_td_lambda
 
+    def assign_returns(self, trajectories, evaluator, args):
+        truncated = [
+            trajectory.board
+            for trajectory in trajectories
+            if not game_is_over(trajectory.board)
+        ]
+        truncated_values = iter(
+            evaluator.evaluate_boards_full(truncated).values.tolist()
+            if truncated
+            else []
+        )
+        lam = float(np.clip(self.td_lambda(args), 0.0, 1.0))
+        for trajectory in trajectories:
+            if game_is_over(trajectory.board):
+                next_return = terminal_value(trajectory.board)
+            else:
+                next_return = float(next(truncated_values))
+            final_value = next_return
+            positions = trajectory.positions
+            for index in range(len(positions) - 1, -1, -1):
+                next_value = (
+                    final_value
+                    if index + 1 == len(positions)
+                    else float(positions[index + 1].root_value)
+                )
+                current_return = -((1.0 - lam) * next_value + lam * next_return)
+                positions[index].value_target = float(
+                    np.clip(current_return, -1.0, 1.0)
+                )
+                next_return = current_return
+
     @staticmethod
     def counterfactual_topk(args):
         return args.resnet_pva_gad_counterfactual_topk
@@ -1027,7 +1058,8 @@ class ResNetPVAGadFCPI:
 
     @staticmethod
     def candidate_reference_q(record, candidate_index):
-        if record.model_advantages is None:
+        data = record.architecture_data
+        if not isinstance(data, PVAGadPositionData):
             raise RuntimeError("resnet_pva_gad FCPI record is missing advantages")
         action = int(record.candidate_indices[candidate_index])
         local = np.flatnonzero(record.legal_indices == action)
@@ -1035,7 +1067,7 @@ class ResNetPVAGadFCPI:
             raise RuntimeError(f"candidate action is missing from legal actions: {action}")
         return float(
             np.clip(
-                record.root_value + record.model_advantages[int(local[0])],
+                record.root_value + data.model_advantages[int(local[0])],
                 -1.0,
                 1.0,
             )
@@ -1062,15 +1094,15 @@ class ResNetPVAGadFCPI:
         behavior = stable_softmax(ranking / temperature)
         mix = float(np.clip(args.resnet_pva_gad_uniform_mix, 0.0, 1.0))
         behavior = (1.0 - mix) * behavior + mix / len(behavior)
-        return behavior, legal_advantages, ranking
+        return behavior, PVAGadPositionData(model_advantages=legal_advantages), ranking
 
     @staticmethod
-    def rollout_move(board, policy, payload, args, profile):
+    def rollout_move(board, policy, payload, args, inference):
         if payload is None:
             raise RuntimeError("resnet_pva_gad FCPI rollout requires advantage output")
         legal_moves = list(board.legal_moves)
         legal_indices = np.asarray(
-            [profile.move_codec.move_to_index(move) for move in legal_moves],
+            [inference.move_codec.move_to_index(move) for move in legal_moves],
             dtype=np.int64,
         )
         legal_prior = normalize(policy[legal_indices])
@@ -1105,7 +1137,8 @@ class ResNetPVAGadFCPI:
         )
         temperature = max(1e-4, float(args.resnet_pva_gad_policy_temperature))
         for record, successor_q in zip(records, successor):
-            if record.model_advantages is None:
+            data = record.architecture_data
+            if not isinstance(data, PVAGadPositionData):
                 raise RuntimeError("resnet_pva_gad FCPI record is missing advantages")
             positions = {int(action): index for index, action in enumerate(record.legal_indices)}
             candidate_local = np.asarray(
@@ -1113,7 +1146,7 @@ class ResNetPVAGadFCPI:
                 dtype=np.int64,
             )
             dueling_q = np.clip(
-                record.root_value + record.model_advantages[candidate_local],
+                record.root_value + data.model_advantages[candidate_local],
                 -1.0,
                 1.0,
             )
@@ -1130,7 +1163,7 @@ class ResNetPVAGadFCPI:
                 )
             # Restricted Bellman backup over the counterfactual candidates.
             value_target = float(np.clip(np.max(candidate_q), -1.0, 1.0))
-            model_advantages = np.clip(record.model_advantages, -2.0, 0.0)
+            model_advantages = np.clip(data.model_advantages, -2.0, 0.0)
             q_all = np.minimum(
                 np.clip(record.root_value + model_advantages, -1.0, 1.0),
                 value_target,
@@ -1144,7 +1177,7 @@ class ResNetPVAGadFCPI:
             record.policy_target = stable_softmax(logits).astype(np.float32)
             record.value_target = value_target
             record.candidate_q = candidate_q.astype(np.float32)
-            record.advantage_target = np.clip(
+            data.advantage_target = np.clip(
                 candidate_q - record.value_target,
                 -2.0,
                 0.0,
@@ -1152,11 +1185,34 @@ class ResNetPVAGadFCPI:
 
     @staticmethod
     def write_architecture_targets(h5, records, candidate_width):
+        for record in records:
+            data = record.architecture_data
+            if not isinstance(data, PVAGadPositionData) or data.advantage_target is None:
+                raise RuntimeError("resnet_pva_gad FCPI record is missing advantage targets")
         h5.create_dataset(
             "advantage_targets",
-            data=padded_rows(records, "advantage_target", np.float32, candidate_width),
+            data=np.stack(
+                [
+                    np.pad(
+                        record.architecture_data.advantage_target,
+                        (0, candidate_width - len(record.architecture_data.advantage_target)),
+                    )
+                    for record in records
+                ]
+            ).astype(np.float32),
             compression="lzf",
         )
+
+    @staticmethod
+    def finalize_aggregated_record(record):
+        data = record.architecture_data
+        if not isinstance(data, PVAGadPositionData):
+            raise RuntimeError("resnet_pva_gad FCPI record is missing architecture data")
+        data.advantage_target = np.clip(
+            record.candidate_q - record.value_target,
+            -2.0,
+            0.0,
+        ).astype(np.float32)
 
     def train(self, source_model, data_path, candidate_path, args):
         return train_fcpi_model(self, source_model, data_path, candidate_path, args)

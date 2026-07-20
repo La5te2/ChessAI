@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 
-from decision import profile_for_model
+from decision import inference_profile_for_model
 
 
 class EvaluationBatch:
@@ -18,13 +18,13 @@ class BatchedEvaluator:
         self.model = model
         self.device = device
         self.batch_size = max(1, int(batch_size))
-        self.profile = profile_for_model(model)
-        self.state_codec = self.profile.state_codec
+        self.inference = inference_profile_for_model(model)
+        self.state_codec = self.inference.state_codec
 
     @torch.no_grad()
     def evaluate_boards_full(self, boards):
         if not boards:
-            action_size = self.profile.move_codec.action_size
+            action_size = self.inference.move_codec.action_size
             return EvaluationBatch(
                 np.zeros((0, action_size), dtype=np.float32),
                 np.zeros((0,), dtype=np.float32),
@@ -39,14 +39,14 @@ class BatchedEvaluator:
             batch = boards[start:start + self.batch_size]
             x = np.stack([self.state_codec.tensor_from_board(board) for board in batch])
             tensor = torch.from_numpy(x).to(self.device, non_blocking=True)
-            output = self.profile.evaluate_tensor(self.model, tensor)
+            output = self.inference.evaluate_tensor(self.model, tensor)
             policies.append(torch.softmax(output.policy_logits, dim=1).cpu().numpy())
             values.append(output.value.squeeze(1).cpu().numpy())
-            payload = self.profile.output_payload_to_numpy(output)
+            payload = self.inference.output_payload_to_numpy(output)
             if payload is not None:
                 payloads.append(payload)
 
-        expansion_payload = self.profile.merge_payloads(payloads)
+        expansion_payload = self.inference.merge_payloads(payloads)
         return EvaluationBatch(
             np.concatenate(policies, axis=0).astype(np.float32, copy=False),
             np.concatenate(values, axis=0).astype(np.float32, copy=False),
@@ -59,7 +59,7 @@ class BatchedEvaluator:
 
     def evaluate_one_full(self, board):
         evaluation = self.evaluate_boards_full([board])
-        payload = self.profile.payload_for_index(evaluation.expansion_payload, 0)
+        payload = self.inference.payload_for_index(evaluation.expansion_payload, 0)
         return evaluation.policies[0], float(evaluation.values[0]), payload
 
     def evaluate_one(self, board):
@@ -68,7 +68,7 @@ class BatchedEvaluator:
 
     def legal_priors(self, board):
         policy, value = self.evaluate_one(board)
-        return self.profile.move_codec.policy_to_legal_distribution(
+        return self.inference.move_codec.policy_to_legal_distribution(
             policy,
             board,
             normalize=True,

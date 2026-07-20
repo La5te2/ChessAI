@@ -1,10 +1,9 @@
 # ChessAI / Gadidae
 
-Gadidae 是一个实验性国际象棋神经网络引擎项目。当前主线由三部分组成：
+Gadidae 是一个实验性国际象棋神经网络引擎项目。
 
 - `resnet_pv_linear`：ResNet + linear policy/value，使用 `resnet_pv_linear_18_planes` state encoding 和 `alphazero_64x73` move encoding。
 - `resnet_pva_gad`：residual geometry transformer + source-destination policy/value/advantage，使用 `resnet_pva_gad_square_tokens` state encoding 和 `sd_64x64_underpromo9` move encoding。
-- `search.py`：模型 policy/value 加 MCTS，支持 `closed` 和 `only-mcts` 两种 search type。
 
 ---
 
@@ -93,7 +92,7 @@ ChessAI/
 - `checkpoint_io.py`：checkpoint 原子写回和备份工具。
 - `config.py`：默认路径、设备、训练参数、搜索参数和平台化 UCI 路径。
 - `data.py`：supervised HDF5 schema 校验和 PyTorch Dataset。
-- `decision.py`：模型到 search 的决策适配层；按 `arch_type` 选择 state codec、move codec、MCTS profile 和架构特有搜索信号。
+- `decision.py`：按 `arch_type` 解码模型推理输出，并选择对应的 state codec 与 move codec。
 - `evaluator.py`：batched neural inference，供 MCTS 批量评估叶子局面。
 - `fcpi.py`：按 checkpoint 架构分派独立 FCPI 进化公式，执行 closed self-play、反事实目标训练与 arena gate。
 - `game_rules.py`：统一实际终局、三次重复、五十回合、胜负结果和终止原因的判定。
@@ -103,7 +102,7 @@ ChessAI/
 - `move_codecs.py`：招法编码、解码、合法招法概率映射和 action size。
 - `opening_book.py`：从 PGN 生成开局书、验证开局书均势性、为 arena 生成 paired opening specs。
 - `preprocess.py`：从 PGN 生成指定架构的 supervised HDF5。
-- `search.py`：单局面模型直出和 MCTS 搜索。
+- `search.py`：单局面模型 Policy 和 MCTS 搜索，并为每个架构注册独立 search backend。
 - `simulator.py`：局面模拟与模型分析 GUI，支持双方走子、实时候选、FEN 和 PGN 操作。
 - `standardize.py`：规范化 checkpoint 结构，并按权重结构识别架构。
 - `state_codecs.py`：棋盘状态编码，按架构注册。
@@ -153,10 +152,10 @@ Windows PowerShell 可把 README 里的多行 bash 命令改成单行，并把 `
 
 ## 3. 架构与数据格式
 
-| 架构 | state encoding | move encoding | HDF5 datasets | 训练入口 | search profile |
+| 架构 | state encoding | move encoding | HDF5 datasets | 训练入口 | search backend |
 | --- | --- | --- | --- | --- | --- |
-| `resnet_pv_linear` | `resnet_pv_linear_18_planes` | `alphazero_64x73` | `states`, `moves`, `values` | supervised + FCPI | policy/value + MCTS |
-| `resnet_pva_gad` | `resnet_pva_gad_square_tokens` | `sd_64x64_underpromo9` | `states`, `moves`, `values`, `adv_moves`, `adv_values` | supervised + FCPI | policy/value/advantage + MCTS |
+| `resnet_pv_linear` | `resnet_pv_linear_18_planes` | `alphazero_64x73` | `states`, `moves`, `values` | supervised + FCPI | `resnet_pv_linear_mcts` |
+| `resnet_pva_gad` | `resnet_pva_gad_square_tokens` | `sd_64x64_underpromo9` | `states`, `moves`, `values`, `adv_moves`, `adv_values` | supervised + FCPI | `resnet_pva_gad_mcts` |
 
 每个 HDF5 都带有：
 
@@ -182,8 +181,8 @@ has_cmt
 
 架构相关训练参数：
 
-- `--channels` 默认值为 `128`。对 `resnet_pv_linear`，它表示卷积通道数；对 `resnet_pva_gad`，它表示 square/global token embedding 与 attention hidden size。
-- `--blocks` 默认值为 `10`。对 `resnet_pv_linear`，它表示 ResNet residual block 数；对 `resnet_pva_gad`，它表示 geometry attention block 数。
+- `--channels` 默认值为 `128`。对 `resnet_pv_linear`，它表示卷积通道数。对 `resnet_pva_gad`，它表示 square/global token embedding 与 attention hidden size。
+- `--blocks` 默认值为 `10`。对 `resnet_pv_linear`，它表示 ResNet residual block 数。对 `resnet_pva_gad`，它表示 geometry attention block 数。
 
 `resnet_pv_linear` 使用 18-plane packbits state。`resnet_pva_gad` 使用紧凑 square-token state，HDF5 中 `states` 形状为 `(N, 67)`。
 
@@ -305,7 +304,7 @@ python src/preprocess.py \
 {(Rd8) +0.71/14 171s}
 ```
 
-批注数值按白方视角解析。`values` 使用当前节点评价并转换为 side-to-move 视角；缺少 `+/-` 数值的节点按 $0$ 处理。`adv_values` 先把走前、走后评价分别转换到 value head 的 $[-1,1]$ 尺度，再计算当前走子方视角的变化：
+批注数值按白方视角解析。`values` 使用当前节点评价并转换为 side-to-move 视角。缺少 `+/-` 数值的节点按 $0$ 处理。`adv_values` 先把走前、走后评价分别转换到 value head 的 $[-1,1]$ 尺度，再计算当前走子方视角的变化：
 
 $$
 \begin{aligned}
@@ -315,9 +314,9 @@ A_{target} &= \operatorname{clip}(\min(0,Q_{after}-V_{before}),-2,0)
 \end{aligned}
 $$
 
-状态包含当前行棋方，$V$、$Q$ 与 $A$ 都采用该行棋方视角。确定性零和转移满足 $Q(s,a)=-V(T(s,a))$，最优性定义为 $V(s)=\max_{a\in\mathcal L(s)}Q(s,a)$，因此 $A(s,a)=Q(s,a)-V(s)$ 必为非正数。正差值按评估噪声处理并写为 $0$；$V,Q\in[-1,1]$，所以完整 $A$ 范围为 $[-2,0]$。
+状态包含当前行棋方，$V$、$Q$ 与 $A$ 都采用该行棋方视角。确定性零和转移满足 $Q(s,a)=-V(T(s,a))$，最优性定义为 $V(s)=\max_{a\in\mathcal L(s)}Q(s,a)$，因此 $A(s,a)=Q(s,a)-V(s)$ 必为非正数。正差值按评估噪声处理并写为 $0$。$V,Q\in[-1,1]$，所以完整 $A$ 范围为 $[-2,0]$。
 
-使用 `--has-cmt 1` 时，整盘主线至少需要一个可解析评价批注；整盘没有评价批注的 game 会被跳过。使用 `analyze.py --pgn-comments` 可以把普通 PGN 转成带 UCI 评价批注的 `<name>_cmt.pgn`，再生成 `resnet_pva_gad` 的 HDF5。
+使用 `--has-cmt 1` 时，整盘主线至少需要一个可解析评价批注。整盘没有评价批注的 game 会被跳过。使用 `analyze.py --pgn-comments` 可以把普通 PGN 转成带 UCI 评价批注的 `<name>_cmt.pgn`，再生成 `resnet_pva_gad` 的 HDF5。
 
 ---
 
@@ -361,8 +360,8 @@ python src/train.py \
 
 训练 loss 参数：
 
-- `resnet_pv_linear`：`--value-weight` 控制 Value loss；该架构只注册 Policy/Value 训练参数。
-- `resnet_pva_gad`：`--value-weight` 控制 Value loss；`--dueling-q-weight` 控制组合 Dueling Q loss。该项使用 $Q_{pred}=\operatorname{clip}(V_{pred}+A_{pred},-1,1)$ 对走后局面价值进行监督，使 V 与 A 通过同一动作价值联合训练；`has_cmt=0` 时该项关闭。
+- `resnet_pv_linear`：`--value-weight` 控制 Value loss。该架构只注册 Policy/Value 训练参数。
+- `resnet_pva_gad`：`--value-weight` 控制 Value loss。`--dueling-q-weight` 控制组合 Dueling Q loss。该项使用 $Q_{pred}=\operatorname{clip}(V_{pred}+A_{pred},-1,1)$ 对走后局面价值进行监督，使 V 与 A 通过同一动作价值联合训练。`has_cmt=0` 时该项关闭。
 
 本地 CPU smoke test：
 
@@ -372,9 +371,13 @@ python src/train.py --data data/games-pv-linear.h5 --out models/test-train.pth -
 
 ---
 
-## 7. 单局面 Search
+## 7. Search
 
-模型直出：
+### 7.1 resnet_pv_linear
+
+`decision.py` 解码 `resnet_pv_linear` 的网络输出，并选择 `resnet_pv_linear_18_planes` state codec 与 `alphazero_64x73` move codec。`search.py` 选择 `resnet_pv_linear_mcts` backend。
+
+模型 Policy：
 
 ```bash
 python src/search.py \
@@ -384,6 +387,8 @@ python src/search.py \
   --search-type closed \
   --root-topn 16
 ```
+
+`closed` 只执行一次该架构的网络推理。Policy 头给出合法招法排序。Value 头给出根局面的 side-to-move 估值，并供输出及 RPP 优势判断使用。
 
 MCTS：
 
@@ -407,38 +412,13 @@ python src/search.py \
   --root-topn 16
 ```
 
-### 7.1 共同搜索流程
-
-`decision.py` 根据 checkpoint 的 `arch.type` 选择架构对应的 state codec、move codec 和 decision profile。`closed` 只执行一次网络推理；`only-mcts` 在每个展开节点读取模型输出，使用 PUCT 选择叶子并把 leaf value 逐层变号回传。`resnet_pv_linear` profile 使用该架构的 Policy/Value，`resnet_pva_gad` profile 使用该架构的 Policy/Value/Advantage；搜索结果按所选 profile 呈现对应字段。
-
-对已经访问的子节点，父节点视角的利用项为：
+`only-mcts` 在每个展开节点读取该架构的 Policy/Value。Policy 提供 $P(s,a)$。Value 评价叶子并逐层变号回传。已经访问的边使用：
 
 $$
-Q_{select}(s,a)=-Q(child)
+Q_{select}(s,a)=-\frac{value\_sum(child)}{visits(child)}
 $$
 
-$$
-Q(child)=\frac{value\_sum(child)}{visits(child)}
-$$
-
-负号来自 value 与 $Q$ 始终采用当前局面 side-to-move 视角。PUCT 选择分数为：
-
-$$
-\operatorname{PUCT}(s,a)=Q_{select}(s,a)
-+C(s)P(s,a)\frac{\sqrt{N(s)+N_{virtual}(s)+1}}
-{1+N(s,a)+N_{virtual}(s,a)}
--virtual\_loss\,N_{virtual}(s,a)
-$$
-
-其中 $P(s,a)$ 是模型 policy 在合法招法上的归一化先验。搜索结束后，根节点策略由 $visits+prior$ 归一化得到；实际 top1 先按该策略确定，再经过可选的 IMF/RPP 决策层。$Q_{MCTS}$ 来自叶子 value 回传，决策组件不会修改树内 prior、visits 或 $Q$。
-
-搜索先运行 `--mcts-min-sims`；该值为 $0$ 时使用 $\max(mcts\_batch\_size,mcts\_sims/4)$。之后根据根节点访问分布熵、前两名 visits 接近程度和 $Q$ 接近程度得到 `uncertainty`，在最小模拟数与 `--mcts-sims` 软上限之间动态确定目标。`--movetime-ms` 是独立的硬时间预算。
-
-### 7.2 resnet_pv_linear
-
-- `closed`：Policy 头给出合法招法排序；Value 头给出根局面的 side-to-move 估值，并供输出及 RPP 优势判断使用。
-- `only-mcts`：Policy 头提供每个节点的 $P(s,a)$；Value 头评价叶子并形成回传的 $Q_{MCTS}$。
-- 未访问子节点采用父节点 FPU：
+未访问边采用父节点 FPU：
 
 $$
 \operatorname{FPU}(s)=\operatorname{clip}
@@ -449,16 +429,86 @@ $$
 Q_{select,unvisited}(s,a)=\operatorname{FPU}(s)
 $$
 
-### 7.3 resnet_pva_gad
+该架构的 PUCT 选择分数为：
 
-- `closed`：与 `resnet_pv_linear` 的直出路径一样，由 Policy 排序、Value 评价根局面；Advantage 头不参与 closed 排序。
-- `only-mcts`：Policy 与 Value 的职责不变；节点展开时按 move codec 为每条边保存非正 $A(s,a)$，并构造固定网络先验：
+$$
+\operatorname{PUCT}_{resnet\_pv\_linear}(s,a)=Q_{select}(s,a)
++C(s)P(s,a)\frac{\sqrt{N(s)+N_{virtual}(s)+1}}
+{1+N(s,a)+N_{virtual}(s,a)}
+-virtual\_loss\,N_{virtual}(s,a)
+$$
+
+搜索结束后，根节点策略由 $visits+prior$ 归一化得到，再经过可选 IMF/RPP 决策层选择实际 top1。IMF/RPP 不修改树内 prior、visits 或 $Q$。
+
+该架构的搜索参数：
+
+- `--search-type closed`：执行 `resnet_pv_linear` 的模型 Policy 路径。
+- `--search-type only-mcts`：执行 `resnet_pv_linear_mcts`。`--mcts-sims 0` 时只使用模型 Policy。
+- `--mcts-sims`：simulations 软上限。
+- `--mcts-min-sims`：动态预算的最小 simulations。为 $0$ 时使用 $\max(mcts\_batch\_size,mcts\_sims/4)$。
+- `--mcts-batch-size`：一次网络批处理中选择的叶子数。
+- `--movetime-ms`：完整搜索的硬时间预算。
+- `--c-puct`、`--c-puct-base`、`--c-puct-factor`：探索常数及随访问数增长的 schedule。
+- `--fpu-reduction`：该架构未访问边的 FPU 折减。
+- `--virtual-loss`：batched MCTS 对同批已选路径施加的临时分数惩罚。负数与非有限值归一化为 $0$。
+- `--repetition-policy-penalty`：RPP。己方优势时，对直接完成第三次重复或允许对手下一手完成第三次重复的候选降低决策排序分数。
+- `--instant-mate-first`：IMF。若存在一步将杀，将搜索 policy 最高的一步杀提升为决策 top1。
+
+动态探索常数为：
+
+$$
+C(s)=c_{puct}+c_{puct\_factor}
+\log\left(\frac{N(s)+c_{puct\_base}+1}{c_{puct\_base}}\right)
+$$
+
+完成最小 simulations 后，该架构根据根节点访问分布熵、前两名 visits 接近程度和回传 $Q$ 接近程度计算 `uncertainty`，在最小值与软上限之间确定目标 simulations。
+
+### 7.2 resnet_pva_gad
+
+`decision.py` 解码 `resnet_pva_gad` 的网络输出，并选择 `resnet_pva_gad_square_tokens` state codec 与 `sd_64x64_underpromo9` move codec。`search.py` 选择 `resnet_pva_gad_mcts` backend。
+
+模型 Policy：
+
+```bash
+python src/search.py \
+  --model models/pva-gad.pth \
+  --fen startpos \
+  --device cpu \
+  --search-type closed \
+  --root-topn 16
+```
+
+`closed` 只执行一次该架构的网络推理。Policy 给出合法招法排序，Value 给出根局面的 side-to-move 估值。Advantage 不参与 `closed` 排序。
+
+MCTS：
+
+```bash
+python src/search.py \
+  --model models/pva-gad.pth \
+  --fen startpos \
+  --device cuda \
+  --search-type only-mcts \
+  --mcts-sims 30000 \
+  --mcts-min-sims 6000 \
+  --mcts-batch-size 64 \
+  --movetime-ms 30000 \
+  --c-puct 0.5 \
+  --c-puct-base 19652 \
+  --c-puct-factor 1.0 \
+  --fpu-reduction 0.15 \
+  --virtual-loss 0.0 \
+  --repetition-policy-penalty 0.15 \
+  --instant-mate-first \
+  --root-topn 16
+```
+
+`only-mcts` 在每个展开节点读取该架构的 Policy/Value/Advantage。Policy 提供 $P(s,a)$，Value 评价叶子并逐层变号回传。Advantage 为每条展开边构造固定网络动作价值先验：
 
 $$
 Q_{prior}(s,a)=\operatorname{clip}\left(V_{net}(s)+A_{net}(s,a),-1,1\right)
 $$
 
-- 未访问边使用 $Q_{prior}-fpu\_penalty$。已访问边通过 Q 先验权重 $\lambda$ 与实际叶子回传均值平滑融合：
+未访问边使用 $Q_{prior}-fpu\_penalty$。已经访问的边将叶子回传均值与固定先验融合：
 
 $$
 Q_{select}(s,a)=
@@ -466,10 +516,43 @@ Q_{select}(s,a)=
 {N(s,a)+\lambda}
 $$
 
-**项目内部定义：伪访问（pseudo-visit）**是从统计学 pseudocount / prior sample weight 迁移来的名称，表示 $Q_{prior}$ 在上述加权平均中占有 $\lambda$ 个样本单位的先验权重。它不是 MCTS 真正遍历过的边，不增加 `visits`，不写入 `value_sum`，也不代表一次叶子观测；该名称是项目内部定义，不把它视为 MCTS 领域的公认学术术语。
+**定义：伪访问（pseudo-visit）**表示 $Q_{prior}$ 在上述加权平均中占有 $\lambda$ 个样本单位的统计先验权重。它不增加 `visits`，不写入 `value_sum`，也不表示一次叶子遍历。
 
-- 当前 $\lambda=1$，即一个伪访问。网络 $Q$ 的实际占比为 $1/(N+1)$：未访问和低访问边更多使用 $V+A$，随后平滑收敛到 $Q_{MCTS}$。固定的小权重不假设当前模型已经具备可靠的置信度校准。
-- $A$ 不进入 PUCT 的探索项、MCTS `value_sum` 或叶子回传。它通过低访问量下的利用项影响后续 visits，而不是永久叠加到搜索 $Q$，也不会被当作新的叶子观测重复回传。
+当前 $\lambda=1$。网络 $Q$ 的占比为 $1/(N+1)$。低访问边更多使用 $V+A$，随后平滑收敛到叶子回传形成的 $Q_{MCTS}$。$A$ 不进入探索项、`value_sum` 或叶子回传。它通过低访问量下的利用项改变后续 visits。
+
+该架构的 PUCT 选择分数为：
+
+$$
+\operatorname{PUCT}_{resnet\_pva\_gad}(s,a)=Q_{select}(s,a)
++C(s)P(s,a)\frac{\sqrt{N(s)+N_{virtual}(s)+1}}
+{1+N(s,a)+N_{virtual}(s,a)}
+-virtual\_loss\,N_{virtual}(s,a)
+$$
+
+搜索结束后，根节点策略由 $visits+prior$ 归一化得到，再经过可选 IMF/RPP 决策层选择实际 top1。输出在该架构的根节点条目中包含 `adv` 与 `q_prior`。
+
+该架构的搜索参数：
+
+- `--search-type closed`：执行 `resnet_pva_gad` 的模型 Policy 路径。
+- `--search-type only-mcts`：执行 `resnet_pva_gad_mcts`。`--mcts-sims 0` 时只使用模型 Policy。
+- `--mcts-sims`：simulations 软上限。
+- `--mcts-min-sims`：动态预算的最小 simulations。为 $0$ 时使用 $\max(mcts\_batch\_size,mcts\_sims/4)$。
+- `--mcts-batch-size`：一次网络批处理中选择的叶子数。
+- `--movetime-ms`：完整搜索的硬时间预算。
+- `--c-puct`、`--c-puct-base`、`--c-puct-factor`：探索常数及随访问数增长的 schedule。
+- `--fpu-reduction`：从未访问边的 $Q_{prior}$ 扣除的 FPU penalty。
+- `--virtual-loss`：batched MCTS 对同批已选路径施加的临时分数惩罚。负数与非有限值归一化为 $0$。
+- `--repetition-policy-penalty`：RPP。己方优势时，对直接完成第三次重复或允许对手下一手完成第三次重复的候选降低决策排序分数。
+- `--instant-mate-first`：IMF。若存在一步将杀，将搜索 policy 最高的一步杀提升为决策 top1。
+
+动态探索常数为：
+
+$$
+C(s)=c_{puct}+c_{puct\_factor}
+\log\left(\frac{N(s)+c_{puct\_base}+1}{c_{puct\_base}}\right)
+$$
+
+完成最小 simulations 后，该架构根据根节点访问分布熵、前两名 visits 接近程度和叶子回传 $Q_{MCTS}$ 的接近程度计算 `uncertainty`，在最小值与软上限之间确定目标 simulations。网络 $Q_{prior}$ 参与边选择，不替代该诊断量中的实际回传 $Q_{MCTS}$。
 
 若模型能够输出经过校准的动作 Q 认知不确定性，并且 MCTS 节点记录叶子回传方差，可以改用精度加权：
 
@@ -490,30 +573,7 @@ $$
 \lambda(s,a)=\frac{\sigma^2_{mcts}(s,a)}{\sigma^2_{net}(s,a)}
 $$
 
-网络越确定，$Q$ 先验保留越久；MCTS 回传越稳定，搜索均值接管越快。Policy entropy、Advantage 差距和 $|Q_{MCTS}-Q_{prior}|$ 都不直接等价于认知不确定性，当前实现不使用这些量替代 $\sigma_{net}$。
-
-### 7.4 参数含义
-
-- `--search-type closed`：执行模型直出路径。
-- `--search-type only-mcts`：执行架构对应的 MCTS profile；`--mcts-sims 0` 时退化为模型直出。
-- `--mcts-sims`：MCTS simulations 软上限，表示模拟次数。
-- `--mcts-min-sims`：动态预算下的最小模拟次数。
-- `--movetime-ms`：完整 search 的时间预算。
-- `--c-puct`：PUCT 初始探索常数。
-- `--c-puct-base` / `--c-puct-factor`：随访问数增长的 C-PUCT schedule。
-- `--fpu-reduction`：未访问节点的 FPU 折减。
-- `--virtual-loss`：batched MCTS 中对同批已选路径施加的额外临时分数惩罚。搜索始终使用 virtual visits 做路径占位；设为 `0` 只关闭额外惩罚，负数与非有限值统一归一化为 `0`。
-- `--repetition-policy-penalty`：RPP（Repetition Policy Penalty）。己方优势时，软惩罚己方当前招法直接完成第三次重复的候选，以及会让对手存在一手合法回复完成第三次重复的候选；对手是否申请和棋不属于 RPP。取值范围为 $[0,1]$，默认 $0$。搜索结束后，决策层复制搜索 policy 作为排序分数，从目标招法的分数中直接减去 $penalty\cdot\max(value,0)$ 并钳到 $0$；其他招法保持原值，决策层不重新归一化，也不修改搜索 policy。该构件依赖完整走棋历史，只有 FEN 时无法识别此前重复次数。
-- `--instant-mate-first`：IMF（Instant Mate First）。搜索结束后若根节点存在一步将杀，在所有一步杀中采用搜索 policy 最高的一手，并把该手的决策排序分数设为 `1`；其他招法保持原值，决策层不重新归一化，也不修改搜索 policy。默认关闭，可用 `--no-instant-mate-first` 显式关闭。IMF 与 RPP 独立执行；合法对局中的一步将杀既不会完成历史重复，也不会留下对手回复，因此两者自然不会冲突。
-
-搜索输出中的 `p`/`mcts_p` 始终表示组件介入前的搜索概率，`decision_score` 表示 IMF/RPP 处理后的临时排序分数；实际走法按 `decision_score` 选择。
-
-动态 C-PUCT：
-
-$$
-c_{puct}+c_{puct\_factor}
-\log\left(\frac{parent\_visits+c_{puct\_base}+1}{c_{puct\_base}}\right)
-$$
+网络越确定，$Q$ 先验保留越久。MCTS 回传越稳定，搜索均值接管越快。Policy entropy、Advantage 差距和 $|Q_{MCTS}-Q_{prior}|$ 都不直接等价于认知不确定性，当前实现不使用这些量替代 $\sigma_{net}$。
 
 ---
 
@@ -540,18 +600,18 @@ python src/arena.py \
 arena 行为：
 
 - paired openings：同一个起始局面交换颜色各下一局。
-- candidate 与 baseline 可使用不同架构；arena 给双方同一 search budget；每个模型按 checkpoint 的 `arch_type` 通过 `decision.py` 选择 decision profile、state codec、move codec 和架构特有的搜索信号。
-- `--search-type closed` 使用模型直出的 policy/value。
-- `--search-type only-mcts` 使用模型 policy/value 加 MCTS。
+- candidate 与 baseline 可使用不同架构，arena 给双方同一 search budget。每个模型按 checkpoint 的 `arch_type` 选择自己的推理解码、state codec、move codec 和架构 search backend。
+- `--search-type closed` 使用双方各自架构的模型 Policy 路径。
+- `--search-type only-mcts` 使用双方各自架构的 MCTS 选择公式。`resnet_pv_linear` 使用 Policy/Value，`resnet_pva_gad` 使用 Policy/Value/Advantage。
 - `--games 100` 使用 50 个 unique start positions。
 - `--games-in-flight` 控制同时驻留的棋局数。arena 只加载一份 candidate 和一份 baseline，并按当前行棋模型合并多个棋局的神经网络推理。
-- 每盘棋保有独立的棋盘、MCTS tree、visits、Q、dynamic target 和时间预算；`--mcts-batch-size` 仍表示每盘 MCTS 单轮选择的叶子数量，随后再跨棋局合并推理。
+- 每盘棋保有独立的棋盘、MCTS tree、visits、Q、dynamic target 和时间预算。`--mcts-batch-size` 仍表示每盘 MCTS 单轮选择的叶子数量，随后再跨棋局合并推理。
 - candidate 与 baseline 始终使用相同的 search type、sims、movetime、C-PUCT、FPU 和 MCTS batch 参数。
 - 输出 W/D/L、net wins、score、score confidence interval 和 Elo diff。
 - arena 与 acceptance 使用模型对战结果作为独立比较与 gate 信号。
 - `--pgn-output` 保存棋谱。
 - `--trace-output` 保存逐手 search 细节。
-- Arena 在当前位置实际达到三次重复或五十回合条件后判和；仅存在下一手可申请和棋的走法时继续对局，使 RPP 能在决策层处理该候选。
+- Arena 在当前位置实际达到三次重复或五十回合条件后判和。仅存在下一手可申请和棋的走法时继续对局，使 RPP 能在决策层处理该候选。
 - 从标准初始局面开始时使用 `--opening-book ""`。
 - 查看逐手 search 时加入 `--trace-output data/runs/arena.trace.jsonl --pgn-comments --trace-root-topn 12`。
 
@@ -567,92 +627,23 @@ python src/arena.py --candidate models/candidate.pth --baseline models/champion.
 
 FCPI（Folded Counterfactual Policy Iteration，折叠式反事实策略迭代）在采样和验收时均可使用 `closed` 模型。它通过自对战回报与少量自适应多步反事实评价生成训练信号，运行过程不调用 UCI 教师机。
 
-启动后台 run：
+### 9.1 resnet_pv_linear
+
+`run_fcpi.sh` 读取 checkpoint 的 `arch.type` 后选择 `ResNetPVLinearFCPI`。启动与查看日志：
 
 ```bash
 bash run_fcpi.sh
-```
-
-查看最新 run：
-
-```bash
 RUN_ID="$(ls -td data/runs/fcpi_* | head -1 | xargs basename)"
 tail -f "data/runs/$RUN_ID/info.log"
 ```
 
-`fcpi.py` 先读取 `--model` checkpoint 的 `arch.type`，再选择该架构的 FCPI 实现与参数表。FCPI 的 TD、反事实 value expansion、KL policy improvement 和 arena gate 原理通用；每个架构单独定义 rollout 排序及目标到自身 heads 的投影：
-
-- `resnet_pv_linear`：rollout 按 Policy 排序；多深度 Value 混合形成反事实 Q；训练 policy/value。
-- `resnet_pva_gad`：rollout 按 Policy+Advantage 排序；多深度 Value 与 $V(s)+A(s,a)$ 融合形成候选 Q；$V_{target}$ 取已评价候选 Q 的最大值，$A_{target}=Q_{target}-V_{target}\in[-2,0]$，并通过组合 Dueling Q loss 训练 policy/value/advantage。
-
-FCPI 一次只训练一个 checkpoint。入口先识别 `arch.type`，再由对应架构注册同一组用户参数、提供自己的默认值，并把例如 `--counterfactual-topk` 映射为该架构内部的独立参数变量。`resnet_pva_gad` 还会注册仅供其 Advantage 路径使用的参数；这些参数不会出现在 `resnet_pv_linear` 命令中。
-
-### 9.1 共同目标
-
-记本轮开始时冻结的 `current.pth` 参数为 $\theta_0$，从它初始化并接受梯度更新的 candidate 参数为 $\theta$。$\pi_0$、$V_0$、$A_0$ 均来自冻结模型；Value、$Q$ 和 Advantage 使用 side-to-move 视角。
-
-完整轨迹的终点目标为：
-
-$$
-G_T =
-\begin{cases}
-z_T, & \text{正式终局} \\
-V_0(s_T), & \text{达到 max-plies}
-\end{cases}
-$$
-
-其中 $z_T$ 取值为 $-1$、$0$ 或 $1$。TD($\lambda$) 从轨迹末端反向计算：
-
-$$
-G_t = \operatorname{clip}\left(
--\left[(1-\lambda_{TD})V_0(s_{t+1})+\lambda_{TD}G_{t+1}\right],
--1,1
-\right)
-$$
-
-Value 监督目标为：
-
-$$
-V^*(s_t)=G_t
-$$
-
-对根局面 $s$ 的候选招法 $a$，先走出该招法，再沿冻结模型在后续局面的确定性 top1 继续 rollout。深度 $d$ 的 Value 转换回根节点行棋方视角：
-
-$$
-e_d(s,a)=(-1)^dV_0(s_d)
-$$
-
-若 $s_d$ 已经终局，则使用真实终局值。不同深度的结果按 `counterfactual-lambda` 混合：
-
-$$
-Q_{CF}(s,a)=
-(1-\lambda_{CF})
-\sum_{d=1}^{D-1}\lambda_{CF}^{d-1}e_d(s,a)
-+\lambda_{CF}^{D-1}e_D(s,a)
-$$
-
-得到架构对应的改进值 $\widehat Q$ 后，Policy 目标统一为：
-
-$$
-\pi^*(a\mid s)=
-\frac{
-\pi_0(a\mid s)^\rho
-\exp\left((\widehat Q(s,a)-V_0(s))/\tau_\pi\right)
-}{
-\sum_b \pi_0(b\mid s)^\rho
-\exp\left((\widehat Q(s,b)-V_0(s))/\tau_\pi\right)
-}
-$$
-
-`prior-power` 对应 $\rho$，`policy-temperature` 对应 $\tau_\pi$。当前脚本中二者分别为 $1.0$ 和 $0.25$。
-
-### 9.2 resnet_pv_linear
-
-该架构输出 Policy 与 Value：
+该实现使用 `resnet_pv_linear_18_planes` state codec、`alphazero_64x73` move codec，并输出：
 
 $$
 f_\theta(s)=\left(\pi_\theta(s),V_\theta(s)\right)
 $$
+
+每轮冻结 `current.pth` 为 $\theta_0$，从同一参数初始化 candidate $\theta$。$\pi_0$ 与 $V_0$ 来自冻结模型，Value 与反事实 $Q$ 使用 side-to-move 视角。
 
 自对局 behavior 覆盖全部合法招法：
 
@@ -664,7 +655,42 @@ $$
 +\frac{\epsilon}{|\mathcal A(s)|}
 $$
 
-当前脚本使用 $T_b=1.0$、$\epsilon=0.03$。反事实候选取 Policy 排名前 $K=6$ 的招法，并始终包含实际走出的招法。候选初值为：
+当前脚本使用 $T_b=1.0$、$\epsilon=0.03$。反事实候选取 Policy 排名前 $K=6$ 的招法，并始终包含实际走出的招法。
+
+轨迹终点使用正式终局 $z_T\in\{-1,0,1\}$。达到 `max-plies` 的未终局轨迹使用冻结 Value bootstrap：
+
+$$
+G_T=
+\begin{cases}
+z_T,&\text{正式终局}\\
+V_0(s_T),&\text{达到 max-plies}
+\end{cases}
+$$
+
+该架构以 $\lambda_{TD}=0.80$ 独立计算 TD($\lambda$) 回报：
+
+$$
+G_t=\operatorname{clip}\left(
+-\left[(1-\lambda_{TD})V_0(s_{t+1})+\lambda_{TD}G_{t+1}\right],
+-1,1
+\right)
+$$
+
+对候选 $a$ 先走一步，再沿冻结 Policy top1 rollout。深度 $d$ 的冻结 Value 转回根节点视角：
+
+$$
+e_d(s,a)=(-1)^dV_0(s_d)
+$$
+
+终局分支使用真实终局值。该架构以 $\lambda_{CF}=0.80$ 混合自适应多深度结果：
+
+$$
+Q_{CF}(s,a)=
+(1-\lambda_{CF})\sum_{d=1}^{D-1}\lambda_{CF}^{d-1}e_d(s,a)
++\lambda_{CF}^{D-1}e_D(s,a)
+$$
+
+候选初值为：
 
 $$
 Q_c(s,a)=Q_{CF}(s,a)
@@ -685,6 +711,21 @@ Q'_c(s,a), & a\text{ 是反事实候选} \\
 V_0(s), & a\text{ 未展开}
 \end{cases}
 $$
+
+该架构的 Policy target 为：
+
+$$
+\pi^*(a\mid s)=
+\frac{
+\pi_0(a\mid s)^\rho
+\exp\left((\widehat Q(s,a)-V_0(s))/\tau_\pi\right)
+}{
+\sum_b\pi_0(b\mid s)^\rho
+\exp\left((\widehat Q(s,b)-V_0(s))/\tau_\pi\right)
+}
+$$
+
+脚本使用 $\rho=1.0$、$\tau_\pi=0.25$。
 
 令 $p_\theta$ 为 candidate 在合法招法上的 Policy softmax：
 
@@ -709,18 +750,66 @@ $$
 总损失为：
 
 $$
-L_{PV}=L_{policy}+L_V+0.05L_{KL}-0.001H(p_\theta)
+L_{resnet\_pv\_linear}=L_{policy}+L_V+0.05L_{KL}-0.001H(p_\theta)
 $$
 
-### 9.3 resnet_pva_gad
+该架构在本轮数据内按编码 state 聚合重复 position：Policy target、Value target 和相同候选的反事实 $Q$ 分别取均值。优化器为 AdamW，脚本使用学习率 $2\times10^{-5}$、weight decay $10^{-4}$ 和梯度范数裁剪 $1.0$。
 
-该架构输出 Policy、Value 与 Advantage：
+candidate 先与本轮 `current.pth` 进行 paired-opening arena，再与历史接受模型池逐一比赛。所有 gate 均要求 `net_wins >= EVAL_MIN_NET_WINS`。通过后原子写回本 run 的 `current.pth`。运行文件为：
+
+```text
+data/runs/<run-id>/info.log
+data/runs/<run-id>/pid
+data/runs/<run-id>/fcpi_iter_*.h5
+data/runs/<run-id>/summary.json
+models/runs/<run-id>/current.pth
+models/runs/<run-id>/initial.pth
+models/runs/<run-id>/candidate_iter_*.pth
+```
+
+主赛未达到 `EVAL_MIN_NET_WINS` 时跳过历史赛。历史池由 `initial.pth` 和真正晋升过的 `candidate_iter_*.pth` 构成，并排除当前模型与重复 checkpoint。超过 `EVAL_HISTORY_POOL_SIZE` 时按时间轴保留里程碑。`fcpi.py` 管理历史列表，`arena.py` 执行两模型对战，`acceptance.py` 只根据 `net_wins` 和 `EVAL_MIN_NET_WINS` 计算无状态 gate。
+
+`EVAL_REPETITION_POLICY_PENALTY` 与 `EVAL_INSTANT_MATE_FIRST` 同时作用于该架构的主 Arena 和历史稳定赛，不进入该架构的自对战采样或梯度目标。`EVAL_HISTORY_GAMES=0` 或 `EVAL_HISTORY_POOL_SIZE=0` 可关闭历史稳定赛。
+
+`run_fcpi.sh` 中该架构的主要参数：
+
+```text
+TD_LAMBDA=0.80
+COUNTERFACTUAL_TOPK=6
+COUNTERFACTUAL_MIN_PLIES=2
+COUNTERFACTUAL_MAX_PLIES=6
+COUNTERFACTUAL_TARGET_AVERAGE_PLIES=4.0
+COUNTERFACTUAL_LAMBDA=0.80
+BEHAVIOR_TEMPERATURE=1.00
+UNIFORM_MIX=0.03
+POLICY_TEMPERATURE=0.25
+PRIOR_POWER=1.0
+PLAYED_RETURN_WEIGHT=0.50
+```
+
+所有候选至少展开 `COUNTERFACTUAL_MIN_PLIES`。之后根据 Bellman residual、相邻深度 $Q$ 变化和根节点候选竞争性分配剩余预算，单个候选最多展开到 `COUNTERFACTUAL_MAX_PLIES`，整体目标平均深度由 `COUNTERFACTUAL_TARGET_AVERAGE_PLIES` 控制。
+
+同一盘中的相同编码 state 只保留一次。超过 `POSITIONS_PER_GAME` 时均匀无放回采样。脚本默认 50% startpos 与 50% 开局书起点，开局书不足时完整洗牌后循环使用。
+
+### 9.2 resnet_pva_gad
+
+`run_fcpi.sh` 读取 checkpoint 的 `arch.type` 后选择 `ResNetPVAGadFCPI`。启动与查看日志：
+
+```bash
+bash run_fcpi.sh
+RUN_ID="$(ls -td data/runs/fcpi_* | head -1 | xargs basename)"
+tail -f "data/runs/$RUN_ID/info.log"
+```
+
+该实现使用 `resnet_pva_gad_square_tokens` state codec、`sd_64x64_underpromo9` move codec，并输出：
 
 $$
 f_\theta(s)=\left(\pi_\theta(s),V_\theta(s),A_\theta(s,a)\right)
 $$
 
-状态包含当前行棋方，PVA 使用 minimax Dueling 定义：
+每轮冻结 `current.pth` 为 $\theta_0$，从同一参数初始化 candidate $\theta$。$\pi_0$、$V_0$ 与 $A_0$ 来自冻结模型。Value、反事实 $Q$ 和 Advantage 使用 side-to-move 视角。
+
+状态包含当前行棋方，`resnet_pva_gad` 使用 minimax Dueling 定义：
 
 $$
 Q(s,a)=-V(T(s,a))
@@ -752,7 +841,40 @@ $$
 +\frac{\epsilon}{|\mathcal A(s)|}
 $$
 
-当前脚本使用 $\beta=0.5$、$T_b=1.0$、$\epsilon=0.03$。反事实候选取 $R_0$ 排名前 $K=8$ 的招法，并包含实际走法；后续 rollout 同样选择 $R_0$ 的 top1。
+当前脚本使用 $\beta=0.5$、$T_b=1.0$、$\epsilon=0.03$。反事实候选取 $R_0$ 排名前 $K=8$ 的招法，并包含实际走法。后续 rollout 同样选择 $R_0$ 的 top1。
+
+轨迹终点使用正式终局 $z_T\in\{-1,0,1\}$。达到 `max-plies` 的未终局轨迹使用该架构冻结 Value bootstrap：
+
+$$
+G_T=
+\begin{cases}
+z_T,&\text{正式终局}\\
+V_0(s_T),&\text{达到 max-plies}
+\end{cases}
+$$
+
+该架构以 $\lambda_{TD}=0.85$ 独立计算 TD($\lambda$) 回报：
+
+$$
+G_t=\operatorname{clip}\left(
+-\left[(1-\lambda_{TD})V_0(s_{t+1})+\lambda_{TD}G_{t+1}\right],
+-1,1
+\right)
+$$
+
+对候选 $a$ 先走一步，再沿冻结模型的 $R_0$ top1 rollout。深度 $d$ 的冻结 Value 转回根节点视角：
+
+$$
+e_d(s,a)=(-1)^dV_0(s_d)
+$$
+
+终局分支使用真实终局值。该架构以 $\lambda_{CF}=0.85$ 混合自适应多深度结果：
+
+$$
+Q_{CF}(s,a)=
+(1-\lambda_{CF})\sum_{d=1}^{D-1}\lambda_{CF}^{d-1}e_d(s,a)
++\lambda_{CF}^{D-1}e_D(s,a)
+$$
 
 反事实展开结果与冻结模型的 dueling Q 混合：
 
@@ -766,7 +888,7 @@ $$
 Q'_c(s,a_t)=(1-w_p)Q_c(s,a_t)+w_pG_t
 $$
 
-反事实候选形成最终动作值，轨迹 TD 回报只通过实际走法的 $Q'_c$ 进入。PVA 的改进 Value 取已评价候选动作最大值：
+反事实候选形成最终动作值，轨迹 TD 回报只通过实际走法的 $Q'_c$ 进入。`resnet_pva_gad` 的改进 Value 取已评价候选动作最大值：
 
 $$
 V^*(s)=\max_{a\in C(s)}Q'_c(s,a)
@@ -781,6 +903,45 @@ $$
 未展开动作使用冻结模型的 $V_0+A_0$，并截断到不高于 $V^*(s)$，作为 Policy soft target 的保守背景值。训练不单独回归 A，而是组合动作价值：
 
 $$
+\widehat Q(s,a)=
+\begin{cases}
+Q'_c(s,a),&a\in C(s)\\
+\min\left(Q_0(s,a),V^*(s)\right),&a\notin C(s)
+\end{cases}
+$$
+
+$$
+\pi^*(a\mid s)=
+\frac{
+\pi_0(a\mid s)^\rho
+\exp\left((\widehat Q(s,a)-V_0(s))/\tau_\pi\right)
+}{
+\sum_b\pi_0(b\mid s)^\rho
+\exp\left((\widehat Q(s,b)-V_0(s))/\tau_\pi\right)
+}
+$$
+
+脚本使用 $\rho=1.0$、$\tau_\pi=0.25$。
+
+令 $p_\theta$ 为 candidate 在合法招法上的 Policy softmax：
+
+$$
+L_{policy}=-\mathbb E_s\sum_a\pi^*(a\mid s)\log p_\theta(a\mid s)
+$$
+
+$$
+L_V=\operatorname{SmoothL1}\left(V_\theta(s),V^*(s)\right)
+$$
+
+$$
+L_{KL}=D_{KL}\left(p_\theta(\cdot\mid s)\parallel\pi_0(\cdot\mid s)\right)
+$$
+
+$$
+H(p_\theta)=-\sum_a p_\theta(a\mid s)\log p_\theta(a\mid s)
+$$
+
+$$
 Q_\theta(s,a)=\operatorname{clip}\left(V_\theta(s)+A_\theta(s,a),-1,1\right)
 $$
 
@@ -791,92 +952,37 @@ $$
 总损失为：
 
 $$
-L_{PVA}=L_{policy}+L_V+0.5L_Q+0.05L_{KL}-0.001H(p_\theta)
+L_{resnet\_pva\_gad}=L_{policy}+L_V+0.5L_Q+0.05L_{KL}-0.001H(p_\theta)
 $$
 
 $L_Q$ 只在反事实候选上计算，并通过 $V+A$ 同时更新 Value head、Advantage head 与共享 trunk。Policy、Value、Q 和 Advantage 目标由冻结的 $\theta_0$ 与反事实展开预先生成，训练时作为常量。
 
-### 9.4 参数更新与重复 state 聚合
+该架构在本轮数据内按编码 state 聚合重复 position：Policy target、Value target 和相同候选的反事实 $Q$ 分别取均值，再按聚合后的 $V^*$ 与候选 $Q$ 重新计算 $A^*=Q-V^*$。优化器为 AdamW，脚本使用学习率 $2\times10^{-5}$、weight decay $10^{-4}$ 和梯度范数裁剪 $1.0$。
 
-两个架构都使用 AdamW，当前脚本学习率为 $10^{-5}$、weight decay 为 $10^{-4}$，梯度范数裁剪为 $1.0$：
+该架构的 run 目录、paired-opening arena、历史模型稳定赛、原子晋升和日志文件沿用 9.1 所列运行流程。这些运行设施不改变 `resnet_pva_gad` 的目标或损失方程。
 
-$$
-\theta\leftarrow\operatorname{AdamW}\left(\theta,\nabla_\theta L,10^{-5},10^{-4}\right)
-$$
-
-反事实目标生成后，相同编码 state 在本轮训练数据内统一聚合。Value 与 Policy 目标取平均：
-
-$$
-\overline G(s)=\frac{1}{N_s}\sum_{i=1}^{N_s}G_i(s)
-$$
-
-$$
-\overline\pi^*(a\mid s)=\frac{1}{N_s}\sum_{i=1}^{N_s}\pi_i^*(a\mid s)
-$$
-
-同一候选招法的 $Q$ 只在实际展开过该候选的记录之间取平均；`resnet_pva_gad` 随后使用聚合后的 $V$ 和 $Q$ 重新计算 $A=Q-V$，保持 Dueling 定义。Arena 与 acceptance 不进入梯度方程，只负责 candidate 晋升 gate。
-
-`run_fcpi.sh` 默认使用 50% startpos 与 50% 均势开局书起点。开局书数量不足时，每轮完整洗牌后循环使用全部开局，使复用次数均匀；arena 继续使用唯一 paired openings。常用参数：
+`run_fcpi.sh` 中该架构的主要参数：
 
 ```text
-MODEL=models/chessnet.pth
-ITERATIONS=10
-GAMES_PER_ITER=1000
-GAMES_IN_FLIGHT=100
-MAX_PLIES=240
-POSITIONS_PER_GAME=200
-STARTPOS_FRACTION=0.50
-EPOCHS=15
-TRAIN_MAX_STEPS=2000
-EVAL_GAMES=400
-EVAL_SEARCH_TYPE=closed
-EVAL_SIMS=0
-EVAL_MIN_NET_WINS=4
-EVAL_REPETITION_POLICY_PENALTY=0.15
-EVAL_INSTANT_MATE_FIRST=true
-EVAL_HISTORY_GAMES=100
-EVAL_HISTORY_POOL_SIZE=3
-```
-
-自适应多步参数只输入一次。以下为 `resnet_pv_linear` 默认值；加载 `resnet_pva_gad` 时，同名参数会采用该架构在脚本中定义的默认值：
-
-```text
-COUNTERFACTUAL_TOPK=6
+TD_LAMBDA=0.85
+COUNTERFACTUAL_TOPK=8
 COUNTERFACTUAL_MIN_PLIES=2
 COUNTERFACTUAL_MAX_PLIES=6
 COUNTERFACTUAL_TARGET_AVERAGE_PLIES=4.0
-COUNTERFACTUAL_LAMBDA=0.80
+COUNTERFACTUAL_LAMBDA=0.85
+BEHAVIOR_TEMPERATURE=1.00
+UNIFORM_MIX=0.03
+BEHAVIOR_ADVANTAGE_WEIGHT=0.50
+POLICY_TEMPERATURE=0.25
+PRIOR_POWER=1.0
+SUCCESSOR_WEIGHT=0.75
+PLAYED_RETURN_WEIGHT=0.50
+DUELING_Q_WEIGHT=0.50
 ```
 
-所有候选至少展开 `MIN_PLIES`。之后根据相邻局面的 Bellman residual、不同深度的 $Q$ 变化和候选在根节点的竞争性计算优先级，将剩余评价预算集中到高优先级分支，单个分支最多展开到 `MAX_PLIES`。`TARGET_AVERAGE_PLIES` 直接控制每批候选的目标平均展开深度；终局分支或最大深度限制可能使实际值略低。`LAMBDA` 以几何权重混合各深度 $Q$；该过程不维护 visits 和搜索树。
+所有候选至少展开 `COUNTERFACTUAL_MIN_PLIES`。之后该架构根据 Bellman residual、相邻深度 $Q$ 变化和根节点候选竞争性分配剩余预算，单个候选最多展开到 `COUNTERFACTUAL_MAX_PLIES`，整体目标平均深度由 `COUNTERFACTUAL_TARGET_AVERAGE_PLIES` 控制。
 
-`info.log` 中的 `counterfactual summary` 会输出 `average_depth`、`depth_histogram`、`target_average_plies` 和 `budget_utilization`，用于确认实际计算量与目标预算。
-
-自对战先在完整轨迹上计算 TD($\lambda$)，再按局处理训练 position：同一局中编码后完全相同的模型 state 只保留一次；超过 `POSITIONS_PER_GAME` 时均匀无放回采样，并保持选中 position 的时间顺序。生成反事实目标后，本轮全部训练记录按编码 state 聚合，平均 policy/value 及对应候选目标，避免常见开局前缀按重复次数主导 loss。日志与 `summary.json` 会记录采样、起点复用和聚合数量。
-
-达到 `MAX_PLIES` 时，正式规则已经判定的将死、逼和、子力不足、重复或五十回合结果照常使用；仍未终局的轨迹使用当前模型对尾部局面的连续 Value bootstrap，不强制改写为和棋。
-
-输出：
-
-```text
-data/runs/<run-id>/info.log
-data/runs/<run-id>/pid
-data/runs/<run-id>/fcpi_iter_*.h5
-data/runs/<run-id>/summary.json
-models/runs/<run-id>/current.pth
-models/runs/<run-id>/initial.pth
-models/runs/<run-id>/candidate_iter_*.pth
-```
-
-每轮 candidate 训练完成后直接与本 run 的 `current.pth` 进行 paired arena。主赛达到 `EVAL_MIN_NET_WINS` 后才运行历史稳定赛；主赛失败时跳过历史赛。
-
-`initial.pth` 保存本 run 的输入模型。历史池只收录 `initial.pth` 和真正晋升过的 `candidate_iter_*.pth`，并排除当前模型与重复 checkpoint。池超过 `EVAL_HISTORY_POOL_SIZE` 时，在时间轴上均匀保留里程碑。Candidate 分别与每个选中的历史模型使用成对开局和相同搜索参数比赛，每组都必须满足 `net_wins >= EVAL_MIN_NET_WINS`。主赛和历史赛复用同一个门槛；所有历史项通过后，candidate 原子写入本 run 的 `current.pth`。`EVAL_HISTORY_GAMES=0` 或 `EVAL_HISTORY_POOL_SIZE=0` 可关闭历史稳定赛。
-
-历史列表、去重、时间轴抽样和稳定性判断均由 `fcpi.py` 管理。`arena.py` 只执行指定的两模型对战并返回统计；`acceptance.py` 根据 `net_wins` 和同一个 `EVAL_MIN_NET_WINS` 计算无状态 gate，不保存历史池。
-
-`EVAL_REPETITION_POLICY_PENALTY` 与 `EVAL_INSTANT_MATE_FIRST` 同时作用于主 Arena 和历史稳定赛，并适用于所有已注册模型架构以及 `closed`、`only-mcts` 两种 search type。它们不会进入 FCPI 自对战采样或梯度目标。
-
-FCPI 提供 policy/value/advantage 的可学习改进信号；实际棋力提升仍由 arena 结果确认。目标网络误差、自对战分布偏移和有限反事实候选都会影响结果，因此单轮 loss 下降不等价于 Elo 上升。
+同一盘中的相同 `resnet_pva_gad_square_tokens` state 只保留一次。超过 `POSITIONS_PER_GAME` 时均匀无放回采样。脚本默认 50% startpos 与 50% 开局书起点，开局书不足时完整洗牌后循环使用。
 
 ---
 
@@ -920,7 +1026,7 @@ Simulator 功能：
 - `Settings`：选择模型、设备和 search 参数。
 - 棋盘：双方轮流走子，自动显示当前局面候选。
 - `Close / Open`：暂停或恢复自动候选。
-- `Reset FEN`：载入 FEN；空输入恢复 `startpos`。
+- `Reset FEN`：载入 FEN。空输入恢复 `startpos`。
 - `Import PGN` / `Save PGN`：导入或保存主线棋谱。
 - `Board state`：复制 FEN 和 PGN。
 
@@ -944,7 +1050,7 @@ Windows 一键启动：
 run_stadium.vbs
 ```
 
-Stadium 的 `Settings` 分别配置白方与黑方的 UCI command、UCI options JSON 和每步思考时间，也可配置显示间隔与最大 ply；`Start FEN` 设置单盘起始局面。双方资源可以不同，例如为 Gadidae 分配更长思考时间、为 Stockfish 设置独立的 `Threads` 与 `Hash`。`Moves` 在当前行棋方尚未落子时实时显示其最新 MultiPV，`*` 标记当前暂定首选；`UCI analysis` 同步显示该候选的 score、深度、nodes 和 PV。收到 `bestmove` 后棋盘落子并清空旧分析，面板随后切换到下一行棋方。Stadium 始终运行一盘可视化对局，并保留人工启动、暂停和停止。
+Stadium 的 `Settings` 分别配置白方与黑方的 UCI command、UCI options JSON 和每步思考时间，也可配置显示间隔与最大 ply。`Start FEN` 设置单盘起始局面。双方资源可以不同，例如为 Gadidae 分配更长思考时间、为 Stockfish 设置独立的 `Threads` 与 `Hash`。`Moves` 在当前行棋方尚未落子时实时显示其最新 MultiPV，`*` 标记当前暂定首选。`UCI analysis` 同步显示该候选的 score、深度、nodes 和 PV。收到 `bestmove` 后棋盘落子并清空旧分析，面板随后切换到下一行棋方。Stadium 始终运行一盘可视化对局，并保留人工启动、暂停和停止。
 
 ---
 
@@ -1073,9 +1179,9 @@ tail -f ".bot/runs/$RUN_ID/info.log"
 bash .bot/stop_lichess_bot.sh "$RUN_ID"
 ```
 
-启动脚本通过 `.bot/lichess-bot.lock` 保证同一项目同时只有一个 lichess-bot 实例。`RATE_LIMITING_DELAY_MS` 写入 lichess-bot 的 `engine.rate_limiting_delay`，表示提交一步棋后等待的毫秒数；默认 `1000`，主要用于降低短时间内连续 move 请求的概率。
+启动脚本通过 `.bot/lichess-bot.lock` 保证同一项目同时只有一个 lichess-bot 实例。`RATE_LIMITING_DELAY_MS` 写入 lichess-bot 的 `engine.rate_limiting_delay`，表示提交一步棋后等待的毫秒数。默认 `1000`，主要用于降低短时间内连续 move 请求的概率。
 
-Lichess API 要求请求串行执行。收到 HTTP `429` 后至少等待完整一分钟，再继续 API 活动；部分 endpoint 的限制会持续更久。等待期间保留当前进程，反复停止和重启会重新建立 event stream，并不会缩短服务端限制。event/game stream 的 `timeout=15` 是连接健康检查时间，保持该值即可。持续遇到 `429` 时检查后台进程数量，并确认代理出口 IP 没有被其他程序共享使用。官方说明：<https://lichess.org/page/api-tips>。
+Lichess API 要求请求串行执行。收到 HTTP `429` 后至少等待完整一分钟，再继续 API 活动。部分 endpoint 的限制会持续更久。等待期间保留当前进程，反复停止和重启会重新建立 event stream，并不会缩短服务端限制。event/game stream 的 `timeout=15` 是连接健康检查时间，保持该值即可。持续遇到 `429` 时检查后台进程数量，并确认代理出口 IP 没有被其他程序共享使用。官方说明：<https://lichess.org/page/api-tips>。
 
 云端使用本地代理时，先保持 SSH 反向隧道：
 
@@ -1162,7 +1268,7 @@ python src/inspection.py --path data/games-pv-linear.h5
 python src/inspection.py --path data/games-pva-gad.h5
 ```
 
-`inspection.py` 只检查 `preprocess.py` 生成的 supervised HDF5；FCPI 的架构专属数据由 `fcpi.py` 在生成和读取时校验。
+`inspection.py` 只检查 `preprocess.py` 生成的 supervised HDF5。FCPI 的架构专属数据由 `fcpi.py` 在生成和读取时校验。
 
 ---
 

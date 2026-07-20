@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
-import chess
 import numpy as np
 import torch
 
@@ -19,7 +18,7 @@ class NetworkOutput:
     expansion_payload: Any = None
 
 
-class DecisionProfile:
+class InferenceProfile:
     name = "base"
     arch_type = ""
 
@@ -36,6 +35,23 @@ class DecisionProfile:
         return get_move_codec(self.spec.move_encoding)
 
     def evaluate_tensor(self, model, tensor: torch.Tensor) -> NetworkOutput:
+        raise NotImplementedError
+
+    def output_payload_to_numpy(self, output: NetworkOutput):
+        raise NotImplementedError
+
+    def merge_payloads(self, payloads: List[Any]):
+        raise NotImplementedError
+
+    def payload_for_index(self, payloads, index: int):
+        raise NotImplementedError
+
+
+class ResNetPVLinearInference(InferenceProfile):
+    name = "resnet_pv_linear_inference"
+    arch_type = RESNET_PV_LINEAR
+
+    def evaluate_tensor(self, model, tensor: torch.Tensor) -> NetworkOutput:
         logits, value = model(tensor)
         return NetworkOutput(policy_logits=logits, value=value)
 
@@ -48,45 +64,16 @@ class DecisionProfile:
     def payload_for_index(self, payloads, index: int):
         return None
 
-    def child_profile_state(
-        self,
-        expansion_payload,
-        move: chess.Move,
-        parent_value: float,
-    ) -> Dict[str, Any]:
-        return {}
 
-    def selection_q_from_parent(
-        self,
-        child,
-        parent_fpu: float,
-        fpu_penalty: float,
-    ) -> float:
-        if child.visit_count > 0:
-            return float(-child.q)
-        return float(parent_fpu)
-
-    def root_row_fields(self, child) -> Dict[str, Any]:
-        return {}
-
-
-class ResNetPVLinearDecision(DecisionProfile):
-    name = "resnet_pv_linear_mcts"
-    arch_type = RESNET_PV_LINEAR
-
-
-class ResNetPVAGadDecision(DecisionProfile):
-    name = "resnet_pva_gad_mcts"
+class ResNetPVAGadInference(InferenceProfile):
+    name = "resnet_pva_gad_inference"
     arch_type = RESNET_PVA_GAD
-    # Project term: one pseudo-visit is a statistical prior weight of one,
-    # not a traversed MCTS edge or a value observation.
-    q_prior_visits = 1.0
 
     def evaluate_tensor(self, model, tensor: torch.Tensor) -> NetworkOutput:
         heads = model.forward_heads(tensor)
         advantages = heads.get("advantages")
         if advantages is None:
-            raise RuntimeError("resnet_pva_gad decision profile received invalid model heads")
+            raise RuntimeError("resnet_pva_gad inference profile received invalid model heads")
         return NetworkOutput(
             policy_logits=heads["policy_logits"],
             value=heads["value"],
@@ -95,7 +82,7 @@ class ResNetPVAGadDecision(DecisionProfile):
 
     def output_payload_to_numpy(self, output: NetworkOutput):
         if output.expansion_payload is None:
-            raise RuntimeError("resnet_pva_gad decision profile received no payload")
+            raise RuntimeError("resnet_pva_gad inference profile received no payload")
         return output.expansion_payload.detach().float().cpu().numpy()
 
     def merge_payloads(self, payloads: List[Any]):
@@ -105,69 +92,25 @@ class ResNetPVAGadDecision(DecisionProfile):
 
     def payload_for_index(self, payloads, index: int):
         if payloads is None:
-            raise RuntimeError("resnet_pva_gad decision profile received no batch payload")
+            raise RuntimeError("resnet_pva_gad inference profile received no batch payload")
         return payloads[index]
 
-    def child_profile_state(
-        self,
-        expansion_payload,
-        move: chess.Move,
-        parent_value: float,
-    ) -> Dict[str, Any]:
-        if expansion_payload is None:
-            raise RuntimeError("resnet_pva_gad decision profile received no action payload")
-        index = self.move_codec.move_to_index(move)
-        if index >= len(expansion_payload):
-            raise RuntimeError(f"resnet_pva_gad payload missing action index {index}")
-        advantage = float(np.clip(float(expansion_payload[index]), -2.0, 0.0))
-        return {
-            "adv": advantage,
-            "q_prior": float(np.clip(float(parent_value) + advantage, -1.0, 1.0)),
-        }
 
-    def selection_q_from_parent(
-        self,
-        child,
-        parent_fpu: float,
-        fpu_penalty: float,
-    ) -> float:
-        try:
-            q_prior = float(child.profile_state["q_prior"])
-        except KeyError as exc:
-            raise RuntimeError("resnet_pva_gad child missing q_prior") from exc
-        if child.visit_count <= 0:
-            return float(np.clip(q_prior - float(fpu_penalty), -1.0, 1.0))
-        visits = float(child.visit_count)
-        empirical_q = float(-child.q)
-        return float(
-            (visits * empirical_q + self.q_prior_visits * q_prior)
-            / (visits + self.q_prior_visits)
-        )
-
-    def root_row_fields(self, child) -> Dict[str, Any]:
-        if child is None or "adv" not in child.profile_state:
-            return {}
-        return {
-            "adv": float(child.profile_state["adv"]),
-            "q_prior": float(child.profile_state["q_prior"]),
-        }
-
-
-PROFILES_BY_ARCH: Dict[str, DecisionProfile] = {
-    RESNET_PV_LINEAR: ResNetPVLinearDecision(),
-    RESNET_PVA_GAD: ResNetPVAGadDecision(),
+INFERENCE_PROFILES_BY_ARCH: Dict[str, InferenceProfile] = {
+    RESNET_PV_LINEAR: ResNetPVLinearInference(),
+    RESNET_PVA_GAD: ResNetPVAGadInference(),
 }
 
 
 def model_arch_type(model) -> str:
     if not hasattr(model, "arch"):
-        raise RuntimeError("model must expose arch() for decision profile selection")
+        raise RuntimeError("model must expose arch() for inference profile selection")
     arch = model.arch()
     arch_type = arch.get("type") if isinstance(arch, dict) else None
-    if arch_type not in PROFILES_BY_ARCH:
-        raise RuntimeError(f"no decision profile registered for arch type {arch_type!r}")
+    if arch_type not in INFERENCE_PROFILES_BY_ARCH:
+        raise RuntimeError(f"no inference profile registered for arch type {arch_type!r}")
     return str(arch_type)
 
 
-def profile_for_model(model) -> DecisionProfile:
-    return PROFILES_BY_ARCH[model_arch_type(model)]
+def inference_profile_for_model(model) -> InferenceProfile:
+    return INFERENCE_PROFILES_BY_ARCH[model_arch_type(model)]

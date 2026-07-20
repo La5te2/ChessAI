@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Set
 import chess
 
 from config import CPUCT, DEFAULT_SIMS, DEVICE
-from decision import profile_for_model
+from decision import inference_profile_for_model
 from game_rules import game_is_over
 from model import load_model
 from search import (
@@ -242,7 +242,7 @@ class UCIEngine:
 
         with contextlib.redirect_stdout(sys.stderr):
             self.model = load_model(path, device=device)
-        self.codec = profile_for_model(self.model).move_codec
+        self.codec = inference_profile_for_model(self.model).move_codec
         self.loaded_model_path = path
         self.loaded_device = device
         return self.model

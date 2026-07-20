@@ -1053,9 +1053,18 @@ class SimulatorApp(ChessGUIBase):
         if not info:
             return
 
+        backend_diagnostic = ""
+        if "fpu_root" in info:
+            backend_diagnostic = f"FPU root: {info.get('fpu_root')}\n"
+        elif "q_prior_penalty_root" in info:
+            backend_diagnostic = (
+                "Q-prior penalty root: "
+                f"{info.get('q_prior_penalty_root')}\n"
+            )
         text = (
             f"Best: {info.get('best_san')} ({info.get('best_move')})\n"
             f"Search: {info.get('search_type')}\n"
+            f"Backend: {info.get('search_backend')}\n"
             f"Partial: {info.get('partial')}\n"
             f"Cancelled: {info.get('cancelled')}\n"
             f"MCTS sims: {info.get('sims_completed')}/"
@@ -1064,7 +1073,7 @@ class SimulatorApp(ChessGUIBase):
             f"Uncertainty: {info.get('uncertainty')}\n"
             f"Value: {info.get('value')}\n"
             f"C-PUCT root: {info.get('c_puct_root')}\n"
-            f"FPU root: {info.get('fpu_root')}\n"
+            f"{backend_diagnostic}"
             f"Expanded nodes: {info.get('nodes')}\n"
             f"NN batches: {info.get('nn_batches')}\n"
             f"Leaf depth avg/max: "

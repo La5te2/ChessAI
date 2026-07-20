@@ -12,13 +12,14 @@ import chess
 import numpy as np
 import torch
 
+from architectures import RESNET_PVA_GAD, RESNET_PV_LINEAR
 from config import (
     CPUCT,
     DEFAULT_SIMS,
     DEVICE,
     MODEL_PATH,
 )
-from decision import profile_for_model
+from decision import inference_profile_for_model
 from evaluator import BatchedEvaluator
 from model import load_model
 
@@ -54,21 +55,18 @@ def normalize_policy(policy: np.ndarray, board: chess.Board, codec) -> np.ndarra
     legal = list(board.legal_moves)
     if not legal:
         return output
-
     total = 0.0
     for move in legal:
         index = codec.move_to_index(move)
-        value = max(0.0, float(policy[index])) if index < len(policy) else 0.0
-        output[index] = value
-        total += value
-
-    if total <= 0:
+        probability = max(0.0, float(policy[index])) if index < len(policy) else 0.0
+        output[index] = probability
+        total += probability
+    if total <= 0.0:
         probability = 1.0 / len(legal)
         for move in legal:
             output[codec.move_to_index(move)] = probability
-    else:
-        output /= total
-    return output
+        return output
+    return output / total
 
 
 def apply_repetition_policy_penalty(
@@ -229,9 +227,9 @@ def normalize_search_type(search_type: str) -> str:
 
 
 class MCTSNode:
-    def __init__(self, prior=0.0, profile_state: Optional[Dict[str, Any]] = None):
+    def __init__(self, prior=0.0, search_state: Optional[Dict[str, Any]] = None):
         self.prior = float(prior)
-        self.profile_state = dict(profile_state or {})
+        self.search_state = dict(search_state or {})
         self.visit_count = 0
         self.value_sum = 0.0
         self.virtual_visits = 0
@@ -247,6 +245,358 @@ class MCTSNode:
         return bool(self.children)
 
 
+class SearchBackend:
+    """Architecture-owned formulas used by the shared MCTS runner."""
+
+    arch_type = ""
+    name = ""
+
+    def __init__(self, inference):
+        if inference.arch_type != self.arch_type:
+            raise RuntimeError(
+                f"search backend {self.name} cannot use inference {inference.arch_type}"
+            )
+        self.inference = inference
+        self.move_codec = inference.move_codec
+
+    def child_search_state(self, expansion_payload, move, parent_value):
+        raise NotImplementedError
+
+    def scheduled_c_puct(self, parent, options):
+        raise NotImplementedError
+
+    def selection_score(self, parent, child, options):
+        raise NotImplementedError
+
+    def root_policy(self, root, board, network_policy):
+        raise NotImplementedError
+
+    def root_value(self, root, network_value):
+        raise NotImplementedError
+
+    def root_uncertainty(self, root):
+        raise NotImplementedError
+
+    def minimum_simulations(self, soft_cap, batch_size, configured_minimum):
+        raise NotImplementedError
+
+    def dynamic_target(self, root, minimum, soft_cap):
+        raise NotImplementedError
+
+    def root_row_fields(self, child):
+        raise NotImplementedError
+
+    def root_diagnostics(self, root, options):
+        raise NotImplementedError
+
+
+class ResNetPVLinearSearchBackend(SearchBackend):
+    """Search formulas for resnet_pv_linear Policy/Value output."""
+
+    arch_type = RESNET_PV_LINEAR
+    name = "resnet_pv_linear_mcts"
+
+    def child_search_state(self, expansion_payload, move, parent_value):
+        return {}
+
+    @staticmethod
+    def _visited_policy_mass(parent):
+        return float(
+            sum(
+                max(0.0, float(child.prior))
+                for child in parent.children.values()
+                if child.visit_count > 0
+            )
+        )
+
+    def _fpu(self, parent, reduction):
+        parent_q = float(parent.q) if parent.visit_count > 0 else 0.0
+        penalty = max(0.0, float(reduction)) * math.sqrt(
+            self._visited_policy_mass(parent)
+        )
+        return float(np.clip(parent_q - penalty, -1.0, 1.0))
+
+    def scheduled_c_puct(self, parent, options):
+        visits = max(0.0, float(parent.visit_count + parent.virtual_visits))
+        base = max(1.0, float(options.c_puct_base))
+        growth = max(0.0, float(options.c_puct_factor)) * math.log(
+            (visits + base + 1.0) / base
+        )
+        return max(0.0, float(options.c_puct) + growth)
+
+    def selection_score(self, parent, child, options):
+        # A child stores Value from its own side-to-move perspective, so a
+        # visited edge is negated before it becomes the parent's Q(s, a).
+        exploitation = (
+            float(-child.q)
+            if child.visit_count > 0
+            else self._fpu(parent, options.fpu_reduction)
+        )
+        visits = child.visit_count + child.virtual_visits
+        exploration = (
+            self.scheduled_c_puct(parent, options)
+            * float(child.prior)
+            * math.sqrt(parent.visit_count + parent.virtual_visits + 1.0)
+            / (1.0 + visits)
+        )
+        virtual_penalty = float(options.virtual_loss) * child.virtual_visits
+        return float(exploitation + exploration - virtual_penalty)
+
+    def root_policy(self, root, board, network_policy):
+        policy = np.zeros(self.move_codec.action_size, dtype=np.float32)
+        for move, child in root.children.items():
+            policy[self.move_codec.move_to_index(move)] = (
+                float(child.visit_count) + float(child.prior)
+            )
+        if float(policy.sum()) <= 0.0:
+            policy = np.asarray(network_policy, dtype=np.float32)
+        return normalize_policy(policy, board, self.move_codec)
+
+    def root_value(self, root, network_value):
+        return float(root.q if root.visit_count > 0 else network_value)
+
+    def root_uncertainty(self, root):
+        children = list(root.children.values())
+        if len(children) <= 1:
+            return 0.0
+        counts = np.asarray([child.visit_count for child in children], dtype=np.float64)
+        if counts.sum() > 0:
+            distribution = counts / counts.sum()
+        else:
+            priors = np.asarray(
+                [max(0.0, child.prior) for child in children],
+                dtype=np.float64,
+            )
+            distribution = priors / max(1e-12, priors.sum())
+        entropy = -float(
+            np.sum(distribution * np.log(np.maximum(distribution, 1e-12)))
+        )
+        entropy /= max(1e-12, math.log(len(children)))
+        ordered = sorted(
+            children,
+            key=lambda child: (child.visit_count, child.prior),
+            reverse=True,
+        )
+        first = float(ordered[0].visit_count)
+        second = float(ordered[1].visit_count)
+        visit_uncertainty = 1.0 - abs(first - second) / max(1.0, first + second)
+        q_first = -float(ordered[0].q)
+        q_second = -float(ordered[1].q)
+        q_uncertainty = 1.0 - min(1.0, abs(q_first - q_second) / 0.50)
+        return float(
+            np.clip(
+                0.50 * entropy + 0.35 * visit_uncertainty + 0.15 * q_uncertainty,
+                0.0,
+                1.0,
+            )
+        )
+
+    def minimum_simulations(self, soft_cap, batch_size, configured_minimum):
+        minimum = (
+            int(configured_minimum)
+            if int(configured_minimum) > 0
+            else max(int(batch_size), int(soft_cap) // 4)
+        )
+        return max(1, min(int(soft_cap), minimum)) if int(soft_cap) > 0 else 0
+
+    def dynamic_target(self, root, minimum, soft_cap):
+        uncertainty = self.root_uncertainty(root)
+        desired = minimum + int(
+            math.ceil(uncertainty * max(0, soft_cap - minimum))
+        )
+        return max(minimum, min(soft_cap, desired))
+
+    def root_row_fields(self, child):
+        return {}
+
+    def root_diagnostics(self, root, options):
+        return {
+            "fpu_reduction": float(options.fpu_reduction),
+            "fpu_root": self._fpu(root, options.fpu_reduction),
+        }
+
+
+class ResNetPVAGadSearchBackend(SearchBackend):
+    """Search formulas for resnet_pva_gad Policy/Value/Advantage output."""
+
+    arch_type = RESNET_PVA_GAD
+    name = "resnet_pva_gad_mcts"
+    # A pseudo-visit gives Q_prior one statistical sample of weight without
+    # incrementing visit_count or value_sum.
+    q_prior_visits = 1.0
+
+    def child_search_state(self, expansion_payload, move, parent_value):
+        if expansion_payload is None:
+            raise RuntimeError("resnet_pva_gad backend received no action payload")
+        index = self.move_codec.move_to_index(move)
+        if index >= len(expansion_payload):
+            raise RuntimeError(f"resnet_pva_gad payload missing action index {index}")
+        advantage = float(np.clip(float(expansion_payload[index]), -2.0, 0.0))
+        return {
+            "adv": advantage,
+            "q_prior": float(np.clip(float(parent_value) + advantage, -1.0, 1.0)),
+        }
+
+    @staticmethod
+    def _visited_policy_mass(parent):
+        return float(
+            sum(
+                max(0.0, float(child.prior))
+                for child in parent.children.values()
+                if child.visit_count > 0
+            )
+        )
+
+    def _q_prior_penalty(self, parent, reduction):
+        return float(
+            max(0.0, float(reduction))
+            * math.sqrt(self._visited_policy_mass(parent))
+        )
+
+    def _exploitation(self, parent, child, options):
+        try:
+            q_prior = float(child.search_state["q_prior"])
+        except KeyError as exc:
+            raise RuntimeError("resnet_pva_gad edge is missing q_prior") from exc
+        if child.visit_count <= 0:
+            return float(
+                np.clip(
+                    q_prior - self._q_prior_penalty(parent, options.fpu_reduction),
+                    -1.0,
+                    1.0,
+                )
+            )
+        visits = float(child.visit_count)
+        empirical_q = float(-child.q)
+        return float(
+            (visits * empirical_q + self.q_prior_visits * q_prior)
+            / (visits + self.q_prior_visits)
+        )
+
+    def scheduled_c_puct(self, parent, options):
+        visits = max(0.0, float(parent.visit_count + parent.virtual_visits))
+        base = max(1.0, float(options.c_puct_base))
+        growth = max(0.0, float(options.c_puct_factor)) * math.log(
+            (visits + base + 1.0) / base
+        )
+        return max(0.0, float(options.c_puct) + growth)
+
+    def selection_score(self, parent, child, options):
+        # For resnet_pva_gad, Q_select blends the empirical parent-perspective
+        # return with the architecture's V+A action prior. It is distinct from
+        # the empirical Q used by the resnet_pv_linear backend.
+        exploitation = self._exploitation(parent, child, options)
+        visits = child.visit_count + child.virtual_visits
+        exploration = (
+            self.scheduled_c_puct(parent, options)
+            * float(child.prior)
+            * math.sqrt(parent.visit_count + parent.virtual_visits + 1.0)
+            / (1.0 + visits)
+        )
+        virtual_penalty = float(options.virtual_loss) * child.virtual_visits
+        return float(exploitation + exploration - virtual_penalty)
+
+    def root_policy(self, root, board, network_policy):
+        policy = np.zeros(self.move_codec.action_size, dtype=np.float32)
+        for move, child in root.children.items():
+            policy[self.move_codec.move_to_index(move)] = (
+                float(child.visit_count) + float(child.prior)
+            )
+        if float(policy.sum()) <= 0.0:
+            policy = np.asarray(network_policy, dtype=np.float32)
+        return normalize_policy(policy, board, self.move_codec)
+
+    def root_value(self, root, network_value):
+        return float(root.q if root.visit_count > 0 else network_value)
+
+    def root_uncertainty(self, root):
+        children = list(root.children.values())
+        if len(children) <= 1:
+            return 0.0
+        counts = np.asarray([child.visit_count for child in children], dtype=np.float64)
+        if counts.sum() > 0:
+            distribution = counts / counts.sum()
+        else:
+            priors = np.asarray(
+                [max(0.0, child.prior) for child in children],
+                dtype=np.float64,
+            )
+            distribution = priors / max(1e-12, priors.sum())
+        entropy = -float(
+            np.sum(distribution * np.log(np.maximum(distribution, 1e-12)))
+        )
+        entropy /= max(1e-12, math.log(len(children)))
+        ordered = sorted(
+            children,
+            key=lambda child: (child.visit_count, child.prior),
+            reverse=True,
+        )
+        first = float(ordered[0].visit_count)
+        second = float(ordered[1].visit_count)
+        visit_uncertainty = 1.0 - abs(first - second) / max(1.0, first + second)
+        # Q_MCTS is kept empirical here. Q_prior guides edge selection but is
+        # not treated as a leaf observation when sizing the remaining budget.
+        q_first = -float(ordered[0].q)
+        q_second = -float(ordered[1].q)
+        q_uncertainty = 1.0 - min(1.0, abs(q_first - q_second) / 0.50)
+        return float(
+            np.clip(
+                0.50 * entropy + 0.35 * visit_uncertainty + 0.15 * q_uncertainty,
+                0.0,
+                1.0,
+            )
+        )
+
+    def minimum_simulations(self, soft_cap, batch_size, configured_minimum):
+        minimum = (
+            int(configured_minimum)
+            if int(configured_minimum) > 0
+            else max(int(batch_size), int(soft_cap) // 4)
+        )
+        return max(1, min(int(soft_cap), minimum)) if int(soft_cap) > 0 else 0
+
+    def dynamic_target(self, root, minimum, soft_cap):
+        uncertainty = self.root_uncertainty(root)
+        desired = minimum + int(
+            math.ceil(uncertainty * max(0, soft_cap - minimum))
+        )
+        return max(minimum, min(soft_cap, desired))
+
+    def root_row_fields(self, child):
+        if child is None or "adv" not in child.search_state:
+            return {}
+        return {
+            "adv": float(child.search_state["adv"]),
+            "q_prior": float(child.search_state["q_prior"]),
+        }
+
+    def root_diagnostics(self, root, options):
+        return {
+            "q_prior_penalty_reduction": float(options.fpu_reduction),
+            "q_prior_penalty_root": self._q_prior_penalty(
+                root,
+                options.fpu_reduction,
+            ),
+        }
+
+
+SEARCH_BACKENDS = {
+    RESNET_PV_LINEAR: ResNetPVLinearSearchBackend,
+    RESNET_PVA_GAD: ResNetPVAGadSearchBackend,
+}
+
+
+def search_backend_for_model(model):
+    inference = inference_profile_for_model(model)
+    try:
+        backend_type = SEARCH_BACKENDS[inference.arch_type]
+    except KeyError as exc:
+        raise RuntimeError(
+            f"no search backend registered for arch type {inference.arch_type!r}"
+        ) from exc
+    return backend_type(inference)
+
+
 @dataclass
 class SearchResult:
     move: chess.Move
@@ -257,38 +607,6 @@ class SearchResult:
     info: Dict[str, Any]
 
 
-def root_uncertainty(root: MCTSNode) -> float:
-    children = list(root.children.values())
-    if len(children) <= 1:
-        return 0.0
-
-    counts = np.asarray([child.visit_count for child in children], dtype=np.float64)
-    if counts.sum() > 0:
-        distribution = counts / counts.sum()
-    else:
-        priors = np.asarray([max(0.0, child.prior) for child in children], dtype=np.float64)
-        distribution = priors / max(1e-12, priors.sum())
-
-    entropy = -float(np.sum(distribution * np.log(np.maximum(distribution, 1e-12))))
-    entropy /= max(1e-12, math.log(len(children)))
-
-    ordered = sorted(children, key=lambda child: (child.visit_count, child.prior), reverse=True)
-    first = float(ordered[0].visit_count)
-    second = float(ordered[1].visit_count)
-    visit_margin_uncertainty = 1.0 - abs(first - second) / max(1.0, first + second)
-
-    q_first = -float(ordered[0].q)
-    q_second = -float(ordered[1].q)
-    q_gap_uncertainty = 1.0 - min(1.0, abs(q_first - q_second) / 0.50)
-
-    uncertainty = (
-        0.50 * entropy
-        + 0.35 * visit_margin_uncertainty
-        + 0.15 * q_gap_uncertainty
-    )
-    return float(max(0.0, min(1.0, uncertainty)))
-
-
 class MCTS:
     """PUCT MCTS with batched neural evaluation and uncertainty-sized budget."""
 
@@ -296,8 +614,8 @@ class MCTS:
         self.model = model
         self.options = options
         self.device = str(device)
-        self.profile = profile_for_model(model)
-        self.codec = self.profile.move_codec
+        self.backend = search_backend_for_model(model)
+        self.codec = self.backend.move_codec
         self.action_size = self.codec.action_size
         self.evaluator = BatchedEvaluator(
             model,
@@ -310,52 +628,14 @@ class MCTS:
         self.total_leaf_depth = 0
         self.leaf_samples = 0
 
-    def _scheduled_c_puct(self, parent: MCTSNode) -> float:
-        visits = max(0.0, float(parent.visit_count + parent.virtual_visits))
-        base = max(1.0, float(self.options.c_puct_base))
-        growth = max(0.0, float(self.options.c_puct_factor)) * math.log(
-            (visits + base + 1.0) / base
-        )
-        return max(0.0, float(self.options.c_puct) + growth)
-
-    def _fpu_value(self, parent: MCTSNode) -> float:
-        parent_q = float(parent.q) if parent.visit_count > 0 else 0.0
-        reduction = self._fpu_penalty(parent)
-        return float(
-            max(-1.0, min(1.0, parent_q - reduction))
-        )
-
-    def _fpu_penalty(self, parent: MCTSNode) -> float:
-        visited_policy_mass = sum(
-            max(0.0, float(child.prior))
-            for child in parent.children.values()
-            if child.visit_count > 0
-        )
-        reduction = max(0.0, float(self.options.fpu_reduction))
-        return float(reduction * math.sqrt(visited_policy_mass))
-
-    def _ucb_score(self, parent: MCTSNode, child: MCTSNode):
-        fpu = self._fpu_value(parent)
-        q_from_parent = self.profile.selection_q_from_parent(
-            child,
-            parent_fpu=fpu,
-            fpu_penalty=self._fpu_penalty(parent),
-        )
-        visits = child.visit_count + child.virtual_visits
-        exploration = (
-            self._scheduled_c_puct(parent)
-            * child.prior
-            * np.sqrt(parent.visit_count + parent.virtual_visits + 1.0)
-            / (1.0 + visits)
-        )
-        penalty = normalize_virtual_loss(self.options.virtual_loss) * child.virtual_visits
-        return q_from_parent + exploration - penalty
+    def _selection_score(self, parent: MCTSNode, child: MCTSNode):
+        return self.backend.selection_score(parent, child, self.options)
 
     def _select_child(self, node: MCTSNode):
         return max(
             node.children.items(),
             key=lambda item: (
-                self._ucb_score(node, item[1]),
+                self._selection_score(node, item[1]),
                 item[1].prior,
                 item[0].uci(),
             ),
@@ -372,12 +652,12 @@ class MCTS:
         priors = self.codec.policy_to_legal_distribution(policy, board, normalize=True)
         if not node.expanded():
             for move, prior in priors.items():
-                profile_state = self.profile.child_profile_state(
+                search_state = self.backend.child_search_state(
                     expansion_payload,
                     move,
                     parent_value=node_value,
                 )
-                node.children[move] = MCTSNode(prior=prior, profile_state=profile_state)
+                node.children[move] = MCTSNode(prior=prior, search_state=search_state)
             self.expanded_nodes += 1
 
     @staticmethod
@@ -410,15 +690,8 @@ class MCTS:
             "max_leaf_depth": int(self.max_leaf_depth),
         }
 
-    def _policy_from_root(self, root: MCTSNode, board: chess.Board, root_policy):
-        policy = np.zeros(self.action_size, dtype=np.float32)
-        for move, child in root.children.items():
-            policy[self.codec.move_to_index(move)] = (
-                float(child.visit_count) + max(0.0, float(child.prior))
-            )
-        if float(policy.sum()) <= 0:
-            policy = np.asarray(root_policy, dtype=np.float32)
-        return normalize_policy(policy, board, self.codec)
+    def _root_stats(self, root: MCTSNode):
+        return self.backend.root_diagnostics(root, self.options)
 
     def _select_leaf(self, root: MCTSNode, root_board: chess.Board):
         node = root
@@ -456,15 +729,15 @@ class MCTS:
             stats = {
                 "sims_completed": 0,
                 "dynamic_target": 0,
-                "decision_profile": self.profile.name,
+                "search_backend": self.backend.name,
                 "uncertainty": 0.0,
                 "expanded_nodes": 0,
                 "nn_batches": 0,
                 "timeout": False,
                 "cancelled": self._cancelled(cancel_event),
                 "root_node": root,
-                "root_c_puct": self._scheduled_c_puct(root),
-                "root_fpu": self._fpu_value(root),
+                "root_c_puct": self.backend.scheduled_c_puct(root, self.options),
+                **self._root_stats(root),
             }
             stats.update(self._depth_stats())
             return np.zeros(self.action_size, dtype=np.float32), terminal, stats
@@ -480,24 +753,26 @@ class MCTS:
             stats = {
                 "sims_completed": 0,
                 "dynamic_target": 0,
-                "decision_profile": self.profile.name,
-                "uncertainty": root_uncertainty(root),
+                "search_backend": self.backend.name,
+                "uncertainty": self.backend.root_uncertainty(root),
                 "expanded_nodes": self.expanded_nodes,
                 "nn_batches": self.nn_batches,
                 "timeout": False,
                 "cancelled": self._cancelled(cancel_event),
                 "root_node": root,
-                "root_c_puct": self._scheduled_c_puct(root),
-                "root_fpu": self._fpu_value(root),
+                "root_c_puct": self.backend.scheduled_c_puct(root, self.options),
+                **self._root_stats(root),
             }
             stats.update(self._depth_stats())
             if progress_callback is not None:
                 progress_callback(policy, float(root_value), dict(stats))
             return policy, float(root_value), stats
 
-        configured_minimum = int(self.options.mcts_min_sims)
-        minimum = configured_minimum if configured_minimum > 0 else max(batch_size, soft_cap // 4)
-        minimum = max(1, min(soft_cap, minimum))
+        minimum = self.backend.minimum_simulations(
+            soft_cap,
+            batch_size,
+            self.options.mcts_min_sims,
+        )
         dynamic_target = minimum
         sims_completed = 0
         uncertainty = 1.0
@@ -525,26 +800,28 @@ class MCTS:
                     and now - last_progress_time < progress_interval
                 ):
                     return
-            policy = self._policy_from_root(root, board, root_policy)
+            policy = self.backend.root_policy(root, board, root_policy)
             stats = {
                 "sims_completed": int(sims_completed),
                 "dynamic_target": int(dynamic_target),
-                "decision_profile": self.profile.name,
-                "uncertainty": float(root_uncertainty(root)),
+                "search_backend": self.backend.name,
+                "uncertainty": float(self.backend.root_uncertainty(root)),
                 "expanded_nodes": int(self.expanded_nodes),
                 "nn_batches": int(self.nn_batches),
                 "timeout": bool(deadline is not None and now >= deadline),
                 "cancelled": self._cancelled(cancel_event),
                 "root_node": root,
-                "root_c_puct": float(self._scheduled_c_puct(root)),
-                "root_fpu": float(self._fpu_value(root)),
+                "root_c_puct": float(
+                    self.backend.scheduled_c_puct(root, self.options)
+                ),
+                **self._root_stats(root),
             }
             stats.update(self._depth_stats())
             last_progress_time = now
             last_progress_sims = sims_completed
             progress_callback(
                 policy,
-                float(root.q if root.visit_count else root_value),
+                self.backend.root_value(root, root_value),
                 stats,
             )
 
@@ -603,7 +880,7 @@ class MCTS:
                 for index, (leaf, leaf_board, path) in enumerate(selected):
                     policy = evaluation.policies[index]
                     value = evaluation.values[index]
-                    payload = self.profile.payload_for_index(
+                    payload = self.backend.inference.payload_for_index(
                         evaluation.expansion_payload,
                         index,
                     )
@@ -613,35 +890,38 @@ class MCTS:
                     sims_completed += 1
 
             if sims_completed >= minimum:
-                uncertainty = root_uncertainty(root)
-                desired = minimum + int(
-                    math.ceil(uncertainty * max(0, soft_cap - minimum))
+                uncertainty = self.backend.root_uncertainty(root)
+                dynamic_target = self.backend.dynamic_target(
+                    root,
+                    minimum,
+                    soft_cap,
                 )
-                dynamic_target = max(minimum, min(soft_cap, desired))
 
             emit_progress()
 
             if not selected and attempts >= max_attempts:
                 break
 
-        policy = self._policy_from_root(root, board, root_policy)
+        policy = self.backend.root_policy(root, board, root_policy)
 
         stats = {
             "sims_completed": int(sims_completed),
             "dynamic_target": int(dynamic_target),
-            "decision_profile": self.profile.name,
-            "uncertainty": float(root_uncertainty(root)),
+            "search_backend": self.backend.name,
+            "uncertainty": float(self.backend.root_uncertainty(root)),
             "expanded_nodes": int(self.expanded_nodes),
             "nn_batches": int(self.nn_batches),
             "timeout": bool(deadline is not None and time.monotonic() >= deadline),
             "cancelled": self._cancelled(cancel_event),
             "root_node": root,
-            "root_c_puct": float(self._scheduled_c_puct(root)),
-            "root_fpu": float(self._fpu_value(root)),
+            "root_c_puct": float(
+                self.backend.scheduled_c_puct(root, self.options)
+            ),
+            **self._root_stats(root),
         }
         stats.update(self._depth_stats())
         emit_progress(force=progress_callback is not None)
-        return policy, float(root.q if root.visit_count else root_value), stats
+        return policy, self.backend.root_value(root, root_value), stats
 
     def run_many(self, boards: List[chess.Board], deadline=None):
         """Run independent MCTS trees while batching leaves across root positions."""
@@ -650,13 +930,11 @@ class MCTS:
 
         batch_size = max(1, int(self.options.mcts_batch_size))
         soft_cap = max(0, int(self.options.mcts_sims))
-        configured_minimum = int(self.options.mcts_min_sims)
-        minimum = (
-            configured_minimum
-            if configured_minimum > 0
-            else max(batch_size, soft_cap // 4)
+        minimum = self.backend.minimum_simulations(
+            soft_cap,
+            batch_size,
+            self.options.mcts_min_sims,
         )
-        minimum = max(1, min(soft_cap, minimum)) if soft_cap > 0 else 0
         deadlines = (
             list(deadline)
             if isinstance(deadline, (list, tuple))
@@ -698,7 +976,7 @@ class MCTS:
                 state = states[state_index]
                 policy = evaluation.policies[batch_index]
                 value = float(evaluation.values[batch_index])
-                payload = self.profile.payload_for_index(
+                payload = self.backend.inference.payload_for_index(
                     evaluation.expansion_payload,
                     batch_index,
                 )
@@ -801,7 +1079,7 @@ class MCTS:
                             state = states[state_index]
                             policy = evaluation.policies[batch_index]
                             value = float(evaluation.values[batch_index])
-                            payload = self.profile.payload_for_index(
+                            payload = self.backend.inference.payload_for_index(
                                 evaluation.expansion_payload,
                                 batch_index,
                             )
@@ -837,14 +1115,14 @@ class MCTS:
             policy = (
                 normalize_policy(state["root_policy"], board, self.codec)
                 if soft_cap <= 0
-                else self._policy_from_root(root, board, state["root_policy"])
+                else self.backend.root_policy(root, board, state["root_policy"])
             )
             leaf_samples = int(state["leaf_samples"])
             stats = {
                 "sims_completed": int(state["sims_completed"]),
                 "dynamic_target": int(state["dynamic_target"] if soft_cap > 0 else 0),
-                "decision_profile": self.profile.name,
-                "uncertainty": float(root_uncertainty(root)),
+                "search_backend": self.backend.name,
+                "uncertainty": float(self.backend.root_uncertainty(root)),
                 "expanded_nodes": int(state["expanded_nodes"]),
                 "nn_batches": int(state["nn_batches"]),
                 "timeout": bool(
@@ -852,15 +1130,17 @@ class MCTS:
                 ),
                 "cancelled": False,
                 "root_node": root,
-                "root_c_puct": float(self._scheduled_c_puct(root)),
-                "root_fpu": float(self._fpu_value(root)),
+                "root_c_puct": float(
+                    self.backend.scheduled_c_puct(root, self.options)
+                ),
+                **self._root_stats(root),
                 "leaf_samples": leaf_samples,
                 "avg_leaf_depth": float(
                     state["total_leaf_depth"] / leaf_samples if leaf_samples else 0.0
                 ),
                 "max_leaf_depth": int(state["max_leaf_depth"]),
             }
-            value = float(root.q if root.visit_count else state["root_value"])
+            value = self.backend.root_value(root, state["root_value"])
             outputs.append((policy, value, stats))
         return outputs
 
@@ -876,22 +1156,21 @@ class MCTS:
         if node.expanded():
             return
         for move, prior in priors.items():
-            profile_state = self.profile.child_profile_state(
+            search_state = self.backend.child_search_state(
                 expansion_payload,
                 move,
                 parent_value=node_value,
             )
-            node.children[move] = MCTSNode(prior=prior, profile_state=profile_state)
+            node.children[move] = MCTSNode(prior=prior, search_state=search_state)
 
-    @staticmethod
-    def _update_batch_dynamic_target(state, minimum: int, soft_cap: int):
+    def _update_batch_dynamic_target(self, state, minimum: int, soft_cap: int):
         if state["sims_completed"] < minimum:
             return
-        uncertainty = root_uncertainty(state["root"])
-        desired = minimum + int(
-            math.ceil(uncertainty * max(0, soft_cap - minimum))
+        state["dynamic_target"] = self.backend.dynamic_target(
+            state["root"],
+            minimum,
+            soft_cap,
         )
-        state["dynamic_target"] = max(minimum, min(soft_cap, desired))
 
 
 class UnifiedSearch:
@@ -905,8 +1184,8 @@ class UnifiedSearch:
         elif device is None:
             device = DEVICE
         self.device = str(device)
-        self.profile = profile_for_model(self.model) if self.model is not None else None
-        self.codec = self.profile.move_codec if self.profile is not None else None
+        self.backend = search_backend_for_model(self.model) if self.model is not None else None
+        self.codec = self.backend.move_codec if self.backend is not None else None
         if self.model is not None:
             self.model.to(self.device)
             self.model.eval()
@@ -1040,7 +1319,11 @@ class UnifiedSearch:
                 row["repetition_penalized"] = True
             if candidate.uci() in instant_mate_moves:
                 row["instant_mate"] = True
-            row.update(self.profile.root_row_fields(child) if self.profile is not None else {})
+            row.update(
+                self.backend.root_row_fields(child)
+                if self.backend is not None
+                else {}
+            )
             root_lines.append(row)
         root_lines.sort(
             key=lambda row: (
@@ -1063,10 +1346,10 @@ class UnifiedSearch:
 
         info = {
             "search_type": search_type,
-            "decision_profile": str(
+            "search_backend": str(
                 stats.get(
-                    "decision_profile",
-                    self.profile.name if self.profile is not None else "uniform_legal",
+                    "search_backend",
+                    self.backend.name if self.backend is not None else "uniform_legal",
                 )
             ),
             "partial": bool(partial),
@@ -1085,8 +1368,6 @@ class UnifiedSearch:
             "c_puct_base": float(self.options.c_puct_base),
             "c_puct_factor": float(self.options.c_puct_factor),
             "c_puct_root": float(stats.get("root_c_puct", self.options.c_puct)),
-            "fpu_reduction": float(self.options.fpu_reduction),
-            "fpu_root": float(stats.get("root_fpu", 0.0)),
             "virtual_loss": normalize_virtual_loss(self.options.virtual_loss),
             "mcts_move": search_move.uci() if search_move else None,
             "piece_count": count_pieces(root_board),
@@ -1100,6 +1381,14 @@ class UnifiedSearch:
             },
             "root": root_lines[: max(1, int(self.options.root_topn))],
         }
+        for key in (
+            "fpu_reduction",
+            "fpu_root",
+            "q_prior_penalty_reduction",
+            "q_prior_penalty_root",
+        ):
+            if key in stats:
+                info[key] = float(stats[key])
         if isinstance(repetition_policy, dict):
             info["repetition_policy"] = dict(repetition_policy)
         if isinstance(instant_mate, dict):
@@ -1142,7 +1431,7 @@ class UnifiedSearch:
             stats = {
                 "sims_completed": 0,
                 "dynamic_target": 0,
-                "decision_profile": self.profile.name if self.profile is not None else "uniform_legal",
+                "search_backend": self.backend.name if self.backend is not None else "uniform_legal",
                 "uncertainty": 0.0,
                 "expanded_nodes": 0,
                 "nn_batches": 1 if self.model is not None else 0,
@@ -1224,7 +1513,7 @@ class UnifiedSearch:
                     {
                         "sims_completed": 0,
                         "dynamic_target": 0,
-                        "decision_profile": "uniform_legal",
+                        "search_backend": "uniform_legal",
                         "uncertainty": 0.0,
                         "expanded_nodes": 0,
                         "nn_batches": 0,
@@ -1251,7 +1540,7 @@ class UnifiedSearch:
                 stats = {
                     "sims_completed": 0,
                     "dynamic_target": 0,
-                    "decision_profile": self.profile.name,
+                    "search_backend": self.backend.name,
                     "uncertainty": 0.0,
                     "expanded_nodes": 0,
                     "nn_batches": 1,
@@ -1388,7 +1677,7 @@ def main():
     result = UnifiedSearch(model, options, device=args.device).search(board)
     print("fen:", board.fen())
     print("best:", result.info["best_san"], result.move.uci())
-    print("decision_profile:", result.info["decision_profile"])
+    print("search_backend:", result.info["search_backend"])
     print("value:", result.value)
     print(
         "mcts:",
@@ -1400,7 +1689,10 @@ def main():
     )
     print("uncertainty:", result.info["uncertainty"])
     print("c_puct_root:", result.info["c_puct_root"])
-    print("fpu_root:", result.info["fpu_root"])
+    if "fpu_root" in result.info:
+        print("fpu_root:", result.info["fpu_root"])
+    if "q_prior_penalty_root" in result.info:
+        print("q_prior_penalty_root:", result.info["q_prior_penalty_root"])
     print("virtual_loss:", result.info["virtual_loss"])
     if "repetition_policy" in result.info:
         print("repetition_policy:", result.info["repetition_policy"])
