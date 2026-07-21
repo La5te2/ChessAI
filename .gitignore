@@ -9,3 +9,15 @@ backup/
 /.bot/lichess-bot/
 /.bot/runs/
 /.bot/*.lock
+/api/libtorch/
+/api/hdf5/
+/api/hdf5-src/
+/api/hdf5-build/
+/api/zlib/
+/api/zlib-src/
+/api/zlib-build/
+/api/chess/
+/api/nlohmann/
+/api/downloads/
+/api/ninja/
+/build/
