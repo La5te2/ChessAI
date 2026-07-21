@@ -5,27 +5,12 @@ import chess
 import numpy as np
 
 
-MOVE_ENCODING_AZ_64X73 = "alphazero_64x73"
-MOVE_ENCODING_SD_64X64_UP9 = "sd_64x64_underpromo9"
-BOARD_SQUARES = 64
-POLICY_PLANES = 73
+# Shared move codec interface
 
-DIRECTIONS = [
-    (-1, -1), (-1, 0), (-1, 1),
-    (0, -1),           (0, 1),
-    (1, -1),  (1, 0),  (1, 1),
-]
-KNIGHT_MOVES = [
-    (-2, -1), (-2, 1),
-    (-1, -2), (-1, 2),
-    (1, -2),  (1, 2),
-    (2, -1),  (2, 1),
-]
+
+BOARD_SQUARES = 64
 UNDERPROMOTION_PIECES = [chess.KNIGHT, chess.BISHOP, chess.ROOK]
-PROMOTION_DCS = [-1, 0, 1]
-UNDERPROMOTION_PLANES = len(PROMOTION_DCS) * len(UNDERPROMOTION_PIECES)
-AZ_64X73_ACTION_SIZE = BOARD_SQUARES * POLICY_PLANES
-SD_64X64_UP9_ACTION_SIZE = BOARD_SQUARES * BOARD_SQUARES + BOARD_SQUARES * UNDERPROMOTION_PLANES
+UNDERPROMOTION_FILE_DELTAS = [-1, 0, 1]
 
 
 @dataclass(frozen=True)
@@ -62,7 +47,26 @@ class MoveCodec:
         return distribution
 
 
-class AlphaZero64x73Codec(MoveCodec):
+# resnet_pv_linear move codec
+
+
+MOVE_ENCODING_AZ_64X73 = "alphazero_64x73"
+ALPHAZERO_POLICY_PLANES = 73
+ALPHAZERO_DIRECTIONS = [
+    (-1, -1), (-1, 0), (-1, 1),
+    (0, -1),           (0, 1),
+    (1, -1),  (1, 0),  (1, 1),
+]
+ALPHAZERO_KNIGHT_MOVES = [
+    (-2, -1), (-2, 1),
+    (-1, -2), (-1, 2),
+    (1, -2),  (1, 2),
+    (2, -1),  (2, 1),
+]
+AZ_64X73_ACTION_SIZE = BOARD_SQUARES * ALPHAZERO_POLICY_PLANES
+
+
+class ResNetPVLinearMoveCodec(MoveCodec):
     def __init__(self):
         super().__init__(MOVE_ENCODING_AZ_64X73, AZ_64X73_ACTION_SIZE)
 
@@ -73,25 +77,48 @@ class AlphaZero64x73Codec(MoveCodec):
         dr, dc = to_rank - from_rank, to_file - from_file
 
         if move.promotion in UNDERPROMOTION_PIECES:
-            if dc not in PROMOTION_DCS:
+            if dc not in UNDERPROMOTION_FILE_DELTAS:
                 raise ValueError(f"bad promotion direction: {move}")
-            dir_idx = PROMOTION_DCS.index(dc)
+            dir_idx = UNDERPROMOTION_FILE_DELTAS.index(dc)
             piece_idx = UNDERPROMOTION_PIECES.index(move.promotion)
-            return from_square * POLICY_PLANES + BOARD_SQUARES + dir_idx * 3 + piece_idx
+            return (
+                from_square * ALPHAZERO_POLICY_PLANES
+                + BOARD_SQUARES
+                + dir_idx * 3
+                + piece_idx
+            )
 
-        for direction, (rr, cc) in enumerate(DIRECTIONS):
+        for direction, (rr, cc) in enumerate(ALPHAZERO_DIRECTIONS):
             for distance in range(1, 8):
                 if dr == rr * distance and dc == cc * distance:
-                    return from_square * POLICY_PLANES + direction * 7 + (distance - 1)
+                    return (
+                        from_square * ALPHAZERO_POLICY_PLANES
+                        + direction * 7
+                        + distance
+                        - 1
+                    )
 
-        for offset, (rr, cc) in enumerate(KNIGHT_MOVES):
+        for offset, (rr, cc) in enumerate(ALPHAZERO_KNIGHT_MOVES):
             if dr == rr and dc == cc:
-                return from_square * POLICY_PLANES + 56 + offset
+                return from_square * ALPHAZERO_POLICY_PLANES + 56 + offset
 
         raise ValueError(f"cannot encode move: {move}")
 
 
-class SourceDestinationUnderpromotionCodec(MoveCodec):
+# resnet_pva_gad move codec
+
+
+MOVE_ENCODING_SD_64X64_UP9 = "sd_64x64_underpromo9"
+SOURCE_DESTINATION_UNDERPROMOTION_PLANES = (
+    len(UNDERPROMOTION_FILE_DELTAS) * len(UNDERPROMOTION_PIECES)
+)
+SD_64X64_UP9_ACTION_SIZE = (
+    BOARD_SQUARES * BOARD_SQUARES
+    + BOARD_SQUARES * SOURCE_DESTINATION_UNDERPROMOTION_PLANES
+)
+
+
+class ResNetPVAGadMoveCodec(MoveCodec):
     def __init__(self):
         super().__init__(MOVE_ENCODING_SD_64X64_UP9, SD_64X64_UP9_ACTION_SIZE)
 
@@ -100,11 +127,16 @@ class SourceDestinationUnderpromotionCodec(MoveCodec):
             _, from_file = divmod(move.from_square, 8)
             _, to_file = divmod(move.to_square, 8)
             dc = to_file - from_file
-            if dc not in PROMOTION_DCS:
+            if dc not in UNDERPROMOTION_FILE_DELTAS:
                 raise ValueError(f"bad promotion direction: {move}")
-            dir_idx = PROMOTION_DCS.index(dc)
+            dir_idx = UNDERPROMOTION_FILE_DELTAS.index(dc)
             piece_idx = UNDERPROMOTION_PIECES.index(move.promotion)
-            return BOARD_SQUARES * BOARD_SQUARES + move.from_square * 9 + dir_idx * 3 + piece_idx
+            return (
+                BOARD_SQUARES * BOARD_SQUARES
+                + move.from_square * SOURCE_DESTINATION_UNDERPROMOTION_PLANES
+                + dir_idx * 3
+                + piece_idx
+            )
         return move.from_square * BOARD_SQUARES + move.to_square
 
     def index_to_move(self, index: int, board: chess.Board) -> Optional[chess.Move]:
@@ -122,11 +154,11 @@ class SourceDestinationUnderpromotionCodec(MoveCodec):
             return None
 
         rem = index - BOARD_SQUARES * BOARD_SQUARES
-        from_square = rem // 9
-        underpromotion = rem % 9
+        from_square = rem // SOURCE_DESTINATION_UNDERPROMOTION_PLANES
+        underpromotion = rem % SOURCE_DESTINATION_UNDERPROMOTION_PLANES
         dir_idx = underpromotion // 3
         piece_idx = underpromotion % 3
-        dc = PROMOTION_DCS[dir_idx]
+        dc = UNDERPROMOTION_FILE_DELTAS[dir_idx]
         _, from_file = divmod(from_square, 8)
         to_file = from_file + dc
         if to_file < 0 or to_file >= 8:
@@ -138,9 +170,12 @@ class SourceDestinationUnderpromotionCodec(MoveCodec):
         return move if move in board.legal_moves else None
 
 
+# Move codec registry
+
+
 CODECS = {
-    MOVE_ENCODING_AZ_64X73: AlphaZero64x73Codec(),
-    MOVE_ENCODING_SD_64X64_UP9: SourceDestinationUnderpromotionCodec(),
+    MOVE_ENCODING_AZ_64X73: ResNetPVLinearMoveCodec(),
+    MOVE_ENCODING_SD_64X64_UP9: ResNetPVAGadMoveCodec(),
 }
 
 
