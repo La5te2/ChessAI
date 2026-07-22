@@ -1,4 +1,4 @@
-#include "gadus/arena.hpp"
+#include "melano/arena.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -11,9 +11,9 @@
 #include <utility>
 #include <vector>
 
-#include "gadus/checkpoint.hpp"
+#include "melano/checkpoint.hpp"
 
-namespace gadus {
+namespace melano {
 
 namespace {
 
@@ -142,7 +142,7 @@ void write_pgn(const std::filesystem::path &path, const std::vector<GameRecord> 
 	for (const auto &record : records) {
 		const std::string white = record.candidate_white ? candidate : baseline;
 		const std::string black = record.candidate_white ? baseline : candidate;
-		output << "[Event \"Gadus Arena\"]\n"
+		output << "[Event \"Melano Arena\"]\n"
 			   << "[Site \"?\"]\n"
 			   << "[Round \"" << record.index + 1 << "\"]\n"
 			   << "[White \"" << white << "\"]\n"
@@ -277,4 +277,4 @@ nlohmann::json evaluate_models(const ArenaOptions &options) {
 	return summary;
 }
 
-} // namespace gadus
+} // namespace melano

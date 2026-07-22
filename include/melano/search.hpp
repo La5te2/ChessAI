@@ -8,10 +8,10 @@
 
 #include <torch/torch.h>
 
-#include "gadus/game.hpp"
-#include "gadus/model.hpp"
+#include "melano/game.hpp"
+#include "melano/model.hpp"
 
-namespace gadus {
+namespace melano {
 
 enum class SearchType { Closed, OnlyMcts };
 
@@ -37,6 +37,8 @@ struct RootMove {
 	float decision_score = 0.0F;
 	float prior = 0.0F;
 	float q = 0.0F;
+	float advantage = 0.0F;
+	float q_prior = 0.0F;
 	int visits = 0;
 	bool repetition_penalized = false;
 	bool instant_mate = false;
@@ -45,6 +47,7 @@ struct RootMove {
 struct SearchResult {
 	chess::Move move;
 	std::vector<float> policy;
+	std::vector<float> advantages;
 	std::vector<float> decision_scores;
 	float value = 0.0F;
 	int sims_completed = 0;
@@ -73,4 +76,4 @@ class Searcher {
 SearchType parse_search_type(const std::string &value);
 std::string search_type_name(SearchType value);
 
-} // namespace gadus
+} // namespace melano

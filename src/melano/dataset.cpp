@@ -1,4 +1,4 @@
-#include "gadus/dataset.hpp"
+#include "melano/dataset.hpp"
 
 #include <hdf5.h>
 
@@ -12,9 +12,9 @@
 #include <stdexcept>
 #include <utility>
 
-#include "gadus/checkpoint.hpp"
+#include "melano/checkpoint.hpp"
 
-namespace gadus {
+namespace melano {
 
 namespace {
 
@@ -98,13 +98,19 @@ class H5Writer {
 								   "tanh(side_to_move_pawn_score/3)");
 		}
 		states_ = create_dataset(
-			"states", {0, kStatePlanes, 8}, {H5S_UNLIMITED, kStatePlanes, 8},
-			{static_cast<hsize_t>(std::max(1, options.chunk_size)), kStatePlanes, 8}, H5T_STD_U8LE);
+			"states", {0, kStateFeatures}, {H5S_UNLIMITED, kStateFeatures},
+			{static_cast<hsize_t>(std::max(1, options.chunk_size)), kStateFeatures}, H5T_STD_U8LE);
 		moves_ =
 			create_dataset("moves", {0}, {H5S_UNLIMITED},
 						   {static_cast<hsize_t>(std::max(1, options.chunk_size))}, H5T_STD_U16LE);
 		values_ =
 			create_dataset("values", {0}, {H5S_UNLIMITED},
+						   {static_cast<hsize_t>(std::max(1, options.chunk_size))}, H5T_IEEE_F32LE);
+		advantage_moves_ =
+			create_dataset("adv_moves", {0}, {H5S_UNLIMITED},
+						   {static_cast<hsize_t>(std::max(1, options.chunk_size))}, H5T_STD_U16LE);
+		advantage_values_ =
+			create_dataset("adv_values", {0}, {H5S_UNLIMITED},
 						   {static_cast<hsize_t>(std::max(1, options.chunk_size))}, H5T_IEEE_F32LE);
 	}
 
@@ -115,28 +121,38 @@ class H5Writer {
 			H5Dclose(moves_);
 		if (values_ >= 0)
 			H5Dclose(values_);
+		if (advantage_moves_ >= 0)
+			H5Dclose(advantage_moves_);
+		if (advantage_values_ >= 0)
+			H5Dclose(advantage_values_);
 		if (file_ >= 0)
 			H5Fclose(file_);
 	}
 
 	void append(const std::vector<PackedState> &states, const std::vector<std::uint16_t> &moves,
-				const std::vector<float> &values) {
+				const std::vector<float> &values,
+				const std::vector<std::uint16_t> &advantage_moves,
+				const std::vector<float> &advantage_values) {
 		if (states.empty())
 			return;
-		if (states.size() != moves.size() || states.size() != values.size()) {
+		if (states.size() != moves.size() || states.size() != values.size() ||
+			states.size() != advantage_moves.size() || states.size() != advantage_values.size()) {
 			throw std::runtime_error("preprocess buffers have mismatched lengths");
 		}
 		const hsize_t count = states.size();
 		const hsize_t old = size_;
 		const hsize_t next = old + count;
-		extend(states_, {next, kStatePlanes, 8});
+		extend(states_, {next, kStateFeatures});
 		extend(moves_, {next});
 		extend(values_, {next});
+		extend(advantage_moves_, {next});
+		extend(advantage_values_, {next});
 
-		write_slice(states_, H5T_NATIVE_UINT8, states.data(), {old, 0, 0},
-					{count, kStatePlanes, 8});
+		write_slice(states_, H5T_NATIVE_UINT8, states.data(), {old, 0}, {count, kStateFeatures});
 		write_slice(moves_, H5T_NATIVE_UINT16, moves.data(), {old}, {count});
 		write_slice(values_, H5T_NATIVE_FLOAT, values.data(), {old}, {count});
+		write_slice(advantage_moves_, H5T_NATIVE_UINT16, advantage_moves.data(), {old}, {count});
+		write_slice(advantage_values_, H5T_NATIVE_FLOAT, advantage_values.data(), {old}, {count});
 		size_ = next;
 	}
 
@@ -195,6 +211,8 @@ class H5Writer {
 	hid_t states_ = -1;
 	hid_t moves_ = -1;
 	hid_t values_ = -1;
+	hid_t advantage_moves_ = -1;
+	hid_t advantage_values_ = -1;
 	hsize_t size_ = 0;
 };
 
@@ -240,6 +258,8 @@ class PreprocessVisitor : public chess::pgn::Visitor {
 		game_states_.clear();
 		game_moves_.clear();
 		game_values_.clear();
+		game_advantage_moves_.clear();
+		game_advantage_values_.clear();
 	}
 
 	void header(std::string_view key, std::string_view value) override {
@@ -255,10 +275,20 @@ class PreprocessVisitor : public chess::pgn::Visitor {
 		try {
 			const auto move = chess::uci::parseSan(board_, san);
 			game_states_.push_back(encode_state(board_));
-			game_moves_.push_back(static_cast<std::uint16_t>(move_to_index(move)));
-			game_values_.push_back(options_.has_comments
-									   ? comment_value(previous_comment_, board_.sideToMove())
-									   : result_value(result_, board_.sideToMove()));
+			const auto move_index = static_cast<std::uint16_t>(move_to_index(move));
+			game_moves_.push_back(move_index);
+			game_advantage_moves_.push_back(move_index);
+			const float before = options_.has_comments
+				? comment_value(previous_comment_, board_.sideToMove())
+				: result_value(result_, board_.sideToMove());
+			game_values_.push_back(before);
+			float advantage = 0.0F;
+			if (options_.has_comments && comment_score_white(previous_comment_).has_value() &&
+				comment_score_white(std::string(comment)).has_value()) {
+				const float after = comment_value(std::string(comment), board_.sideToMove());
+				advantage = std::clamp(after - before, -2.0F, 0.0F);
+			}
+			game_advantage_values_.push_back(advantage);
 			if (comment_score_white(std::string(comment)).has_value())
 				game_has_eval_ = true;
 			board_.makeMove(move);
@@ -273,7 +303,8 @@ class PreprocessVisitor : public chess::pgn::Visitor {
 			++skipped_games_;
 			return;
 		}
-		writer_.append(game_states_, game_moves_, game_values_);
+		writer_.append(game_states_, game_moves_, game_values_, game_advantage_moves_,
+					   game_advantage_values_);
 		++games_;
 		if (options_.log_every > 0 && games_ % options_.log_every == 0) {
 			std::cout << "preprocess progress: games=" << games_ << " positions=" << writer_.size()
@@ -296,6 +327,8 @@ class PreprocessVisitor : public chess::pgn::Visitor {
 	std::vector<PackedState> game_states_;
 	std::vector<std::uint16_t> game_moves_;
 	std::vector<float> game_values_;
+	std::vector<std::uint16_t> game_advantage_moves_;
+	std::vector<float> game_advantage_values_;
 	std::int64_t games_ = 0;
 	std::int64_t skipped_moves_ = 0;
 	std::int64_t skipped_games_ = 0;
@@ -304,9 +337,9 @@ class PreprocessVisitor : public chess::pgn::Visitor {
 void select_rows(hid_t space, const std::vector<std::int64_t> &indices, int rank) {
 	require_h5(H5Sselect_none(space), "clear dataset selection");
 	for (const auto index : indices) {
-		if (rank == 3) {
-			const hsize_t start[] = {static_cast<hsize_t>(index), 0, 0};
-			const hsize_t count[] = {1, kStatePlanes, 8};
+		if (rank == 2) {
+			const hsize_t start[] = {static_cast<hsize_t>(index), 0};
+			const hsize_t count[] = {1, kStateFeatures};
 			require_h5(H5Sselect_hyperslab(space, H5S_SELECT_OR, start, nullptr, count, nullptr),
 					   "select state rows");
 		} else {
@@ -331,20 +364,22 @@ struct SupervisedH5::Impl {
 		info.has_comments = static_cast<int>(read_int_attribute(file, "has_cmt"));
 		if (info.arch_type != kArchType || info.state_encoding != kStateEncoding ||
 			info.move_encoding != kMoveEncoding || info.target_schema != kTargetSchema) {
-			throw std::runtime_error("HDF5 schema does not match the Gadus architecture");
+			throw std::runtime_error("HDF5 schema does not match the Melano architecture");
 		}
 		states = require_id(H5Dopen2(file, "states", H5P_DEFAULT), "open states");
 		moves = require_id(H5Dopen2(file, "moves", H5P_DEFAULT), "open moves");
 		values = require_id(H5Dopen2(file, "values", H5P_DEFAULT), "open values");
+		advantage_moves = require_id(H5Dopen2(file, "adv_moves", H5P_DEFAULT), "open adv_moves");
+		advantage_values = require_id(H5Dopen2(file, "adv_values", H5P_DEFAULT), "open adv_values");
 		const hid_t space = require_id(H5Dget_space(states), "get states shape");
-		hsize_t dimensions[3]{};
-		if (H5Sget_simple_extent_ndims(space) != 3) {
-			throw std::runtime_error("states must have rank 3");
+		hsize_t dimensions[2]{};
+		if (H5Sget_simple_extent_ndims(space) != 2) {
+			throw std::runtime_error("states must have rank 2");
 		}
 		H5Sget_simple_extent_dims(space, dimensions, nullptr);
 		H5Sclose(space);
-		if (dimensions[1] != kStatePlanes || dimensions[2] != 8) {
-			throw std::runtime_error("states must have shape [N,18,8]");
+		if (dimensions[1] != kStateFeatures) {
+			throw std::runtime_error("states must have shape [N,67]");
 		}
 		info.length = static_cast<std::int64_t>(dimensions[0]);
 		if (info.length <= 0)
@@ -358,6 +393,10 @@ struct SupervisedH5::Impl {
 			H5Dclose(moves);
 		if (values >= 0)
 			H5Dclose(values);
+		if (advantage_moves >= 0)
+			H5Dclose(advantage_moves);
+		if (advantage_values >= 0)
+			H5Dclose(advantage_values);
 		if (file >= 0)
 			H5Fclose(file);
 	}
@@ -366,6 +405,8 @@ struct SupervisedH5::Impl {
 	hid_t states = -1;
 	hid_t moves = -1;
 	hid_t values = -1;
+	hid_t advantage_moves = -1;
+	hid_t advantage_values = -1;
 	DatasetInfo info;
 };
 
@@ -393,14 +434,16 @@ SupervisedBatch SupervisedH5::read(const std::vector<std::int64_t> &requested) c
 			throw std::out_of_range("HDF5 row index");
 	}
 	const hsize_t batch = indices.size();
-	std::vector<std::uint8_t> packed(batch * kStatePlanes * 8);
+	std::vector<std::uint8_t> packed(batch * kStateFeatures);
 	std::vector<std::uint16_t> moves(batch);
 	std::vector<float> values(batch);
+	std::vector<std::uint16_t> advantage_moves(batch);
+	std::vector<float> advantage_values(batch);
 
 	const hid_t state_space = require_id(H5Dget_space(impl_->states), "get states selection");
-	select_rows(state_space, indices, 3);
-	const hsize_t state_dims[] = {batch, kStatePlanes, 8};
-	const hid_t state_memory = require_id(H5Screate_simple(3, state_dims, nullptr), "state memory");
+	select_rows(state_space, indices, 2);
+	const hsize_t state_dims[] = {batch, kStateFeatures};
+	const hid_t state_memory = require_id(H5Screate_simple(2, state_dims, nullptr), "state memory");
 	require_h5(H5Dread(impl_->states, H5T_NATIVE_UINT8, state_memory, state_space, H5P_DEFAULT,
 					   packed.data()),
 			   "read state rows");
@@ -410,6 +453,10 @@ SupervisedBatch SupervisedH5::read(const std::vector<std::int64_t> &requested) c
 	for (const auto [dataset, type, destination] : {
 			 std::tuple<hid_t, hid_t, void *>{impl_->moves, H5T_NATIVE_UINT16, moves.data()},
 			 std::tuple<hid_t, hid_t, void *>{impl_->values, H5T_NATIVE_FLOAT, values.data()},
+			 std::tuple<hid_t, hid_t, void *>{impl_->advantage_moves, H5T_NATIVE_UINT16,
+												advantage_moves.data()},
+			 std::tuple<hid_t, hid_t, void *>{impl_->advantage_values, H5T_NATIVE_FLOAT,
+												advantage_values.data()},
 		 }) {
 		const hid_t space = require_id(H5Dget_space(dataset), "get scalar selection");
 		select_rows(space, indices, 1);
@@ -427,6 +474,12 @@ SupervisedBatch SupervisedH5::read(const std::vector<std::int64_t> &requested) c
 			.clone()
 			.to(torch::kInt64),
 		torch::from_blob(values.data(), {static_cast<std::int64_t>(batch)}, torch::kFloat32)
+			.clone(),
+		torch::from_blob(advantage_moves.data(), {static_cast<std::int64_t>(batch)}, torch::kUInt16)
+			.clone()
+			.to(torch::kInt64),
+		torch::from_blob(advantage_values.data(), {static_cast<std::int64_t>(batch)},
+							 torch::kFloat32)
 			.clone(),
 	};
 }
@@ -486,6 +539,7 @@ void train_supervised(const TrainOptions &options) {
 		std::shuffle(order.begin(), order.end(), rng);
 		double policy_total = 0.0;
 		double value_total = 0.0;
+		double dueling_q_total = 0.0;
 		std::int64_t batches = 0;
 		for (std::int64_t begin = 0; begin < data.info().length; begin += options.batch_size) {
 			const auto end = std::min<std::int64_t>(begin + options.batch_size, data.info().length);
@@ -494,12 +548,23 @@ void train_supervised(const TrainOptions &options) {
 			auto states = batch.states.to(device, true);
 			auto moves = batch.moves.to(device, true);
 			auto values = batch.values.to(device, true);
+			auto advantage_moves = batch.advantage_moves.to(device, true);
+			auto advantage_values = batch.advantage_values.to(device, true);
 			optimizer.zero_grad();
 
-			auto [logits, predicted] = model->forward(states);
-			auto policy_loss = torch::nn::functional::cross_entropy(logits, moves);
-			auto value_loss = torch::mse_loss(predicted.squeeze(1), values);
-			auto loss = policy_loss + options.value_weight * value_loss;
+			auto output = model->forward(states);
+			auto policy_loss = torch::nn::functional::cross_entropy(output.policy, moves);
+			auto predicted_value = output.value.squeeze(1);
+			auto value_loss = torch::mse_loss(predicted_value, values);
+			auto selected_advantage = output.advantages.gather(1, advantage_moves.unsqueeze(1)).squeeze(1);
+			auto dueling_q_loss = torch::zeros({}, states.options().dtype(torch::kFloat32));
+			if (data.info().has_comments) {
+				auto predicted_q = torch::clamp(predicted_value + selected_advantage, -1.0, 1.0);
+				auto target_q = torch::clamp(values + advantage_values, -1.0, 1.0);
+				dueling_q_loss = torch::mse_loss(predicted_q, target_q);
+			}
+			auto loss = policy_loss + options.value_weight * value_loss +
+					options.dueling_q_weight * dueling_q_loss;
 			loss.backward();
 			optimizer.step();
 
@@ -507,11 +572,13 @@ void train_supervised(const TrainOptions &options) {
 			++batches;
 			policy_total += policy_loss.item<double>();
 			value_total += value_loss.item<double>();
+			dueling_q_total += dueling_q_loss.item<double>();
 			if (options.log_every > 0 &&
 				(global_step == 1 || global_step % options.log_every == 0)) {
 				std::cout << "train step: epoch=" << epoch << " global_step=" << global_step
 						  << " policy=" << policy_loss.item<double>()
 						  << " value=" << value_loss.item<double>()
+						  << " dueling_q=" << dueling_q_loss.item<double>()
 						  << " loss=" << loss.item<double>() << std::endl;
 			}
 			if (options.save_every > 0 && global_step % options.save_every == 0) {
@@ -528,9 +595,11 @@ void train_supervised(const TrainOptions &options) {
 		save_checkpoint_atomic(options.output, model, {options.channels, options.blocks});
 		std::cout << "epoch=" << epoch << ", steps=" << global_step
 				  << ", policy=" << policy_total / std::max<std::int64_t>(1, batches)
-				  << ", value=" << value_total / std::max<std::int64_t>(1, batches) << std::endl;
+				  << ", value=" << value_total / std::max<std::int64_t>(1, batches)
+				  << ", dueling_q=" << dueling_q_total / std::max<std::int64_t>(1, batches)
+				  << std::endl;
 	}
 	std::cout << "training finished: " << options.output.string() << std::endl;
 }
 
-} // namespace gadus
+} // namespace melano

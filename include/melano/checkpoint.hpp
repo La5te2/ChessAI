@@ -6,9 +6,9 @@
 
 #include <torch/torch.h>
 
-#include "gadus/model.hpp"
+#include "melano/model.hpp"
 
-namespace gadus {
+namespace melano {
 
 struct ArchitectureInfo {
 	int channels = 128;
@@ -24,4 +24,4 @@ Model load_checkpoint(const std::filesystem::path &path, const torch::Device &de
 std::string file_sha256(const std::filesystem::path &path);
 void atomic_copy(const std::filesystem::path &source, const std::filesystem::path &target);
 
-} // namespace gadus
+} // namespace melano

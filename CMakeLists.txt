@@ -16,7 +16,14 @@ set(GADIDAE_HDF5_DIR "${GADIDAE_API_DIR}/hdf5" CACHE PATH "HDF5 install root")
 set(GADIDAE_ZLIB_DIR "${GADIDAE_API_DIR}/zlib" CACHE PATH "zlib install root")
 
 if(EXISTS "${GADIDAE_TORCH_DIR}/share/cmake/Torch")
-  list(PREPEND CMAKE_PREFIX_PATH "${GADIDAE_TORCH_DIR}")
+	unset(TORCH_LIBRARY CACHE)
+	unset(c10_LIBRARY CACHE)
+	unset(kineto_LIBRARY CACHE)
+	unset(CAFFE2_NVRTC_LIBRARY CACHE)
+	unset(C10_CUDA_LIBRARY CACHE)
+	set(Torch_DIR "${GADIDAE_TORCH_DIR}/share/cmake/Torch" CACHE PATH "Torch CMake package" FORCE)
+	set(Caffe2_DIR "${GADIDAE_TORCH_DIR}/share/cmake/Caffe2" CACHE PATH "Caffe2 CMake package" FORCE)
+	list(PREPEND CMAKE_PREFIX_PATH "${GADIDAE_TORCH_DIR}")
 endif()
 if(EXISTS "${GADIDAE_HDF5_DIR}")
 	list(PREPEND CMAKE_PREFIX_PATH "${GADIDAE_HDF5_DIR}")
@@ -33,6 +40,7 @@ find_package(ZLIB REQUIRED)
 find_package(Threads REQUIRED)
 
 if(MSVC)
+	add_compile_options(/external:templates-)
 	find_library(
 		GADIDAE_ZLIB_STATIC
 		NAMES zlibstatic
@@ -43,14 +51,19 @@ if(MSVC)
 endif()
 
 add_library(gadus
-  src/gadus/checkpoint.cpp
-  src/gadus/args.cpp
-  src/gadus/dataset.cpp
-  src/gadus/evolution.cpp
-  src/gadus/game.cpp
-  src/gadus/match.cpp
-  src/gadus/model.cpp
-  src/gadus/searcher.cpp
+	src/gadus/checkpoint.cpp
+	src/gadus/args.cpp
+	src/gadus/dataset.cpp
+	src/gadus/evolution.cpp
+	src/gadus/game.cpp
+	src/gadus/match.cpp
+	src/gadus/model.cpp
+	src/gadus/searcher.cpp
+)
+set_target_properties(gadus PROPERTIES
+	ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/gadus"
+	LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/gadus"
+	PDB_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/gadus"
 )
 
 target_include_directories(gadus
@@ -80,32 +93,127 @@ else()
 endif()
 
 function(gadusexecutable name source)
-  set(target "gadus${name}")
-  add_executable(${target} ${source})
-  set_target_properties(${target} PROPERTIES
-    OUTPUT_NAME "${name}"
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/gadus"
-  )
-  target_link_libraries(${target} PRIVATE gadus)
-  if(MSVC)
-    file(GLOB TORCH_DLLS "${GADIDAE_TORCH_DIR}/lib/*.dll")
-    if(TORCH_DLLS)
-      add_custom_command(TARGET ${target} POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-          ${TORCH_DLLS}
-          $<TARGET_FILE_DIR:${target}>)
-    endif()
-  endif()
+	set(target "gadus${name}")
+	add_executable(${target} ${source})
+	set_target_properties(${target} PROPERTIES
+		OUTPUT_NAME "${name}"
+		RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/gadus"
+		ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/gadus"
+		LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/gadus"
+		PDB_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/gadus"
+	)
+	target_link_libraries(${target} PRIVATE gadus)
+	if(MSVC)
+		add_dependencies(${target} torchruntime)
+	endif()
 endfunction()
+
+if(MSVC)
+	file(GLOB TORCH_DLLS "${GADIDAE_TORCH_DIR}/lib/*.dll")
+	if(TORCH_DLLS)
+		add_custom_target(torchruntime ALL
+			COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/gadus"
+			COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/melano"
+			COMMAND ${CMAKE_COMMAND} -E copy_if_different
+				${TORCH_DLLS}
+				"${CMAKE_BINARY_DIR}/gadus"
+			COMMAND ${CMAKE_COMMAND} -E copy_if_different
+				${TORCH_DLLS}
+				"${CMAKE_BINARY_DIR}/melano"
+			COMMENT "Copying LibTorch runtime"
+		)
+	else()
+		message(FATAL_ERROR "No LibTorch runtime DLLs found in ${GADIDAE_TORCH_DIR}/lib")
+	endif()
+endif()
 
 gadusexecutable(preprocess src/gadus/preprocess.cpp)
 gadusexecutable(train src/gadus/train.cpp)
 gadusexecutable(search src/gadus/search.cpp)
 gadusexecutable(arena src/gadus/arena.cpp)
 gadusexecutable(fcpi src/gadus/fcpi.cpp)
+gadusexecutable(uci src/gadus/uci.cpp)
 
 enable_testing()
-add_executable(gadustests tests/gadustests.cpp)
-set_target_properties(gadustests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/gadus")
+add_executable(gadustests src/gadus/tests.cpp)
+set_target_properties(gadustests PROPERTIES
+	RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/gadus"
+	ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/gadus"
+	LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/gadus"
+	PDB_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/gadus"
+)
 target_link_libraries(gadustests PRIVATE gadus)
+if(MSVC)
+	add_dependencies(gadustests torchruntime)
+endif()
 add_test(NAME gadustests COMMAND gadustests)
+
+add_library(melano
+	src/melano/checkpoint.cpp
+	src/melano/args.cpp
+	src/melano/dataset.cpp
+	src/melano/evolution.cpp
+	src/melano/game.cpp
+	src/melano/match.cpp
+	src/melano/model.cpp
+	src/melano/searcher.cpp
+)
+set_target_properties(melano PROPERTIES
+	ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/melano"
+	LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/melano"
+	PDB_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/melano"
+)
+target_include_directories(melano PUBLIC "${CMAKE_SOURCE_DIR}/include")
+target_include_directories(melano SYSTEM PUBLIC
+	"${GADIDAE_API_DIR}/chess"
+	"${GADIDAE_API_DIR}/nlohmann/include"
+	${HDF5_INCLUDE_DIRS}
+)
+target_precompile_headers(melano PRIVATE <chess.hpp> <nlohmann/json.hpp> <torch/torch.h>)
+if(MSVC)
+	target_link_libraries(
+		melano
+		PUBLIC ${TORCH_LIBRARIES} ${HDF5_LIBRARIES} "${GADIDAE_ZLIB_STATIC}" Threads::Threads Shlwapi
+	)
+	target_compile_options(melano PRIVATE /MP /W4 /permissive- /utf-8)
+else()
+	target_link_libraries(melano PUBLIC ${TORCH_LIBRARIES} ${HDF5_LIBRARIES} ZLIB::ZLIB Threads::Threads)
+	target_compile_options(melano PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+target_compile_definitions(melano PRIVATE H5_USE_110_API)
+
+function(melanoexecutable name source)
+	set(target "melano${name}")
+	add_executable(${target} ${source})
+	set_target_properties(${target} PROPERTIES
+		OUTPUT_NAME "${name}"
+		RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/melano"
+		ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/melano"
+		LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/melano"
+		PDB_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/melano"
+	)
+	target_link_libraries(${target} PRIVATE melano)
+	if(MSVC)
+		add_dependencies(${target} torchruntime)
+	endif()
+endfunction()
+
+melanoexecutable(preprocess src/melano/preprocess.cpp)
+melanoexecutable(train src/melano/train.cpp)
+melanoexecutable(search src/melano/search.cpp)
+melanoexecutable(arena src/melano/arena.cpp)
+melanoexecutable(fcpi src/melano/fcpi.cpp)
+melanoexecutable(uci src/melano/uci.cpp)
+
+add_executable(melanotests src/melano/tests.cpp)
+set_target_properties(melanotests PROPERTIES
+	RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/melano"
+	ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/melano"
+	LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/melano"
+	PDB_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/melano"
+)
+target_link_libraries(melanotests PRIVATE melano)
+if(MSVC)
+	add_dependencies(melanotests torchruntime)
+endif()
+add_test(NAME melanotests COMMAND melanotests)

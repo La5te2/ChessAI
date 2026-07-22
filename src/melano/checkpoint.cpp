@@ -1,4 +1,4 @@
-#include "gadus/checkpoint.hpp"
+#include "melano/checkpoint.hpp"
 
 #include <array>
 #include <cstring>
@@ -12,7 +12,7 @@
 #include <windows.h>
 #endif
 
-namespace gadus {
+namespace melano {
 
 namespace {
 
@@ -175,7 +175,7 @@ void save_checkpoint_atomic(const std::filesystem::path &path, const Model &mode
 	torch::serialize::OutputArchive model_archive;
 	torch::serialize::OutputArchive arch_archive;
 	model->save(model_archive);
-	arch_archive.write("type_id", scalar(1));
+	arch_archive.write("type_id", scalar(2));
 	arch_archive.write("channels", scalar(arch.channels));
 	arch_archive.write("blocks", scalar(arch.blocks));
 	arch_archive.write("action_size", scalar(kActionSize));
@@ -196,14 +196,14 @@ Model load_checkpoint(const std::filesystem::path &path, const torch::Device &de
 	torch::serialize::InputArchive arch_archive;
 	archive.read("model", model_archive);
 	archive.read("arch", arch_archive);
-	if (read_scalar(arch_archive, "type_id") != 1) {
-		throw std::runtime_error("checkpoint is not a Gadus model: " + path.string());
+	if (read_scalar(arch_archive, "type_id") != 2) {
+		throw std::runtime_error("checkpoint is not a Melano model: " + path.string());
 	}
 	ArchitectureInfo loaded;
 	loaded.channels = static_cast<int>(read_scalar(arch_archive, "channels"));
 	loaded.blocks = static_cast<int>(read_scalar(arch_archive, "blocks"));
 	if (read_scalar(arch_archive, "action_size") != kActionSize) {
-		throw std::runtime_error("checkpoint action size does not match Gadus: " + path.string());
+		throw std::runtime_error("checkpoint action size does not match Melano: " + path.string());
 	}
 	auto model = Model(loaded.channels, loaded.blocks);
 	model->to(device);
@@ -244,4 +244,4 @@ void atomic_copy(const std::filesystem::path &source, const std::filesystem::pat
 	replace_file(temporary, target);
 }
 
-} // namespace gadus
+} // namespace melano

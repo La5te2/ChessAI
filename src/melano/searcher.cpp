@@ -1,4 +1,4 @@
-#include "gadus/search.hpp"
+#include "melano/search.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -9,7 +9,7 @@
 #include <unordered_set>
 #include <utility>
 
-namespace gadus {
+namespace melano {
 
 namespace {
 
@@ -18,16 +18,21 @@ using Clock = std::chrono::steady_clock;
 struct Evaluation {
 	std::vector<std::vector<float>> policies;
 	std::vector<float> values;
+	std::vector<std::vector<float>> advantages;
 };
 
 struct Node {
-	explicit Node(float initial_prior = 0.0F, chess::Move incoming = chess::Move::NO_MOVE)
-		: prior(initial_prior), move(incoming) {}
+	explicit Node(float initial_prior = 0.0F, chess::Move incoming = chess::Move::NO_MOVE,
+				  float initial_advantage = 0.0F, float initial_q_prior = 0.0F)
+		: prior(initial_prior), move(incoming), advantage(initial_advantage),
+		  q_prior(initial_q_prior) {}
 
 	float q() const { return visits > 0 ? value_sum / static_cast<float>(visits) : 0.0F; }
 
 	float prior = 0.0F;
 	chess::Move move;
+	float advantage = 0.0F;
+	float q_prior = 0.0F;
 	int visits = 0;
 	float value_sum = 0.0F;
 	int virtual_visits = 0;
@@ -45,6 +50,7 @@ struct TreeState {
 	chess::Board board;
 	std::unique_ptr<Node> root = std::make_unique<Node>();
 	std::vector<float> network_policy;
+	std::vector<float> network_advantages;
 	float network_value = 0.0F;
 	int sims_completed = 0;
 	int dynamic_target = 0;
@@ -96,7 +102,7 @@ struct Searcher::Impl {
 		: model(std::move(source_model)), device(std::move(source_device)),
 		  options(source_options) {
 		if (!model) {
-			throw std::invalid_argument("Gadus search requires a model");
+			throw std::invalid_argument("Melano search requires a model");
 		}
 		options.virtual_loss = std::max(0.0, options.virtual_loss);
 		model->to(device);
@@ -109,31 +115,40 @@ struct Searcher::Impl {
 		}
 		torch::InferenceMode guard;
 		auto states = encode_boards(boards).to(device, true);
-		auto [logits, raw_values] = model->forward(states);
-		auto probabilities = torch::softmax(logits, 1).to(torch::kCPU).contiguous();
-		auto values = raw_values.reshape({-1}).to(torch::kCPU).contiguous();
+		auto prediction = model->forward(states);
+		auto probabilities = torch::softmax(prediction.policy, 1).to(torch::kCPU).contiguous();
+		auto values = prediction.value.reshape({-1}).to(torch::kCPU).contiguous();
+		auto advantages = prediction.advantages.to(torch::kCPU).contiguous();
 
 		Evaluation output;
 		output.policies.resize(boards.size(), std::vector<float>(kActionSize));
 		output.values.resize(boards.size());
+		output.advantages.resize(boards.size(), std::vector<float>(kActionSize));
 		auto probability_rows = probabilities.accessor<float, 2>();
 		auto value_rows = values.accessor<float, 1>();
+		auto advantage_rows = advantages.accessor<float, 2>();
 		for (std::size_t row = 0; row < boards.size(); ++row) {
 			std::copy_n(&probability_rows[static_cast<std::int64_t>(row)][0], kActionSize,
 						output.policies[row].begin());
 			output.values[row] = value_rows[static_cast<std::int64_t>(row)];
+			std::copy_n(&advantage_rows[static_cast<std::int64_t>(row)][0], kActionSize,
+						output.advantages[row].begin());
 		}
 		return output;
 	}
 
-	void expand(Node *node, const chess::Board &board, const std::vector<float> &policy) {
+	void expand(Node *node, const chess::Board &board, const std::vector<float> &policy,
+				const std::vector<float> &advantages, float parent_value) {
 		if (!node->children.empty()) {
 			return;
 		}
 		const auto legal_policy = normalize_legal_policy(policy, board);
 		for (const auto &move : legal_moves(board)) {
+			const int action = move_to_index(move);
+			const float advantage = advantages[action];
+			const float q_prior = clamp_unit(parent_value + advantage);
 			node->children.push_back(
-				std::make_unique<Node>(legal_policy[move_to_index(move)], move));
+				std::make_unique<Node>(legal_policy[action], move, advantage, q_prior));
 		}
 	}
 
@@ -147,10 +162,14 @@ struct Searcher::Impl {
 		return mass;
 	}
 
-	float fpu(const Node *parent) const {
-		const float parent_q = parent->visits > 0 ? parent->q() : 0.0F;
-		return clamp_unit(parent_q - static_cast<float>(std::max(0.0, options.fpu_reduction)) *
-										 std::sqrt(visited_policy_mass(parent)));
+	float edge_value(const Node *parent, const Node *child) const {
+		if (child->visits > 0) {
+			return clamp_unit((static_cast<float>(child->visits) * -child->q() + child->q_prior) /
+							  static_cast<float>(child->visits + 1));
+		}
+		return clamp_unit(child->q_prior -
+			static_cast<float>(std::max(0.0, options.fpu_reduction)) *
+				std::sqrt(visited_policy_mass(parent)));
 	}
 
 	double scheduled_c_puct(const Node *parent) const {
@@ -162,7 +181,7 @@ struct Searcher::Impl {
 	}
 
 	double selection_score(const Node *parent, const Node *child) const {
-		const double exploitation = child->visits > 0 ? -child->q() : fpu(parent);
+		const double exploitation = edge_value(parent, child);
 		const int child_visits = child->visits + child->virtual_visits;
 		const double exploration = scheduled_c_puct(parent) * child->prior *
 								   std::sqrt(parent->visits + parent->virtual_visits + 1.0) /
@@ -335,6 +354,7 @@ struct Searcher::Impl {
 		result.policy = options.type == SearchType::Closed || options.mcts_sims <= 0
 							? normalize_legal_policy(state.network_policy, state.board)
 							: root_policy(state);
+		result.advantages = state.network_advantages;
 		result.decision_scores = result.policy;
 		result.value = state.root->visits > 0 ? state.root->q() : state.network_value;
 		result.sims_completed = state.sims_completed;
@@ -382,7 +402,9 @@ struct Searcher::Impl {
 				if (child->move == move) {
 					root_move.prior = child->prior;
 					root_move.visits = child->visits;
-					root_move.q = child->visits > 0 ? -child->q() : fpu(state.root.get());
+					root_move.q = edge_value(state.root.get(), child.get());
+					root_move.advantage = child->advantage;
+					root_move.q_prior = child->q_prior;
 					break;
 				}
 			}
@@ -420,10 +442,12 @@ struct Searcher::Impl {
 		const int minimum = minimum_simulations();
 		for (std::size_t index = 0; index < states.size(); ++index) {
 			states[index].network_policy = roots.policies[index];
+			states[index].network_advantages = roots.advantages[index];
 			states[index].network_value = roots.values[index];
 			states[index].nn_batches = 1;
 			states[index].dynamic_target = minimum;
-			expand(states[index].root.get(), states[index].board, roots.policies[index]);
+			expand(states[index].root.get(), states[index].board, roots.policies[index],
+				   roots.advantages[index], roots.values[index]);
 			states[index].expanded_nodes = 1;
 		}
 		auto next_progress = start;
@@ -487,7 +511,8 @@ struct Searcher::Impl {
 						auto &state = states[leaf.state_index];
 						const std::size_t row = index - begin;
 						if (leaf.leaf->children.empty()) {
-							expand(leaf.leaf, leaf.board, evaluation.policies[row]);
+							expand(leaf.leaf, leaf.board, evaluation.policies[row],
+								   evaluation.advantages[row], evaluation.values[row]);
 							state.expanded_nodes += 1;
 						}
 						clear_virtual(leaf.path);
@@ -557,4 +582,4 @@ std::string search_type_name(SearchType value) {
 	return value == SearchType::Closed ? "closed" : "only-mcts";
 }
 
-} // namespace gadus
+} // namespace melano

@@ -1,4 +1,4 @@
-#include "gadus/fcpi.hpp"
+#include "melano/fcpi.hpp"
 
 #include <hdf5.h>
 
@@ -21,14 +21,14 @@
 
 #include <nlohmann/json.hpp>
 
-#include "gadus/args.hpp"
-#include "gadus/checkpoint.hpp"
+#include "melano/args.hpp"
+#include "melano/checkpoint.hpp"
 
-namespace gadus {
+namespace melano {
 
 namespace {
 
-inline constexpr const char *kFcpiFormula = "gadus_adaptive_value_expansion_td_kl";
+inline constexpr const char *kFcpiFormula = "melano_pva_adaptive_value_expansion_td_kl";
 
 std::string zero_pad(int value, int width) {
 	std::ostringstream output;
@@ -43,11 +43,13 @@ struct Position {
 	float root_value = 0.0F;
 	std::vector<int> legal_indices;
 	std::vector<float> legal_prior;
+	std::vector<float> legal_advantage;
 	int played_index = 0;
 	std::vector<int> candidate_indices;
 	float value_target = 0.0F;
 	std::vector<float> policy_target;
 	std::vector<float> candidate_q;
+	std::vector<float> advantage_target;
 	int aggregate_count = 1;
 };
 
@@ -309,20 +311,23 @@ std::vector<Position> collect_selfplay(Model model, const torch::Device &device,
 				const auto moves = legal_moves(board);
 				std::vector<int> legal;
 				std::vector<float> prior;
+				std::vector<float> advantages;
 				for (const auto &move : moves) {
 					const int action = move_to_index(move);
 					legal.push_back(action);
 					prior.push_back(results[row].policy[action]);
+					advantages.push_back(results[row].advantages[action]);
 				}
 				prior = normalize(std::move(prior));
 				const double temperature = std::max(1e-4, options.behavior_temperature);
-				std::vector<float> behavior(prior.size());
+				std::vector<double> behavior_logits(prior.size());
 				for (std::size_t index = 0; index < prior.size(); ++index) {
-					behavior[index] = static_cast<float>(
-						std::pow(std::clamp(static_cast<double>(prior[index]), 1e-12, 1.0),
-								 1.0 / temperature));
+					behavior_logits[index] =
+						(std::log(std::clamp(static_cast<double>(prior[index]), 1e-12, 1.0)) +
+						 options.behavior_advantage_weight * advantages[index]) /
+						temperature;
 				}
-				behavior = normalize(std::move(behavior));
+				auto behavior = stable_softmax(behavior_logits);
 				const double mix = std::clamp(options.uniform_mix, 0.0, 1.0);
 				for (float &probability : behavior) {
 					probability =
@@ -337,9 +342,10 @@ std::vector<Position> collect_selfplay(Model model, const torch::Device &device,
 				position.root_value = results[row].value;
 				position.legal_indices = legal;
 				position.legal_prior = prior;
+				position.legal_advantage = advantages;
 				position.played_index = played;
 				position.candidate_indices =
-					choose_candidates(legal, prior, played, options.counterfactual_topk);
+					choose_candidates(legal, behavior, played, options.counterfactual_topk);
 				trajectory.positions.push_back(std::move(position));
 				board.makeMove(moves[choice]);
 				const bool terminal = game_is_over(board);
@@ -615,18 +621,42 @@ void construct_targets(std::vector<Position> &records, Model model, const torch:
 	const double played_weight = std::clamp(options.played_return_weight, 0.0, 1.0);
 	const double temperature = std::max(1e-4, options.policy_temperature);
 	for (auto &record : records) {
+		const float trajectory_target = record.value_target;
+		const double successor_weight = std::clamp(options.successor_weight, 0.0, 1.0);
+		for (std::size_t index = 0; index < record.candidate_indices.size(); ++index) {
+			const auto legal = std::find(record.legal_indices.begin(), record.legal_indices.end(),
+								 record.candidate_indices[index]);
+			const auto legal_index = static_cast<std::size_t>(legal - record.legal_indices.begin());
+			const float reference_q = std::clamp(
+				record.root_value + record.legal_advantage[legal_index], -1.0F, 1.0F);
+			record.candidate_q[index] = static_cast<float>(
+				(1.0 - successor_weight) * reference_q + successor_weight * record.candidate_q[index]);
+		}
 		for (std::size_t index = 0; index < record.candidate_indices.size(); ++index) {
 			if (record.candidate_indices[index] == record.played_index) {
 				record.candidate_q[index] =
 					static_cast<float>((1.0 - played_weight) * record.candidate_q[index] +
-									   played_weight * record.value_target);
+									   played_weight * trajectory_target);
 			}
 		}
-		std::vector<float> q_all(record.legal_indices.size(), record.root_value);
+		const float improved_value = *std::max_element(record.candidate_q.begin(),
+												 record.candidate_q.end());
+		record.value_target = improved_value;
+		std::vector<float> q_all(record.legal_indices.size());
+		for (std::size_t index = 0; index < q_all.size(); ++index) {
+			q_all[index] = std::min(
+				std::clamp(record.root_value + record.legal_advantage[index], -1.0F, 1.0F),
+				improved_value);
+		}
 		for (std::size_t candidate = 0; candidate < record.candidate_indices.size(); ++candidate) {
 			const auto found = std::find(record.legal_indices.begin(), record.legal_indices.end(),
 										 record.candidate_indices[candidate]);
 			q_all[found - record.legal_indices.begin()] = record.candidate_q[candidate];
+		}
+		record.advantage_target.resize(record.candidate_q.size());
+		for (std::size_t index = 0; index < record.candidate_q.size(); ++index) {
+			record.advantage_target[index] =
+				std::clamp(record.candidate_q[index] - improved_value, -2.0F, 0.0F);
 		}
 		std::vector<double> logits(record.legal_indices.size());
 		for (std::size_t index = 0; index < logits.size(); ++index) {
@@ -670,6 +700,11 @@ std::vector<Position> aggregate_records(std::vector<Position> records, nlohmann:
 			merged.policy_target[index] =
 				(merged.policy_target[index] * old_count + record.policy_target[index]) / new_count;
 		}
+		for (std::size_t index = 0; index < merged.legal_advantage.size(); ++index) {
+			merged.legal_advantage[index] =
+				(merged.legal_advantage[index] * old_count + record.legal_advantage[index]) /
+				new_count;
+		}
 		merged.value_target = (merged.value_target * old_count + record.value_target) / new_count;
 		for (std::size_t candidate = 0; candidate < record.candidate_indices.size(); ++candidate) {
 			const int action = record.candidate_indices[candidate];
@@ -690,6 +725,11 @@ std::vector<Position> aggregate_records(std::vector<Position> records, nlohmann:
 	for (auto &record : output) {
 		record.legal_prior = normalize(std::move(record.legal_prior));
 		record.policy_target = normalize(std::move(record.policy_target));
+		record.advantage_target.resize(record.candidate_q.size());
+		for (std::size_t index = 0; index < record.candidate_q.size(); ++index) {
+			record.advantage_target[index] =
+				std::clamp(record.candidate_q[index] - record.value_target, -2.0F, 0.0F);
+		}
 	}
 	summary = {
 		{"source_positions", source_count},
@@ -715,7 +755,7 @@ nlohmann::json write_fcpi_h5(const std::filesystem::path &path, std::vector<Posi
 			return left.candidate_indices.size() < right.candidate_indices.size();
 		})->candidate_indices.size();
 	const std::size_t count = records.size();
-	std::vector<std::uint8_t> states(count * kStatePlanes * 8);
+	std::vector<std::uint8_t> states(count * kStateFeatures);
 	std::vector<std::int32_t> legal(count * legal_width, 0);
 	std::vector<float> priors(count * legal_width, 0.0F);
 	std::vector<float> policy(count * legal_width, 0.0F);
@@ -723,10 +763,11 @@ nlohmann::json write_fcpi_h5(const std::filesystem::path &path, std::vector<Posi
 	std::vector<float> values(count);
 	std::vector<std::int32_t> candidates(count * candidate_width, 0);
 	std::vector<float> candidate_q(count * candidate_width, 0.0F);
+	std::vector<float> advantage_targets(count * candidate_width, 0.0F);
 	std::vector<std::uint8_t> candidate_counts(count);
 	for (std::size_t row = 0; row < count; ++row) {
 		std::copy(records[row].state.begin(), records[row].state.end(),
-				  states.begin() + row * kStatePlanes * 8);
+				  states.begin() + row * kStateFeatures);
 		legal_counts[row] = static_cast<std::uint8_t>(records[row].legal_indices.size());
 		candidate_counts[row] = static_cast<std::uint8_t>(records[row].candidate_indices.size());
 		values[row] = records[row].value_target;
@@ -738,6 +779,8 @@ nlohmann::json write_fcpi_h5(const std::filesystem::path &path, std::vector<Posi
 		for (std::size_t column = 0; column < records[row].candidate_indices.size(); ++column) {
 			candidates[row * candidate_width + column] = records[row].candidate_indices[column];
 			candidate_q[row * candidate_width + column] = records[row].candidate_q[column];
+			advantage_targets[row * candidate_width + column] =
+				records[row].advantage_target[column];
 		}
 	}
 	if (!path.parent_path().empty()) {
@@ -747,7 +790,7 @@ nlohmann::json write_fcpi_h5(const std::filesystem::path &path, std::vector<Posi
 		H5Fcreate(path.string().c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT), path.string());
 	write_string_attribute(file, "arch_type", kArchType);
 	write_string_attribute(file, "fcpi_formula", kFcpiFormula);
-	write_dataset(file, "states", H5T_STD_U8LE, H5T_NATIVE_UINT8, {count, kStatePlanes, 8},
+	write_dataset(file, "states", H5T_STD_U8LE, H5T_NATIVE_UINT8, {count, kStateFeatures},
 				  states.data());
 	write_dataset(file, "legal_indices", H5T_STD_I32LE, H5T_NATIVE_INT32, {count, legal_width},
 				  legal.data());
@@ -762,6 +805,8 @@ nlohmann::json write_fcpi_h5(const std::filesystem::path &path, std::vector<Posi
 				  {count, candidate_width}, candidates.data());
 	write_dataset(file, "candidate_q", H5T_IEEE_F32LE, H5T_NATIVE_FLOAT, {count, candidate_width},
 				  candidate_q.data());
+	write_dataset(file, "advantage_targets", H5T_IEEE_F32LE, H5T_NATIVE_FLOAT,
+				  {count, candidate_width}, advantage_targets.data());
 	write_dataset(file, "candidate_counts", H5T_STD_U8LE, H5T_NATIVE_UINT8, {count},
 				  candidate_counts.data());
 	H5Fclose(file);
@@ -788,6 +833,7 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 	double total_loss = 0.0;
 	double total_policy = 0.0;
 	double total_value = 0.0;
+	double total_dueling_q = 0.0;
 	double total_kl = 0.0;
 	double total_entropy = 0.0;
 	for (int epoch = 0; epoch < std::max(0, options.epochs); ++epoch) {
@@ -797,11 +843,14 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 			const auto end = std::min(order.size(), begin + std::max(1, options.batch_size));
 			const std::int64_t batch = static_cast<std::int64_t>(end - begin);
 			std::size_t width = 1;
-			std::vector<std::uint8_t> packed(batch * kStatePlanes * 8);
+			std::vector<std::uint8_t> packed(batch * kStateFeatures);
+			std::size_t candidate_width = 1;
 			for (std::size_t index = begin; index < end; ++index) {
 				width = std::max(width, records[order[index]].legal_indices.size());
+				candidate_width =
+					std::max(candidate_width, records[order[index]].candidate_indices.size());
 				std::copy(records[order[index]].state.begin(), records[order[index]].state.end(),
-						  packed.begin() + (index - begin) * kStatePlanes * 8);
+						  packed.begin() + (index - begin) * kStateFeatures);
 			}
 			auto states = decode_states(packed.data(), batch).to(device, true);
 			auto legal = torch::zeros({batch, static_cast<std::int64_t>(width)}, torch::kInt64);
@@ -809,20 +858,33 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 			auto targets = torch::zeros({batch, static_cast<std::int64_t>(width)}, torch::kFloat32);
 			auto counts = torch::zeros({batch}, torch::kInt64);
 			auto values = torch::zeros({batch}, torch::kFloat32);
+			auto candidate_indices =
+				torch::zeros({batch, static_cast<std::int64_t>(candidate_width)}, torch::kInt64);
+			auto advantage_targets =
+				torch::zeros({batch, static_cast<std::int64_t>(candidate_width)}, torch::kFloat32);
+			auto candidate_counts = torch::zeros({batch}, torch::kInt64);
 			auto legal_access = legal.accessor<std::int64_t, 2>();
 			auto prior_access = priors.accessor<float, 2>();
 			auto target_access = targets.accessor<float, 2>();
 			auto count_access = counts.accessor<std::int64_t, 1>();
 			auto value_access = values.accessor<float, 1>();
+			auto candidate_access = candidate_indices.accessor<std::int64_t, 2>();
+			auto advantage_access = advantage_targets.accessor<float, 2>();
+			auto candidate_count_access = candidate_counts.accessor<std::int64_t, 1>();
 			for (std::size_t index = begin; index < end; ++index) {
 				const auto &record = records[order[index]];
 				const auto row = static_cast<std::int64_t>(index - begin);
 				count_access[row] = record.legal_indices.size();
 				value_access[row] = record.value_target;
+				candidate_count_access[row] = record.candidate_indices.size();
 				for (std::size_t column = 0; column < record.legal_indices.size(); ++column) {
 					legal_access[row][column] = record.legal_indices[column];
 					prior_access[row][column] = record.legal_prior[column];
 					target_access[row][column] = record.policy_target[column];
+				}
+				for (std::size_t column = 0; column < record.candidate_indices.size(); ++column) {
+					candidate_access[row][column] = record.candidate_indices[column];
+					advantage_access[row][column] = record.advantage_target[column];
 				}
 			}
 			legal = legal.to(device, true);
@@ -830,10 +892,13 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 			targets = targets.to(device, true);
 			counts = counts.to(device, true);
 			values = values.to(device, true);
+			candidate_indices = candidate_indices.to(device, true);
+			advantage_targets = advantage_targets.to(device, true);
+			candidate_counts = candidate_counts.to(device, true);
 
 			optimizer.zero_grad();
-			auto [logits, predicted] = model->forward(states);
-			auto selected = logits.gather(1, legal).to(torch::kFloat32);
+			auto output = model->forward(states);
+			auto selected = output.policy.gather(1, legal).to(torch::kFloat32);
 			auto columns = torch::arange(static_cast<std::int64_t>(width), counts.options());
 			auto mask = columns.unsqueeze(0) < counts.unsqueeze(1);
 			selected = selected.masked_fill(~mask, -1e9);
@@ -849,8 +914,22 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 					.sum(1)
 					.mean();
 			auto entropy = -(probabilities * log_probability).sum(1).mean();
-			auto value_loss = torch::nn::functional::smooth_l1_loss(predicted.squeeze(1), values);
+			auto predicted_values = output.value.squeeze(1);
+			auto value_loss = torch::nn::functional::smooth_l1_loss(predicted_values, values);
+			auto selected_advantages = output.advantages.gather(1, candidate_indices);
+			auto predicted_q = torch::clamp(predicted_values.unsqueeze(1) + selected_advantages,
+										 -1.0, 1.0);
+			auto target_q = torch::clamp(values.unsqueeze(1) + advantage_targets, -1.0, 1.0);
+			auto candidate_columns = torch::arange(
+				static_cast<std::int64_t>(candidate_width), candidate_counts.options());
+			auto candidate_mask = candidate_columns.unsqueeze(0) < candidate_counts.unsqueeze(1);
+			auto q_errors = torch::nn::functional::smooth_l1_loss(
+				predicted_q, target_q,
+				torch::nn::functional::SmoothL1LossFuncOptions().reduction(torch::kNone));
+			auto dueling_q_loss =
+				(q_errors * candidate_mask).sum() / candidate_mask.sum().clamp_min(1);
 			auto loss = options.policy_weight * policy_loss + options.value_weight * value_loss +
+						options.dueling_q_weight * dueling_q_loss +
 						options.kl_weight * kl - options.entropy_weight * entropy;
 			loss.backward();
 			if (options.grad_clip > 0.0) {
@@ -861,12 +940,14 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 			total_loss += loss.item<double>();
 			total_policy += policy_loss.item<double>();
 			total_value += value_loss.item<double>();
+			total_dueling_q += dueling_q_loss.item<double>();
 			total_kl += kl.item<double>();
 			total_entropy += entropy.item<double>();
 			if (options.log_every > 0 && (steps == 1 || steps % options.log_every == 0)) {
 				std::cout << "fcpi train: step=" << steps
 						  << " policy=" << policy_loss.item<double>()
 						  << " value=" << value_loss.item<double>() << " kl=" << kl.item<double>()
+						  << " dueling_q=" << dueling_q_loss.item<double>()
 						  << " entropy=" << entropy.item<double>()
 						  << " loss=" << loss.item<double>() << std::endl;
 			}
@@ -891,6 +972,7 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 			 {"loss", total_loss / divisor},
 			 {"policy", total_policy / divisor},
 			 {"value", total_value / divisor},
+			 {"dueling_q", total_dueling_q / divisor},
 			 {"kl", total_kl / divisor},
 			 {"entropy", total_entropy / divisor},
 		 }},
@@ -978,4 +1060,4 @@ void run_fcpi(const FcpiOptions &options) {
 	}
 }
 
-} // namespace gadus
+} // namespace melano

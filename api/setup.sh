@@ -4,7 +4,7 @@ set -euo pipefail
 API_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${API_DIR}/.." && pwd)"
 DOWNLOADS="${API_DIR}/downloads"
-TORCH_VERSION="${GADUS_TORCH_VERSION:-2.13.0}"
+TORCH_VERSION="${GADIDAE_TORCH_VERSION:-2.13.0}"
 HDF5_VERSION="1.14.6"
 ZLIB_VERSION="1.3.1"
 JSON_VERSION="3.12.0"
@@ -14,10 +14,10 @@ CHESS_SHA256="f2c8e2e929641e2c71cbe9d8abd718cf3cac46c2a34531215ebd733905e98d7f"
 mkdir -p "${DOWNLOADS}"
 
 TORCH_VARIANT="cpu"
-if command -v nvidia-smi >/dev/null 2>&1; then
-  TORCH_VARIANT="cu126"
+if nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits >/dev/null 2>&1; then
+	TORCH_VARIANT="cu126"
 fi
-TORCH_VARIANT="${GADUS_TORCH_VARIANT:-${TORCH_VARIANT}}"
+TORCH_VARIANT="${GADIDAE_TORCH_VARIANT:-${TORCH_VARIANT}}"
 
 download() {
   local url="$1"
@@ -32,7 +32,7 @@ download() {
   fi
 }
 
-if [[ "${GADUS_SKIP_TORCH:-0}" == "1" ]]; then
+if [[ "${GADIDAE_SKIP_TORCH:-0}" == "1" ]]; then
   echo "Skipping LibTorch setup."
 elif [[ ! -d "${API_DIR}/libtorch/share/cmake/Torch" ]]; then
   TORCH_ZIP="${DOWNLOADS}/libtorch-${TORCH_VERSION}-${TORCH_VARIANT}-linux.zip"

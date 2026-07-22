@@ -1,16 +1,16 @@
 #include <iomanip>
 #include <iostream>
 
-#include "gadus/args.hpp"
-#include "gadus/checkpoint.hpp"
-#include "gadus/search.hpp"
+#include "melano/args.hpp"
+#include "melano/checkpoint.hpp"
+#include "melano/search.hpp"
 
 int main(int argc, char **argv) {
 	try {
-		gadus::Args args(argc, argv);
+		melano::Args args(argc, argv);
 		if (args.has("help")) {
 			std::cout
-				<< "Usage: search --model <gadus.pth> [--fen <fen>] [options]\n"
+				<< "Usage: search --model <melano.pth> [--fen <fen>] [options]\n"
 				<< "  --device <auto|cpu|cuda> --search-type <closed|only-mcts>\n"
 				<< "  --mcts-sims <n> --mcts-min-sims <n> --mcts-batch-size <n> --movetime-ms "
 				   "<ms>\n"
@@ -19,10 +19,10 @@ int main(int argc, char **argv) {
 				<< "  --instant-mate-first <0|1> --root-topn <n>\n";
 			return 0;
 		}
-		const auto model_path = args.get("model", "models/gadus.pth");
-		const auto device = gadus::resolve_device(args.get("device", "auto"));
-		gadus::SearchOptions options;
-		options.type = gadus::parse_search_type(args.get("search-type", "only-mcts"));
+		const auto model_path = args.get("model", "models/melano.pth");
+		const auto device = melano::resolve_device(args.get("device", "auto"));
+		melano::SearchOptions options;
+		options.type = melano::parse_search_type(args.get("search-type", "only-mcts"));
 		options.mcts_sims = args.get_int("mcts-sims", options.mcts_sims);
 		options.mcts_min_sims = args.get_int("mcts-min-sims", options.mcts_min_sims);
 		options.mcts_batch_size = args.get_int("mcts-batch-size", options.mcts_batch_size);
@@ -38,16 +38,16 @@ int main(int argc, char **argv) {
 			args.get_bool("instant-mate-first", options.instant_mate_first);
 		options.root_topn = args.get_int("root-topn", options.root_topn);
 
-		auto model = gadus::load_checkpoint(model_path, device);
-		gadus::Searcher searcher(model, device, options);
+		auto model = melano::load_checkpoint(model_path, device);
+		melano::Searcher searcher(model, device, options);
 		const std::string fen = args.get("fen", std::string(chess::constants::STARTPOS));
 		chess::Board board(fen);
 		const auto result = searcher.search(board);
 
 		std::cout << std::fixed << std::setprecision(6);
 		std::cout << "fen: " << board.getFen() << '\n';
-		std::cout << "best: " << gadus::move_san(board, result.move) << ' '
-				  << gadus::move_uci(result.move) << '\n';
+		std::cout << "best: " << melano::move_san(board, result.move) << ' '
+				  << melano::move_uci(result.move) << '\n';
 		std::cout << "value: " << result.value << '\n';
 		std::cout << "mcts: " << result.sims_completed << " / " << result.dynamic_target << " / "
 				  << options.mcts_sims << '\n';
@@ -58,10 +58,11 @@ int main(int argc, char **argv) {
 		std::cout << "root:\n";
 		for (std::size_t index = 0; index < result.root.size(); ++index) {
 			const auto &row = result.root[index];
-			std::cout << index + 1 << ". " << gadus::move_san(board, row.move) << ' '
-					  << gadus::move_uci(row.move) << " p=" << row.probability
+			std::cout << index + 1 << ". " << melano::move_san(board, row.move) << ' '
+					  << melano::move_uci(row.move) << " p=" << row.probability
 					  << " decision=" << row.decision_score << " prior=" << row.prior
-					  << " visits=" << row.visits << " q=" << row.q;
+					  << " visits=" << row.visits << " q=" << row.q
+					  << " adv=" << row.advantage << " q_prior=" << row.q_prior;
 			if (row.instant_mate) {
 				std::cout << " imf";
 			}

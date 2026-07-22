@@ -1,6 +1,6 @@
 # Gadus C++
 
-Gadus C++ 是 `resnet_pv_linear` 思路的独立 C++ 实现，覆盖以下链路：
+Gadus C++ 覆盖以下链路：
 
 ```text
 PGN -> preprocess -> HDF5 -> train -> checkpoint
@@ -9,7 +9,7 @@ candidate + baseline -> arena
 checkpoint -> FCPI self-play -> train -> arena gate -> current checkpoint
 ```
 
-Python 实现保留在 `src/*.py`，可在 C++ 链路调试期间继续使用。C++ Gadus 的数据、模型、搜索公式和入口均位于 Gadus 自己的模块中。后续 Melano 可采用同样的目录形式建立独立实现。
+Gadus 的数据、模型、搜索公式和入口均位于自身模块中。Melano 采用对称目录和独立 library 实现自身链路。
 
 ## 1. 目录
 
@@ -45,8 +45,8 @@ src/gadus/
 	search.cpp
 	arena.cpp
 	fcpi.cpp
-tests/
-	gadustests.cpp
+	uci.cpp
+	tests.cpp
 CMakeLists.txt
 ```
 
@@ -57,8 +57,8 @@ CMakeLists.txt
 - `src/gadus/searcher.cpp`：closed 决策、batched MCTS、PUCT、FPU、IMF 和 RPP。
 - `src/gadus/match.cpp`：paired-opening batched arena 和 PGN 输出。
 - `src/gadus/evolution.cpp`：Gadus FCPI 采样、反事实目标、训练、arena gate 和晋升。
-- `src/gadus/*.cpp` 中的五个同名入口：`preprocess`、`train`、`search`、`arena`、`fcpi`。
-- `tests/gadustests.cpp`：状态编码、招法编码、模型前反向和 checkpoint 测试。
+- `src/gadus/*.cpp` 中的六个入口：`preprocess`、`train`、`search`、`arena`、`fcpi`、`uci`。
+- `src/gadus/tests.cpp`：状态编码、招法编码、模型前反向和 checkpoint 测试。
 
 ## 2. 依赖
 
@@ -71,47 +71,49 @@ CMakeLists.txt
 - chess-library
 - Ninja
 
-脚本通过 `nvidia-smi` 选择 LibTorch CUDA `cu126` 或 CPU 包。可使用 `GADUS_TORCH_VARIANT` 显式选择：
+脚本仅在 `nvidia-smi` 能成功查询实际 GPU compute capability 时选择 LibTorch CUDA `cu126`，其余情况选择 CPU 包。可使用 `GADIDAE_TORCH_VARIANT` 显式选择。Windows 使用 `curl.exe` 下载并显示进度、速度和预计剩余时间。
 
 依赖安装成功后，脚本清理下载包、HDF5/zlib 源码和中间构建目录，仅保留运行与开发所需的安装目录、头文件和脚本。
 
 ### Windows
 
 ```powershell
-$env:GADUS_TORCH_VARIANT = "cpu"
-api\setup.bat
+$env:GADIDAE_TORCH_VARIANT = "cpu"
+.\api\setup.bat
 ```
 
 CUDA：
 
 ```powershell
-$env:GADUS_TORCH_VARIANT = "cu126"
-api\setup.bat
+$env:GADIDAE_TORCH_VARIANT = "cu126"
+.\api\setup.bat
 ```
 
 ### Linux
 
 ```bash
-GADUS_TORCH_VARIANT=cpu bash api/setup.sh
+GADIDAE_TORCH_VARIANT=cpu bash api/setup.sh
 ```
 
 CUDA：
 
 ```bash
-GADUS_TORCH_VARIANT=cu126 bash api/setup.sh
+GADIDAE_TORCH_VARIANT=cu126 bash api/setup.sh
 ```
 
 ## 3. 构建
 
 ### Windows
 
-官方 Windows LibTorch 使用 MSVC ABI。完整 Visual Studio IDE 可由 Microsoft C++ Build Tools 与 Windows SDK 代替。`build.bat` 通过 `vswhere` 初始化编译环境，并让 CMake 生成 Ninja 构建文件。
+官方 Windows LibTorch 使用 MSVC ABI。完整 Visual Studio IDE 可由 Microsoft C++ Build Tools 与 Windows SDK 代替。`scripts/build.bat` 通过 `vswhere` 初始化编译环境，并让 CMake 生成 Ninja 构建文件。
 
-Gadus library 使用 LibTorch/chess-library 预编译头，MSVC 使用 `/MP` 并行编译，第三方依赖作为 system headers 处理。`build/` 保存 Ninja 增量构建缓存，可在需要回收空间时删除并重新生成。
+Gadus library 使用 LibTorch/chess-library 预编译头，MSVC 使用 `/MP` 并行编译，第三方依赖作为 system headers 处理。构建脚本在临时目录完成编译与 CTest，再将运行文件发布到 `build/gadus/`。
 
 ```powershell
-build.bat
+.\scripts\build.bat
 ```
+
+`scripts/build.bat` 默认读取 `api/libtorch`。使用已有 LibTorch 安装时，可将 `GADIDAE_TORCH_DIR` 指向其根目录。
 
 可执行文件位于：
 
@@ -121,12 +123,13 @@ build/gadus/train.exe
 build/gadus/search.exe
 build/gadus/arena.exe
 build/gadus/fcpi.exe
+build/gadus/uci.exe
 ```
 
 ### Linux
 
 ```bash
-bash build.sh
+bash scripts/build.sh
 ```
 
 可执行文件位于 `build/gadus/`。
@@ -165,7 +168,7 @@ target_schema=policy_value
 has_cmt=0|1
 ```
 
-C++ Gadus checkpoint 使用 LibTorch archive，保存模型参数以及 `channels`、`blocks`、`epoch`、`global_step`、`stage` 元数据，并由 C++ Gadus 各入口读取。
+C++ Gadus checkpoint 使用 LibTorch archive，逻辑顶层仅包含 `model` 与 `arch`。`model` 保存网络参数，`arch` 保存 Gadus 标识、`channels`、`blocks` 与 `action_size`。监督训练与 FCPI 的轮次和步数只写入运行日志。
 
 监督训练损失：
 
@@ -307,7 +310,7 @@ build/gadus/arena \
 	--log-every 1
 ```
 
-Arena 使用 paired openings，同一开局交换双方颜色。`games-in-flight` 表示同时推进的对局数，两个模型各加载一次并批量评估轮到自己走子的局面。结果包含 wins、draws、losses、net wins、score、置信区间和 Elo 差估计。
+Arena 使用 paired openings，同一开局交换双方颜色。`games` 使用正偶数。`games-in-flight` 表示同时推进的对局数，两个模型各加载一次并批量评估轮到自己走子的局面。结果包含 wins、draws、losses、net wins、score、置信区间和 Elo 差估计。
 
 从标准初始局面开始：
 
