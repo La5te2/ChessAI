@@ -99,6 +99,7 @@ Windows：
 
 ```powershell
 .\scripts\build.bat
+# cmake -S <根目录> -B <根目录>\.build-work -G Ninja
 ```
 
 Linux：
