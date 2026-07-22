@@ -41,7 +41,9 @@ cmd = "pythonw.exe scripts\stadium.py" & _
   " --white-uci """ & whiteUci & """" & _
   " --black-uci """ & blackUci & """" & _
   " --white-movetime-ms " & whiteMovetimeMs & _
+  " --white-multipv 5" & _
   " --black-movetime-ms " & blackMovetimeMs & _
+  " --black-multipv 5" & _
   " --delay-ms 2000" & _
   " --max-plies 300"
 

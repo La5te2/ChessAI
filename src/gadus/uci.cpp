@@ -1,3 +1,5 @@
+// Exposes Gadus checkpoints as a standards-oriented UCI process for GUI and bot clients.
+
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -9,7 +11,6 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
-
 #include "gadus/args.hpp"
 #include "gadus/checkpoint.hpp"
 #include "gadus/search.hpp"
@@ -30,6 +31,7 @@ struct EngineOptions {
 	int score_scale = 1000;
 };
 
+// Remove surrounding ASCII whitespace from protocol input and option values.
 std::string trim(std::string value) {
 	const auto first = value.find_first_not_of(" \t\r\n");
 	if (first == std::string::npos) {
@@ -39,6 +41,7 @@ std::string trim(std::string value) {
 	return value.substr(first, last - first + 1);
 }
 
+// Tokenize one UCI command on whitespace.
 std::vector<std::string> split(const std::string &line) {
 	std::istringstream stream(line);
 	std::vector<std::string> tokens;
@@ -48,6 +51,7 @@ std::vector<std::string> split(const std::string &line) {
 	return tokens;
 }
 
+// Canonicalize option names by keeping lowercase alphanumeric characters only.
 std::string normalized(std::string value) {
 	std::string output;
 	for (const unsigned char character : value) {
@@ -58,6 +62,7 @@ std::string normalized(std::string value) {
 	return output;
 }
 
+// Parse permissive UCI Boolean text while retaining a caller-provided fallback.
 bool parse_bool(const std::string &value, bool fallback) {
 	const auto key = normalized(value);
 	if (key == "1" || key == "true" || key == "yes" || key == "on") {
@@ -69,6 +74,7 @@ bool parse_bool(const std::string &value, bool fallback) {
 	return fallback;
 }
 
+// Parse an integer option without letting malformed client input terminate the engine.
 int parse_int(const std::string &value, int fallback) {
 	try {
 		return std::stoi(value);
@@ -77,6 +83,7 @@ int parse_int(const std::string &value, int fallback) {
 	}
 }
 
+// Parse a floating option without letting malformed client input terminate the engine.
 double parse_double(const std::string &value, double fallback) {
 	try {
 		return std::stod(value);
@@ -87,8 +94,10 @@ double parse_double(const std::string &value, double fallback) {
 
 class UciEngine {
 	public:
+	// Store initial options; model loading remains lazy until readiness or search.
 	explicit UciEngine(EngineOptions options) : options_(std::move(options)) {}
 
+	// Dispatch UCI commands until quit or end-of-input, reporting command errors as info strings.
 	void loop() {
 		for (std::string line; std::getline(std::cin, line);) {
 			line = trim(line);
@@ -133,10 +142,12 @@ class UciEngine {
 	}
 
 	private:
+	// Emit and flush one complete protocol line.
 	static void print(const std::string &text) {
 		std::cout << text << std::endl;
 	}
 
+	// Advertise engine identity and every configurable UCI option before uciok.
 	void emit_identity() const {
 		print("id name Gadidae Gadus");
 		print("id author La5te2");
@@ -184,6 +195,7 @@ class UciEngine {
 		print("uciok");
 	}
 
+	// Load or reload the checkpoint only when model path or device changed.
 	void ensure_model() {
 		if (options_.model_path.empty()) {
 			throw std::runtime_error("ModelPath is empty");
@@ -197,6 +209,7 @@ class UciEngine {
 		loaded_device_ = options_.device;
 	}
 
+	// Parse setoption name/value and update the matching typed engine setting.
 	void set_option(const std::string &line) {
 		const auto name_at = line.find(" name ");
 		if (name_at == std::string::npos) {
@@ -261,6 +274,7 @@ class UciEngine {
 		}
 	}
 
+	// Reconstruct startpos/FEN and apply the optional legal UCI move sequence.
 	void set_position(const std::string &line) {
 		const auto tokens = split(line);
 		if (tokens.size() < 2) {
@@ -294,6 +308,7 @@ class UciEngine {
 		}
 	}
 
+	// Parse go tokens into a lookup table, preserving valueless flags such as infinite.
 	std::unordered_map<std::string, std::string> parse_go(const std::string &line) const {
 		const auto tokens = split(line);
 		std::unordered_map<std::string, std::string> values;
@@ -307,6 +322,7 @@ class UciEngine {
 		return values;
 	}
 
+	// Derive a bounded per-move budget from movetime or the active side's clock and increment.
 	int movetime_for(const std::unordered_map<std::string, std::string> &go) const {
 		if (const auto found = go.find("movetime"); found != go.end()) {
 			return std::max(0, parse_int(found->second, static_cast<int>(options_.search.movetime_ms)));
@@ -333,10 +349,12 @@ class UciEngine {
 		return std::max(0, static_cast<int>(options_.search.movetime_ms));
 	}
 
+	// Map bounded neural value to a monotonic centipawn-like UCI display score.
 	int score_cp(float value) const {
 		return static_cast<int>(std::lround(std::clamp(value, -0.999F, 0.999F) * options_.score_scale));
 	}
 
+	// Emit final or progressive MultiPV lines using root-side values and search statistics.
 	void emit_info(const gadus::SearchResult &result) const {
 		const int elapsed = std::max(0, static_cast<int>(std::lround(result.elapsed_ms)));
 		const int nodes = std::max(result.sims_completed, result.nn_batches > 0 ? 1 : 0);
@@ -354,6 +372,7 @@ class UciEngine {
 		}
 	}
 
+	// Run one search under go overrides, emit progress, then publish exactly one bestmove.
 	void go(const std::string &line) {
 		if (gadus::game_is_over(board_)) {
 			print("bestmove 0000");
@@ -375,6 +394,7 @@ class UciEngine {
 		print("bestmove " + gadus::move_uci(result.move));
 	}
 
+	// Supply a deterministic legal move only when command recovery needs a protocol response.
 	std::string fallback_move() const {
 		const auto moves = gadus::legal_moves(board_);
 		return moves.empty() ? "0000" : gadus::move_uci(moves.front());
@@ -388,6 +408,7 @@ class UciEngine {
 	std::string loaded_device_;
 };
 
+// Convert process arguments to initial UCI options before entering the protocol loop.
 EngineOptions options_from_args(int argc, char **argv) {
 	gadus::Args args(argc, argv);
 	EngineOptions options;
@@ -425,6 +446,7 @@ EngineOptions options_from_args(int argc, char **argv) {
 
 } // namespace
 
+// Start the Gadus UCI process and convert fatal initialization errors to stderr/exit failure.
 int main(int argc, char **argv) {
 	try {
 		UciEngine(options_from_args(argc, argv)).loop();

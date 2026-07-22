@@ -1,8 +1,10 @@
-#include <iostream>
+// Gadus arena command-line entry point; match logic lives in match.cpp.
 
+#include <iostream>
 #include "gadus/arena.hpp"
 #include "gadus/args.hpp"
 
+// Parse arena/search options, run evaluation, and print the final JSON summary.
 int main(int argc, char **argv) {
 	try {
 		gadus::Args args(argc, argv);

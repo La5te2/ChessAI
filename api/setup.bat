@@ -2,15 +2,22 @@
 setlocal EnableExtensions EnableDelayedExpansion
 
 set "API_DIR=%~dp0"
+for %%I in ("%API_DIR%.") do set "API_ROOT=%%~fI"
 for %%I in ("%API_DIR%..") do set "ROOT_DIR=%%~fI"
-set "TORCH_VERSION=2.13.0"
-set "HDF5_VERSION=1.14.6"
-set "ZLIB_VERSION=1.3.1"
-set "JSON_VERSION=3.12.0"
-set "NINJA_VERSION=1.12.1"
-set "CHESS_REF=master"
 
-if not "%GADIDAE_TORCH_VERSION%"=="" set "TORCH_VERSION=%GADIDAE_TORCH_VERSION%"
+call :main
+set "SETUP_STATUS=%ERRORLEVEL%"
+call :cleanup
+exit /b %SETUP_STATUS%
+
+:main
+set "VERSION_FILE=%API_DIR%versions.env"
+if not exist "%VERSION_FILE%" (
+	echo Dependency lock is missing: %VERSION_FILE%
+	exit /b 1
+)
+for /f "usebackq eol=# tokens=1,* delims==" %%A in ("%VERSION_FILE%") do set "%%A=%%B"
+
 if not exist "%API_DIR%downloads" mkdir "%API_DIR%downloads"
 
 where curl.exe >nul 2>nul
@@ -21,8 +28,14 @@ if errorlevel 1 (
 
 set "TORCH_VARIANT=cpu"
 nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits >nul 2>nul
-if not errorlevel 1 set "TORCH_VARIANT=cu126"
+if not errorlevel 1 set "TORCH_VARIANT=%TORCH_GPU_VARIANT%"
 if not "%GADIDAE_TORCH_VARIANT%"=="" set "TORCH_VARIANT=%GADIDAE_TORCH_VARIANT%"
+set "TORCH_VARIANT_ALLOWED="
+for %%V in (%TORCH_VARIANTS:,= %) do if /i "%%V"=="%TORCH_VARIANT%" set "TORCH_VARIANT_ALLOWED=1"
+if not defined TORCH_VARIANT_ALLOWED (
+	echo Unsupported LibTorch variant %TORCH_VARIANT%; allowed: %TORCH_VARIANTS%
+	exit /b 1
+)
 
 if "%GADIDAE_SKIP_TORCH%"=="1" goto torch_ready
 if not exist "%API_DIR%libtorch\share\cmake\Torch" (
@@ -56,7 +69,7 @@ if not exist "%API_DIR%chess\chess.hpp" (
   echo Downloading chess-library 0.9.4...
   if not exist "%API_DIR%chess" mkdir "%API_DIR%chess"
   curl.exe --fail --location --retry 3 --output "%API_DIR%chess\chess.hpp" "https://raw.githubusercontent.com/Disservin/chess-library/%CHESS_REF%/include/chess.hpp" || exit /b 1
-  powershell -NoProfile -ExecutionPolicy Bypass -Command "if ((Get-FileHash '%API_DIR%chess\chess.hpp' -Algorithm SHA256).Hash -ne 'F2C8E2E929641E2C71CBE9D8ABD718CF3CAC46C2A34531215EBD733905E98D7F') { throw 'chess.hpp checksum mismatch' }" || exit /b 1
+  powershell -NoProfile -ExecutionPolicy Bypass -Command "if ((Get-FileHash '%API_DIR%chess\chess.hpp' -Algorithm SHA256).Hash -ne '%CHESS_SHA256%') { throw 'chess.hpp checksum mismatch' }" || exit /b 1
 )
 
 if not exist "%API_DIR%zlib\lib" (
@@ -87,13 +100,16 @@ if not exist "%API_DIR%hdf5\lib" (
 
 if not exist "%API_DIR%hdf5\lib" exit /b 1
 
-if exist "%API_DIR%zlib-src" rmdir /s /q "%API_DIR%zlib-src"
-if exist "%API_DIR%zlib-build" rmdir /s /q "%API_DIR%zlib-build"
-if exist "%API_DIR%hdf5-src" rmdir /s /q "%API_DIR%hdf5-src"
-if exist "%API_DIR%hdf5-build" rmdir /s /q "%API_DIR%hdf5-build"
-if exist "%API_DIR%downloads" rmdir /s /q "%API_DIR%downloads"
+cmake "-DAPI_DIR=%API_ROOT%" "-DTORCH_DIR=%API_ROOT%\libtorch" "-DEXPECTED_TORCH_VARIANT=%TORCH_VARIANT%" -P "%API_ROOT%\verify.cmake" || exit /b 1
 
 echo.
 echo Gadus dependencies ready.
 echo LibTorch variant: %TORCH_VARIANT%
-echo Build: call "%ROOT_DIR%\build.bat"
+echo Build: call "%ROOT_DIR%\scripts\build.bat"
+exit /b 0
+
+:cleanup
+for %%D in (zlib-src zlib-build zlib-unpack hdf5-src hdf5-build hdf5-unpack downloads) do (
+	if exist "%API_DIR%%%D" rmdir /s /q "%API_DIR%%%D"
+)
+exit /b 0

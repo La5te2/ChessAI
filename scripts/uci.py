@@ -23,7 +23,7 @@ def uci_executable(architecture: str) -> Path:
 
 def main(argv: list[str] | None = None) -> int:
 	parser = argparse.ArgumentParser(
-		description="Launch an architecture-specific Gadidae C++ UCI engine"
+		description="Launch an architecture-specific Gadidae UCI engine"
 	)
 	parser.add_argument("--arch", choices=ARCHITECTURES, required=True)
 	parser.add_argument("--model", required=True)

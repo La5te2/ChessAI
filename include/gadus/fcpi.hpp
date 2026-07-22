@@ -1,9 +1,10 @@
 #pragma once
 
+// Gadus FCPI self-play, counterfactual target construction, training, and promotion loop.
+
 #include <cstdint>
 #include <filesystem>
 #include <string>
-
 #include "gadus/arena.hpp"
 
 namespace gadus {
@@ -48,6 +49,7 @@ struct FcpiOptions {
 	std::uint64_t seed = 2026;
 };
 
+/// Runs all configured FCPI iterations and advances current.pth only after arena acceptance.
 void run_fcpi(const FcpiOptions &options);
 
 } // namespace gadus

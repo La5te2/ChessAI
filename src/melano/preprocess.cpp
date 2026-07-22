@@ -1,8 +1,10 @@
-#include <iostream>
+// Melano PGN-to-HDF5 preprocessing command-line entry point.
 
+#include <iostream>
 #include "melano/args.hpp"
 #include "melano/dataset.hpp"
 
+// Parse preprocessing controls and build one architecture-locked P/V/A HDF5 dataset.
 int main(int argc, char **argv) {
 	try {
 		melano::Args args(argc, argv);

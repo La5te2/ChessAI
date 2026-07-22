@@ -272,7 +272,6 @@ def simulator_search_worker(
                     ),
                     "InstantMateFirst": parameters.get("instant_mate_first", False),
                     "ProgressIntervalMS": parameters.get("progress_interval_ms", 750),
-                    "MultiPV": int(job.get("root_topn", 8)),
                 }
                 available = {name.lower(): name for name in engine.options}
                 configured = {
@@ -590,98 +589,129 @@ class EngineSettingsDialog(tk.Toplevel):
         super().__init__(parent)
         self.engine = engine
         self.on_applied = on_applied
-        self.title("UCI and Search Parameters")
-        self.resizable(False, True)
+        self.title("Settings")
+        self.resizable(True, False)
         self.transient(parent)
         self.grab_set()
 
         self.variables = {}
-        row = 0
+        notebook = ttk.Notebook(self)
+        notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=(10, 6))
 
-        ttk.Label(self, text="UCI command").grid(
-            row=row,
-            column=0,
-            sticky="w",
-            padx=8,
-            pady=5,
-        )
+        engine_tab = ttk.Frame(notebook, padding=10)
+        budget_tab = ttk.Frame(notebook, padding=10)
+        mcts_tab = ttk.Frame(notebook, padding=10)
+        decisions_tab = ttk.Frame(notebook, padding=10)
+        notebook.add(engine_tab, text="Engine")
+        notebook.add(budget_tab, text="Budget")
+        notebook.add(mcts_tab, text="MCTS")
+        notebook.add(decisions_tab, text="Decisions")
+
         self.path_var = tk.StringVar(value=engine.uci_command or "")
-        ttk.Entry(self, textvariable=self.path_var, width=54).grid(
-            row=row,
-            column=1,
-            sticky="ew",
-            padx=8,
-            pady=5,
+        ttk.Label(engine_tab, text="UCI command").grid(
+            row=0, column=0, sticky="w", padx=(0, 8), pady=6
         )
-        row += 1
+        path_entry = ttk.Entry(engine_tab, textvariable=self.path_var, width=64)
+        path_entry.grid(row=0, column=1, sticky="ew", pady=6)
+        ttk.Button(engine_tab, text="Browse", command=self.browse).grid(
+            row=0, column=2, padx=(8, 0), pady=6
+        )
 
-        labels = {
-            "device": "Device",
-            "search_type": "Search type",
-            "mcts_sims": "MCTS sims soft cap",
-            "mcts_min_sims": "MCTS minimum sims",
-            "mcts_batch_size": "MCTS batch size",
-            "movetime_ms": "Movetime (ms)",
-            "c_puct": "C-PUCT initial",
-            "c_puct_base": "C-PUCT schedule base",
-            "c_puct_factor": "C-PUCT schedule factor",
-            "fpu_reduction": "FPU reduction",
-            "repetition_policy_penalty": "Repetition policy penalty",
-            "instant_mate_first": "Instant Mate First",
-            "progress_interval_ms": "Progress interval (ms)",
-            "root_topn": "Suggestion count",
-        }
         current = engine.parameter_dict()
-        for name, converter in SEARCH_PARAMETER_TYPES.items():
-            ttk.Label(self, text=labels[name]).grid(
-                row=row,
-                column=0,
-                sticky="w",
-                padx=8,
-                pady=3,
-            )
-            if converter is bool_from_text:
-                variable = tk.BooleanVar(value=bool(current[name]))
-                control = ttk.Checkbutton(self, variable=variable)
-            else:
-                variable = tk.StringVar(value=str(current[name]))
-                control = ttk.Entry(self, textvariable=variable, width=24)
-            self.variables[name] = variable
-            control.grid(
-                row=row,
-                column=1,
-                sticky="ew",
-                padx=8,
-                pady=3,
-            )
-            row += 1
+        self._add_choice(engine_tab, 1, "device", "Device", current, ("auto", "cpu", "cuda"))
+        self._add_choice(
+            engine_tab, 2, "search_type", "Search type", current, VALID_SEARCH_TYPES
+        )
+        engine_tab.columnconfigure(1, weight=1)
+
+        budget_fields = (
+            ("movetime_ms", "Movetime (ms)"),
+            ("mcts_sims", "MCTS sims soft cap"),
+            ("mcts_min_sims", "MCTS minimum sims"),
+            ("mcts_batch_size", "MCTS batch size"),
+            ("root_topn", "Analysis lines"),
+            ("progress_interval_ms", "Display update (ms)"),
+        )
+        for row, (name, label) in enumerate(budget_fields):
+            self._add_entry(budget_tab, row, name, label, current)
+        budget_tab.columnconfigure(1, weight=1)
+
+        mcts_fields = (
+            ("c_puct", "C-PUCT initial"),
+            ("c_puct_base", "C-PUCT schedule base"),
+            ("c_puct_factor", "C-PUCT schedule factor"),
+            ("fpu_reduction", "FPU reduction"),
+        )
+        for row, (name, label) in enumerate(mcts_fields):
+            self._add_entry(mcts_tab, row, name, label, current)
+        mcts_tab.columnconfigure(1, weight=1)
+
+        self._add_entry(
+            decisions_tab,
+            0,
+            "repetition_policy_penalty",
+            "Repetition policy penalty",
+            current,
+        )
+        variable = tk.BooleanVar(value=bool(current["instant_mate_first"]))
+        self.variables["instant_mate_first"] = variable
+        ttk.Checkbutton(
+            decisions_tab,
+            text="Instant Mate First",
+            variable=variable,
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=6)
+        decisions_tab.columnconfigure(1, weight=1)
 
         buttons = ttk.Frame(self)
-        buttons.grid(
-            row=row,
-            column=0,
-            columnspan=3,
-            sticky="e",
-            padx=8,
-            pady=10,
-        )
+        buttons.pack(fill=tk.X, padx=10, pady=(0, 10))
         ttk.Button(
             buttons,
             text="Disconnect",
             command=self.unload,
-        ).pack(side=tk.LEFT, padx=4)
+        ).pack(side=tk.LEFT)
         ttk.Button(
             buttons,
             text="Apply and Reload",
             command=self.apply,
-        ).pack(side=tk.LEFT, padx=4)
+        ).pack(side=tk.RIGHT, padx=(6, 0))
         ttk.Button(
             buttons,
             text="Cancel",
             command=self.destroy,
-        ).pack(side=tk.LEFT, padx=4)
+        ).pack(side=tk.RIGHT)
 
-        self.columnconfigure(1, weight=1)
+        self.bind("<Escape>", lambda _event: self.destroy())
+        self.minsize(620, 300)
+        path_entry.focus_set()
+
+    def _add_entry(self, parent, row, name, label, current):
+        ttk.Label(parent, text=label).grid(
+            row=row, column=0, sticky="w", padx=(0, 12), pady=6
+        )
+        variable = tk.StringVar(value=str(current[name]))
+        self.variables[name] = variable
+        ttk.Entry(parent, textvariable=variable, width=24).grid(
+            row=row, column=1, sticky="ew", pady=6
+        )
+
+    def _add_choice(self, parent, row, name, label, current, choices):
+        ttk.Label(parent, text=label).grid(
+            row=row, column=0, sticky="w", padx=(0, 12), pady=6
+        )
+        variable = tk.StringVar(value=str(current[name]))
+        self.variables[name] = variable
+        ttk.Combobox(
+            parent,
+            textvariable=variable,
+            values=tuple(choices),
+            state="readonly",
+            width=22,
+        ).grid(row=row, column=1, sticky="w", pady=6)
+
+    def browse(self):
+        path = filedialog.askopenfilename(parent=self, title="Select UCI engine")
+        if path:
+            self.path_var.set(f'"{path}"' if " " in path else path)
 
     def apply(self):
         command = self.path_var.get().strip()

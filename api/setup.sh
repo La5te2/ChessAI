@@ -4,20 +4,39 @@ set -euo pipefail
 API_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${API_DIR}/.." && pwd)"
 DOWNLOADS="${API_DIR}/downloads"
-TORCH_VERSION="${GADIDAE_TORCH_VERSION:-2.13.0}"
-HDF5_VERSION="1.14.6"
-ZLIB_VERSION="1.3.1"
-JSON_VERSION="3.12.0"
-NINJA_VERSION="1.12.1"
-CHESS_REF="master"
-CHESS_SHA256="f2c8e2e929641e2c71cbe9d8abd718cf3cac46c2a34531215ebd733905e98d7f"
+VERSION_FILE="${API_DIR}/versions.env"
+
+cleanup() {
+	rm -rf -- \
+		"${API_DIR}/zlib-src" \
+		"${API_DIR}/zlib-build" \
+		"${API_DIR}/zlib-unpack" \
+		"${API_DIR}/hdf5-src" \
+		"${API_DIR}/hdf5-build" \
+		"${API_DIR}/hdf5-unpack" \
+		"${DOWNLOADS}"
+}
+trap cleanup EXIT
+
+if [[ ! -f "${VERSION_FILE}" ]]; then
+	echo "Dependency lock is missing: ${VERSION_FILE}" >&2
+	exit 1
+fi
+source "${VERSION_FILE}"
 mkdir -p "${DOWNLOADS}"
 
 TORCH_VARIANT="cpu"
 if nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits >/dev/null 2>&1; then
-	TORCH_VARIANT="cu126"
+	TORCH_VARIANT="${TORCH_GPU_VARIANT}"
 fi
 TORCH_VARIANT="${GADIDAE_TORCH_VARIANT:-${TORCH_VARIANT}}"
+case ",${TORCH_VARIANTS}," in
+	*,"${TORCH_VARIANT}",*) ;;
+	*)
+		echo "Unsupported LibTorch variant ${TORCH_VARIANT}; allowed: ${TORCH_VARIANTS}" >&2
+		exit 1
+		;;
+esac
 
 download() {
   local url="$1"
@@ -116,14 +135,13 @@ else
   echo "HDF5 already installed."
 fi
 
-rm -rf \
-  "${API_DIR}/zlib-src" \
-  "${API_DIR}/zlib-build" \
-  "${API_DIR}/hdf5-src" \
-  "${API_DIR}/hdf5-build" \
-  "${DOWNLOADS}"
+cmake \
+	"-DAPI_DIR=${API_DIR}" \
+	"-DTORCH_DIR=${API_DIR}/libtorch" \
+	"-DEXPECTED_TORCH_VARIANT=${TORCH_VARIANT}" \
+	-P "${API_DIR}/verify.cmake"
 
 echo
 echo "Gadus dependencies ready."
 echo "LibTorch variant: ${TORCH_VARIANT}"
-echo "Build: bash \"${ROOT_DIR}/build.sh\""
+echo "Build: bash \"${ROOT_DIR}/scripts/build.sh\""

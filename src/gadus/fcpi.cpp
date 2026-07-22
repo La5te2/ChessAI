@@ -1,8 +1,10 @@
-#include <iostream>
+// Gadus FCPI command-line entry point; evolution.cpp contains the learning algorithm.
 
+#include <iostream>
 #include "gadus/args.hpp"
 #include "gadus/fcpi.hpp"
 
+// Parse self-play, counterfactual, optimizer, and arena controls, then run FCPI.
 int main(int argc, char **argv) {
 	try {
 		gadus::Args args(argc, argv);

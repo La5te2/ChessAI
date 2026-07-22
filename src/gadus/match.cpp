@@ -1,5 +1,6 @@
-#include "gadus/arena.hpp"
+// Implements batched, paired Gadus arena games and result-only promotion statistics.
 
+#include "gadus/arena.hpp"
 #include <algorithm>
 #include <cmath>
 #include <fstream>
@@ -10,7 +11,6 @@
 #include <stdexcept>
 #include <utility>
 #include <vector>
-
 #include "gadus/checkpoint.hpp"
 
 namespace gadus {
@@ -33,6 +33,7 @@ struct ActiveGame {
 	bool finished = false;
 };
 
+// Convert a PGN result to candidate points after accounting for assigned color.
 double candidate_score(const GameRecord &record) {
 	if (record.result == "1/2-1/2") {
 		return 0.5;
@@ -41,6 +42,7 @@ double candidate_score(const GameRecord &record) {
 	return white_won == record.candidate_white ? 1.0 : 0.0;
 }
 
+// Freeze one active game into its immutable result record.
 void finish_game(ActiveGame &game, const std::string &result, const std::string &termination) {
 	game.finished = true;
 	game.record.result = result;
@@ -48,6 +50,7 @@ void finish_game(ActiveGame &game, const std::string &result, const std::string 
 	game.record.plies = static_cast<int>(game.record.san_moves.size());
 }
 
+// Apply exact terminal rules or the configured max-ply draw boundary.
 void update_finished(ActiveGame &game, int max_plies) {
 	if (game.finished) {
 		return;
@@ -59,6 +62,7 @@ void update_finished(ActiveGame &game, int max_plies) {
 	}
 }
 
+// Advance all active games by batching positions according to which model must move.
 void play_turns(std::vector<ActiveGame> &games, Searcher &candidate, Searcher &baseline,
 				int max_plies) {
 	while (true) {
@@ -88,6 +92,7 @@ void play_turns(std::vector<ActiveGame> &games, Searcher &candidate, Searcher &b
 			break;
 		}
 
+		// Commit a model batch while preserving each result's originating game index.
 		auto apply_results = [&](const std::vector<std::size_t> &indices,
 								 const std::vector<SearchResult> &results) {
 			for (std::size_t row = 0; row < indices.size(); ++row) {
@@ -107,6 +112,7 @@ void play_turns(std::vector<ActiveGame> &games, Searcher &candidate, Searcher &b
 	}
 }
 
+// Format SAN movetext with PGN move numbers and conventional 80-column wrapping.
 std::string wrap_moves(const std::vector<std::string> &moves) {
 	std::ostringstream output;
 	int column = 0;
@@ -127,6 +133,7 @@ std::string wrap_moves(const std::vector<std::string> &moves) {
 	return output.str();
 }
 
+// Write all arena records, colors, starts, terminations, and SAN moves as PGN.
 void write_pgn(const std::filesystem::path &path, const std::vector<GameRecord> &records,
 			   const std::string &candidate, const std::string &baseline) {
 	if (path.empty()) {
@@ -156,6 +163,7 @@ void write_pgn(const std::filesystem::path &path, const std::vector<GameRecord> 
 	}
 }
 
+// Convert score fraction to logistic Elo difference, clamped away from infinities.
 double elo_from_score(double score) {
 	const double bounded = std::clamp(score, 1e-6, 1.0 - 1e-6);
 	return 400.0 * std::log10(bounded / (1.0 - bounded));
@@ -163,6 +171,7 @@ double elo_from_score(double score) {
 
 } // namespace
 
+// Load both models once, play paired batches, and evaluate the net-win acceptance rule.
 nlohmann::json evaluate_models(const ArenaOptions &options) {
 	if (options.candidate.empty() || options.baseline.empty()) {
 		throw std::invalid_argument("arena requires candidate and baseline models");

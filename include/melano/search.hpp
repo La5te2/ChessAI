@@ -1,13 +1,13 @@
 #pragma once
 
+// Melano direct-policy and advantage-seeded batched PUCT search API.
+
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
 #include <vector>
-
 #include <torch/torch.h>
-
 #include "melano/game.hpp"
 #include "melano/model.hpp"
 
@@ -63,9 +63,12 @@ using SearchProgressCallback = std::function<void(const SearchResult &)>;
 
 class Searcher {
 	public:
+	/// Owns a Melano model in inference mode with an immutable search configuration.
 	Searcher(Model model, torch::Device device, SearchOptions options);
+	/// Searches one position and optionally emits periodic snapshots for interactive clients.
 	SearchResult search(const chess::Board &board,
 						const SearchProgressCallback &progress = {}, int progress_interval_ms = 0);
+	/// Searches independent positions together so leaf evaluations share neural batches.
 	std::vector<SearchResult> search_many(const std::vector<chess::Board> &boards);
 
 	private:
@@ -73,7 +76,9 @@ class Searcher {
 	std::shared_ptr<Impl> impl_;
 };
 
+/// Parses the exact public names closed and only-mcts.
 SearchType parse_search_type(const std::string &value);
+/// Returns the stable command-line name of a search type.
 std::string search_type_name(SearchType value);
 
 } // namespace melano

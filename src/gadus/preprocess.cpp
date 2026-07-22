@@ -1,8 +1,10 @@
-#include <iostream>
+// Gadus PGN-to-HDF5 preprocessing command-line entry point.
 
+#include <iostream>
 #include "gadus/args.hpp"
 #include "gadus/dataset.hpp"
 
+// Parse preprocessing controls and build one architecture-locked HDF5 dataset.
 int main(int argc, char **argv) {
 	try {
 		gadus::Args args(argc, argv);

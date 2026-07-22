@@ -1,10 +1,12 @@
+// Gadus single-position analysis CLI; the reusable algorithm is implemented in searcher.cpp.
+
 #include <iomanip>
 #include <iostream>
-
 #include "gadus/args.hpp"
 #include "gadus/checkpoint.hpp"
 #include "gadus/search.hpp"
 
+// Parse a FEN/search configuration, load one checkpoint, and print ranked root diagnostics.
 int main(int argc, char **argv) {
 	try {
 		gadus::Args args(argc, argv);

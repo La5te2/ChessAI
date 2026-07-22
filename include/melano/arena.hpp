@@ -1,11 +1,11 @@
 #pragma once
 
+// Paired, batched Melano-vs-Melano evaluation used by promotion gates.
+
 #include <cstdint>
 #include <filesystem>
 #include <string>
-
 #include <nlohmann/json.hpp>
-
 #include "melano/search.hpp"
 
 namespace melano {
@@ -27,6 +27,7 @@ struct ArenaOptions {
 	SearchOptions search;
 };
 
+/// Plays a color-balanced match and returns result statistics and acceptance state as JSON.
 nlohmann::json evaluate_models(const ArenaOptions &options);
 
 } // namespace melano

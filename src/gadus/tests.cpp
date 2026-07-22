@@ -1,20 +1,24 @@
+// Focused Gadus smoke tests for codecs, gradients, checkpoint round-trips, and search.
+
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
 #include <unordered_set>
-
 #include "gadus/checkpoint.hpp"
 #include "gadus/game.hpp"
 #include "gadus/model.hpp"
+#include "gadus/search.hpp"
 
 namespace {
 
+// Fail one test with a concise message instead of introducing a test-framework dependency.
 void require(bool condition, const char *message) {
 	if (!condition) {
 		throw std::runtime_error(message);
 	}
 }
 
+// Verify every legal action survives move->index->legal-move decoding in this position.
 void require_move_codec(const chess::Board &board) {
 	std::unordered_set<int> actions;
 	for (const auto &move : gadus::legal_moves(board)) {
@@ -26,6 +30,7 @@ void require_move_codec(const chess::Board &board) {
 	}
 }
 
+// Ensure one backward pass produced finite gradients for every participating parameter.
 void require_finite_gradients(const gadus::Model &model) {
 	for (const auto &parameter : model->parameters()) {
 		require(parameter.grad().defined(), "model parameter has no gradient");
@@ -36,6 +41,7 @@ void require_finite_gradients(const gadus::Model &model) {
 
 } // namespace
 
+// Exercise the complete minimal Gadus inference/training/checkpoint/search surface.
 int main() {
 	try {
 		chess::Board board;
@@ -113,6 +119,30 @@ int main() {
 				"checkpoint changed policy output");
 		require(torch::allclose(reference.second, loaded_output.second),
 				"checkpoint changed value output");
+
+		// Closed search ranks legal policy actions without constructing an MCTS tree.
+		gadus::SearchOptions closed_options;
+		closed_options.type = gadus::SearchType::Closed;
+		closed_options.mcts_sims = 0;
+		closed_options.root_topn = 4;
+		gadus::Searcher closed_searcher(loaded, torch::Device(torch::kCPU), closed_options);
+		const auto closed_result = closed_searcher.search(board);
+		require(closed_result.root.size() == 4, "closed search root size mismatch");
+		require(closed_result.sims_completed == 0, "closed search unexpectedly ran MCTS");
+		require(gadus::index_to_move(gadus::move_to_index(closed_result.move), board) ==
+					closed_result.move,
+				"closed search selected an illegal move");
+
+		// Four simulations exercise selection, batched expansion, and value backup.
+		gadus::SearchOptions mcts_options = closed_options;
+		mcts_options.type = gadus::SearchType::OnlyMcts;
+		mcts_options.mcts_sims = 4;
+		mcts_options.mcts_min_sims = 4;
+		mcts_options.mcts_batch_size = 2;
+		gadus::Searcher mcts_searcher(loaded, torch::Device(torch::kCPU), mcts_options);
+		const auto mcts_result = mcts_searcher.search(board);
+		require(mcts_result.sims_completed == 4, "MCTS simulation budget mismatch");
+		require(mcts_result.expanded_nodes > 0, "MCTS did not expand a node");
 		std::filesystem::remove(checkpoint);
 
 		std::cout << "gadustests passed" << std::endl;

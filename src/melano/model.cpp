@@ -1,5 +1,6 @@
-#include "melano/model.hpp"
+// Implements Melano's geometry-aware token network and P/V/A heads.
 
+#include "melano/model.hpp"
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
@@ -7,6 +8,7 @@
 
 namespace melano {
 
+// Select a practical multi-head factor without requiring channels to use one fixed width.
 int attention_heads_for_channels(int channels) {
 	for (const int heads : {8, 4, 2}) {
 		if (channels % heads == 0) {
@@ -18,6 +20,7 @@ int attention_heads_for_channels(int channels) {
 
 namespace {
 
+// Classify an ordered square pair by chessboard geometry for attention bias lookup.
 int square_geometry_relation(int source, int target) {
 	const int source_rank = source / 8;
 	const int source_file = source % 8;
@@ -48,6 +51,7 @@ int square_geometry_relation(int source, int target) {
 
 } // namespace
 
+// Materialize relation ids once; registered buffers move with the model but are not trained.
 torch::Tensor build_geometry_relation_ids() {
 	auto relation = torch::zeros({kTokenCount, kTokenCount}, torch::kInt64);
 	auto accessor = relation.accessor<std::int64_t, 2>();
@@ -59,6 +63,7 @@ torch::Tensor build_geometry_relation_ids() {
 	return relation;
 }
 
+// Embed board contents and global rule state into one global plus 64 square tokens.
 StateEmbeddingImpl::StateEmbeddingImpl(int channels) {
 	piece = register_module("piece", torch::nn::Embedding(13, channels));
 	square = register_module("square", torch::nn::Embedding(kBoardSquares, channels));
@@ -69,6 +74,7 @@ StateEmbeddingImpl::StateEmbeddingImpl(int channels) {
 	square_indices = register_buffer("square_indices", torch::arange(kBoardSquares, torch::kInt64));
 }
 
+// Add piece, absolute-square, and rule-context embeddings before token concatenation.
 torch::Tensor StateEmbeddingImpl::forward(torch::Tensor state) {
 	if (state.dim() != 2 || state.size(1) != kStateFeatures) {
 		throw std::runtime_error("expected Melano state [batch, 67]");
@@ -87,6 +93,7 @@ torch::Tensor StateEmbeddingImpl::forward(torch::Tensor state) {
 	return torch::cat({global, squares}, 1);
 }
 
+// Construct pre-norm attention with learned static geometry and state-conditioned bias.
 GeometryAttentionBlockImpl::GeometryAttentionBlockImpl(int channel_count)
 	: channels(channel_count), heads(attention_heads_for_channels(channel_count)),
 	  head_dim(channel_count / heads) {
@@ -108,6 +115,7 @@ GeometryAttentionBlockImpl::GeometryAttentionBlockImpl(int channel_count)
 								 torch::nn::Linear(channels * 4, channels)));
 }
 
+// Compute softmax((QK^T)/sqrt(d) + static_bias + dynamic_bias)V with residual updates.
 torch::Tensor GeometryAttentionBlockImpl::forward(torch::Tensor tokens) {
 	if (tokens.dim() != 3 || tokens.size(1) != kTokenCount || tokens.size(2) != channels) {
 		throw std::runtime_error("invalid Melano geometry-attention token shape");
@@ -136,6 +144,7 @@ torch::Tensor GeometryAttentionBlockImpl::forward(torch::Tensor tokens) {
 	return tokens + ffn->forward(norm2->forward(tokens));
 }
 
+// Build factorized from/to logits and a dedicated underpromotion suffix.
 ActionHeadImpl::ActionHeadImpl(int channels) {
 	norm = register_module("norm", torch::nn::LayerNorm(torch::nn::LayerNormOptions({channels})));
 	from_proj = register_module("from_proj", torch::nn::Linear(channels, channels));
@@ -143,6 +152,7 @@ ActionHeadImpl::ActionHeadImpl(int channels) {
 	underpromotion = register_module("underpromotion", torch::nn::Linear(channels, kUnderpromotionPlanes));
 }
 
+// Score ordinary moves by scaled source-destination dot products, then append promotions.
 torch::Tensor ActionHeadImpl::forward(torch::Tensor square_tokens) {
 	if (square_tokens.dim() != 3 || square_tokens.size(1) != kBoardSquares) {
 		throw std::runtime_error("expected Melano square tokens [batch, 64, channels]");
@@ -159,6 +169,7 @@ torch::Tensor ActionHeadImpl::forward(torch::Tensor square_tokens) {
 		1);
 }
 
+// Map the global token to a bounded side-to-move value.
 ValueHeadImpl::ValueHeadImpl(int channels) {
 	norm = register_module("norm", torch::nn::LayerNorm(torch::nn::LayerNormOptions({channels})));
 	value = register_module(
@@ -166,10 +177,12 @@ ValueHeadImpl::ValueHeadImpl(int channels) {
 									 torch::nn::Linear(256, 1), torch::nn::Tanh()));
 }
 
+// Read only the global token because attention has already pooled square information into it.
 torch::Tensor ValueHeadImpl::forward(torch::Tensor tokens) {
 	return value->forward(norm->forward(tokens.index({torch::indexing::Slice(), 0})));
 }
 
+// Reuse the action-shaped projection while initializing the final mappings near zero.
 AdvantageHeadImpl::AdvantageHeadImpl(int channels) {
 	action_head = register_module("action_head", ActionHead(channels));
 	torch::nn::init::normal_(action_head->to_proj->weight, 0.0, 0.01);
@@ -178,11 +191,13 @@ AdvantageHeadImpl::AdvantageHeadImpl(int channels) {
 	torch::nn::init::zeros_(action_head->underpromotion->bias);
 }
 
+// Enforce the project invariant A(s,a) <= 0 with -2*tanh(raw)^2.
 torch::Tensor AdvantageHeadImpl::forward(torch::Tensor square_tokens) {
 	auto raw = torch::tanh(action_head->forward(square_tokens));
 	return -2.0 * raw.square();
 }
 
+// Stack geometry-attention blocks and attach independent policy, value, and advantage heads.
 ModelImpl::ModelImpl(int channels, int blocks)
 	: channels_(channels), blocks_(std::max(1, blocks)) {
 	state_embedding = register_module("state_embedding", StateEmbedding(channels_));
@@ -195,6 +210,7 @@ ModelImpl::ModelImpl(int channels, int blocks)
 	advantage_head = register_module("advantage_head", AdvantageHead(channels_));
 }
 
+// Produce all three heads from one contextual token representation.
 ModelOutput ModelImpl::forward(torch::Tensor state) {
 	auto tokens = trunk->forward(state_embedding->forward(state));
 	auto squares = tokens.index({torch::indexing::Slice(), torch::indexing::Slice(1, torch::indexing::None)});
@@ -202,9 +218,12 @@ ModelOutput ModelImpl::forward(torch::Tensor state) {
 			advantage_head->forward(squares)};
 }
 
+// Expose the checkpoint-defining embedding width.
 int ModelImpl::channels() const noexcept { return channels_; }
+// Expose the checkpoint-defining attention depth.
 int ModelImpl::blocks() const noexcept { return blocks_; }
 
+// Sum tensor element counts rather than serialized bytes or optimizer state.
 std::int64_t parameter_count(const Model &model) {
 	std::int64_t count = 0;
 	for (const auto &parameter : model->parameters()) {

@@ -18,6 +18,7 @@ if not exist "%TORCH_DIR%\share\cmake\Torch\TorchConfig.cmake" (
 	echo LibTorch is missing or GADIDAE_TORCH_DIR is invalid.
 	exit /b 1
 )
+cmake -DAPI_DIR="%ROOT_DIR%\api" -DTORCH_DIR="%TORCH_DIR%" -P "%ROOT_DIR%\api\verify.cmake" || exit /b 1
 
 where cl >nul 2>nul
 if errorlevel 1 (

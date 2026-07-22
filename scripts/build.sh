@@ -43,6 +43,10 @@ if [[ ! -f "${TORCH_DIR}/share/cmake/Torch/TorchConfig.cmake" ]]; then
 	echo "LibTorch is missing or GADIDAE_TORCH_DIR is invalid." >&2
 	exit 1
 fi
+cmake \
+	"-DAPI_DIR=${ROOT_DIR}/api" \
+	"-DTORCH_DIR=${TORCH_DIR}" \
+	-P "${ROOT_DIR}/api/verify.cmake"
 if [[ "${PUBLISH_DIR}" != "${ROOT_DIR}/build" ]]; then
 	exit 1
 fi

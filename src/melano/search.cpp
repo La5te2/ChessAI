@@ -1,10 +1,12 @@
+// Melano single-position analysis CLI; the reusable algorithm is implemented in searcher.cpp.
+
 #include <iomanip>
 #include <iostream>
-
 #include "melano/args.hpp"
 #include "melano/checkpoint.hpp"
 #include "melano/search.hpp"
 
+// Parse a FEN/search configuration, load one checkpoint, and print P/V/A root diagnostics.
 int main(int argc, char **argv) {
 	try {
 		melano::Args args(argc, argv);

@@ -1,5 +1,6 @@
-#include "gadus/checkpoint.hpp"
+// Implements Gadus checkpoint metadata, atomic replacement, and self-contained SHA-256.
 
+#include "gadus/checkpoint.hpp"
 #include <array>
 #include <cstring>
 #include <fstream>
@@ -7,7 +8,6 @@
 #include <sstream>
 #include <stdexcept>
 #include <vector>
-
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -18,6 +18,7 @@ namespace {
 
 class Sha256 {
 	public:
+	// Stream bytes into 512-bit SHA-256 blocks without loading a whole checkpoint in memory.
 	void update(const std::uint8_t *data, std::size_t size) {
 		for (std::size_t index = 0; index < size; ++index) {
 			buffer_[buffer_size_++] = data[index];
@@ -29,6 +30,7 @@ class Sha256 {
 		}
 	}
 
+	// Apply SHA-256 padding and return the final 256-bit digest in network byte order.
 	std::array<std::uint8_t, 32> finish() {
 		bit_count_ += static_cast<std::uint64_t>(buffer_size_) * 8;
 		buffer_[buffer_size_++] = 0x80;
@@ -71,10 +73,12 @@ class Sha256 {
 		0xc67178f2,
 	}};
 
+	// Rotate a 32-bit word as required by the SHA-256 compression functions.
 	static std::uint32_t rotate(std::uint32_t value, int shift) {
 		return (value >> shift) | (value << (32 - shift));
 	}
 
+	// Expand one message block and fold its 64 rounds into the running hash state.
 	void transform() {
 		std::array<std::uint32_t, 64> words{};
 		for (int index = 0; index < 16; ++index) {
@@ -140,16 +144,19 @@ class Sha256 {
 	}};
 };
 
+// Store integer metadata as one-element tensors supported by LibTorch archives.
 torch::Tensor scalar(std::int64_t value) {
 	return torch::tensor(value, torch::TensorOptions().dtype(torch::kInt64));
 }
 
+// Read a required integer checkpoint field and normalize it to int64.
 std::int64_t read_scalar(torch::serialize::InputArchive &archive, const std::string &key) {
 	torch::Tensor value;
 	archive.read(key, value);
 	return value.item<std::int64_t>();
 }
 
+// Replace a checkpoint atomically on each platform so readers never observe a partial file.
 void replace_file(const std::filesystem::path &temporary, const std::filesystem::path &target) {
 #ifdef _WIN32
 	if (!MoveFileExW(temporary.wstring().c_str(), target.wstring().c_str(),
@@ -165,6 +172,7 @@ void replace_file(const std::filesystem::path &temporary, const std::filesystem:
 
 } // namespace
 
+// Serialize parameters and the exact Gadus architecture descriptor to a sibling temp file.
 void save_checkpoint_atomic(const std::filesystem::path &path, const Model &model,
 							const ArchitectureInfo &arch) {
 	if (!path.parent_path().empty()) {
@@ -185,6 +193,7 @@ void save_checkpoint_atomic(const std::filesystem::path &path, const Model &mode
 	replace_file(temporary, path);
 }
 
+// Validate the Gadus type/action dimensions before constructing and loading the model.
 Model load_checkpoint(const std::filesystem::path &path, const torch::Device &device,
 					  ArchitectureInfo *arch) {
 	if (!std::filesystem::exists(path)) {
@@ -214,6 +223,7 @@ Model load_checkpoint(const std::filesystem::path &path, const torch::Device &de
 	return model;
 }
 
+// Hash checkpoint bytes for reproducible arena and run summaries.
 std::string file_sha256(const std::filesystem::path &path) {
 	std::ifstream input(path, std::ios::binary);
 	if (!input) {
@@ -234,6 +244,7 @@ std::string file_sha256(const std::filesystem::path &path) {
 	return output.str();
 }
 
+// Stage a full copy beside its destination, then publish it with replace_file.
 void atomic_copy(const std::filesystem::path &source, const std::filesystem::path &target) {
 	if (!target.parent_path().empty()) {
 		std::filesystem::create_directories(target.parent_path());

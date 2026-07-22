@@ -1,8 +1,10 @@
-#include <iostream>
+// Gadus one-shot supervised training command-line entry point.
 
+#include <iostream>
 #include "gadus/args.hpp"
 #include "gadus/dataset.hpp"
 
+// Parse training hyperparameters and train a fresh policy/value checkpoint.
 int main(int argc, char **argv) {
 	try {
 		gadus::Args args(argc, argv);

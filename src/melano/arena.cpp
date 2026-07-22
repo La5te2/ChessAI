@@ -1,8 +1,10 @@
-#include <iostream>
+// Melano arena command-line entry point; match logic lives in match.cpp.
 
+#include <iostream>
 #include "melano/arena.hpp"
 #include "melano/args.hpp"
 
+// Parse arena/search options, run evaluation, and print the final JSON summary.
 int main(int argc, char **argv) {
 	try {
 		melano::Args args(argc, argv);

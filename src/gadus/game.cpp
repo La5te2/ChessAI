@@ -1,5 +1,6 @@
-#include "gadus/game.hpp"
+// Implements Gadus's chess-facing codecs, rule queries, and Polyglot opening traversal.
 
+#include "gadus/game.hpp"
 #include <algorithm>
 #include <bit>
 #include <cmath>
@@ -13,6 +14,7 @@ namespace gadus {
 
 namespace {
 
+// Map a colored piece to one of twelve binary piece planes.
 int piece_plane(const chess::Piece &piece) {
 	int type = static_cast<int>(piece.type().internal());
 	if (type < 0 || type > 5) {
@@ -24,12 +26,14 @@ int piece_plane(const chess::Piece &piece) {
 	return type;
 }
 
+// Read a Polyglot 16-bit field, whose on-disk byte order is big-endian.
 std::uint16_t read_be16(std::istream &input) {
 	std::uint8_t bytes[2]{};
 	input.read(reinterpret_cast<char *>(bytes), 2);
 	return static_cast<std::uint16_t>((bytes[0] << 8U) | bytes[1]);
 }
 
+// Read a Polyglot 32-bit field in big-endian order.
 std::uint32_t read_be32(std::istream &input) {
 	std::uint8_t bytes[4]{};
 	input.read(reinterpret_cast<char *>(bytes), 4);
@@ -38,6 +42,7 @@ std::uint32_t read_be32(std::istream &input) {
 		   (static_cast<std::uint32_t>(bytes[2]) << 8U) | static_cast<std::uint32_t>(bytes[3]);
 }
 
+// Read a Polyglot 64-bit field in big-endian order.
 std::uint64_t read_be64(std::istream &input) {
 	std::uint8_t bytes[8]{};
 	input.read(reinterpret_cast<char *>(bytes), 8);
@@ -48,6 +53,7 @@ std::uint64_t read_be64(std::istream &input) {
 	return value;
 }
 
+// Match a raw Polyglot move against legal moves so special move flags remain correct.
 chess::Move decode_polyglot_move(std::uint16_t raw, const chess::Board &board) {
 	const int to_file = raw & 7;
 	const int to_rank = (raw >> 3) & 7;
@@ -72,16 +78,19 @@ chess::Move decode_polyglot_move(std::uint16_t raw, const chess::Board &board) {
 	return chess::Move(chess::Move::NO_MOVE);
 }
 
+// Use repetition-relevant FEN fields as the opening traversal identity.
 std::string state_key(const chess::Board &board) { return board.getFen(false); }
 
 } // namespace
 
+// Delegate legal move generation to chess-library and return an owning vector.
 std::vector<chess::Move> legal_moves(const chess::Board &board) {
 	chess::Movelist moves;
 	chess::movegen::legalmoves(moves, board);
 	return {moves.begin(), moves.end()};
 }
 
+// Encode underpromotions separately, then sliding rays and knight jumps in 73 planes.
 int move_to_index(const chess::Move &move) {
 	const int from = move.from().index();
 	const int to = move.to().index();
@@ -140,6 +149,7 @@ int move_to_index(const chess::Move &move) {
 	throw std::invalid_argument("cannot encode move: " + move_uci(move));
 }
 
+// Decode by legal-move round-trip, which also validates position-dependent legality.
 chess::Move index_to_move(int index, const chess::Board &board) {
 	if (index < 0 || index >= kActionSize) {
 		return chess::Move(chess::Move::NO_MOVE);
@@ -152,8 +162,10 @@ chess::Move index_to_move(int index, const chess::Board &board) {
 	return chess::Move(chess::Move::NO_MOVE);
 }
 
+// Produce the protocol-level coordinate representation of a move.
 std::string move_uci(const chess::Move &move) { return chess::uci::moveToUci(move); }
 
+// Produce SAN while turning library formatting failures into a stable UCI fallback.
 std::string move_san(const chess::Board &board, const chess::Move &move) {
 	try {
 		return chess::uci::moveToSan(board, move);
@@ -162,6 +174,7 @@ std::string move_san(const chess::Board &board, const chess::Move &move) {
 	}
 }
 
+// Pack each 8-square rank into one byte per plane to reduce HDF5 traffic by 8x.
 PackedState encode_state(const chess::Board &board) {
 	PackedState packed{};
 	for (int square = 0; square < 64; ++square) {
@@ -199,6 +212,7 @@ PackedState encode_state(const chess::Board &board) {
 	return packed;
 }
 
+// Expand packed rank bits to the floating-point NCHW tensor consumed by convolutions.
 torch::Tensor decode_states(const std::uint8_t *packed, std::int64_t count) {
 	auto output = torch::zeros({count, kStatePlanes, 8, 8}, torch::kFloat32);
 	auto accessor = output.accessor<float, 4>();
@@ -217,6 +231,7 @@ torch::Tensor decode_states(const std::uint8_t *packed, std::int64_t count) {
 	return output;
 }
 
+// Pack a live batch first, then use the same decoder as persisted training data.
 torch::Tensor encode_boards(const std::vector<chess::Board> &boards) {
 	std::vector<std::uint8_t> packed(boards.size() * kStatePlanes * 8);
 	for (std::size_t index = 0; index < boards.size(); ++index) {
@@ -226,10 +241,12 @@ torch::Tensor encode_boards(const std::vector<chess::Board> &boards) {
 	return decode_states(packed.data(), static_cast<std::int64_t>(boards.size()));
 }
 
+// Report any library-recognized terminal reason, including mate and rule draws.
 bool game_is_over(const chess::Board &board) {
 	return board.isGameOver().first != chess::GameResultReason::NONE;
 }
 
+// Convert the terminal result to the current player's value convention.
 float terminal_value_side_to_move(const chess::Board &board) {
 	const auto outcome = board.isGameOver();
 	if (outcome.first == chess::GameResultReason::NONE) {
@@ -241,6 +258,7 @@ float terminal_value_side_to_move(const chess::Board &board) {
 	return outcome.second == chess::GameResult::WIN ? 1.0F : -1.0F;
 }
 
+// Translate the library outcome into the canonical PGN result token.
 std::string game_result(const chess::Board &board) {
 	const auto outcome = board.isGameOver();
 	if (outcome.first == chess::GameResultReason::NONE) {
@@ -254,6 +272,7 @@ std::string game_result(const chess::Board &board) {
 	return white_wins ? "1-0" : "0-1";
 }
 
+// Translate terminal reason enums to concise diagnostics and PGN metadata.
 std::string game_termination(const chess::Board &board) {
 	switch (board.isGameOver().first) {
 	case chess::GameResultReason::CHECKMATE:
@@ -271,6 +290,7 @@ std::string game_termination(const chess::Board &board) {
 	}
 }
 
+// Restrict arbitrary network probabilities to legal actions and make their sum exactly one.
 std::vector<float> normalize_legal_policy(const std::vector<float> &policy,
 										  const chess::Board &board) {
 	std::vector<float> normalized(kActionSize, 0.0F);
@@ -299,6 +319,7 @@ std::vector<float> normalize_legal_policy(const std::vector<float> &policy,
 	return normalized;
 }
 
+// Resolve device policy once at process startup and fail explicitly on unavailable CUDA.
 torch::Device resolve_device(const std::string &requested) {
 	if (requested == "auto") {
 		return torch::Device(torch::cuda::is_available() ? torch::kCUDA : torch::kCPU);
@@ -316,6 +337,7 @@ torch::Device resolve_device(const std::string &requested) {
 	throw std::invalid_argument("unsupported device: " + requested);
 }
 
+// Breadth-first traverse Polyglot entries and emit unique non-terminal frontier positions.
 std::vector<std::string> load_opening_positions(const std::string &path, int book_plies,
 												int max_positions, std::uint64_t seed) {
 	if (path.empty()) {
@@ -389,6 +411,7 @@ std::vector<std::string> load_opening_positions(const std::string &path, int boo
 	return positions;
 }
 
+// Pair each selected FEN with swapped candidate colors to remove first-move/color bias.
 std::vector<OpeningSpec> make_arena_specs(int games, const std::string &opening_book,
 										  int book_plies, int max_positions, std::uint64_t seed) {
 	if (games <= 0) {

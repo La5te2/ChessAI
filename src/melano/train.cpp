@@ -1,8 +1,10 @@
-#include <iostream>
+// Melano one-shot supervised training command-line entry point.
 
+#include <iostream>
 #include "melano/args.hpp"
 #include "melano/dataset.hpp"
 
+// Parse training hyperparameters and train a fresh policy/value/advantage checkpoint.
 int main(int argc, char **argv) {
 	try {
 		melano::Args args(argc, argv);

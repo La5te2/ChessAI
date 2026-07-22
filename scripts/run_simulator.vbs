@@ -6,7 +6,7 @@ shell.CurrentDirectory = rootDir
 
 uciCommand = "python.exe scripts\uci.py" & _
   " --arch gadus" & _
-  " --model models\gadus.pth"
+  " --model models\candidate2.pth"
 
 cmd = "pythonw.exe scripts\simulator.py" & _
   " --uci """ & uciCommand & """" & _

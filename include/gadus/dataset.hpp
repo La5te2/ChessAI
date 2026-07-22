@@ -1,12 +1,12 @@
 #pragma once
 
+// Gadus PGN-to-HDF5 preprocessing and one-shot supervised policy/value training.
+
 #include <cstdint>
 #include <filesystem>
 #include <string>
 #include <vector>
-
 #include <torch/torch.h>
-
 #include "gadus/game.hpp"
 
 namespace gadus {
@@ -28,14 +28,22 @@ struct DatasetInfo {
 
 class SupervisedH5 {
 	public:
+	/// Opens and validates a Gadus HDF5 dataset and its architecture schema.
 	explicit SupervisedH5(const std::filesystem::path &path);
+	/// Closes all HDF5 handles owned by this reader.
 	~SupervisedH5();
+	/// Dataset handles have unique ownership and cannot be copied.
 	SupervisedH5(const SupervisedH5 &) = delete;
+	/// Dataset handles have unique ownership and cannot be copy-assigned.
 	SupervisedH5 &operator=(const SupervisedH5 &) = delete;
+	/// Transfers ownership of an open dataset reader.
 	SupervisedH5(SupervisedH5 &&) noexcept;
+	/// Replaces this reader with another reader's open HDF5 handles.
 	SupervisedH5 &operator=(SupervisedH5 &&) noexcept;
 
+	/// Returns immutable schema and row-count metadata.
 	const DatasetInfo &info() const noexcept;
+	/// Reads arbitrary rows and decodes them into state, move, and value tensors.
 	SupervisedBatch read(const std::vector<std::int64_t> &indices) const;
 
 	private:
@@ -53,6 +61,7 @@ struct PreprocessOptions {
 	int log_every = 10000;
 };
 
+/// Parses PGN games and writes Gadus-specific state, policy, and value targets.
 void preprocess_pgn(const PreprocessOptions &options);
 
 struct TrainOptions {
@@ -72,6 +81,7 @@ struct TrainOptions {
 	std::string device = "auto";
 };
 
+/// Trains a new Gadus model from scratch and atomically writes the final checkpoint.
 void train_supervised(const TrainOptions &options);
 
 } // namespace gadus

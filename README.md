@@ -32,7 +32,7 @@ scripts/
 	rules.py
 	simulator.py
 	stadium.py
-	transit.py
+	check.py
 	uci.py
 	build.bat
 	build.sh
@@ -51,7 +51,7 @@ docs/
 - `include/melano/`、`src/melano/`：Melano 独立实现。文件职责与入口形式和 Gadus 对称，状态编码、动作编码、网络、搜索与 FCPI 方程均由 Melano 自身实现。
 - `preprocess.cpp`、`train.cpp`、`search.cpp`、`arena.cpp`、`fcpi.cpp`、`uci.cpp`：每套架构的六个命令入口。
 - `tests.cpp`：每套架构的状态编码、特殊走法、棋规、网络前反向、数值范围与 checkpoint 往返测试。
-- `scripts/`：通用 UCI 工具、图形界面与构建启动脚本。
+- `scripts/`：通用 UCI 工具、模型检查、图形界面与构建启动脚本。
 - `api/`：仓库本地 C++ 依赖与安装脚本。
 - `build/gadus/`、`build/melano/`：可直接运行的架构程序与运行 DLL。
 - `data/`：PGN、HDF5、开局书、分析结果和运行数据。
@@ -76,7 +76,7 @@ Python 公共脚本：
 python -m pip install -r requirements.txt
 ```
 
-C++ 依赖安装到 `api/`：LibTorch、HDF5、zlib、nlohmann-json、chess-library 与 Ninja。安装脚本在 `nvidia-smi` 能查询 GPU compute capability 时选择 LibTorch CUDA `cu126`，其余环境选择 CPU 包，也可通过 `GADIDAE_TORCH_VARIANT=cpu|cu126` 指定。已有 LibTorch 安装可通过 `GADIDAE_TORCH_DIR` 指向其根目录。下载过程显示进度、速度和 ETA，成功后清理压缩包、源码和依赖构建目录。
+C++ 依赖安装到 `api/`：LibTorch、HDF5、zlib、nlohmann-json、chess-library 与 Ninja。`api/versions.env` 是 Windows 与 Linux 共用的依赖版本锁。安装脚本在 `nvidia-smi` 能查询 GPU compute capability 时选择 LibTorch CUDA `cu126`，其余环境选择 CPU 包，也可通过 `GADIDAE_TORCH_VARIANT=cpu|cu126` 指定。已有 LibTorch 安装可通过 `GADIDAE_TORCH_DIR` 指向其根目录。`setup.bat/.sh` 在安装结束时验证实际依赖，`build.bat/.sh` 在配置前再次验证，CMake 对 LibTorch、HDF5 与 zlib 使用精确版本约束。版本、variant 或 chess-library 校验和不匹配时立即停止。下载过程显示进度、速度和 ETA，成功后清理压缩包、源码和依赖构建目录。
 
 Windows：
 
@@ -136,17 +136,15 @@ build/gadus/search --help
 build/melano/fcpi --help
 ```
 
-### 3.1 历史模型迁移
+### 3.1 模型检查
 
-`scripts/transit.py` 将历史 Python `state_dict` 或带 `model` 字段的 `.pth` 转换为当前 LibTorch checkpoint。脚本根据参数名称和张量形状识别架构，并校验完整参数集合：
+`scripts/check.py` 只读检查现行 LibTorch checkpoint，输出架构、网络头、channels、blocks、动作空间、参数规模、张量类型、内存规模、有限性、文件大小与 SHA-256：
 
 ```bash
-python scripts/transit.py \
-	--input models/candidate0.pth \
-	--output models/candidate0.gadus.pth
+python scripts/check.py --model models/gadus.pth
 ```
 
-迁移脚本需要 Python PyTorch。生成的模型由对应架构的 C++ search、arena、FCPI、UCI 及图形界面直接读取。当前迁移器覆盖历史 `resnet_pv_linear` 参数，即当前 Gadus 架构。
+模型逻辑顶层必须仅包含 `model` 与 `arch`。检查过程不会修改模型。
 
 ## 4. Gadus
 
@@ -895,7 +893,7 @@ UCI 输出包含 MultiPV、side-to-move `score cp`、节点数、NPS、耗时和
 
 ## 7. Simulator
 
-Simulator 接收任意完整 UCI 命令：
+Simulator 接收任意完整 UCI 命令。Settings 使用 `Engine`、`Budget`、`MCTS`、`Decisions` 四个标签页：
 
 ```powershell
 python scripts\simulator.py `
@@ -916,14 +914,16 @@ wscript.exe scripts\run_simulator.vbs
 
 ## 8. Stadium
 
-Stadium 让两个任意 UCI 引擎进行一盘可视化对局。双方拥有独立命令、UCI options 和 movetime。
+Stadium 让两个任意 UCI 引擎进行一盘可视化对局。双方拥有独立命令、UCI options、movetime 和 MultiPV 行数。Settings 使用 `White`、`Black`、`Match` 三个标签页。
 
 ```powershell
 python scripts\stadium.py `
 	--white-uci "python scripts\uci.py --arch gadus --model models\gadus.pth" `
 	--black-uci "python scripts\uci.py --arch melano --model models\melano.pth" `
 	--white-movetime-ms 3000 `
+	--white-multipv 5 `
 	--black-movetime-ms 3000 `
+	--black-multipv 5 `
 	--max-plies 240
 ```
 

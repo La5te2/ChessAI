@@ -1,8 +1,10 @@
-#include <iostream>
+// Melano FCPI command-line entry point; evolution.cpp contains the learning algorithm.
 
+#include <iostream>
 #include "melano/args.hpp"
 #include "melano/fcpi.hpp"
 
+// Parse P/V/A self-play, counterfactual, optimizer, and arena controls, then run FCPI.
 int main(int argc, char **argv) {
 	try {
 		melano::Args args(argc, argv);

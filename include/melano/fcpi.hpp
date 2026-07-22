@@ -1,9 +1,10 @@
 #pragma once
 
+// Melano FCPI self-play, PVA counterfactual training, and promotion loop.
+
 #include <cstdint>
 #include <filesystem>
 #include <string>
-
 #include "melano/arena.hpp"
 
 namespace melano {
@@ -51,6 +52,7 @@ struct FcpiOptions {
 	std::uint64_t seed = 2026;
 };
 
+/// Runs all configured FCPI iterations and advances current.pth only after arena acceptance.
 void run_fcpi(const FcpiOptions &options);
 
 } // namespace melano

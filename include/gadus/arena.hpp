@@ -1,11 +1,11 @@
 #pragma once
 
+// Paired, batched Gadus-vs-Gadus evaluation used by promotion gates.
+
 #include <cstdint>
 #include <filesystem>
 #include <string>
-
 #include <nlohmann/json.hpp>
-
 #include "gadus/search.hpp"
 
 namespace gadus {
@@ -27,6 +27,7 @@ struct ArenaOptions {
 	SearchOptions search;
 };
 
+/// Plays a color-balanced match and returns result statistics and acceptance state as JSON.
 nlohmann::json evaluate_models(const ArenaOptions &options);
 
 } // namespace gadus

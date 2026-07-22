@@ -1,7 +1,7 @@
+// Implements Melano FCPI with advantage-aware behavior, targets, training, and arena gating.
+
 #include "melano/fcpi.hpp"
-
 #include <hdf5.h>
-
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -18,9 +18,7 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
-
 #include <nlohmann/json.hpp>
-
 #include "melano/args.hpp"
 #include "melano/checkpoint.hpp"
 
@@ -30,6 +28,7 @@ namespace {
 
 inline constexpr const char *kFcpiFormula = "melano_pva_adaptive_value_expansion_td_kl";
 
+// Format iteration numbers for stable, lexically sortable artifact names.
 std::string zero_pad(int value, int width) {
 	std::ostringstream output;
 	output << std::setfill('0') << std::setw(width) << value;
@@ -84,12 +83,14 @@ struct SamplingSpec {
 	std::string fen;
 };
 
+// Convert failed HDF5 status codes to descriptive C++ exceptions.
 void require_h5(herr_t status, const std::string &operation) {
 	if (status < 0) {
 		throw std::runtime_error("HDF5 operation failed: " + operation);
 	}
 }
 
+// Validate HDF5 object handles before subsequent operations use them.
 hid_t require_id(hid_t id, const std::string &operation) {
 	if (id < 0) {
 		throw std::runtime_error("HDF5 operation failed: " + operation);
@@ -97,6 +98,7 @@ hid_t require_id(hid_t id, const std::string &operation) {
 	return id;
 }
 
+// Store an FCPI schema/formula marker as an HDF5 string attribute.
 void write_string_attribute(hid_t object, const char *name, const std::string &value) {
 	const hid_t space = require_id(H5Screate(H5S_SCALAR), name);
 	const hid_t type = require_id(H5Tcopy(H5T_C_S1), name);
@@ -109,6 +111,7 @@ void write_string_attribute(hid_t object, const char *name, const std::string &v
 	H5Sclose(space);
 }
 
+// Write one compressed, fixed-shape FCPI tensor dataset and close all temporary handles.
 void write_dataset(hid_t file, const char *name, hid_t file_type, hid_t memory_type,
 				   const std::vector<hsize_t> &shape, const void *data) {
 	const hid_t space =
@@ -128,6 +131,7 @@ void write_dataset(hid_t file, const char *name, hid_t file_type, hid_t memory_t
 	H5Sclose(space);
 }
 
+// Clamp invalid weights and normalize; use uniform mass when no positive mass remains.
 std::vector<float> normalize(std::vector<float> values) {
 	double total = 0.0;
 	for (float &value : values) {
@@ -145,6 +149,7 @@ std::vector<float> normalize(std::vector<float> values) {
 	return values;
 }
 
+// Compute softmax after max subtraction and exponent clamping for numerical stability.
 std::vector<float> stable_softmax(const std::vector<double> &logits) {
 	if (logits.empty()) {
 		return {};
@@ -158,12 +163,14 @@ std::vector<float> stable_softmax(const std::vector<double> &logits) {
 	return normalize(std::move(values));
 }
 
+// Draw one categorical sample from an already normalized behavior distribution.
 std::size_t sample_index(const std::vector<float> &probabilities, std::mt19937_64 &rng) {
 	std::discrete_distribution<std::size_t> distribution(probabilities.begin(),
 														 probabilities.end());
 	return distribution(rng);
 }
 
+// Mix depth-k root-perspective estimates with a truncated lambda-return weighting.
 float mixed_depth_q(const std::vector<float> &estimates, double lambda) {
 	if (estimates.empty()) {
 		throw std::runtime_error("counterfactual branch has no estimates");
@@ -180,10 +187,12 @@ float mixed_depth_q(const std::vector<float> &estimates, double lambda) {
 	return static_cast<float>(std::clamp(total, -1.0, 1.0));
 }
 
+// Use model-visible packed state bytes as the aggregation and per-game deduplication key.
 std::string packed_key(const PackedState &state) {
 	return std::string(reinterpret_cast<const char *>(state.data()), state.size());
 }
 
+// Build a shuffled mixture of startpos and opening-book starts for one iteration.
 std::vector<SamplingSpec> make_sampling_specs(const FcpiOptions &options, int iteration,
 											  nlohmann::json &summary) {
 	std::mt19937_64 rng(options.seed + iteration);
@@ -231,6 +240,7 @@ std::vector<SamplingSpec> make_sampling_specs(const FcpiOptions &options, int it
 	return specs;
 }
 
+// Evaluate arbitrarily many positions through bounded neural batches.
 std::vector<SearchResult> evaluate_chunks(Searcher &searcher,
 										  const std::vector<chess::Board> &boards, int batch_size) {
 	std::vector<SearchResult> output;
@@ -245,6 +255,7 @@ std::vector<SearchResult> evaluate_chunks(Searcher &searcher,
 	return output;
 }
 
+// Select highest-scoring counterfactual actions while guaranteeing inclusion of the played move.
 std::vector<int> choose_candidates(const std::vector<int> &legal, const std::vector<float> &scores,
 								   int played, int topk) {
 	std::vector<std::size_t> order(legal.size());
@@ -264,6 +275,7 @@ std::vector<int> choose_candidates(const std::vector<int> &legal, const std::vec
 	return selected;
 }
 
+// Generate closed-policy games using log(P)+w*A behavior logits and lambda-return V targets.
 std::vector<Position> collect_selfplay(Model model, const torch::Device &device,
 									   const FcpiOptions &options, int iteration,
 									   nlohmann::json &sampling_summary) {
@@ -439,6 +451,7 @@ std::vector<Position> collect_selfplay(Model model, const torch::Device &device,
 	return records;
 }
 
+// Evaluate branch frontiers and convert alternating side-to-move V into root-player estimates.
 void evaluate_frontier(std::vector<Branch *> branches, Searcher &evaluator,
 					   const FcpiOptions &options) {
 	std::vector<chess::Board> boards;
@@ -459,6 +472,7 @@ void evaluate_frontier(std::vector<Branch *> branches, Searcher &evaluator,
 	}
 }
 
+// Improve policy/value and derive A_target=clamp(Q_candidate-V_improved, -2, 0).
 void construct_targets(std::vector<Position> &records, Model model, const torch::Device &device,
 					   const FcpiOptions &options, TargetSummary &summary) {
 	SearchOptions closed;
@@ -676,6 +690,7 @@ void construct_targets(std::vector<Position> &records, Model model, const torch:
 			  << std::endl;
 }
 
+// Merge model-indistinguishable states and average their stochastic P/V/A targets.
 std::vector<Position> aggregate_records(std::vector<Position> records, nlohmann::json &summary) {
 	const std::size_t source_count = records.size();
 	std::unordered_map<std::string, std::size_t> groups;
@@ -739,6 +754,7 @@ std::vector<Position> aggregate_records(std::vector<Position> records, nlohmann:
 	return output;
 }
 
+// Persist generated P/V/A FCPI targets for diagnostics and iteration reproducibility.
 nlohmann::json write_fcpi_h5(const std::filesystem::path &path, std::vector<Position> &records) {
 	nlohmann::json aggregation;
 	records = aggregate_records(std::move(records), aggregation);
@@ -817,6 +833,7 @@ nlohmann::json write_fcpi_h5(const std::filesystem::path &path, std::vector<Posi
 	};
 }
 
+// Fine-tune P/V/A with CE, Huber V and Q losses, KL anchoring, and entropy regularization.
 nlohmann::json train_candidate(const std::filesystem::path &source,
 							   const std::filesystem::path &candidate, Model model,
 							   const torch::Device &device, std::vector<Position> &records,
@@ -981,6 +998,7 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 
 } // namespace
 
+// Create an isolated run, iterate generation/training/arena, and atomically promote accepted models.
 void run_fcpi(const FcpiOptions &options) {
 	if (options.iterations <= 0 || options.games_per_iter <= 0 || options.games_in_flight <= 0) {
 		throw std::invalid_argument("FCPI iteration and game counts must be positive");

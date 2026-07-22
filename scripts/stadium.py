@@ -102,22 +102,26 @@ def pv_text(board: chess.Board, pv: Sequence[chess.Move], limit: int = 8) -> str
 
 def engine_multipv_count(
     engine: chess.engine.SimpleEngine,
-    configured_options: Dict[str, object],
+    requested: int,
 ) -> int:
     option = engine.options.get("MultiPV")
     if option is None:
         return 1
-    value = option.default
-    for name, configured_value in configured_options.items():
-        if str(name).lower() == "multipv":
-            value = configured_value
-            break
-    count = int(value)
+    count = int(requested)
     if option.min is not None:
         count = max(int(option.min), count)
     if option.max is not None:
         count = min(int(option.max), count)
     return max(1, count)
+
+
+def configurable_uci_options(options: Dict[str, object]) -> Dict[str, object]:
+    managed = {name.lower() for name in chess.engine.MANAGED_OPTIONS}
+    return {
+        name: value
+        for name, value in options.items()
+        if str(name).lower() not in managed
+    }
 
 
 def primary_info_for_move(infos: Sequence[Dict], move: chess.Move) -> Dict:
@@ -172,11 +176,13 @@ def analyse_uci_turn(
         time=(movetime_ms / 1000.0) if movetime_ms > 0 else None,
         nodes=int(nodes) if nodes is not None and int(nodes) > 0 else None,
     )
+    analysis_options = {"info": chess.engine.INFO_ALL}
+    if engine.options.get("MultiPV") is not None:
+        analysis_options["multipv"] = max(1, int(multipv))
     with engine.analysis(
         board,
         limit,
-        multipv=max(1, int(multipv)),
-        info=chess.engine.INFO_ALL,
+        **analysis_options,
     ) as analysis:
         for _ in analysis:
             if stop_event is not None and stop_event.is_set():
@@ -284,46 +290,64 @@ class StadiumSettingsDialog(tk.Toplevel):
     def __init__(self, parent, app):
         super().__init__(parent)
         self.app = app
-        self.title("Stadium Settings")
+        self.title("Settings")
         self.resizable(True, False)
         self.transient(parent)
         self.grab_set()
 
         self.values = {}
-        fields = (
-            ("white_uci", "White UCI command"),
-            ("white_options", "White UCI options (JSON)"),
-            ("white_movetime_ms", "White move time (ms)"),
-            ("black_uci", "Black UCI command"),
-            ("black_options", "Black UCI options (JSON)"),
-            ("black_movetime_ms", "Black move time (ms)"),
-            ("delay_ms", "Display delay (ms)"),
-            ("max_plies", "Max plies"),
-        )
-        for row, (name, label) in enumerate(fields):
-            ttk.Label(self, text=label).grid(
-                row=row,
-                column=0,
-                sticky="w",
-                padx=8,
-                pady=5,
-            )
-            variable = tk.StringVar(value=str(app.settings[name]))
-            self.values[name] = variable
-            entry = ttk.Entry(self, textvariable=variable, width=72)
-            entry.grid(row=row, column=1, sticky="ew", padx=8, pady=5)
-            if name in {"white_uci", "black_uci"}:
-                ttk.Button(
-                    self,
-                    text="Browse",
-                    command=lambda target=entry: app.browse_uci(target),
-                ).grid(row=row, column=2, padx=8, pady=5)
+        notebook = ttk.Notebook(self)
+        notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=(10, 6))
+
+        white_tab = ttk.Frame(notebook, padding=10)
+        black_tab = ttk.Frame(notebook, padding=10)
+        match_tab = ttk.Frame(notebook, padding=10)
+        notebook.add(white_tab, text="White")
+        notebook.add(black_tab, text="Black")
+        notebook.add(match_tab, text="Match")
+
+        self._add_engine_tab(white_tab, "white", app)
+        self._add_engine_tab(black_tab, "black", app)
+        self._add_entry(match_tab, 0, "delay_ms", "Display delay (ms)", app)
+        self._add_entry(match_tab, 1, "max_plies", "Max plies", app)
+        match_tab.columnconfigure(1, weight=1)
 
         actions = ttk.Frame(self)
-        actions.grid(row=len(fields), column=0, columnspan=3, sticky="e", padx=8, pady=8)
-        ttk.Button(actions, text="Apply", command=self.apply).pack(side=tk.LEFT, padx=3)
-        ttk.Button(actions, text="Cancel", command=self.destroy).pack(side=tk.LEFT, padx=3)
-        self.columnconfigure(1, weight=1)
+        actions.pack(fill=tk.X, padx=10, pady=(0, 10))
+        ttk.Button(actions, text="Apply", command=self.apply).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(actions, text="Cancel", command=self.destroy).pack(side=tk.RIGHT)
+        self.bind("<Escape>", lambda _event: self.destroy())
+        self.minsize(680, 280)
+
+    def _add_engine_tab(self, parent, color: str, app):
+        command_name = f"{color}_uci"
+        ttk.Label(parent, text="UCI command").grid(
+            row=0, column=0, sticky="w", padx=(0, 12), pady=6
+        )
+        command_var = tk.StringVar(value=str(app.settings[command_name]))
+        self.values[command_name] = command_var
+        command_entry = ttk.Entry(parent, textvariable=command_var, width=66)
+        command_entry.grid(row=0, column=1, sticky="ew", pady=6)
+        ttk.Button(
+            parent,
+            text="Browse",
+            command=lambda: app.browse_uci(command_entry),
+        ).grid(row=0, column=2, padx=(8, 0), pady=6)
+
+        self._add_entry(parent, 1, f"{color}_movetime_ms", "Move time (ms)", app)
+        self._add_entry(parent, 2, f"{color}_multipv", "Analysis lines", app)
+        self._add_entry(parent, 3, f"{color}_options", "Additional UCI options (JSON)", app)
+        parent.columnconfigure(1, weight=1)
+
+    def _add_entry(self, parent, row, name, label, app):
+        ttk.Label(parent, text=label).grid(
+            row=row, column=0, sticky="w", padx=(0, 12), pady=6
+        )
+        variable = tk.StringVar(value=str(app.settings[name]))
+        self.values[name] = variable
+        ttk.Entry(parent, textvariable=variable, width=28).grid(
+            row=row, column=1, sticky="ew", pady=6
+        )
 
     def apply(self):
         try:
@@ -331,9 +355,11 @@ class StadiumSettingsDialog(tk.Toplevel):
                 "white_uci": self.values["white_uci"].get().strip(),
                 "white_options": self.values["white_options"].get().strip(),
                 "white_movetime_ms": int(self.values["white_movetime_ms"].get()),
+                "white_multipv": int(self.values["white_multipv"].get()),
                 "black_uci": self.values["black_uci"].get().strip(),
                 "black_options": self.values["black_options"].get().strip(),
                 "black_movetime_ms": int(self.values["black_movetime_ms"].get()),
+                "black_multipv": int(self.values["black_multipv"].get()),
                 "delay_ms": int(self.values["delay_ms"].get()),
                 "max_plies": int(self.values["max_plies"].get()),
             }
@@ -345,6 +371,8 @@ class StadiumSettingsDialog(tk.Toplevel):
                 raise ValueError("white move time must be positive")
             if settings["black_movetime_ms"] <= 0:
                 raise ValueError("black move time must be positive")
+            if settings["white_multipv"] <= 0 or settings["black_multipv"] <= 0:
+                raise ValueError("analysis lines must be positive")
             if settings["delay_ms"] < 0:
                 raise ValueError("display delay must be non-negative")
             if settings["max_plies"] <= 0:
@@ -371,9 +399,11 @@ class StadiumApp(ChessGUIBase):
             "white_uci": str(defaults.get("white_uci") or ""),
             "white_options": str(defaults.get("white_options") or "{}"),
             "white_movetime_ms": int(defaults.get("white_movetime_ms", 1000)),
+            "white_multipv": int(defaults.get("white_multipv", 5)),
             "black_uci": str(defaults.get("black_uci") or ""),
             "black_options": str(defaults.get("black_options") or "{}"),
             "black_movetime_ms": int(defaults.get("black_movetime_ms", 1000)),
+            "black_multipv": int(defaults.get("black_multipv", 5)),
             "delay_ms": int(defaults.get("delay_ms", 250)),
             "max_plies": int(defaults.get("max_plies", 240)),
         }
@@ -541,13 +571,17 @@ class StadiumApp(ChessGUIBase):
         fen_text = strip_wrapping_quotes(self.fen_entry.get())
         board = chess.Board() if not fen_text or fen_text == "startpos" else chess.Board(fen_text)
         white_movetime_ms = int(self.settings["white_movetime_ms"])
+        white_multipv = int(self.settings["white_multipv"])
         black_movetime_ms = int(self.settings["black_movetime_ms"])
+        black_multipv = int(self.settings["black_multipv"])
         delay_ms = int(self.settings["delay_ms"])
         max_plies = int(self.settings["max_plies"])
         if white_movetime_ms <= 0:
             raise ValueError("white move time must be positive")
         if black_movetime_ms <= 0:
             raise ValueError("black move time must be positive")
+        if white_multipv <= 0 or black_multipv <= 0:
+            raise ValueError("analysis lines must be positive")
         if delay_ms < 0:
             raise ValueError("display delay must be non-negative")
         if max_plies <= 0:
@@ -556,9 +590,11 @@ class StadiumApp(ChessGUIBase):
             white,
             white_options,
             white_movetime_ms,
+            white_multipv,
             black,
             black_options,
             black_movetime_ms,
+            black_multipv,
             board.fen(),
             delay_ms,
             max_plies,
@@ -572,9 +608,11 @@ class StadiumApp(ChessGUIBase):
                 white,
                 white_options,
                 white_movetime_ms,
+                white_multipv,
                 black,
                 black_options,
                 black_movetime_ms,
+                black_multipv,
                 fen,
                 delay_ms,
                 max_plies,
@@ -605,9 +643,11 @@ class StadiumApp(ChessGUIBase):
                 white,
                 white_options,
                 white_movetime_ms,
+                white_multipv,
                 black,
                 black_options,
                 black_movetime_ms,
+                black_multipv,
                 fen,
                 delay_ms,
                 max_plies,
@@ -623,9 +663,11 @@ class StadiumApp(ChessGUIBase):
         white_command: Sequence[str],
         white_options: Dict[str, object],
         white_movetime_ms: int,
+        white_multipv: int,
         black_command: Sequence[str],
         black_options: Dict[str, object],
         black_movetime_ms: int,
+        black_multipv: int,
         fen: str,
         delay_ms: int,
         max_plies: int,
@@ -640,12 +682,14 @@ class StadiumApp(ChessGUIBase):
             engines.append(white)
             black = popen_uci_engine(black_command)
             engines.append(black)
-            if white_options:
-                white.configure(white_options)
-            if black_options:
-                black.configure(black_options)
-            white_multipv = engine_multipv_count(white, white_options)
-            black_multipv = engine_multipv_count(black, black_options)
+            white_multipv = engine_multipv_count(white, white_multipv)
+            black_multipv = engine_multipv_count(black, black_multipv)
+            white_configurable = configurable_uci_options(white_options)
+            black_configurable = configurable_uci_options(black_options)
+            if white_configurable:
+                white.configure(white_configurable)
+            if black_configurable:
+                black.configure(black_configurable)
             with self.uci_lock:
                 self.uci_engines = list(engines)
 
@@ -899,9 +943,11 @@ def parse_args():
     parser.add_argument("--white-uci", default="")
     parser.add_argument("--white-options", default="{}")
     parser.add_argument("--white-movetime-ms", type=int, default=1000)
+    parser.add_argument("--white-multipv", type=int, default=5)
     parser.add_argument("--black-uci", default="")
     parser.add_argument("--black-options", default="{}")
     parser.add_argument("--black-movetime-ms", type=int, default=1000)
+    parser.add_argument("--black-multipv", type=int, default=5)
     parser.add_argument("--fen", default="startpos")
     parser.add_argument("--delay-ms", type=int, default=250)
     parser.add_argument("--max-plies", type=int, default=240)
@@ -918,9 +964,11 @@ def main():
             "white_uci": args.white_uci,
             "white_options": args.white_options,
             "white_movetime_ms": args.white_movetime_ms,
+            "white_multipv": args.white_multipv,
             "black_uci": args.black_uci,
             "black_options": args.black_options,
             "black_movetime_ms": args.black_movetime_ms,
+            "black_multipv": args.black_multipv,
             "fen": args.fen,
             "delay_ms": args.delay_ms,
             "max_plies": args.max_plies,

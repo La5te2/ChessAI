@@ -1,5 +1,6 @@
-#include "melano/search.hpp"
+// Implements Melano advantage-seeded batched PUCT; search.cpp is its CLI front end.
 
+#include "melano/search.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -22,11 +23,13 @@ struct Evaluation {
 };
 
 struct Node {
+	// Create an edge/node pair carrying P, A, and the derived Q prior V(s)+A(s,a).
 	explicit Node(float initial_prior = 0.0F, chess::Move incoming = chess::Move::NO_MOVE,
 				  float initial_advantage = 0.0F, float initial_q_prior = 0.0F)
 		: prior(initial_prior), move(incoming), advantage(initial_advantage),
 		  q_prior(initial_q_prior) {}
 
+	// Return the empirical value from this node's side-to-move perspective.
 	float q() const { return visits > 0 ? value_sum / static_cast<float>(visits) : 0.0F; }
 
 	float prior = 0.0F;
@@ -61,22 +64,27 @@ struct TreeState {
 	int max_leaf_depth = 0;
 };
 
+// Keep V, A-derived Q, and backed-up values inside the model's [-1, 1] convention.
 float clamp_unit(float value) { return std::clamp(value, -1.0F, 1.0F); }
 
+// Convert steady-clock elapsed time to seconds for deadlines and reporting.
 double seconds_since(Clock::time_point start) {
 	return std::chrono::duration<double>(Clock::now() - start).count();
 }
 
+// Centralize optional deadline checks so a zero movetime means no time cap.
 bool deadline_reached(const std::optional<Clock::time_point> &deadline) {
 	return deadline.has_value() && Clock::now() >= *deadline;
 }
 
+// Remove temporary reservations made while assembling one neural evaluation batch.
 void clear_virtual(const std::vector<Node *> &path) {
 	for (std::size_t index = 1; index < path.size(); ++index) {
 		path[index]->virtual_visits = std::max(0, path[index]->virtual_visits - 1);
 	}
 }
 
+// Back up a leaf value and negate it at every ply because side to move alternates.
 void backpropagate(const std::vector<Node *> &path, float value) {
 	for (auto iterator = path.rbegin(); iterator != path.rend(); ++iterator) {
 		(*iterator)->visits += 1;
@@ -85,6 +93,7 @@ void backpropagate(const std::vector<Node *> &path, float value) {
 	}
 }
 
+// Detect terminal leaves and optionally expose their exact side-to-move outcome.
 bool is_terminal(const chess::Board &board, float *value = nullptr) {
 	if (!game_is_over(board)) {
 		return false;
@@ -98,6 +107,7 @@ bool is_terminal(const chess::Board &board, float *value = nullptr) {
 } // namespace
 
 struct Searcher::Impl {
+	// Move the model once to its inference device and sanitize non-negative virtual loss.
 	Impl(Model source_model, torch::Device source_device, SearchOptions source_options)
 		: model(std::move(source_model)), device(std::move(source_device)),
 		  options(source_options) {
@@ -109,6 +119,7 @@ struct Searcher::Impl {
 		model->eval();
 	}
 
+	// Evaluate independent boards in one LibTorch batch and copy P/V/A outputs to host memory.
 	Evaluation evaluate(const std::vector<chess::Board> &boards) {
 		if (boards.empty()) {
 			return {};
@@ -137,6 +148,7 @@ struct Searcher::Impl {
 		return output;
 	}
 
+	// Expand legal edges and derive each current-player Q prior as clamp(V(s)+A(s,a)).
 	void expand(Node *node, const chess::Board &board, const std::vector<float> &policy,
 				const std::vector<float> &advantages, float parent_value) {
 		if (!node->children.empty()) {
@@ -152,6 +164,7 @@ struct Searcher::Impl {
 		}
 	}
 
+	// Sum priors already explored under a parent for first-play uncertainty reduction.
 	float visited_policy_mass(const Node *parent) const {
 		float mass = 0.0F;
 		for (const auto &child : parent->children) {
@@ -162,6 +175,7 @@ struct Searcher::Impl {
 		return mass;
 	}
 
+	// Blend one A-derived pseudo-visit with empirical child returns, both in parent perspective.
 	float edge_value(const Node *parent, const Node *child) const {
 		if (child->visits > 0) {
 			return clamp_unit((static_cast<float>(child->visits) * -child->q() + child->q_prior) /
@@ -172,6 +186,7 @@ struct Searcher::Impl {
 				std::sqrt(visited_policy_mass(parent)));
 	}
 
+	// Increase exploration logarithmically with parent visits: c_init + factor*log((N+base+1)/base).
 	double scheduled_c_puct(const Node *parent) const {
 		const double visits = std::max(0, parent->visits + parent->virtual_visits);
 		const double base = std::max(1.0, options.c_puct_base);
@@ -180,6 +195,7 @@ struct Searcher::Impl {
 		return std::max(0.0, options.c_puct + growth);
 	}
 
+	// Score an edge with PUCT using its pseudo-visit-adjusted exploitation value.
 	double selection_score(const Node *parent, const Node *child) const {
 		const double exploitation = edge_value(parent, child);
 		const int child_visits = child->visits + child->virtual_visits;
@@ -189,6 +205,7 @@ struct Searcher::Impl {
 		return exploitation + exploration - options.virtual_loss * child->virtual_visits;
 	}
 
+	// Choose the maximum PUCT edge with deterministic prior and UCI tie breaks.
 	Node *select_child(Node *parent) const {
 		if (parent->children.empty()) {
 			return nullptr;
@@ -208,6 +225,7 @@ struct Searcher::Impl {
 			->get();
 	}
 
+	// Descend to an unexpanded or terminal node while reserving the path for batching.
 	SelectedLeaf select_leaf(std::size_t state_index, TreeState &state) const {
 		SelectedLeaf selected;
 		selected.state_index = state_index;
@@ -230,6 +248,7 @@ struct Searcher::Impl {
 		return selected;
 	}
 
+	// Combine normalized visit entropy, top-two visit proximity, and top-two Q proximity.
 	double uncertainty(const Node *root) const {
 		if (root->children.size() <= 1) {
 			return 0.0;
@@ -271,6 +290,7 @@ struct Searcher::Impl {
 						  1.0);
 	}
 
+	// Establish the mandatory simulation floor before uncertainty can extend the budget.
 	int minimum_simulations() const {
 		const int cap = std::max(0, options.mcts_sims);
 		if (cap == 0) {
@@ -282,6 +302,7 @@ struct Searcher::Impl {
 		return std::max(1, std::min(cap, configured));
 	}
 
+	// Interpolate from minimum to the hard cap using the current root uncertainty.
 	int dynamic_target(const Node *root, int minimum) const {
 		const int cap = std::max(0, options.mcts_sims);
 		const int desired =
@@ -289,6 +310,7 @@ struct Searcher::Impl {
 		return std::max(minimum, std::min(cap, desired));
 	}
 
+	// Convert root visits to legal move probabilities; priors keep zero-visit moves representable.
 	std::vector<float> root_policy(const TreeState &state) const {
 		std::vector<float> policy(kActionSize, 0.0F);
 		for (const auto &child : state.root->children) {
@@ -297,6 +319,7 @@ struct Searcher::Impl {
 		return normalize_legal_policy(policy, state.board);
 	}
 
+	// Apply optional post-search ranking rules without modifying priors or the MCTS tree.
 	void apply_decision_components(const chess::Board &board, float root_value,
 								   std::vector<float> &scores, std::unordered_set<int> &repetitions,
 								   std::unordered_set<int> &mates) const {
@@ -349,6 +372,7 @@ struct Searcher::Impl {
 		}
 	}
 
+	// Assemble final ranking plus P/V/A and pseudo-visit diagnostics for one tree.
 	SearchResult make_result(TreeState &state, Clock::time_point start) const {
 		SearchResult result;
 		result.policy = options.type == SearchType::Closed || options.mcts_sims <= 0
@@ -413,6 +437,7 @@ struct Searcher::Impl {
 		return result;
 	}
 
+	// Search many independent roots while sharing neural leaf batches across games.
 	std::vector<SearchResult> search_many(const std::vector<chess::Board> &boards,
 									   const SearchProgressCallback &progress = {},
 									   int progress_interval_ms = 0) {
@@ -556,18 +581,22 @@ struct Searcher::Impl {
 	SearchOptions options;
 };
 
+// Construct the public value-type wrapper around the shared implementation.
 Searcher::Searcher(Model model, torch::Device device, SearchOptions options)
 	: impl_(std::make_shared<Impl>(std::move(model), std::move(device), options)) {}
 
+// Search one position and expose timed snapshots to interactive front ends.
 SearchResult Searcher::search(const chess::Board &board,
 							  const SearchProgressCallback &progress, int progress_interval_ms) {
 	return impl_->search_many({board}, progress, progress_interval_ms)[0];
 }
 
+// Search a batch without progress callbacks, as used by arena and FCPI.
 std::vector<SearchResult> Searcher::search_many(const std::vector<chess::Board> &boards) {
 	return impl_->search_many(boards);
 }
 
+// Convert the command-line search mode to the strongly typed enum.
 SearchType parse_search_type(const std::string &value) {
 	if (value == "closed") {
 		return SearchType::Closed;
@@ -578,6 +607,7 @@ SearchType parse_search_type(const std::string &value) {
 	throw std::invalid_argument("search-type must be closed or only-mcts");
 }
 
+// Convert a search mode back to its stable external spelling.
 std::string search_type_name(SearchType value) {
 	return value == SearchType::Closed ? "closed" : "only-mcts";
 }
