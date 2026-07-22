@@ -1,6 +1,6 @@
 # Gadidae
 
-Gadidae 是一个实验性国际象棋神经网络引擎项目。当前有两套彼此独立的 C++ 架构：
+Gadidae 是一个实验性国际象棋神经网络引擎项目。当前架构如下：
 
 - `Gadus`：ResNet + linear policy/value，使用 `gadus_18_planes` state encoding 和 `alphazero_64x73` move encoding。
 - `Melano`：geometry attention + source-destination policy/value/advantage，使用 `melano_square_tokens` state encoding 和 `sd_64x64_underpromo9` move encoding。
