@@ -962,13 +962,6 @@ $$
 
 Melano 每轮依次执行自身 `current.pth` 自对战、局面采样、带对手响应的反事实展开、PVA 与 latent-dynamics 目标构造、candidate 训练和 paired-game arena。每次运行由程序生成 `fcpi_YYYYMMDD_HHMMSS_id`，创建对应的 `data/runs/<run-id>/` 与 `models/runs/<run-id>/`。其中 HDF5 schema、candidate 和 current checkpoint 均属于 Melano，candidate 达到 arena gate 后原子写入该 run 的 `current.pth`。`summary.json` 记录反事实分支数、平均深度、实际评价的对手响应数和 arena 结果。
 
-### 5.5 当前边界
-
-- Gadus 保持 Policy/Value ResNet 与普通 MCTS，作为无 latent dynamics 的独立架构。
-- Melano 使用一步动作条件 dynamics 与 $K=2$ anchored latent MCTS。精确棋规始终维护真实状态，预测 latent 只跨越一个动作。
-- Melano FCPI 的多步反事实来自精确棋盘状态序列，latent consistency 与 imagined Value 训练集中在一步后继。
-- 更大的固定或自适应 $K$ 需要多步 latent rollout 目标、误差控制和对应搜索验证，当前程序不会把一步 dynamics 当作已校准的任意长度世界模型。
-
 ## 6. UCI
 
 两个 C++ UCI 程序直接加载对应 LibTorch checkpoint。公共 launcher 根据架构选择已构建程序：
