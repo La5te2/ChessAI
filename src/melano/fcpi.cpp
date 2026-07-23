@@ -15,6 +15,7 @@ int main(int argc, char **argv) {
 				<< "  --positions-per-game <n> --opening-book <path|empty> --startpos-fraction "
 				   "<x>\n"
 				<< "  --counterfactual-topk <n> --counterfactual-min-plies <n>\n"
+				<< "  --opponent-reply-topk <n> --opponent-reply-temperature <x>\n"
 				<< "  --counterfactual-max-plies <n> --counterfactual-target-average-plies <x>\n"
 				<< "  --counterfactual-lambda <x> --td-lambda <x> --behavior-temperature <x>\n"
 				<< "  --uniform-mix <x> --behavior-advantage-weight <x>\n"
@@ -49,6 +50,10 @@ int main(int argc, char **argv) {
 			args.get_int("target-records-per-batch", options.target_records_per_batch);
 		options.counterfactual_topk =
 			args.get_int("counterfactual-topk", options.counterfactual_topk);
+		options.opponent_reply_topk =
+			args.get_int("opponent-reply-topk", options.opponent_reply_topk);
+		options.opponent_reply_temperature = args.get_double(
+			"opponent-reply-temperature", options.opponent_reply_temperature);
 		options.counterfactual_min_plies =
 			args.get_int("counterfactual-min-plies", options.counterfactual_min_plies);
 		options.counterfactual_max_plies =

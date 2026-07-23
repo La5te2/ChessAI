@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <vector>
 #include "melano/arena.hpp"
 
 namespace melano {
@@ -24,6 +25,8 @@ struct FcpiOptions {
 	int inference_batch_size = 64;
 	int target_records_per_batch = 256;
 	int counterfactual_topk = 8;
+	int opponent_reply_topk = 4;
+	double opponent_reply_temperature = 0.2;
 	int counterfactual_min_plies = 2;
 	int counterfactual_max_plies = 6;
 	double counterfactual_target_average_plies = 4.0;
@@ -53,6 +56,16 @@ struct FcpiOptions {
 	int log_every = 50;
 	std::uint64_t seed = 2026;
 };
+
+struct OpponentReplyInput {
+	float prior = 0.0F;
+	float advantage = 0.0F;
+	float root_value = 0.0F;
+};
+
+/// Computes Melano's P/A-regularized soft-min weights over exact opponent replies.
+std::vector<float> opponent_reply_weights(const std::vector<OpponentReplyInput> &replies,
+										  double advantage_weight, double temperature);
 
 /// Runs all configured FCPI iterations and advances current.pth only after arena acceptance.
 void run_fcpi(const FcpiOptions &options);

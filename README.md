@@ -813,6 +813,8 @@ build/melano/fcpi \
 	--inference-batch-size 64 \
 	--target-records-per-batch 256 \
 	--counterfactual-topk 8 \
+	--opponent-reply-topk 4 \
+	--opponent-reply-temperature 0.2 \
 	--counterfactual-min-plies 2 \
 	--counterfactual-max-plies 6 \
 	--counterfactual-target-average-plies 4 \
@@ -874,6 +876,32 @@ $$
 \frac{\epsilon}{|\mathcal A(s)|}
 $$
 
+Melano 的反事实候选使用精确棋规生成走后局面。对候选动作 $a$ 的对手局面 $s_a$，先按 Melano 自身的 Policy 与 Advantage 选出 $R$ 个响应：
+
+$$
+B(r\mid s_a)=\log(P(r\mid s_a)+\varepsilon)+w_AA(s_a,r)
+$$
+
+每个响应 $r$ 都通过精确棋盘执行，再由冻结网络评价两步后的根方视角价值：
+
+$$
+q_r=V(s_{a,r})
+$$
+
+对手响应权重同时考虑 Melano 认为该响应的合理程度，以及它对根方造成的损失：
+
+$$
+\omega_r=
+\frac{\exp\left(B(r\mid s_a)-q_r/T_{opp}\right)}
+{\sum_{j=1}^{R}\exp\left(B(j\mid s_a)-q_j/T_{opp}\right)}
+$$
+
+$$
+q^{(2)}(s,a)=\sum_{r=1}^{R}\omega_rq_r
+$$
+
+`--opponent-reply-topk` 控制 $R$，`--opponent-reply-temperature` 控制对低根方价值响应的集中程度。权重最大的响应作为后续反事实分支的连续状态。该响应层使用 Melano 的 $P+A$ 动作语义筛选可行响应，使用精确棋盘与冻结网络 Value 构造训练目标。
+
 终局取真实 side-to-move 结果，截断局面取冻结模型 Value 作为 bootstrap。Melano 从后向前计算 TD($\lambda$)：
 
 $$
@@ -930,7 +958,16 @@ w_{KL}D_{KL}(\pi_{new}\Vert P_{old})-
 w_H H(\pi_{new})
 $$
 
-其中每个 FCPI 候选动作都通过精确棋规生成 $s'$，并写入 `candidate_next_states`。$L_D$ 使用与监督训练相同的 latent cosine consistency。Melano 每轮依次执行自身 `current.pth` 自对战、局面采样、反事实展开、PVA 与 latent-dynamics 目标构造、candidate 训练和 paired-game arena。每次运行由程序生成 `fcpi_YYYYMMDD_HHMMSS_id`，创建对应的 `data/runs/<run-id>/` 与 `models/runs/<run-id>/`。其中 HDF5 schema、candidate 和 current checkpoint 均属于 Melano，candidate 达到 arena gate 后原子写入该 run 的 `current.pth`。
+其中每个 FCPI 候选动作都通过精确棋规生成 $s'$，并写入 `candidate_next_states`。$L_D$ 使用与监督训练相同的 latent cosine consistency。反事实价值可以沿精确棋盘展开 2 到 6 plies，动作条件 dynamics 仍只学习根候选动作的一步转移 $E(s)\rightarrow E(s')$，与 $K=2$ anchored latent MCTS 的运行时假设保持一致。
+
+Melano 每轮依次执行自身 `current.pth` 自对战、局面采样、带对手响应的反事实展开、PVA 与 latent-dynamics 目标构造、candidate 训练和 paired-game arena。每次运行由程序生成 `fcpi_YYYYMMDD_HHMMSS_id`，创建对应的 `data/runs/<run-id>/` 与 `models/runs/<run-id>/`。其中 HDF5 schema、candidate 和 current checkpoint 均属于 Melano，candidate 达到 arena gate 后原子写入该 run 的 `current.pth`。`summary.json` 记录反事实分支数、平均深度、实际评价的对手响应数和 arena 结果。
+
+### 5.5 当前边界
+
+- Gadus 保持 Policy/Value ResNet 与普通 MCTS，作为无 latent dynamics 的独立架构。
+- Melano 使用一步动作条件 dynamics 与 $K=2$ anchored latent MCTS。精确棋规始终维护真实状态，预测 latent 只跨越一个动作。
+- Melano FCPI 的多步反事实来自精确棋盘状态序列，latent consistency 与 imagined Value 训练集中在一步后继。
+- 更大的固定或自适应 $K$ 需要多步 latent rollout 目标、误差控制和对应搜索验证，当前程序不会把一步 dynamics 当作已校准的任意长度世界模型。
 
 ## 6. UCI
 
@@ -1039,4 +1076,4 @@ python scripts/opening_book.py \
 
 Gadus 测试覆盖 `gadus_18_planes`、普通走法与特殊走法编码、棋规、Policy/Value 输出形状、有限数值、反向传播和 checkpoint 往返。本地 Windows CPU 烟测覆盖单盘 PGN 生成 HDF5、一步监督训练、closed 搜索、batched MCTS、两盘 paired arena、PGN 输出以及一轮 FCPI 的采样、反事实展开、训练、arena gate 和 current 晋升。
 
-Melano 测试覆盖 `melano_square_tokens`、普通走法与升变编码、棋规、Policy/Value/Advantage 输出形状、Advantage 范围、动作条件 latent successor、$K=2$ anchored latent MCTS 路径、有限数值、反向传播和 checkpoint 往返。本地 Windows CPU 烟测覆盖单盘 PGN 生成含 `next_states` 的 HDF5、一步监督训练以及一轮 Melano FCPI 的候选后继训练与 arena gate。
+Melano 测试覆盖 `melano_square_tokens`、普通走法与升变编码、棋规、Policy/Value/Advantage 输出形状、Advantage 范围、动作条件 latent successor、对手 $P+A$ 与精确 Value 响应聚合、$K=2$ anchored latent MCTS 路径、有限数值、反向传播和 checkpoint 往返。本地 Windows CPU 烟测覆盖单盘 PGN 生成含 `next_states` 与 `next_values` 的 HDF5、一步监督训练以及一轮 Melano FCPI 的候选后继训练与 arena gate。

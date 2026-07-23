@@ -27,7 +27,7 @@ namespace melano {
 
 namespace {
 
-inline constexpr const char *kFcpiFormula = "melano_pva_latent_dynamics_fcpi";
+inline constexpr const char *kFcpiFormula = "melano_pva_opponent_latent_dynamics_fcpi";
 
 // Format iteration numbers for stable, lexically sortable artifact names.
 std::string zero_pad(int value, int width) {
@@ -67,15 +67,26 @@ struct Branch {
 	int depth = 1;
 	std::vector<float> estimates;
 	std::vector<float> policy;
+	std::vector<float> advantages;
 	float current_value = 0.0F;
 	float last_residual = 0.0F;
 	float last_change = 0.0F;
 	bool terminal = false;
 };
 
+struct OpponentReply {
+	chess::Board board;
+	float prior = 0.0F;
+	float advantage = 0.0F;
+	float root_value = 0.0F;
+	SearchResult evaluation;
+	bool terminal = false;
+};
+
 struct TargetSummary {
 	std::int64_t branches = 0;
 	std::int64_t branch_plies = 0;
+	std::int64_t opponent_replies = 0;
 	std::int64_t terminal_branches = 0;
 	double residual_sum = 0.0;
 	std::int64_t residual_count = 0;
@@ -163,6 +174,12 @@ std::vector<float> stable_softmax(const std::vector<double> &logits) {
 			static_cast<float>(std::exp(std::clamp(logits[index] - maximum, -80.0, 0.0)));
 	}
 	return normalize(std::move(values));
+}
+
+// Score one side-to-move action with Melano's policy and non-positive advantage.
+double pva_action_score(float prior, float advantage, double advantage_weight) {
+	return std::log(std::clamp(static_cast<double>(prior), 1e-12, 1.0)) +
+		   advantage_weight * advantage;
 }
 
 // Draw one categorical sample from an already normalized behavior distribution.
@@ -469,8 +486,95 @@ void evaluate_frontier(std::vector<Branch *> branches, Searcher &evaluator,
 		auto *branch = pending[index];
 		branch->current_value = results[index].value;
 		branch->policy = results[index].policy;
+		branch->advantages = results[index].advantages;
 		const float sign = branch->depth % 2 == 0 ? 1.0F : -1.0F;
 		branch->estimates.push_back(sign * results[index].value);
+	}
+}
+
+// Aggregate plausible P/A-ranked replies with an exact-value soft minimum.
+void apply_opponent_responses(std::vector<Branch> &branches, Searcher &evaluator,
+							  const FcpiOptions &options, TargetSummary &summary) {
+	const int reply_topk = std::max(1, options.opponent_reply_topk);
+	std::vector<OpponentReply> replies;
+	std::unordered_map<Branch *, std::vector<std::size_t>> reply_groups;
+	std::vector<chess::Board> pending_boards;
+	std::vector<std::size_t> pending_indices;
+
+	for (auto &branch : branches) {
+		if (branch.terminal || branch.depth != 1) {
+			continue;
+		}
+		auto moves = legal_moves(branch.board);
+		std::stable_sort(moves.begin(), moves.end(), [&](const auto &left, const auto &right) {
+			const int left_action = move_to_index(left);
+			const int right_action = move_to_index(right);
+			return pva_action_score(branch.policy[left_action], branch.advantages[left_action],
+									options.behavior_advantage_weight) >
+				   pva_action_score(branch.policy[right_action], branch.advantages[right_action],
+									options.behavior_advantage_weight);
+		});
+		moves.resize(std::min<std::size_t>(moves.size(), reply_topk));
+		for (const auto &move : moves) {
+			const int action = move_to_index(move);
+			OpponentReply reply;
+			reply.board = branch.board;
+			reply.prior = std::max(1e-12F, branch.policy[action]);
+			reply.advantage = branch.advantages[action];
+			reply.board.makeMove(move);
+			reply.terminal = game_is_over(reply.board);
+			const std::size_t reply_index = replies.size();
+			reply_groups[&branch].push_back(reply_index);
+			replies.push_back(std::move(reply));
+			++summary.opponent_replies;
+			if (replies.back().terminal) {
+				// Two plies restore the root player as side to move.
+				replies.back().root_value = terminal_value_side_to_move(replies.back().board);
+			} else {
+				pending_boards.push_back(replies.back().board);
+				pending_indices.push_back(reply_index);
+			}
+		}
+	}
+
+	const auto evaluations = evaluate_chunks(evaluator, pending_boards, options.inference_batch_size);
+	for (std::size_t index = 0; index < pending_indices.size(); ++index) {
+		auto &reply = replies[pending_indices[index]];
+		reply.evaluation = evaluations[index];
+		reply.root_value = evaluations[index].value;
+	}
+
+	for (auto &[branch, indices] : reply_groups) {
+		std::vector<OpponentReplyInput> inputs;
+		inputs.reserve(indices.size());
+		for (const auto index : indices) {
+			const auto &reply = replies[index];
+			inputs.push_back({reply.prior, reply.advantage, reply.root_value});
+		}
+		const auto response = opponent_reply_weights(
+			inputs, options.behavior_advantage_weight, options.opponent_reply_temperature);
+		float soft_value = 0.0F;
+		std::size_t continuation = 0;
+		for (std::size_t index = 0; index < indices.size(); ++index) {
+			soft_value += response[index] * replies[indices[index]].root_value;
+			if (response[index] > response[continuation]) {
+				continuation = index;
+			}
+		}
+		auto &selected = replies[indices[continuation]];
+		branch->estimates.push_back(std::clamp(soft_value, -1.0F, 1.0F));
+		branch->board = selected.board;
+		branch->depth = 2;
+		branch->current_value = selected.root_value;
+		branch->terminal = selected.terminal;
+		if (selected.terminal) {
+			branch->policy.clear();
+			branch->advantages.clear();
+			++summary.terminal_branches;
+		} else {
+			branch->policy = std::move(selected.evaluation.policy);
+			branch->advantages = std::move(selected.evaluation.advantages);
+		}
 	}
 }
 
@@ -488,7 +592,10 @@ void construct_targets(std::vector<Position> &records, Model model, const torch:
 		std::clamp(options.counterfactual_target_average_plies, static_cast<double>(min_plies),
 				   static_cast<double>(max_plies));
 	std::cout << "fcpi counterfactual start: positions=" << records.size()
-			  << " target_average_plies=" << target_average << std::endl;
+			  << " target_average_plies=" << target_average
+			  << " opponent_reply_topk=" << options.opponent_reply_topk
+			  << " opponent_reply_temperature=" << options.opponent_reply_temperature
+			  << " behavior_advantage_weight=" << options.behavior_advantage_weight << std::endl;
 
 	for (std::size_t subset_begin = 0; subset_begin < records.size();
 		 subset_begin += std::max(1, options.target_records_per_batch)) {
@@ -523,10 +630,13 @@ void construct_targets(std::vector<Position> &records, Model model, const torch:
 			all.push_back(&branch);
 		}
 		evaluate_frontier(all, evaluator, options);
+		apply_opponent_responses(branches, evaluator, options, summary);
 		for (auto &branch : branches) {
 			if (!branch.terminal) {
-				branch.last_residual =
-					std::abs(records[branch.record].root_value + branch.current_value);
+				branch.last_residual = branch.depth == 1
+					? std::abs(records[branch.record].root_value + branch.current_value)
+					: std::abs(branch.estimates.back() -
+							   branch.estimates[branch.estimates.size() - 2]);
 				branch.last_change =
 					std::abs(branch.estimates.back() - records[branch.record].root_value);
 				summary.residual_sum += branch.last_residual;
@@ -592,14 +702,23 @@ void construct_targets(std::vector<Position> &records, Model model, const torch:
 				const auto moves = legal_moves(branch->board);
 				auto selected = std::max_element(moves.begin(), moves.end(),
 												 [&](const auto &left, const auto &right) {
-													 return branch->policy[move_to_index(left)] <
-															branch->policy[move_to_index(right)];
+													 const int left_action = move_to_index(left);
+													 const int right_action = move_to_index(right);
+													 return pva_action_score(
+																branch->policy[left_action],
+																branch->advantages[left_action],
+																options.behavior_advantage_weight) <
+															pva_action_score(
+																branch->policy[right_action],
+																branch->advantages[right_action],
+																options.behavior_advantage_weight);
 												 });
 				previous.emplace(branch,
 								 std::pair(branch->current_value, branch->estimates.back()));
 				branch->board.makeMove(*selected);
 				branch->depth += 1;
 				branch->policy.clear();
+				branch->advantages.clear();
 				if (game_is_over(branch->board)) {
 					const float sign = branch->depth % 2 == 0 ? 1.0F : -1.0F;
 					branch->current_value = terminal_value_side_to_move(branch->board);
@@ -688,6 +807,7 @@ void construct_targets(std::vector<Position> &records, Model model, const torch:
 			  << (summary.branches > 0
 					  ? static_cast<double>(summary.branch_plies) / summary.branches
 					  : 0.0)
+			  << " opponent_replies=" << summary.opponent_replies
 			  << " terminal_branches=" << summary.terminal_branches << " mean_residual="
 			  << (summary.residual_count > 0 ? summary.residual_sum / summary.residual_count : 0.0)
 			  << std::endl;
@@ -1063,6 +1183,22 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 
 } // namespace
 
+// Combine opponent plausibility from P/A with an exact root-value soft minimum.
+std::vector<float> opponent_reply_weights(const std::vector<OpponentReplyInput> &replies,
+										  double advantage_weight, double temperature) {
+	if (replies.empty()) {
+		throw std::invalid_argument("opponent reply set cannot be empty");
+	}
+	const double bounded_temperature = std::max(1e-4, temperature);
+	std::vector<double> logits;
+	logits.reserve(replies.size());
+	for (const auto &reply : replies) {
+		logits.push_back(pva_action_score(reply.prior, reply.advantage, advantage_weight) -
+						 reply.root_value / bounded_temperature);
+	}
+	return stable_softmax(logits);
+}
+
 // Create an isolated run, iterate generation/training/arena, and atomically promote accepted models.
 void run_fcpi(const FcpiOptions &options) {
 	if (options.iterations <= 0 || options.games_per_iter <= 0 || options.games_in_flight <= 0) {
@@ -1106,6 +1242,10 @@ void run_fcpi(const FcpiOptions &options) {
 			 target_summary.branches > 0
 				 ? static_cast<double>(target_summary.branch_plies) / target_summary.branches
 				 : 0.0},
+			{"opponent_replies", target_summary.opponent_replies},
+			{"opponent_reply_topk", options.opponent_reply_topk},
+			{"opponent_reply_temperature", options.opponent_reply_temperature},
+			{"behavior_advantage_weight", options.behavior_advantage_weight},
 			{"terminal_branches", target_summary.terminal_branches},
 		};
 		const auto candidate = model_dir / ("candidate_iter_" + zero_pad(iteration, 3) + ".pth");
