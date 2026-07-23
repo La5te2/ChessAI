@@ -1,0 +1,6 @@
+* text=auto eol=lf
+
+*.pth binary
+*.h5 binary
+*.bin binary
+*.sqlite binary

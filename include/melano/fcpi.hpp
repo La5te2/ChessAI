@@ -39,6 +39,8 @@ struct FcpiOptions {
 	double policy_weight = 1.0;
 	double value_weight = 1.0;
 	double dueling_q_weight = 0.5;
+	double dynamics_weight = 0.25;
+	double imagined_value_weight = 0.25;
 	double kl_weight = 0.05;
 	double entropy_weight = 0.001;
 	int epochs = 15;

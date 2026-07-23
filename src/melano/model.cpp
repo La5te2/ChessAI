@@ -197,6 +197,37 @@ torch::Tensor AdvantageHeadImpl::forward(torch::Tensor square_tokens) {
 	return -2.0 * raw.square();
 }
 
+// Condition one geometry-attention transition on the selected action id.
+LatentDynamicsImpl::LatentDynamicsImpl(int channel_count) : channels(channel_count) {
+	action_embedding =
+		register_module("action_embedding", torch::nn::Embedding(kActionSize, channels));
+	action_projection =
+		register_module("action_projection", torch::nn::Linear(channels, channels));
+	update_gate = register_module("update_gate", torch::nn::Linear(channels, channels));
+	transition = register_module("transition", GeometryAttentionBlock(channels));
+	output_norm =
+		register_module("output_norm", torch::nn::LayerNorm(torch::nn::LayerNormOptions({channels})));
+	// Begin with a conservative residual update while still allowing immediate gradients.
+	torch::nn::init::zeros_(update_gate->weight);
+	torch::nn::init::constant_(update_gate->bias, -2.0);
+}
+
+// Apply z'=LN(z+sigmoid(g(a))*(T(z+c(a))-z)) as an action-conditioned latent world step.
+torch::Tensor LatentDynamicsImpl::forward(torch::Tensor tokens, torch::Tensor actions) {
+	if (tokens.dim() != 3 || tokens.size(1) != kTokenCount || tokens.size(2) != channels) {
+		throw std::runtime_error("invalid Melano latent-dynamics token shape");
+	}
+	actions = actions.to(torch::kInt64).reshape({-1});
+	if (actions.size(0) != tokens.size(0)) {
+		throw std::runtime_error("latent-dynamics action batch does not match token batch");
+	}
+	auto action = action_embedding->forward(actions);
+	auto conditioned = tokens + action_projection->forward(action).unsqueeze(1);
+	auto proposed = transition->forward(conditioned);
+	auto gate = torch::sigmoid(update_gate->forward(action)).unsqueeze(1);
+	return output_norm->forward(tokens + gate * (proposed - tokens));
+}
+
 // Stack geometry-attention blocks and attach independent policy, value, and advantage heads.
 ModelImpl::ModelImpl(int channels, int blocks)
 	: channels_(channels), blocks_(std::max(1, blocks)) {
@@ -208,15 +239,28 @@ ModelImpl::ModelImpl(int channels, int blocks)
 	policy_head = register_module("policy_head", ActionHead(channels_));
 	value_head = register_module("value_head", ValueHead(channels_));
 	advantage_head = register_module("advantage_head", AdvantageHead(channels_));
+	dynamics = register_module("dynamics", LatentDynamics(channels_));
+}
+
+// Encode one exact state with the embedding and shared geometry transformer.
+torch::Tensor ModelImpl::encode(torch::Tensor state) {
+	return trunk->forward(state_embedding->forward(state));
 }
 
 // Produce all three heads from one contextual token representation.
-ModelOutput ModelImpl::forward(torch::Tensor state) {
-	auto tokens = trunk->forward(state_embedding->forward(state));
+ModelOutput ModelImpl::predict(torch::Tensor tokens) {
 	auto squares = tokens.index({torch::indexing::Slice(), torch::indexing::Slice(1, torch::indexing::None)});
 	return {policy_head->forward(squares), value_head->forward(tokens),
 			advantage_head->forward(squares)};
 }
+
+// Delegate one imagined action step to the registered latent transition model.
+torch::Tensor ModelImpl::transition(torch::Tensor tokens, torch::Tensor actions) {
+	return dynamics->forward(tokens, actions);
+}
+
+// Preserve the public exact-state inference contract while exposing staged internals for training.
+ModelOutput ModelImpl::forward(torch::Tensor state) { return predict(encode(state)); }
 
 // Expose the checkpoint-defining embedding width.
 int ModelImpl::channels() const noexcept { return channels_; }

@@ -8,6 +8,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <vector>
+#include <torch/serialize.h>
 #ifdef _WIN32
 #include <windows.h>
 #endif

@@ -3,7 +3,7 @@
 // Gadus residual convolutional policy/value network.
 
 #include <utility>
-#include <torch/torch.h>
+#include <torch/nn.h>
 #include "gadus/game.hpp"
 
 namespace gadus {

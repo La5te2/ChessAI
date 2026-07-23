@@ -5,7 +5,6 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
-#include <torch/torch.h>
 #include "gadus/model.hpp"
 
 namespace gadus {

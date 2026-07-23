@@ -7,7 +7,7 @@
 #include <random>
 #include <string>
 #include <vector>
-#include <torch/torch.h>
+#include <torch/types.h>
 #include "chess.hpp"
 
 namespace gadus {

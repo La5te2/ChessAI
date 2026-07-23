@@ -7,7 +7,6 @@
 #include <memory>
 #include <string>
 #include <vector>
-#include <torch/torch.h>
 #include "gadus/game.hpp"
 #include "gadus/model.hpp"
 

@@ -62,6 +62,10 @@ elif [[ ! -d "${API_DIR}/libtorch/share/cmake/Torch" ]]; then
 else
   echo "LibTorch already installed."
 fi
+cmake \
+	"-DAPI_DIR=${API_DIR}" \
+	"-DTORCH_DIR=${API_DIR}/libtorch" \
+	-P "${API_DIR}/patch.cmake"
 
 if [[ ! -x "${API_DIR}/ninja/ninja" ]]; then
   NINJA_ZIP="${DOWNLOADS}/ninja-${NINJA_VERSION}-linux.zip"

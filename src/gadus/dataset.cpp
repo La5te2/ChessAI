@@ -11,6 +11,7 @@
 #include <regex>
 #include <stdexcept>
 #include <utility>
+#include <torch/optim.h>
 #include "gadus/checkpoint.hpp"
 
 namespace gadus {

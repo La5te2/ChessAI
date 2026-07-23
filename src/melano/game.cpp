@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
+#include <torch/cuda.h>
 
 namespace melano {
 

@@ -1,13 +1,12 @@
 #pragma once
 
-// Melano direct-policy and advantage-seeded batched PUCT search API.
+// Melano direct-policy and K=2 anchored latent PUCT search API.
 
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
 #include <vector>
-#include <torch/torch.h>
 #include "melano/game.hpp"
 #include "melano/model.hpp"
 
@@ -54,6 +53,8 @@ struct SearchResult {
 	int dynamic_target = 0;
 	int expanded_nodes = 0;
 	int nn_batches = 0;
+	int exact_evaluations = 0;
+	int latent_evaluations = 0;
 	double uncertainty = 0.0;
 	double elapsed_ms = 0.0;
 	std::vector<RootMove> root;

@@ -20,7 +20,8 @@ int main(int argc, char **argv) {
 				<< "  --uniform-mix <x> --behavior-advantage-weight <x>\n"
 				<< "  --policy-temperature <x> --prior-power <x> --successor-weight <x>\n"
 				<< "  --played-return-weight <x> --policy-weight <x> --value-weight <x>\n"
-				<< "  --dueling-q-weight <x>\n"
+				<< "  --dueling-q-weight <x> --dynamics-weight <x> "
+					 "--imagined-value-weight <x>\n"
 				<< "  --kl-weight <x> --entropy-weight <x> --epochs <n> --train-max-steps <n>\n"
 				<< "  --batch-size <n> --lr <x> --weight-decay <x> --grad-clip <x>\n"
 				<< "  --eval-games <n> --eval-games-in-flight <n> --eval-max-plies <n>\n"
@@ -72,6 +73,9 @@ int main(int argc, char **argv) {
 		options.value_weight = args.get_double("value-weight", options.value_weight);
 		options.dueling_q_weight =
 			args.get_double("dueling-q-weight", options.dueling_q_weight);
+		options.dynamics_weight = args.get_double("dynamics-weight", options.dynamics_weight);
+		options.imagined_value_weight =
+			args.get_double("imagined-value-weight", options.imagined_value_weight);
 		options.kl_weight = args.get_double("kl-weight", options.kl_weight);
 		options.entropy_weight = args.get_double("entropy-weight", options.entropy_weight);
 		options.epochs = args.get_int("epochs", options.epochs);

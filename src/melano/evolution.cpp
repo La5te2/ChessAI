@@ -19,6 +19,7 @@
 #include <utility>
 #include <vector>
 #include <nlohmann/json.hpp>
+#include <torch/optim.h>
 #include "melano/args.hpp"
 #include "melano/checkpoint.hpp"
 
@@ -26,7 +27,7 @@ namespace melano {
 
 namespace {
 
-inline constexpr const char *kFcpiFormula = "melano_pva_adaptive_value_expansion_td_kl";
+inline constexpr const char *kFcpiFormula = "melano_pva_latent_dynamics_fcpi";
 
 // Format iteration numbers for stable, lexically sortable artifact names.
 std::string zero_pad(int value, int width) {
@@ -49,6 +50,7 @@ struct Position {
 	std::vector<float> policy_target;
 	std::vector<float> candidate_q;
 	std::vector<float> advantage_target;
+	std::vector<PackedState> candidate_next_states;
 	int aggregate_count = 1;
 };
 
@@ -507,6 +509,7 @@ void construct_targets(std::vector<Position> &records, Model model, const torch:
 				branch.candidate = candidate;
 				branch.board = board;
 				branch.board.makeMove(move);
+				record.candidate_next_states.push_back(encode_state(branch.board));
 				if (game_is_over(branch.board)) {
 					branch.estimates.push_back(-terminal_value_side_to_move(branch.board));
 					branch.terminal = true;
@@ -728,8 +731,12 @@ std::vector<Position> aggregate_records(std::vector<Position> records, nlohmann:
 			if (existing == merged.candidate_indices.end()) {
 				merged.candidate_indices.push_back(action);
 				merged.candidate_q.push_back(record.candidate_q[candidate]);
+				merged.candidate_next_states.push_back(record.candidate_next_states[candidate]);
 			} else {
 				const auto index = existing - merged.candidate_indices.begin();
+				if (merged.candidate_next_states[index] != record.candidate_next_states[candidate]) {
+					throw std::runtime_error("identical state/action produced different successor states");
+				}
 				merged.candidate_q[index] =
 					(merged.candidate_q[index] * old_count + record.candidate_q[candidate]) /
 					new_count;
@@ -780,6 +787,8 @@ nlohmann::json write_fcpi_h5(const std::filesystem::path &path, std::vector<Posi
 	std::vector<std::int32_t> candidates(count * candidate_width, 0);
 	std::vector<float> candidate_q(count * candidate_width, 0.0F);
 	std::vector<float> advantage_targets(count * candidate_width, 0.0F);
+	std::vector<std::uint8_t> candidate_next_states(
+		count * candidate_width * static_cast<std::size_t>(kStateFeatures));
 	std::vector<std::uint8_t> candidate_counts(count);
 	for (std::size_t row = 0; row < count; ++row) {
 		std::copy(records[row].state.begin(), records[row].state.end(),
@@ -797,6 +806,10 @@ nlohmann::json write_fcpi_h5(const std::filesystem::path &path, std::vector<Posi
 			candidate_q[row * candidate_width + column] = records[row].candidate_q[column];
 			advantage_targets[row * candidate_width + column] =
 				records[row].advantage_target[column];
+			std::copy(records[row].candidate_next_states[column].begin(),
+					  records[row].candidate_next_states[column].end(),
+					  candidate_next_states.begin() +
+						  (row * candidate_width + column) * kStateFeatures);
 		}
 	}
 	if (!path.parent_path().empty()) {
@@ -823,6 +836,8 @@ nlohmann::json write_fcpi_h5(const std::filesystem::path &path, std::vector<Posi
 				  candidate_q.data());
 	write_dataset(file, "advantage_targets", H5T_IEEE_F32LE, H5T_NATIVE_FLOAT,
 				  {count, candidate_width}, advantage_targets.data());
+	write_dataset(file, "candidate_next_states", H5T_STD_U8LE, H5T_NATIVE_UINT8,
+				  {count, candidate_width, kStateFeatures}, candidate_next_states.data());
 	write_dataset(file, "candidate_counts", H5T_STD_U8LE, H5T_NATIVE_UINT8, {count},
 				  candidate_counts.data());
 	H5Fclose(file);
@@ -851,6 +866,8 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 	double total_policy = 0.0;
 	double total_value = 0.0;
 	double total_dueling_q = 0.0;
+	double total_dynamics = 0.0;
+	double total_imagined_value = 0.0;
 	double total_kl = 0.0;
 	double total_entropy = 0.0;
 	for (int epoch = 0; epoch < std::max(0, options.epochs); ++epoch) {
@@ -869,6 +886,7 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 				std::copy(records[order[index]].state.begin(), records[order[index]].state.end(),
 						  packed.begin() + (index - begin) * kStateFeatures);
 			}
+			std::vector<std::uint8_t> packed_next(batch * candidate_width * kStateFeatures);
 			auto states = decode_states(packed.data(), batch).to(device, true);
 			auto legal = torch::zeros({batch, static_cast<std::int64_t>(width)}, torch::kInt64);
 			auto priors = torch::zeros({batch, static_cast<std::int64_t>(width)}, torch::kFloat32);
@@ -902,8 +920,15 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 				for (std::size_t column = 0; column < record.candidate_indices.size(); ++column) {
 					candidate_access[row][column] = record.candidate_indices[column];
 					advantage_access[row][column] = record.advantage_target[column];
+					std::copy(record.candidate_next_states[column].begin(),
+							  record.candidate_next_states[column].end(),
+							  packed_next.begin() +
+								  (row * candidate_width + column) * kStateFeatures);
 				}
 			}
+			auto next_states =
+				decode_states(packed_next.data(), batch * static_cast<std::int64_t>(candidate_width))
+					.to(device, true);
 			legal = legal.to(device, true);
 			priors = priors.to(device, true);
 			targets = targets.to(device, true);
@@ -914,7 +939,8 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 			candidate_counts = candidate_counts.to(device, true);
 
 			optimizer.zero_grad();
-			auto output = model->forward(states);
+			auto tokens = model->encode(states);
+			auto output = model->predict(tokens);
 			auto selected = output.policy.gather(1, legal).to(torch::kFloat32);
 			auto columns = torch::arange(static_cast<std::int64_t>(width), counts.options());
 			auto mask = columns.unsqueeze(0) < counts.unsqueeze(1);
@@ -945,8 +971,41 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 				torch::nn::functional::SmoothL1LossFuncOptions().reduction(torch::kNone));
 			auto dueling_q_loss =
 				(q_errors * candidate_mask).sum() / candidate_mask.sum().clamp_min(1);
+			// Exact successor states teach the action-conditioned latent world step.
+			auto repeated_tokens =
+				tokens.unsqueeze(1)
+					.expand({batch, static_cast<std::int64_t>(candidate_width), kTokenCount,
+							 model->channels()})
+					.reshape({batch * static_cast<std::int64_t>(candidate_width), kTokenCount,
+							  model->channels()});
+			auto predicted_next =
+				model->transition(repeated_tokens, candidate_indices.reshape({-1}));
+			torch::Tensor target_next;
+			{
+				torch::NoGradGuard no_grad;
+				target_next = model->encode(next_states).detach();
+			}
+			auto predicted_unit = predicted_next /
+				predicted_next.square().sum(-1, true).sqrt().clamp_min(1e-8);
+			auto target_unit =
+				target_next / target_next.square().sum(-1, true).sqrt().clamp_min(1e-8);
+			auto dynamics_errors =
+				(1.0 - (predicted_unit * target_unit).sum(-1).mean(-1))
+					.reshape({batch, static_cast<std::int64_t>(candidate_width)});
+			auto dynamics_loss =
+				(dynamics_errors * candidate_mask).sum() / candidate_mask.sum().clamp_min(1);
+			auto imagined_q =
+				-model->predict(predicted_next).value.squeeze(1).reshape(
+					{batch, static_cast<std::int64_t>(candidate_width)});
+			auto imagined_errors = torch::nn::functional::smooth_l1_loss(
+				imagined_q, target_q,
+				torch::nn::functional::SmoothL1LossFuncOptions().reduction(torch::kNone));
+			auto imagined_value_loss =
+				(imagined_errors * candidate_mask).sum() / candidate_mask.sum().clamp_min(1);
 			auto loss = options.policy_weight * policy_loss + options.value_weight * value_loss +
 						options.dueling_q_weight * dueling_q_loss +
+						options.dynamics_weight * dynamics_loss +
+						options.imagined_value_weight * imagined_value_loss +
 						options.kl_weight * kl - options.entropy_weight * entropy;
 			loss.backward();
 			if (options.grad_clip > 0.0) {
@@ -958,6 +1017,8 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 			total_policy += policy_loss.item<double>();
 			total_value += value_loss.item<double>();
 			total_dueling_q += dueling_q_loss.item<double>();
+			total_dynamics += dynamics_loss.item<double>();
+			total_imagined_value += imagined_value_loss.item<double>();
 			total_kl += kl.item<double>();
 			total_entropy += entropy.item<double>();
 			if (options.log_every > 0 && (steps == 1 || steps % options.log_every == 0)) {
@@ -965,6 +1026,8 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 						  << " policy=" << policy_loss.item<double>()
 						  << " value=" << value_loss.item<double>() << " kl=" << kl.item<double>()
 						  << " dueling_q=" << dueling_q_loss.item<double>()
+						  << " dynamics=" << dynamics_loss.item<double>()
+						  << " imagined_value=" << imagined_value_loss.item<double>()
 						  << " entropy=" << entropy.item<double>()
 						  << " loss=" << loss.item<double>() << std::endl;
 			}
@@ -990,6 +1053,8 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 			 {"policy", total_policy / divisor},
 			 {"value", total_value / divisor},
 			 {"dueling_q", total_dueling_q / divisor},
+			 {"dynamics", total_dynamics / divisor},
+			 {"imagined_value", total_imagined_value / divisor},
 			 {"kl", total_kl / divisor},
 			 {"entropy", total_entropy / divisor},
 		 }},

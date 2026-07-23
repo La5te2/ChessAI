@@ -55,7 +55,6 @@ find_package(ZLIB ${GADIDAE_ZLIB_VERSION} EXACT REQUIRED)
 find_package(Threads REQUIRED)
 
 if(MSVC)
-	add_compile_options(/external:templates-)
 	find_library(
 		GADIDAE_ZLIB_STATIC
 		NAMES zlibstatic
@@ -90,7 +89,7 @@ target_include_directories(gadus
 		"${GADIDAE_API_DIR}/nlohmann/include"
 		${HDF5_INCLUDE_DIRS}
 )
-target_precompile_headers(gadus PRIVATE <chess.hpp> <nlohmann/json.hpp> <torch/torch.h>)
+target_precompile_headers(gadus PRIVATE <chess.hpp> <nlohmann/json.hpp>)
 if(MSVC)
 	target_link_libraries(
 		gadus
@@ -184,7 +183,7 @@ target_include_directories(melano SYSTEM PUBLIC
 	"${GADIDAE_API_DIR}/nlohmann/include"
 	${HDF5_INCLUDE_DIRS}
 )
-target_precompile_headers(melano PRIVATE <chess.hpp> <nlohmann/json.hpp> <torch/torch.h>)
+target_precompile_headers(melano PRIVATE <chess.hpp> <nlohmann/json.hpp>)
 if(MSVC)
 	target_link_libraries(
 		melano

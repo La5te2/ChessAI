@@ -6,7 +6,7 @@
 #include <filesystem>
 #include <string>
 #include <vector>
-#include <torch/torch.h>
+#include <torch/types.h>
 #include "gadus/game.hpp"
 
 namespace gadus {

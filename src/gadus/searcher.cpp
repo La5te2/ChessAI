@@ -392,8 +392,9 @@ struct Searcher::Impl {
 		}
 		result.move = moves.front();
 
-		const int row_count = std::min<int>(std::max(1, options.root_topn), moves.size());
-		for (int row = 0; row < row_count; ++row) {
+		const auto row_count =
+			std::min(moves.size(), static_cast<std::size_t>(std::max(1, options.root_topn)));
+		for (std::size_t row = 0; row < row_count; ++row) {
 			const auto move = moves[row];
 			const int action = move_to_index(move);
 			RootMove root_move;

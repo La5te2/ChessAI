@@ -3,7 +3,7 @@
 Gadidae 是一个实验性国际象棋神经网络引擎项目。当前架构如下：
 
 - `Gadus`：ResNet + linear policy/value，使用 `gadus_18_planes` state encoding 和 `alphazero_64x73` move encoding。
-- `Melano`：residual geometry attention + source-destination policy/value/advantage，使用 `melano_square_tokens` state encoding 和 `sd_64x64_underpromo9` move encoding。
+- `Melano`：residual geometry attention + action-conditioned latent dynamics + source-destination policy/value/advantage，使用 `melano_square_tokens` state encoding 和 `sd_64x64_underpromo9` move encoding。
 
 两套架构分别实现 preprocess、train、search、arena、FCPI 和 UCI。它们共享 LibTorch、HDF5、chess-library、nlohmann-json、zlib 与构建基础设施。
 
@@ -382,6 +382,8 @@ build/gadus/fcpi \
 	--inference-batch-size 64 \
 	--target-records-per-batch 256 \
 	--counterfactual-topk 6 \
+	--opponent-reply-topk 4 \
+	--opponent-reply-temperature 0.2 \
 	--counterfactual-min-plies 2 \
 	--counterfactual-max-plies 6 \
 	--counterfactual-target-average-plies 4 \
@@ -441,7 +443,21 @@ $$
 G_t=-\left[(1-\lambda_{TD})V(s_{t+1})+\lambda_{TD}G_{t+1}\right]
 $$
 
-负号对应行棋方在每个 ply 的切换。对候选动作展开得到不同深度的根视角估计 $q^{(1)},\ldots,q^{(D)}$，反事实深度混合为：
+负号对应行棋方在每个 ply 的切换。候选动作 $a$ 执行后，Gadus 取对手 Policy 的前 $K_r$ 个应手。设 $Q_b$ 是执行应手 $b$ 后恢复到根行棋方视角的 Value，则对手响应分布为：
+
+$$
+\rho(b\mid s,a)=\operatorname{softmax}_b\left(
+\log(P(b\mid s_a)+\varepsilon)-\frac{Q_b}{T_r}
+\right)
+$$
+
+二层反事实值为：
+
+$$
+q^{(2)}(s,a)=\sum_b\rho(b\mid s,a)Q_b
+$$
+
+$T_r$ 较小时接近对根行棋方不利的 minimax 应手，Policy 项保留对手真实会选择该应手的可能性。后续自适应展开沿 $\rho$ 最大的应手继续。候选动作由此得到不同深度的根视角估计 $q^{(1)},\ldots,q^{(D)}$，反事实深度混合为：
 
 $$
 Q_{cf}=(1-\lambda_{cf})\sum_{d=1}^{D-1}
@@ -528,15 +544,17 @@ Melano HDF5 schema：
 
 ```text
 states:     uint8,  (N, 67)
+next_states:uint8,  (N, 67)
 moves:      uint16, (N,)
 values:     float32, (N,)
+next_values:float32, (N,)
 adv_moves:  uint16, (N,)
 adv_values: float32, (N,)
 
 arch_type=melano
 state_encoding=melano_square_tokens
 move_encoding=sd_64x64_underpromo9
-target_schema=pva_minimax_dueling
+target_schema=pva_latent_dynamics
 value_perspective=side_to_move
 has_cmt=0|1
 ```
@@ -568,8 +586,33 @@ Q_{target}(s,a)=\operatorname{clip}
 $$
 
 $$
+z=E(s),\qquad \widehat z'=D(z,a),\qquad \bar z'=\operatorname{stopgrad}(E(s'))
+$$
+
+潜在转移使用动作 embedding 条件化一个 residual geometry-attention block：
+
+$$
+\widehat z'=\operatorname{LN}\left(z+\sigma(g(a))\odot
+(T(z+c(a))-z)\right)
+$$
+
+其中 $c(a)$ 是动作条件，$g(a)$ 是逐通道更新门。潜在一致性损失逐 token 比较走后预测与精确棋规生成的走后状态编码：
+
+$$
+L_D=1-\frac{1}{65}\sum_i\cos(\widehat z'_i,\bar z'_i)
+$$
+
+`next_values` 独立保存走后局面在新行棋方视角下的 Value target。它直接来自当前走法后的评注，因此每盘棋第一条有效评注也能监督走后 latent：
+
+$$
+L_I=\operatorname{MSE}(V(\widehat z'),V_{target}(s'))
+$$
+
+完整监督损失为：
+
+$$
 L_{sup}=L_{CE}+w_V\operatorname{MSE}(V,V_{target})+
-w_Q\operatorname{MSE}(\widehat Q,Q_{target})
+w_Q\operatorname{MSE}(\widehat Q,Q_{target})+w_D L_D+w_I L_I
 $$
 
 ### 5.2 Preprocess、Train 与 Search
@@ -595,6 +638,8 @@ build/melano/train \
 	--weight-decay 0.0001 \
 	--value-weight 1.0 \
 	--dueling-q-weight 0.5 \
+	--dynamics-weight 0.25 \
+	--imagined-value-weight 0.25 \
 	--device cuda \
 	--log-every 50
 
@@ -621,7 +666,23 @@ build/melano/search \
 - `train` 每次创建新的 Melano 模型。`--channels` 和 `--blocks` 决定 geometry attention 宽度与层数，checkpoint 通过临时文件和 rename 原子写回。
 - Melano checkpoint 的逻辑顶层为 `model` 与 `arch`，其中 `arch` 保存架构标识、`channels`、`blocks` 和 `action_size`。
 
-`closed` 按 Melano Policy 排序。`only-mcts` 为每条边建立一份伪访问。定义：伪访问是 $V+A$ 提供的动作价值先验，它以一个统计样本的权重参与边价值估计，同时保持真实 visits 与叶节点回传独立。
+`closed` 按 Melano Policy 排序。`only-mcts` 使用 $K=2$ anchored latent MCTS，并为每条边建立一份伪访问。定义：伪访问是 $V+A$ 提供的动作价值先验，它以一个统计样本的权重参与边价值估计，同时保持真实 visits 与叶节点回传独立。
+
+MCTS 的每个节点都保留精确 `chess::Board`，合法走法、将军、终局、重复局面与五十回合规则由棋规计算。网络评价在偶数深度重新建立精确 latent 锚点，在奇数深度使用动作条件 latent transition：
+
+$$
+z_d=
+\begin{cases}
+E(s_d),&d\bmod 2=0\\
+D(z_{d-1},a_{d-1}),&d\bmod 2=1
+\end{cases}
+$$
+
+$$
+(P_d,V_d,A_d)=H(z_d)
+$$
+
+因此任意预测 latent 与最近的精确编码只相隔一个动作，运行时分布与当前一步 dynamics 训练目标一致。偶数深度节点缓存 $E(s_d)$，奇数深度 latent 只在批量评价期间存在，从而限制设备内存。`search` 输出中的 `exact_evaluations` 与 `latent_evaluations` 分别报告两类网络评价位置数。
 
 $$
 Q_{prior}(s,a)=\operatorname{clip}(V(s)+A(s,a),-1,1)
@@ -767,6 +828,8 @@ build/melano/fcpi \
 	--policy-weight 1.0 \
 	--value-weight 1.0 \
 	--dueling-q-weight 0.5 \
+	--dynamics-weight 0.25 \
+	--imagined-value-weight 0.25 \
 	--kl-weight 0.05 \
 	--entropy-weight 0.001 \
 	--epochs 15 \
@@ -862,11 +925,12 @@ FCPI 训练损失为：
 $$
 L=w_P L_{CE}+w_V\operatorname{SmoothL1}(V,V^*)+
 w_Q\operatorname{SmoothL1}(\widehat Q,Q^*)+
+w_D L_D+w_I\operatorname{SmoothL1}(-V(\widehat z'),Q^*)+
 w_{KL}D_{KL}(\pi_{new}\Vert P_{old})-
 w_H H(\pi_{new})
 $$
 
-Melano 每轮依次执行自身 `current.pth` 自对战、局面采样、反事实展开、PVA 目标构造、candidate 训练和 paired-game arena。每次运行由程序生成 `fcpi_YYYYMMDD_HHMMSS_id`，创建对应的 `data/runs/<run-id>/` 与 `models/runs/<run-id>/`。其中 HDF5 schema、candidate 和 current checkpoint 均属于 Melano，candidate 达到 arena gate 后原子写入该 run 的 `current.pth`。
+其中每个 FCPI 候选动作都通过精确棋规生成 $s'$，并写入 `candidate_next_states`。$L_D$ 使用与监督训练相同的 latent cosine consistency。Melano 每轮依次执行自身 `current.pth` 自对战、局面采样、反事实展开、PVA 与 latent-dynamics 目标构造、candidate 训练和 paired-game arena。每次运行由程序生成 `fcpi_YYYYMMDD_HHMMSS_id`，创建对应的 `data/runs/<run-id>/` 与 `models/runs/<run-id>/`。其中 HDF5 schema、candidate 和 current checkpoint 均属于 Melano，candidate 达到 arena gate 后原子写入该 run 的 `current.pth`。
 
 ## 6. UCI
 
@@ -975,4 +1039,4 @@ python scripts/opening_book.py \
 
 Gadus 测试覆盖 `gadus_18_planes`、普通走法与特殊走法编码、棋规、Policy/Value 输出形状、有限数值、反向传播和 checkpoint 往返。本地 Windows CPU 烟测覆盖单盘 PGN 生成 HDF5、一步监督训练、closed 搜索、batched MCTS、两盘 paired arena、PGN 输出以及一轮 FCPI 的采样、反事实展开、训练、arena gate 和 current 晋升。
 
-Melano 测试覆盖 `melano_square_tokens`、普通走法与升变编码、棋规、Policy/Value/Advantage 输出形状、Advantage 范围、有限数值、反向传播和 checkpoint 往返。
+Melano 测试覆盖 `melano_square_tokens`、普通走法与升变编码、棋规、Policy/Value/Advantage 输出形状、Advantage 范围、动作条件 latent successor、$K=2$ anchored latent MCTS 路径、有限数值、反向传播和 checkpoint 往返。本地 Windows CPU 烟测覆盖单盘 PGN 生成含 `next_states` 的 HDF5、一步监督训练以及一轮 Melano FCPI 的候选后继训练与 arena gate。

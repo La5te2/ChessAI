@@ -48,6 +48,7 @@ if not exist "%API_DIR%libtorch\share\cmake\Torch" (
   echo LibTorch already installed.
 )
 :torch_ready
+cmake -DAPI_DIR="%API_ROOT%" -DTORCH_DIR="%API_ROOT%\libtorch" -P "%API_ROOT%\patch.cmake" || exit /b 1
 
 if not exist "%API_DIR%ninja\ninja.exe" (
 	set "NINJA_ZIP=%API_DIR%downloads\ninja-%NINJA_VERSION%-win.zip"

@@ -1,10 +1,13 @@
 // Focused Melano smoke tests for codecs, P/V/A gradients, checkpoints, and search.
 
+#include <cmath>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <unordered_set>
 #include "melano/checkpoint.hpp"
+#include "melano/dataset.hpp"
 #include "melano/game.hpp"
 #include "melano/model.hpp"
 #include "melano/search.hpp"
@@ -96,8 +99,41 @@ int main() {
 		require(melano::game_termination(repetition) == "threefold repetition",
 				"threefold-repetition termination mismatch");
 
+		// A first annotated move has no previous score but does have an exact successor value.
+		const auto pgn = std::filesystem::temp_directory_path() / "melanotest.pgn";
+		const auto h5 = std::filesystem::temp_directory_path() / "melanotest.h5";
+		{
+			std::ofstream output(pgn);
+			output << "[Event \"Melano test\"]\n"
+					  "[Result \"1-0\"]\n\n"
+					  "1. e4 {+0.60/12} e5 {+0.20/12} 1-0\n";
+		}
+		melano::PreprocessOptions preprocess;
+		preprocess.input = pgn;
+		preprocess.output = h5;
+		preprocess.max_games = 1;
+		preprocess.chunk_size = 2;
+		preprocess.compression_level = 0;
+		preprocess.log_every = 0;
+		melano::preprocess_pgn(preprocess);
+		{
+			melano::SupervisedH5 supervised(h5);
+			require(supervised.info().length == 2, "annotated PGN row count mismatch");
+			const auto supervised_batch = supervised.read({0, 1});
+			const float expected_successor = -static_cast<float>(std::tanh(0.60 / 3.0));
+			require(std::abs(supervised_batch.values.index({0}).item<float>()) < 1e-6F,
+					"first unanchored value must remain neutral");
+			require(std::abs(supervised_batch.next_values.index({0}).item<float>() -
+							 expected_successor) < 1e-6F,
+					"first annotated successor value was lost");
+		}
+		std::filesystem::remove(pgn);
+		std::filesystem::remove(h5);
+
 		auto model = melano::Model(8, 1);
-		auto output = model->forward(melano::encode_boards({board, board}));
+		auto states = melano::encode_boards({board, board});
+		auto tokens = model->encode(states);
+		auto output = model->predict(tokens);
 		require(output.policy.sizes() == torch::IntArrayRef({2, melano::kActionSize}),
 				"policy shape mismatch");
 		require(output.value.sizes() == torch::IntArrayRef({2, 1}), "value shape mismatch");
@@ -113,12 +149,24 @@ int main() {
 		require(output.advantages.max().item<float>() <= 1e-6F &&
 				output.advantages.min().item<float>() >= -2.000001F,
 				"advantage range mismatch");
-		(output.policy.mean() + output.value.mean() + output.advantages.mean()).backward();
+		auto actions = torch::tensor(
+			{melano::move_to_index(chess::uci::uciToMove(board, "e2e4")),
+			 melano::move_to_index(chess::uci::uciToMove(board, "g1f3"))},
+			torch::kInt64);
+		auto successor = model->transition(tokens, actions);
+		require(successor.sizes() == torch::IntArrayRef({2, melano::kTokenCount, 8}),
+				"latent successor shape mismatch");
+		auto imagined = model->predict(successor);
+		(output.policy.mean() + output.value.mean() + output.advantages.mean() +
+		 successor.mean() + imagined.value.mean())
+			.backward();
 		require_finite_gradients(model);
 
 		const auto checkpoint = std::filesystem::temp_directory_path() / "melanotest.pth";
 		model->eval();
 		auto reference = model->forward(melano::encode_boards({board}));
+		auto reference_latent = model->encode(melano::encode_boards({board}));
+		auto reference_successor = model->transition(reference_latent, actions.index({0}).reshape({1}));
 		melano::save_checkpoint_atomic(checkpoint, model, {8, 1});
 		melano::ArchitectureInfo info;
 		auto loaded = melano::load_checkpoint(checkpoint, torch::Device(torch::kCPU), &info);
@@ -133,6 +181,10 @@ int main() {
 				"checkpoint changed value output");
 		require(torch::allclose(reference.advantages, loaded_output.advantages),
 				"checkpoint changed advantage output");
+		auto loaded_latent = loaded->encode(melano::encode_boards({board}));
+		auto loaded_successor = loaded->transition(loaded_latent, actions.index({0}).reshape({1}));
+		require(torch::allclose(reference_successor, loaded_successor),
+				"checkpoint changed latent transition output");
 
 		// Closed search ranks legal actions with policy and Melano's advantage prior.
 		melano::SearchOptions closed_options;
@@ -157,6 +209,10 @@ int main() {
 		const auto mcts_result = mcts_searcher.search(board);
 		require(mcts_result.sims_completed == 4, "MCTS simulation budget mismatch");
 		require(mcts_result.expanded_nodes > 0, "MCTS did not expand a node");
+		require(mcts_result.exact_evaluations >= 1,
+				"K=2 MCTS did not retain an exact latent anchor");
+		require(mcts_result.latent_evaluations > 0,
+				"K=2 MCTS did not evaluate odd-depth latent successors");
 		std::filesystem::remove(checkpoint);
 
 		std::cout << "melanotests passed" << std::endl;

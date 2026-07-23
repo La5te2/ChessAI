@@ -3,7 +3,7 @@
 // Melano geometry-aware transformer with policy, value, and non-positive advantage heads.
 
 #include <cstdint>
-#include <torch/torch.h>
+#include <torch/nn.h>
 #include "melano/game.hpp"
 
 namespace melano {
@@ -93,9 +93,30 @@ struct ModelOutput {
 	torch::Tensor advantages;
 };
 
+struct LatentDynamicsImpl : torch::nn::Module {
+	/// Builds an action-conditioned residual transition over Melano's 65 latent tokens.
+	explicit LatentDynamicsImpl(int channels);
+	/// Predicts the successor latent z' from z and one encoded legal action.
+	torch::Tensor forward(torch::Tensor tokens, torch::Tensor actions);
+
+	int channels;
+	torch::nn::Embedding action_embedding{nullptr};
+	torch::nn::Linear action_projection{nullptr};
+	torch::nn::Linear update_gate{nullptr};
+	GeometryAttentionBlock transition{nullptr};
+	torch::nn::LayerNorm output_norm{nullptr};
+};
+TORCH_MODULE(LatentDynamics);
+
 struct ModelImpl : torch::nn::Module {
 	/// Builds the token embedding, geometry-attention trunk, and P/V/A heads.
 	ModelImpl(int channels = 128, int blocks = 10);
+	/// Encodes exact board state into the shared geometry-aware latent representation.
+	torch::Tensor encode(torch::Tensor state);
+	/// Applies P/V/A heads to an already encoded latent representation.
+	ModelOutput predict(torch::Tensor tokens);
+	/// Predicts the latent successor of an encoded action without decoding a board.
+	torch::Tensor transition(torch::Tensor tokens, torch::Tensor actions);
 	/// Returns policy logits, side-to-move V(s), and action advantages A(s,a).
 	ModelOutput forward(torch::Tensor state);
 	/// Returns the transformer embedding width stored in the checkpoint descriptor.
@@ -108,6 +129,7 @@ struct ModelImpl : torch::nn::Module {
 	ActionHead policy_head{nullptr};
 	ValueHead value_head{nullptr};
 	AdvantageHead advantage_head{nullptr};
+	LatentDynamics dynamics{nullptr};
 
 	private:
 	int channels_;

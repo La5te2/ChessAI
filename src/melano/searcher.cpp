@@ -1,4 +1,4 @@
-// Implements Melano advantage-seeded batched PUCT; search.cpp is its CLI front end.
+// Implements Melano K=2 anchored latent PUCT; search.cpp is its CLI front end.
 
 #include "melano/search.hpp"
 #include <algorithm>
@@ -20,6 +20,7 @@ struct Evaluation {
 	std::vector<std::vector<float>> policies;
 	std::vector<float> values;
 	std::vector<std::vector<float>> advantages;
+	std::vector<torch::Tensor> latents;
 };
 
 struct Node {
@@ -39,6 +40,8 @@ struct Node {
 	int visits = 0;
 	float value_sum = 0.0F;
 	int virtual_visits = 0;
+	// K=2 anchors retain exact E(s) only at even tree depths.
+	torch::Tensor anchor_latent;
 	std::vector<std::unique_ptr<Node>> children;
 };
 
@@ -47,6 +50,7 @@ struct SelectedLeaf {
 	Node *leaf = nullptr;
 	chess::Board board;
 	std::vector<Node *> path;
+	int depth = 0;
 };
 
 struct TreeState {
@@ -59,6 +63,8 @@ struct TreeState {
 	int dynamic_target = 0;
 	int expanded_nodes = 0;
 	int nn_batches = 0;
+	int exact_evaluations = 0;
+	int latent_evaluations = 0;
 	double total_leaf_depth = 0.0;
 	int leaf_samples = 0;
 	int max_leaf_depth = 0;
@@ -119,33 +125,63 @@ struct Searcher::Impl {
 		model->eval();
 	}
 
-	// Evaluate independent boards in one LibTorch batch and copy P/V/A outputs to host memory.
-	Evaluation evaluate(const std::vector<chess::Board> &boards) {
-		if (boards.empty()) {
-			return {};
-		}
-		torch::InferenceMode guard;
-		auto states = encode_boards(boards).to(device, true);
-		auto prediction = model->forward(states);
+	// Copy P/V/A outputs to host memory and optionally retain one device latent per row.
+	Evaluation collect(ModelOutput prediction, const torch::Tensor &latents = {}) {
 		auto probabilities = torch::softmax(prediction.policy, 1).to(torch::kCPU).contiguous();
 		auto values = prediction.value.reshape({-1}).to(torch::kCPU).contiguous();
 		auto advantages = prediction.advantages.to(torch::kCPU).contiguous();
+		const auto rows = static_cast<std::size_t>(values.size(0));
 
 		Evaluation output;
-		output.policies.resize(boards.size(), std::vector<float>(kActionSize));
-		output.values.resize(boards.size());
-		output.advantages.resize(boards.size(), std::vector<float>(kActionSize));
+		output.policies.resize(rows, std::vector<float>(kActionSize));
+		output.values.resize(rows);
+		output.advantages.resize(rows, std::vector<float>(kActionSize));
+		if (latents.defined()) {
+			output.latents.reserve(rows);
+		}
 		auto probability_rows = probabilities.accessor<float, 2>();
 		auto value_rows = values.accessor<float, 1>();
 		auto advantage_rows = advantages.accessor<float, 2>();
-		for (std::size_t row = 0; row < boards.size(); ++row) {
+		for (std::size_t row = 0; row < rows; ++row) {
 			std::copy_n(&probability_rows[static_cast<std::int64_t>(row)][0], kActionSize,
 						output.policies[row].begin());
 			output.values[row] = value_rows[static_cast<std::int64_t>(row)];
 			std::copy_n(&advantage_rows[static_cast<std::int64_t>(row)][0], kActionSize,
 						output.advantages[row].begin());
+			if (latents.defined()) {
+				output.latents.push_back(
+					latents.index({static_cast<std::int64_t>(row)}).contiguous());
+			}
 		}
 		return output;
+	}
+
+	// Encode exact boards and retain their geometry-aware latents as K=2 anchors.
+	Evaluation evaluate_exact(const std::vector<chess::Board> &boards) {
+		if (boards.empty()) {
+			return {};
+		}
+		torch::InferenceMode guard;
+		auto states = encode_boards(boards).to(device, true);
+		auto latents = model->encode(states);
+		return collect(model->predict(latents), latents);
+	}
+
+	// Predict odd-depth leaves from their exact even-depth parent anchors.
+	Evaluation evaluate_latent(const std::vector<torch::Tensor> &parents,
+							   const std::vector<std::int64_t> &actions) {
+		if (parents.empty()) {
+			return {};
+		}
+		if (parents.size() != actions.size()) {
+			throw std::runtime_error("Melano latent evaluation batch is misaligned");
+		}
+		torch::InferenceMode guard;
+		auto parent_batch = torch::stack(parents);
+		auto action_batch =
+			torch::tensor(actions, torch::TensorOptions().dtype(torch::kInt64).device(device));
+		auto successors = model->transition(parent_batch, action_batch);
+		return collect(model->predict(successors));
 	}
 
 	// Expand legal edges and derive each current-player Q prior as clamp(V(s)+A(s,a)).
@@ -242,6 +278,7 @@ struct Searcher::Impl {
 			}
 		}
 		const int depth = static_cast<int>(selected.path.size()) - 1;
+		selected.depth = depth;
 		state.total_leaf_depth += depth;
 		state.leaf_samples += 1;
 		state.max_leaf_depth = std::max(state.max_leaf_depth, depth);
@@ -385,6 +422,8 @@ struct Searcher::Impl {
 		result.dynamic_target = options.type == SearchType::Closed ? 0 : state.dynamic_target;
 		result.expanded_nodes = state.expanded_nodes;
 		result.nn_batches = state.nn_batches;
+		result.exact_evaluations = state.exact_evaluations;
+		result.latent_evaluations = state.latent_evaluations;
 		result.uncertainty =
 			options.type == SearchType::Closed ? 0.0 : uncertainty(state.root.get());
 		result.elapsed_ms = seconds_since(start) * 1000.0;
@@ -412,8 +451,9 @@ struct Searcher::Impl {
 		}
 		result.move = moves.front();
 
-		const int row_count = std::min<int>(std::max(1, options.root_topn), moves.size());
-		for (int row = 0; row < row_count; ++row) {
+		const auto row_count =
+			std::min(moves.size(), static_cast<std::size_t>(std::max(1, options.root_topn)));
+		for (std::size_t row = 0; row < row_count; ++row) {
 			const auto move = moves[row];
 			const int action = move_to_index(move);
 			RootMove root_move;
@@ -463,14 +503,16 @@ struct Searcher::Impl {
 			state.board = board;
 			states.push_back(std::move(state));
 		}
-		const auto roots = evaluate(boards);
+		const auto roots = evaluate_exact(boards);
 		const int minimum = minimum_simulations();
 		for (std::size_t index = 0; index < states.size(); ++index) {
 			states[index].network_policy = roots.policies[index];
 			states[index].network_advantages = roots.advantages[index];
 			states[index].network_value = roots.values[index];
 			states[index].nn_batches = 1;
+			states[index].exact_evaluations = 1;
 			states[index].dynamic_target = minimum;
+			states[index].root->anchor_latent = roots.latents[index];
 			expand(states[index].root.get(), states[index].board, roots.policies[index],
 				   roots.advantages[index], roots.values[index]);
 			states[index].expanded_nodes = 1;
@@ -525,16 +567,26 @@ struct Searcher::Impl {
 
 				for (std::size_t begin = 0; begin < selected.size(); begin += batch_size) {
 					const auto end = std::min(selected.size(), begin + batch_size);
-					std::vector<chess::Board> leaf_boards;
+					std::vector<std::size_t> exact_rows;
+					std::vector<std::size_t> latent_rows;
 					for (std::size_t index = begin; index < end; ++index) {
-						leaf_boards.push_back(selected[index].board);
+						if (selected[index].depth % 2 == 0) {
+							exact_rows.push_back(index);
+						} else {
+							latent_rows.push_back(index);
+						}
 					}
-					const auto evaluation = evaluate(leaf_boards);
-					std::unordered_set<std::size_t> evaluated_states;
-					for (std::size_t index = begin; index < end; ++index) {
+
+					auto apply_evaluation = [&](std::size_t index, const Evaluation &evaluation,
+												std::size_t row, bool exact) {
 						auto &leaf = selected[index];
 						auto &state = states[leaf.state_index];
-						const std::size_t row = index - begin;
+						if (exact) {
+							leaf.leaf->anchor_latent = evaluation.latents[row];
+							state.exact_evaluations += 1;
+						} else {
+							state.latent_evaluations += 1;
+						}
 						if (leaf.leaf->children.empty()) {
 							expand(leaf.leaf, leaf.board, evaluation.policies[row],
 								   evaluation.advantages[row], evaluation.values[row]);
@@ -543,11 +595,56 @@ struct Searcher::Impl {
 						clear_virtual(leaf.path);
 						backpropagate(leaf.path, evaluation.values[row]);
 						state.sims_completed += 1;
-						evaluated_states.insert(leaf.state_index);
 						progressed = true;
+					};
+
+					if (!exact_rows.empty()) {
+						std::vector<chess::Board> leaf_boards;
+						leaf_boards.reserve(exact_rows.size());
+						for (const auto index : exact_rows) {
+							leaf_boards.push_back(selected[index].board);
+						}
+						const auto evaluation = evaluate_exact(leaf_boards);
+						std::unordered_set<std::size_t> evaluated_states;
+						for (std::size_t row = 0; row < exact_rows.size(); ++row) {
+							const auto index = exact_rows[row];
+							apply_evaluation(index, evaluation, row, true);
+							evaluated_states.insert(selected[index].state_index);
+						}
+						for (const auto state_index : evaluated_states) {
+							states[state_index].nn_batches += 1;
+						}
 					}
-					for (const auto state_index : evaluated_states) {
-						states[state_index].nn_batches += 1;
+
+					if (!latent_rows.empty()) {
+						std::vector<torch::Tensor> parent_latents;
+						std::vector<std::int64_t> actions;
+						parent_latents.reserve(latent_rows.size());
+						actions.reserve(latent_rows.size());
+						for (const auto index : latent_rows) {
+							const auto &leaf = selected[index];
+							if (leaf.path.size() < 2) {
+								throw std::runtime_error(
+									"odd-depth Melano leaf has no parent anchor");
+							}
+							const auto *parent = leaf.path[leaf.path.size() - 2];
+							if (!parent->anchor_latent.defined()) {
+								throw std::runtime_error(
+									"odd-depth Melano leaf is missing its K=2 parent anchor");
+							}
+							parent_latents.push_back(parent->anchor_latent);
+							actions.push_back(move_to_index(leaf.leaf->move));
+						}
+						const auto evaluation = evaluate_latent(parent_latents, actions);
+						std::unordered_set<std::size_t> evaluated_states;
+						for (std::size_t row = 0; row < latent_rows.size(); ++row) {
+							const auto index = latent_rows[row];
+							apply_evaluation(index, evaluation, row, false);
+							evaluated_states.insert(selected[index].state_index);
+						}
+						for (const auto state_index : evaluated_states) {
+							states[state_index].nn_batches += 1;
+						}
 					}
 				}
 

@@ -6,15 +6,17 @@
 #include <filesystem>
 #include <string>
 #include <vector>
-#include <torch/torch.h>
+#include <torch/types.h>
 #include "melano/game.hpp"
 
 namespace melano {
 
 struct SupervisedBatch {
 	torch::Tensor states;
+	torch::Tensor next_states;
 	torch::Tensor moves;
 	torch::Tensor values;
+	torch::Tensor next_values;
 	torch::Tensor advantage_moves;
 	torch::Tensor advantage_values;
 };
@@ -78,6 +80,8 @@ struct TrainOptions {
 	double weight_decay = 1e-4;
 	double value_weight = 0.25;
 	double dueling_q_weight = 0.5;
+	double dynamics_weight = 0.25;
+	double imagined_value_weight = 0.25;
 	int save_every = 5000;
 	int log_every = 100;
 	std::uint64_t seed = 2026;

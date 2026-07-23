@@ -779,7 +779,7 @@ Q_expand = sum[h=1..H-1] (1-lambda) * lambda^(h-1) * q_h
 
 该预算控制器用目标平均深度替代固定 residual/change 阈值。目标平均深度控制总成本，分支优先级控制成本分布，因此模型变强或局面分布改变时无需重新猜测绝对阈值。终局分支和最大深度可能使实际平均深度低于目标，运行汇总会报告预算利用率。它只执行批量 principal rollout，不维护 tree、visits 或 UCB，因此属于自适应 value expansion，而不是 MCTS。
 
-### resnet_pv_linear FCPI
+### Gadus FCPI
 
 该架构只更新已有的 policy/value：
 
@@ -793,7 +793,7 @@ Q_expand = sum[h=1..H-1] (1-lambda) * lambda^(h-1) * q_h
 
 该架构不存在 advantage head，因此 FCPI 不生成或猜测 advantage。
 
-### resnet_pva_gad FCPI
+### Melano FCPI
 
 该架构的三个 head 分工为：
 
@@ -819,9 +819,34 @@ pi_ref(a|s)^rho * exp(Q_target(s,a) / temperature)
 
 冻结的 current target、policy KL 和 candidate/current arena 共同限制单轮变化。arena 与 acceptance 使用 paired-game 结果。Stockfish comment 负责监督初始模型，FCPI 的新增训练信号来自自对战终局、TD return 和模型反事实后继评价。
 
+Melano 额外维护动作条件潜在转移 $D$。它不建立独立的对手响应 head。对手行为仍由同一套 Policy/Value/Advantage heads 在预测后继 latent 上给出：
+
+$$
+z=E(s),\qquad \widehat z'=D(z,a),\qquad
+(\widehat P',\widehat V',\widehat A')=H(\widehat z')
+$$
+
+监督数据与 FCPI 候选都由精确棋规构造 $s'$，目标 latent 停止梯度：
+
+$$
+\bar z'=\operatorname{stopgrad}(E(s'))
+$$
+
+$$
+L_D=1-\frac{1}{65}\sum_i\cos(\widehat z'_i,\bar z'_i)
+$$
+
+动作执行后行棋方切换，因此原行棋方视角的想象动作价值为 $-V(\widehat z')$。训练同时约束：
+
+$$
+L_I=\operatorname{SmoothL1}(-V(\widehat z'),Q_{target}(s,a))
+$$
+
+这一设计让 Melano 学习动作条件状态变化，同时让确定棋规继续负责合法性与真实状态转移。运行时采用 $K=2$ anchored latent MCTS。搜索树始终携带精确棋盘，但网络评价在偶数深度使用 $E(s_d)$，在奇数深度使用 $D(E(s_{d-1}),a_{d-1})$。偶数深度重新锚定后，latent dynamics 不会连续递归，因此当前一步训练误差不会跨多个 ply 累积。预测出的 Policy、Value 与 Advantage 直接参与奇数深度节点展开、叶节点回传与边价值先验。
+
 ### 优先级
 
-先用已有 `resnet_pv_linear` checkpoint 验证该架构的 Policy/Value 路径。`resnet_pva_gad` 完成大规模 commented-PGN 监督训练后，再独立验证该架构的 Policy/Value/Advantage 路径。
+先用已有 Gadus checkpoint 验证 Policy/Value 路径。Melano 完成大规模 commented-PGN 监督训练后，再独立验证 Policy/Value/Advantage 与 latent dynamics 路径。
 
 ## 方向九：Tactic 作为领域增强
 
