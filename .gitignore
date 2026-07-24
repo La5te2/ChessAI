@@ -20,5 +20,7 @@ backup/
 /api/nlohmann/
 /api/downloads/
 /api/ninja/
-/api/gui/
+/api/gui/Gadidae.exe
+/api/gui/*.spec
+/build/.pyinstaller-gui/
 /build/
