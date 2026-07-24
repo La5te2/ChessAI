@@ -50,8 +50,29 @@ function(integer_define path name expected)
 	endif()
 endfunction()
 
+function(python_package_version directory package expected)
+	set(metadata "${directory}/${package}-${expected}.dist-info/METADATA")
+	if(NOT EXISTS "${metadata}")
+		message(FATAL_ERROR "Python package metadata is missing: ${metadata}")
+	endif()
+	file(STRINGS "${metadata}" lines REGEX "^Version: ")
+	list(LENGTH lines count)
+	if(NOT count EQUAL 1)
+		message(FATAL_ERROR "Cannot read the package version from ${metadata}")
+	endif()
+	list(GET lines 0 line)
+	string(REGEX REPLACE "^Version: " "" actual "${line}")
+	if(NOT actual STREQUAL expected)
+		message(FATAL_ERROR
+			"${package} version mismatch: expected ${expected}, found ${actual}")
+	endif()
+endfunction()
+
 lock_value(TORCH_VERSION locked_torch_version)
 lock_value(TORCH_VARIANTS locked_torch_variants)
+lock_value(NVIDIA_CUSPARSELT_VERSION locked_cusparselt_version)
+lock_value(NVIDIA_NCCL_VERSION locked_nccl_version)
+lock_value(NVIDIA_NVSHMEM_VERSION locked_nvshmem_version)
 lock_value(HDF5_VERSION locked_hdf5_version)
 lock_value(ZLIB_VERSION locked_zlib_version)
 lock_value(JSON_VERSION locked_json_version)
@@ -83,6 +104,35 @@ if(DEFINED EXPECTED_TORCH_VARIANT AND
 	NOT actual_torch_variant STREQUAL EXPECTED_TORCH_VARIANT)
 	message(FATAL_ERROR
 		"LibTorch variant mismatch: expected ${EXPECTED_TORCH_VARIANT}, found ${actual_torch_variant}")
+endif()
+
+if(NOT WIN32 AND NOT actual_torch_variant STREQUAL "cpu")
+	python_package_version(
+		"${API_DIR}/nvidia" nvidia_cusparselt_cu12 "${locked_cusparselt_version}")
+	python_package_version(
+		"${API_DIR}/nvidia" nvidia_nccl_cu12 "${locked_nccl_version}")
+	python_package_version(
+		"${API_DIR}/nvidia" nvidia_nvshmem_cu12 "${locked_nvshmem_version}")
+	foreach(runtime IN ITEMS
+		"cusparselt|libcusparseLt.so.0|${locked_cusparselt_version}"
+		"nccl|libnccl.so.2|${locked_nccl_version}"
+		"nvshmem|libnvshmem_host.so.3|${locked_nvshmem_version}"
+	)
+		string(REPLACE "|" ";" fields "${runtime}")
+		list(GET fields 0 component)
+		list(GET fields 1 library)
+		list(GET fields 2 version)
+		set(component_library "${API_DIR}/nvidia/nvidia/${component}/lib/${library}")
+		if(NOT EXISTS "${component_library}")
+			message(FATAL_ERROR
+				"NVIDIA ${component} ${version} runtime is missing: ${component_library}")
+		endif()
+		set(torch_runtime_link "${TORCH_DIR}/lib/${library}")
+		if(NOT EXISTS "${torch_runtime_link}")
+			message(FATAL_ERROR
+				"LibTorch runtime link is missing: ${torch_runtime_link}")
+		endif()
+	endforeach()
 endif()
 
 quoted_define("${API_DIR}/hdf5/include/H5pubconf.h" H5_VERSION "${locked_hdf5_version}")

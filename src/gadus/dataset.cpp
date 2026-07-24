@@ -453,7 +453,7 @@ SupervisedBatch SupervisedH5::read(const std::vector<std::int64_t> &requested,
 	H5Sclose(state_memory);
 	H5Sclose(state_space);
 
-	for (const auto [dataset, type, destination] : {
+	for (const auto &[dataset, type, destination] : {
 			 std::tuple<hid_t, hid_t, void *>{impl_->moves, H5T_NATIVE_UINT16, moves.data()},
 			 std::tuple<hid_t, hid_t, void *>{impl_->values, H5T_NATIVE_FLOAT,
 											  value_tensor.data_ptr<float>()},

@@ -63,6 +63,66 @@ download() {
 	fi
 }
 
+install_nvidia_runtime() {
+	local runtime_dir="${API_DIR}/nvidia"
+	local python_bin=""
+	if command -v python3 >/dev/null 2>&1; then
+		python_bin="$(command -v python3)"
+	elif command -v python >/dev/null 2>&1; then
+		python_bin="$(command -v python)"
+	else
+		echo "Python with pip is required to install the CUDA runtime libraries." >&2
+		exit 1
+	fi
+	if ! "${python_bin}" -m pip --version >/dev/null 2>&1; then
+		echo "pip is required to install the CUDA runtime libraries." >&2
+		exit 1
+	fi
+
+	local cusparselt="${runtime_dir}/nvidia/cusparselt/lib/libcusparseLt.so.0"
+	local nccl="${runtime_dir}/nvidia/nccl/lib/libnccl.so.2"
+	local nvshmem="${runtime_dir}/nvidia/nvshmem/lib/libnvshmem_host.so.3"
+	local metadata_ok=1
+	for package in \
+		"nvidia_cusparselt_cu12|${NVIDIA_CUSPARSELT_VERSION}" \
+		"nvidia_nccl_cu12|${NVIDIA_NCCL_VERSION}" \
+		"nvidia_nvshmem_cu12|${NVIDIA_NVSHMEM_VERSION}"; do
+		local package_name="${package%%|*}"
+		local package_version="${package#*|}"
+		local metadata="${runtime_dir}/${package_name}-${package_version}.dist-info/METADATA"
+		if [[ ! -f "${metadata}" ]] ||
+			! grep -Fxq "Version: ${package_version}" "${metadata}"; then
+			metadata_ok=0
+		fi
+	done
+	if [[ ! -f "${cusparselt}" || ! -f "${nccl}" || ! -f "${nvshmem}" ||
+		"${metadata_ok}" != "1" ]]; then
+		echo "Installing CUDA runtime libraries required by LibTorch ${TORCH_VERSION}..."
+		rm -rf -- "${runtime_dir}"
+		"${python_bin}" -m pip install \
+			--disable-pip-version-check \
+			--no-cache-dir \
+			--no-deps \
+			--retries "${GADIDAE_DOWNLOAD_RETRIES:-8}" \
+			--timeout "${GADIDAE_CONNECT_TIMEOUT:-30}" \
+			--target "${runtime_dir}" \
+			"nvidia-cusparselt-cu12==${NVIDIA_CUSPARSELT_VERSION}" \
+			"nvidia-nccl-cu12==${NVIDIA_NCCL_VERSION}" \
+			"nvidia-nvshmem-cu12==${NVIDIA_NVSHMEM_VERSION}"
+	else
+		echo "CUDA runtime libraries already installed."
+	fi
+
+	# LibTorch's own $ORIGIN runpath then resolves the dependencies both while
+	# linking and when a published executable starts.
+	ln -sfn "../../nvidia/nvidia/cusparselt/lib/libcusparseLt.so.0" \
+		"${API_DIR}/libtorch/lib/libcusparseLt.so.0"
+	ln -sfn "../../nvidia/nvidia/nccl/lib/libnccl.so.2" \
+		"${API_DIR}/libtorch/lib/libnccl.so.2"
+	ln -sfn "../../nvidia/nvidia/nvshmem/lib/libnvshmem_host.so.3" \
+		"${API_DIR}/libtorch/lib/libnvshmem_host.so.3"
+}
+
 if [[ "${GADIDAE_SKIP_TORCH:-0}" == "1" ]]; then
   echo "Skipping LibTorch setup."
 elif [[ ! -d "${API_DIR}/libtorch/share/cmake/Torch" ]]; then
@@ -74,6 +134,9 @@ elif [[ ! -d "${API_DIR}/libtorch/share/cmake/Torch" ]]; then
   rm -f "${TORCH_ZIP}"
 else
   echo "LibTorch already installed."
+fi
+if [[ "${TORCH_VARIANT}" != "cpu" ]]; then
+	install_nvidia_runtime
 fi
 cmake \
 	"-DAPI_DIR=${API_DIR}" \
