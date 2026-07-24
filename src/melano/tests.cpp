@@ -181,29 +181,6 @@ int main() {
 		std::filesystem::remove(pgn);
 		std::filesystem::remove(h5);
 
-		// Melano combines opponent P/A plausibility with exact root-player values.
-		const auto reply_weights = melano::opponent_reply_weights(
-			{
-				{0.5F, 0.0F, 0.4F},
-				{0.3F, -0.05F, 0.0F},
-				{0.2F, -0.2F, -0.2F},
-			},
-			0.5, 0.2);
-		require(reply_weights.size() == 3, "opponent response weight count mismatch");
-		require(std::abs(reply_weights[0] + reply_weights[1] + reply_weights[2] - 1.0F) <
-					1e-6F,
-				"opponent response weights are not normalized");
-		require(reply_weights[2] > reply_weights[1] && reply_weights[1] > reply_weights[0],
-				"opponent response soft minimum ignored exact values");
-		const auto advantage_weights = melano::opponent_reply_weights(
-			{
-				{0.5F, 0.0F, 0.0F},
-				{0.5F, -0.5F, 0.0F},
-			},
-			0.5, 1.0);
-		require(advantage_weights[0] > advantage_weights[1],
-				"opponent response ranking ignored Melano advantage");
-
 		auto model = melano::Model(8, 1);
 		auto states = melano::encode_boards({board, board});
 		auto tokens = model->encode(states);

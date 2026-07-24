@@ -14,13 +14,9 @@ int main(int argc, char **argv) {
 				<< "  --iterations <n> --games-per-iter <n> --games-in-flight <n> --max-plies <n>\n"
 				<< "  --positions-per-game <n> --opening-book <path|empty> --startpos-fraction "
 				   "<x>\n"
-				<< "  --counterfactual-topk <n> --counterfactual-min-plies <n>\n"
-				<< "  --counterfactual-reply-topk <n> --counterfactual-reply-temperature <x>\n"
-				<< "  --counterfactual-max-plies <n> --counterfactual-target-average-plies <x>\n"
-				<< "  --counterfactual-lambda <x> --td-lambda <x> --behavior-temperature <x>\n"
-				<< "  --uniform-mix <x> --policy-temperature <x> --prior-power <x>\n"
-				<< "  --played-return-weight <x> --policy-weight <x> --value-weight <x>\n"
-				<< "  --kl-weight <x> --entropy-weight <x> --epochs <n> --train-max-steps <n>\n"
+				<< "  --counterfactual-budget <n> --td-lambda <x> --behavior-temperature <x>\n"
+				<< "  --uniform-mix <x> --policy-weight <x> --value-weight <x>\n"
+				<< "  --epochs <n> --train-max-steps <n>\n"
 				<< "  --batch-size <n> --lr <x> --weight-decay <x> --grad-clip <x>\n"
 				<< "  --eval-games <n> --eval-games-in-flight <n> --eval-max-plies <n>\n"
 				<< "  --eval-opening-book <path|empty> --eval-search-type <closed|only-mcts>\n"
@@ -48,34 +44,14 @@ int main(int argc, char **argv) {
 			args.get_int("inference-batch-size", options.inference_batch_size);
 		options.target_records_per_batch =
 			args.get_int("target-records-per-batch", options.target_records_per_batch);
-		options.counterfactual_topk =
-			args.get_int("counterfactual-topk", options.counterfactual_topk);
-		options.counterfactual_reply_topk =
-			args.get_int("counterfactual-reply-topk", options.counterfactual_reply_topk);
-		options.counterfactual_reply_temperature =
-			args.get_double("counterfactual-reply-temperature",
-							options.counterfactual_reply_temperature);
-		options.counterfactual_min_plies =
-			args.get_int("counterfactual-min-plies", options.counterfactual_min_plies);
-		options.counterfactual_max_plies =
-			args.get_int("counterfactual-max-plies", options.counterfactual_max_plies);
-		options.counterfactual_target_average_plies = args.get_double(
-			"counterfactual-target-average-plies", options.counterfactual_target_average_plies);
-		options.counterfactual_lambda =
-			args.get_double("counterfactual-lambda", options.counterfactual_lambda);
+		options.counterfactual_budget =
+			args.get_int("counterfactual-budget", options.counterfactual_budget);
 		options.td_lambda = args.get_double("td-lambda", options.td_lambda);
 		options.behavior_temperature =
 			args.get_double("behavior-temperature", options.behavior_temperature);
 		options.uniform_mix = args.get_double("uniform-mix", options.uniform_mix);
-		options.policy_temperature =
-			args.get_double("policy-temperature", options.policy_temperature);
-		options.prior_power = args.get_double("prior-power", options.prior_power);
-		options.played_return_weight =
-			args.get_double("played-return-weight", options.played_return_weight);
 		options.policy_weight = args.get_double("policy-weight", options.policy_weight);
 		options.value_weight = args.get_double("value-weight", options.value_weight);
-		options.kl_weight = args.get_double("kl-weight", options.kl_weight);
-		options.entropy_weight = args.get_double("entropy-weight", options.entropy_weight);
 		options.epochs = args.get_int("epochs", options.epochs);
 		options.train_max_steps = args.get_int64("train-max-steps", options.train_max_steps);
 		options.batch_size = args.get_int("batch-size", options.batch_size);

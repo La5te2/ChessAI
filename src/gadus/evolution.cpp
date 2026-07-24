@@ -28,7 +28,7 @@ namespace gadus {
 namespace {
 
 inline constexpr const char *kFcpiFormula =
-	"gadus_gumbel_soft_bellman_beam_td_kl";
+	"gadus_tree_consistent_fcpi";
 
 // Format iteration numbers for stable, lexically sortable artifact names.
 std::string zero_pad(int value, int width) {
@@ -49,6 +49,8 @@ struct Position {
 	float value_target = 0.0F;
 	std::vector<float> policy_target;
 	std::vector<float> candidate_q;
+	float policy_weight = 1.0F;
+	float value_weight = 1.0F;
 	int aggregate_count = 1;
 };
 
@@ -58,34 +60,39 @@ struct Trajectory {
 	std::vector<Position> positions;
 };
 
-struct Branch {
-	std::size_t record = 0;
-	std::size_t candidate = 0;
+struct TreeNode {
 	chess::Board board;
-	int depth = 1;
-	std::vector<float> estimates;
-	std::vector<float> policy;
-	float current_value = 0.0F;
-	float last_residual = 0.0F;
-	float last_change = 0.0F;
+	PackedState state{};
+	float value = 0.0F;
+	float backed_value = 0.0F;
+	std::vector<int> legal_indices;
+	std::vector<float> legal_prior;
+	std::vector<int> candidate_indices;
+	std::vector<int> children;
+	std::vector<float> candidate_q;
+	std::vector<float> policy_target;
+	int parent = -1;
+	int parent_action = -1;
+	int depth = 0;
+	double reach_probability = 1.0;
+	double priority = 1.0;
 	bool terminal = false;
+	bool expanded = false;
 };
 
-struct SoftReply {
-	Branch *branch = nullptr;
-	chess::Board board;
-	float prior = 0.0F;
-	float child_value = 0.0F;
-	float root_value = 0.0F;
-	SearchResult evaluation;
-	bool terminal = false;
+struct CounterfactualTree {
+	std::size_t root_record = 0;
+	std::vector<TreeNode> nodes;
+	int remaining_budget = 0;
+	int evaluated_edges = 0;
 };
 
 struct TargetSummary {
-	std::int64_t branches = 0;
-	std::int64_t branch_plies = 0;
-	std::int64_t terminal_branches = 0;
-	std::int64_t reply_evaluations = 0;
+	std::int64_t trees = 0;
+	std::int64_t decision_nodes = 0;
+	std::int64_t evaluated_edges = 0;
+	std::int64_t terminal_edges = 0;
+	int max_depth = 0;
 	double residual_sum = 0.0;
 	std::int64_t residual_count = 0;
 };
@@ -181,23 +188,6 @@ std::size_t sample_index(const std::vector<float> &probabilities, std::mt19937_6
 	return distribution(rng);
 }
 
-// Mix depth-k root-perspective estimates with a truncated lambda-return weighting.
-float mixed_depth_q(const std::vector<float> &estimates, double lambda) {
-	if (estimates.empty()) {
-		throw std::runtime_error("counterfactual branch has no estimates");
-	}
-	if (estimates.size() == 1) {
-		return estimates[0];
-	}
-	const double bounded = std::clamp(lambda, 0.0, 1.0);
-	double total = 0.0;
-	for (std::size_t depth = 0; depth + 1 < estimates.size(); ++depth) {
-		total += (1.0 - bounded) * std::pow(bounded, static_cast<double>(depth)) * estimates[depth];
-	}
-	total += std::pow(bounded, static_cast<double>(estimates.size() - 1)) * estimates.back();
-	return static_cast<float>(std::clamp(total, -1.0, 1.0));
-}
-
 // Use model-visible packed state bytes as the aggregation and per-game deduplication key.
 std::string packed_key(const PackedState &state) {
 	return std::string(reinterpret_cast<const char *>(state.data()), state.size());
@@ -266,26 +256,21 @@ std::vector<SearchResult> evaluate_chunks(Searcher &searcher,
 	return output;
 }
 
-// Keep Policy top-1 and the played action, then use Gumbel top-k without replacement
-// to expose plausible alternatives which a fixed Policy top-k would never inspect.
+// Keep Policy top-1 and an optional required action, then fill the local expansion
+// with Gumbel top-k proposals so low-prior alternatives retain a budget-dependent chance.
 std::vector<int> choose_candidates(const std::vector<int> &legal, const std::vector<float> &scores,
-								   int played, int topk, std::mt19937_64 &rng) {
+								   int required, int count_requested, std::mt19937_64 &rng) {
 	if (legal.empty() || legal.size() != scores.size()) {
 		throw std::invalid_argument("counterfactual candidates require aligned legal scores");
 	}
 	const std::size_t count =
-		std::min<std::size_t>(static_cast<std::size_t>(std::max(1, topk)), legal.size());
+		std::min<std::size_t>(static_cast<std::size_t>(std::max(1, count_requested)), legal.size());
 	std::vector<int> selected;
 	selected.reserve(count);
-	if (count == 1) {
-		selected.push_back(played);
-		return selected;
-	}
-
 	const auto top = std::max_element(scores.begin(), scores.end()) - scores.begin();
 	selected.push_back(legal[static_cast<std::size_t>(top)]);
-	if (played != selected.front()) {
-		selected.push_back(played);
+	if (required >= 0 && required != selected.front() && selected.size() < count) {
+		selected.push_back(required);
 	}
 
 	std::uniform_real_distribution<double> uniform(
@@ -328,7 +313,6 @@ std::vector<Position> collect_selfplay(Model model, const torch::Device &device,
 	nlohmann::json starts;
 	const auto specs = make_sampling_specs(options, iteration, starts);
 	std::mt19937_64 rng(options.seed + iteration);
-	std::mt19937_64 proposal_rng(options.seed + iteration + 2'000'003);
 	std::vector<Trajectory> trajectories;
 	trajectories.reserve(specs.size());
 	int completed = 0;
@@ -394,8 +378,6 @@ std::vector<Position> collect_selfplay(Model model, const torch::Device &device,
 				position.legal_indices = legal;
 				position.legal_prior = prior;
 				position.played_index = played;
-				position.candidate_indices = choose_candidates(
-					legal, prior, played, options.counterfactual_topk, proposal_rng);
 				trajectory.positions.push_back(std::move(position));
 				board.makeMove(moves[choice]);
 				const bool terminal = game_is_over(board);
@@ -489,292 +471,298 @@ std::vector<Position> collect_selfplay(Model model, const torch::Device &device,
 	return records;
 }
 
-// Evaluate branch frontiers and convert alternating side-to-move V into root-player estimates.
-void evaluate_frontier(std::vector<Branch *> branches, Searcher &evaluator,
-					   const FcpiOptions &options) {
-	std::vector<chess::Board> boards;
-	std::vector<Branch *> pending;
-	for (auto *branch : branches) {
-		if (!branch->terminal) {
-			pending.push_back(branch);
-			boards.push_back(branch->board);
-		}
+// Materialize one non-terminal decision node from an exact board and a frozen-model evaluation.
+TreeNode make_tree_node(const chess::Board &board, const SearchResult &evaluation, int parent,
+						int parent_action, int depth, double reach_probability) {
+	TreeNode node;
+	node.board = board;
+	node.state = encode_state(board);
+	node.value = evaluation.value;
+	node.backed_value = evaluation.value;
+	node.parent = parent;
+	node.parent_action = parent_action;
+	node.depth = depth;
+	node.reach_probability = reach_probability;
+	const auto moves = legal_moves(board);
+	for (const auto &move : moves) {
+		const int action = move_to_index(move);
+		node.legal_indices.push_back(action);
+		node.legal_prior.push_back(evaluation.policy[action]);
 	}
-	const auto results = evaluate_chunks(evaluator, boards, options.inference_batch_size);
-	for (std::size_t index = 0; index < pending.size(); ++index) {
-		auto *branch = pending[index];
-		branch->current_value = results[index].value;
-		branch->policy = results[index].policy;
-		const float sign = branch->depth % 2 == 0 ? 1.0F : -1.0F;
-		branch->estimates.push_back(sign * results[index].value);
-	}
+	node.legal_prior = normalize(std::move(node.legal_prior));
+	return node;
 }
 
-// Apply the same side-to-move soft Bellman backup at every depth. Each expansion
-// evaluates a local beam of replies, backs up their weighted root values, and
-// retains the highest-weight continuation so the tree grows linearly in depth.
-void apply_soft_replies(const std::vector<Branch *> &branches, Searcher &evaluator,
-						const FcpiOptions &options, TargetSummary &summary) {
-	const int reply_topk = std::max(1, options.counterfactual_reply_topk);
-	const double temperature = std::max(1e-4, options.counterfactual_reply_temperature);
-	std::vector<SoftReply> replies;
-	std::unordered_map<Branch *, std::vector<std::size_t>> reply_groups;
-	std::vector<chess::Board> pending_boards;
-	std::vector<std::size_t> pending_indices;
-
-	for (auto *branch : branches) {
-		if (branch->terminal) {
+// Select the unexpanded node with the largest reach-weighted Bellman residual.
+int select_tree_frontier(const CounterfactualTree &tree) {
+	int selected = -1;
+	double best = -1.0;
+	for (std::size_t index = 0; index < tree.nodes.size(); ++index) {
+		const auto &node = tree.nodes[index];
+		if (node.terminal || node.expanded || node.legal_indices.empty()) {
 			continue;
 		}
-		auto moves = legal_moves(branch->board);
-		std::stable_sort(moves.begin(), moves.end(), [&](const auto &left, const auto &right) {
-			return branch->policy[move_to_index(left)] > branch->policy[move_to_index(right)];
-		});
-		moves.resize(std::min<std::size_t>(moves.size(), reply_topk));
-		for (const auto &move : moves) {
-			SoftReply reply;
-			reply.branch = branch;
-			reply.board = branch->board;
-			reply.prior = std::max(1e-12F, branch->policy[move_to_index(move)]);
-			reply.board.makeMove(move);
-			reply.terminal = game_is_over(reply.board);
-			const std::size_t reply_index = replies.size();
-			reply_groups[branch].push_back(reply_index);
-			replies.push_back(std::move(reply));
-			if (replies.back().terminal) {
-				replies.back().child_value =
-					terminal_value_side_to_move(replies.back().board);
-			} else {
-				pending_boards.push_back(replies.back().board);
-				pending_indices.push_back(reply_index);
-			}
+		if (node.priority > best) {
+			best = node.priority;
+			selected = static_cast<int>(index);
 		}
 	}
-
-	const auto evaluations = evaluate_chunks(evaluator, pending_boards, options.inference_batch_size);
-	for (std::size_t index = 0; index < pending_indices.size(); ++index) {
-		auto &reply = replies[pending_indices[index]];
-		reply.evaluation = evaluations[index];
-		reply.child_value = evaluations[index].value;
-	}
-	for (auto &reply : replies) {
-		const int child_depth = reply.branch->depth + 1;
-		const float root_sign = child_depth % 2 == 0 ? 1.0F : -1.0F;
-		reply.root_value = root_sign * reply.child_value;
-	}
-
-	for (auto &[branch, indices] : reply_groups) {
-		std::vector<double> logits;
-		logits.reserve(indices.size());
-		for (const auto index : indices) {
-			const auto &reply = replies[index];
-			// The current side maximizes -V(child); alternating signs recover root value.
-			const double side_to_move_q = -static_cast<double>(reply.child_value);
-			logits.push_back(options.prior_power *
-								 std::log(static_cast<double>(reply.prior)) +
-							 side_to_move_q / temperature);
-		}
-		const auto weights = stable_softmax(logits);
-		float soft_root_value = 0.0F;
-		float soft_side_value = 0.0F;
-		std::size_t continuation = 0;
-		for (std::size_t index = 0; index < indices.size(); ++index) {
-			const auto &reply = replies[indices[index]];
-			soft_root_value += weights[index] * reply.root_value;
-			soft_side_value += weights[index] * -reply.child_value;
-			if (weights[index] > weights[continuation]) {
-				continuation = index;
-			}
-		}
-		auto &selected = replies[indices[continuation]];
-		const float previous_root = branch->estimates.back();
-		const float previous_side_value = branch->current_value;
-		branch->estimates.push_back(std::clamp(soft_root_value, -1.0F, 1.0F));
-		branch->last_residual = std::abs(previous_side_value - soft_side_value);
-		branch->last_change = std::abs(branch->estimates.back() - previous_root);
-		summary.residual_sum += branch->last_residual;
-		++summary.residual_count;
-		summary.reply_evaluations += static_cast<std::int64_t>(indices.size());
-		branch->board = selected.board;
-		branch->depth += 1;
-		branch->current_value = selected.child_value;
-		branch->terminal = selected.terminal;
-		if (selected.terminal) {
-			branch->policy.clear();
-			++summary.terminal_branches;
-		} else {
-			branch->policy = std::move(selected.evaluation.policy);
-		}
-	}
+	return selected;
 }
 
-// Adaptively widen and deepen candidate continuations, then improve Policy from
-// symmetric soft Bellman estimates under a fixed best-first beam budget.
+// Derive local tree width from the remaining global budget. This couples width and
+// depth without separate top-k or ply controls.
+int expansion_width(const CounterfactualTree &tree) {
+	if (tree.remaining_budget <= 0) {
+		return 0;
+	}
+	const int progressive =
+		std::max(2, static_cast<int>(std::ceil(std::sqrt(tree.remaining_budget))));
+	return std::min(tree.remaining_budget, progressive);
+}
+
+// Improve a local policy from frozen-model priors and backed action values. The
+// maximum absolute local advantage bounds one update's log-odds shift to [-1, 1].
+std::vector<float> improve_policy(const std::vector<float> &prior,
+								  const std::vector<float> &action_values) {
+	if (prior.size() != action_values.size() || prior.empty()) {
+		throw std::invalid_argument("tree policy improvement requires aligned non-empty inputs");
+	}
+	double mean = 0.0;
+	for (std::size_t index = 0; index < prior.size(); ++index) {
+		mean += prior[index] * action_values[index];
+	}
+	double scale = 0.0;
+	for (std::size_t index = 0; index < prior.size(); ++index) {
+		scale = std::max(scale, std::abs(static_cast<double>(action_values[index]) - mean));
+	}
+	if (scale < 1e-4) {
+		return prior;
+	}
+	std::vector<double> logits(prior.size());
+	for (std::size_t index = 0; index < prior.size(); ++index) {
+		logits[index] = std::log(std::clamp(static_cast<double>(prior[index]), 1e-12, 1.0)) +
+						(action_values[index] - mean) / scale;
+	}
+	return stable_softmax(logits);
+}
+
+// Build bounded counterfactual trees, back them up from leaves, and turn every
+// expanded decision node into a Policy sample. Only real self-play roots supervise Value.
 void construct_targets(std::vector<Position> &records, Model model, const torch::Device &device,
 					   const FcpiOptions &options, TargetSummary &summary) {
+	if (options.counterfactual_budget < 2) {
+		throw std::invalid_argument("counterfactual-budget must be at least 2");
+	}
 	SearchOptions closed;
 	closed.type = SearchType::Closed;
 	closed.precision = options.precision;
 	closed.mcts_sims = 0;
 	closed.mcts_batch_size = options.inference_batch_size;
 	Searcher evaluator(model, device, closed);
-	const int min_plies = std::max(1, options.counterfactual_min_plies);
-	const int max_plies = std::max(min_plies, options.counterfactual_max_plies);
-	const double target_average =
-		std::clamp(options.counterfactual_target_average_plies, static_cast<double>(min_plies),
-				   static_cast<double>(max_plies));
-	std::cout << "fcpi counterfactual start: positions=" << records.size()
-			  << " target_average_plies=" << target_average
-			  << " reply_topk=" << options.counterfactual_reply_topk
-			  << " reply_temperature=" << options.counterfactual_reply_temperature << std::endl;
+	std::mt19937_64 rng(options.seed + 3'000'017);
+	std::vector<Position> tree_records;
+	tree_records.reserve(records.size() * 2);
+	std::cout << "fcpi counterfactual tree start: positions=" << records.size()
+			  << " budget_per_root=" << options.counterfactual_budget << std::endl;
 
 	for (std::size_t subset_begin = 0; subset_begin < records.size();
 		 subset_begin += std::max(1, options.target_records_per_batch)) {
 		const auto subset_end =
 			std::min(records.size(), subset_begin + std::max(1, options.target_records_per_batch));
-		std::vector<Branch> branches;
+		std::vector<CounterfactualTree> trees;
+		trees.reserve(subset_end - subset_begin);
 		for (std::size_t record_index = subset_begin; record_index < subset_end; ++record_index) {
-			auto &record = records[record_index];
-			chess::Board board(record.fen);
-			for (std::size_t candidate = 0; candidate < record.candidate_indices.size();
-				 ++candidate) {
-				const auto move = index_to_move(record.candidate_indices[candidate], board);
-				if (move.move() == chess::Move::NO_MOVE) {
-					throw std::runtime_error("FCPI candidate action is illegal");
-				}
-				Branch branch;
-				branch.record = record_index;
-				branch.candidate = candidate;
-				branch.board = board;
-				branch.board.makeMove(move);
-				if (game_is_over(branch.board)) {
-					branch.estimates.push_back(-terminal_value_side_to_move(branch.board));
-					branch.terminal = true;
-					++summary.terminal_branches;
-				}
-				branches.push_back(std::move(branch));
-			}
-		}
-		std::vector<Branch *> all;
-		for (auto &branch : branches) {
-			all.push_back(&branch);
-		}
-		evaluate_frontier(all, evaluator, options);
-		for (auto &branch : branches) {
-			if (!branch.terminal) {
-				branch.last_residual =
-					std::abs(records[branch.record].root_value + branch.current_value);
-				branch.last_change =
-					std::abs(branch.estimates.back() - records[branch.record].root_value);
-				summary.residual_sum += branch.last_residual;
-				++summary.residual_count;
-			}
+			const auto &record = records[record_index];
+			CounterfactualTree tree;
+			tree.root_record = record_index;
+			tree.remaining_budget = options.counterfactual_budget;
+			TreeNode root;
+			root.board = chess::Board(record.fen);
+			root.state = record.state;
+			root.value = record.root_value;
+			root.backed_value = record.root_value;
+			root.legal_indices = record.legal_indices;
+			root.legal_prior = record.legal_prior;
+			tree.nodes.push_back(std::move(root));
+			trees.push_back(std::move(tree));
 		}
 
-		const std::int64_t target_depth =
-			static_cast<std::int64_t>(std::llround(branches.size() * target_average));
 		while (true) {
-			std::vector<Branch *> expandable;
-			for (auto &branch : branches) {
-				if (!branch.terminal && branch.depth < max_plies) {
-					expandable.push_back(&branch);
+			struct PendingChild {
+				std::size_t tree = 0;
+				int parent = 0;
+				std::size_t slot = 0;
+				int action = 0;
+				chess::Board board;
+				bool terminal = false;
+			};
+			std::vector<PendingChild> pending;
+			std::vector<chess::Board> evaluation_boards;
+			std::vector<std::size_t> evaluation_pending;
+			bool expanded_any = false;
+			for (std::size_t tree_index = 0; tree_index < trees.size(); ++tree_index) {
+				auto &tree = trees[tree_index];
+				if (tree.remaining_budget <= 0) {
+					continue;
+				}
+				const int node_index = select_tree_frontier(tree);
+				if (node_index < 0) {
+					continue;
+				}
+				auto &node = tree.nodes[static_cast<std::size_t>(node_index)];
+				const int width = std::min<int>(
+					expansion_width(tree), static_cast<int>(node.legal_indices.size()));
+				const int required =
+					node_index == 0 ? records[tree.root_record].played_index : -1;
+				node.candidate_indices =
+					choose_candidates(node.legal_indices, node.legal_prior, required, width, rng);
+				node.children.assign(node.candidate_indices.size(), -1);
+				node.candidate_q.assign(node.candidate_indices.size(), node.value);
+				node.expanded = true;
+				tree.remaining_budget -= static_cast<int>(node.candidate_indices.size());
+				tree.evaluated_edges += static_cast<int>(node.candidate_indices.size());
+				expanded_any = true;
+				for (std::size_t slot = 0; slot < node.candidate_indices.size(); ++slot) {
+					const int action = node.candidate_indices[slot];
+					const auto move = index_to_move(action, node.board);
+					if (move.move() == chess::Move::NO_MOVE) {
+						throw std::runtime_error("FCPI tree candidate action is illegal");
+					}
+					PendingChild child;
+					child.tree = tree_index;
+					child.parent = node_index;
+					child.slot = slot;
+					child.action = action;
+					child.board = node.board;
+					child.board.makeMove(move);
+					child.terminal = game_is_over(child.board);
+					const std::size_t pending_index = pending.size();
+					pending.push_back(std::move(child));
+					if (!pending.back().terminal) {
+						evaluation_pending.push_back(pending_index);
+						evaluation_boards.push_back(pending.back().board);
+					}
 				}
 			}
-			if (expandable.empty()) {
+			if (!expanded_any) {
 				break;
 			}
-			std::int64_t depth_sum = 0;
-			for (const auto &branch : branches) {
-				depth_sum += branch.depth;
-			}
-			std::vector<Branch *> active;
-			for (auto *branch : expandable) {
-				if (branch->depth < min_plies) {
-					active.push_back(branch);
-				}
-			}
-			if (active.empty()) {
-				const std::int64_t remaining = target_depth - depth_sum;
-				if (remaining <= 0) {
-					break;
-				}
-				std::unordered_map<std::size_t, float> best;
-				for (const auto &branch : branches) {
-					best[branch.record] = std::max(branch.estimates.back(),
-												   best.contains(branch.record)
-													   ? best[branch.record]
-													   : -std::numeric_limits<float>::infinity());
-				}
-				std::sort(expandable.begin(), expandable.end(),
-						  [&](const Branch *left, const Branch *right) {
-							  auto priority = [&](const Branch *branch) {
-								  const double competitiveness =
-									  1.0 -
-									  std::min(1.0, std::max(0.0, static_cast<double>(
-																	  best[branch->record] -
-																	  branch->estimates.back()) /
-																	  2.0));
-								  return std::max(branch->last_residual, branch->last_change) +
-										 0.05 * competitiveness;
-							  };
-							  return priority(left) > priority(right);
-						  });
-				active.assign(expandable.begin(),
-							  expandable.begin() +
-								  std::min<std::int64_t>(remaining, expandable.size()));
-			}
 
-			apply_soft_replies(active, evaluator, options, summary);
+			const auto evaluations =
+				evaluate_chunks(evaluator, evaluation_boards, options.inference_batch_size);
+			std::vector<int> evaluation_row(pending.size(), -1);
+			for (std::size_t row = 0; row < evaluation_pending.size(); ++row) {
+				evaluation_row[evaluation_pending[row]] = static_cast<int>(row);
+			}
+			for (std::size_t pending_index = 0; pending_index < pending.size(); ++pending_index) {
+				auto &request = pending[pending_index];
+				auto &tree = trees[request.tree];
+				const auto &parent = tree.nodes[static_cast<std::size_t>(request.parent)];
+				const auto legal_position =
+					std::find(parent.legal_indices.begin(), parent.legal_indices.end(), request.action);
+				const float edge_prior =
+					parent.legal_prior[static_cast<std::size_t>(legal_position -
+																parent.legal_indices.begin())];
+				TreeNode child;
+				if (request.terminal) {
+					child.board = request.board;
+					child.state = encode_state(request.board);
+					child.value = terminal_value_side_to_move(request.board);
+					child.backed_value = child.value;
+					child.terminal = true;
+					++summary.terminal_edges;
+				} else {
+					child = make_tree_node(
+						request.board,
+						evaluations[static_cast<std::size_t>(evaluation_row[pending_index])],
+						request.parent, request.action, parent.depth + 1,
+						parent.reach_probability * edge_prior);
+				}
+				child.parent = request.parent;
+				child.parent_action = request.action;
+				child.depth = parent.depth + 1;
+				child.reach_probability = parent.reach_probability * edge_prior;
+				const float edge_q = -child.value;
+				const double residual = std::abs(edge_q - parent.value);
+				child.priority = child.reach_probability *
+								 (residual + 1.0 / std::sqrt(2.0 + child.depth));
+				summary.residual_sum += residual;
+				++summary.residual_count;
+				summary.max_depth = std::max(summary.max_depth, child.depth);
+				const int child_index = static_cast<int>(tree.nodes.size());
+				tree.nodes.push_back(std::move(child));
+				tree.nodes[static_cast<std::size_t>(request.parent)].children[request.slot] =
+					child_index;
+			}
 		}
 
-		for (auto &branch : branches) {
-			auto &record = records[branch.record];
-			if (record.candidate_q.empty()) {
-				record.candidate_q.resize(record.candidate_indices.size());
+		for (auto &tree : trees) {
+			for (std::size_t reverse = tree.nodes.size(); reverse-- > 0;) {
+				auto &node = tree.nodes[reverse];
+				if (node.terminal || !node.expanded) {
+					node.backed_value = node.value;
+					continue;
+				}
+				std::vector<float> action_values(node.legal_indices.size(), node.value);
+				for (std::size_t slot = 0; slot < node.candidate_indices.size(); ++slot) {
+					const auto action = node.candidate_indices[slot];
+					const auto legal = std::find(node.legal_indices.begin(),
+												node.legal_indices.end(), action);
+					const float q = -tree.nodes[static_cast<std::size_t>(node.children[slot])]
+										 .backed_value;
+					action_values[static_cast<std::size_t>(legal - node.legal_indices.begin())] = q;
+					node.candidate_q[slot] = q;
+				}
+				node.policy_target = improve_policy(node.legal_prior, action_values);
+				node.backed_value = 0.0F;
+				for (std::size_t index = 0; index < action_values.size(); ++index) {
+					node.backed_value += node.policy_target[index] * action_values[index];
+				}
+				node.backed_value = std::clamp(node.backed_value, -1.0F, 1.0F);
 			}
-			record.candidate_q[branch.candidate] =
-				mixed_depth_q(branch.estimates, options.counterfactual_lambda);
-			summary.branch_plies += branch.depth;
-			++summary.branches;
+
+			const float edge_total =
+				static_cast<float>(std::max(1, tree.evaluated_edges));
+			for (std::size_t node_index = 0; node_index < tree.nodes.size(); ++node_index) {
+				const auto &node = tree.nodes[node_index];
+				if (!node.expanded) {
+					continue;
+				}
+				const auto &root = records[tree.root_record];
+				Position record;
+				record.game_id = root.game_id;
+				record.state = node.state;
+				record.fen = node.board.getFen();
+				record.root_value = node.value;
+				record.legal_indices = node.legal_indices;
+				record.legal_prior = node.legal_prior;
+				record.played_index = node_index == 0 ? root.played_index : -1;
+				record.candidate_indices = node.candidate_indices;
+				record.value_target = node_index == 0 ? root.value_target : node.value;
+				record.policy_target = node.policy_target;
+				record.candidate_q = node.candidate_q;
+				record.policy_weight =
+					static_cast<float>(node.candidate_indices.size()) / edge_total;
+				record.value_weight = node_index == 0 ? 1.0F : 0.0F;
+				tree_records.push_back(std::move(record));
+				++summary.decision_nodes;
+			}
+			++summary.trees;
+			summary.evaluated_edges += tree.evaluated_edges;
 		}
 		if (subset_end == records.size() || subset_end % std::max(1, options.log_every) == 0) {
-			std::cout << "fcpi counterfactual: positions=" << subset_end << '/' << records.size()
-					  << " branches=" << summary.branches
-					  << " branch_plies=" << summary.branch_plies << std::endl;
+			std::cout << "fcpi counterfactual tree: positions=" << subset_end << '/'
+					  << records.size() << " decision_nodes=" << summary.decision_nodes
+					  << " evaluated_edges=" << summary.evaluated_edges << std::endl;
 		}
 	}
-
-	const double played_weight = std::clamp(options.played_return_weight, 0.0, 1.0);
-	const double temperature = std::max(1e-4, options.policy_temperature);
-	for (auto &record : records) {
-		for (std::size_t index = 0; index < record.candidate_indices.size(); ++index) {
-			if (record.candidate_indices[index] == record.played_index) {
-				record.candidate_q[index] =
-					static_cast<float>((1.0 - played_weight) * record.candidate_q[index] +
-									   played_weight * record.value_target);
-			}
-		}
-		std::vector<float> q_all(record.legal_indices.size(), record.root_value);
-		for (std::size_t candidate = 0; candidate < record.candidate_indices.size(); ++candidate) {
-			const auto found = std::find(record.legal_indices.begin(), record.legal_indices.end(),
-										 record.candidate_indices[candidate]);
-			q_all[found - record.legal_indices.begin()] = record.candidate_q[candidate];
-		}
-		std::vector<double> logits(record.legal_indices.size());
-		for (std::size_t index = 0; index < logits.size(); ++index) {
-			logits[index] = options.prior_power *
-								std::log(std::clamp(static_cast<double>(record.legal_prior[index]),
-													1e-12, 1.0)) +
-							(q_all[index] - record.root_value) / temperature;
-		}
-		record.policy_target = stable_softmax(logits);
-	}
-	std::cout << "fcpi counterfactual summary: branches=" << summary.branches << " average_depth="
-			  << (summary.branches > 0
-					  ? static_cast<double>(summary.branch_plies) / summary.branches
-					  : 0.0)
-			  << " reply_evaluations=" << summary.reply_evaluations
-			  << " terminal_branches=" << summary.terminal_branches << " mean_residual="
+	records = std::move(tree_records);
+	std::cout << "fcpi counterfactual summary: trees=" << summary.trees
+			  << " decision_nodes=" << summary.decision_nodes
+			  << " evaluated_edges=" << summary.evaluated_edges
+			  << " terminal_edges=" << summary.terminal_edges
+			  << " max_depth=" << summary.max_depth << " mean_residual="
 			  << (summary.residual_count > 0 ? summary.residual_sum / summary.residual_count : 0.0)
 			  << std::endl;
 }
@@ -798,13 +786,26 @@ std::vector<Position> aggregate_records(std::vector<Position> records, nlohmann:
 		}
 		const float old_count = static_cast<float>(merged.aggregate_count);
 		const float new_count = old_count + 1.0F;
+		const float old_policy_weight = merged.policy_weight;
+		const float new_policy_weight = old_policy_weight + record.policy_weight;
+		const float old_value_weight = merged.value_weight;
+		const float new_value_weight = old_value_weight + record.value_weight;
 		for (std::size_t index = 0; index < merged.legal_prior.size(); ++index) {
 			merged.legal_prior[index] =
 				(merged.legal_prior[index] * old_count + record.legal_prior[index]) / new_count;
-			merged.policy_target[index] =
-				(merged.policy_target[index] * old_count + record.policy_target[index]) / new_count;
+			if (new_policy_weight > 0.0F) {
+				merged.policy_target[index] =
+					(merged.policy_target[index] * old_policy_weight +
+					 record.policy_target[index] * record.policy_weight) /
+					new_policy_weight;
+			}
 		}
-		merged.value_target = (merged.value_target * old_count + record.value_target) / new_count;
+		if (new_value_weight > 0.0F) {
+			merged.value_target =
+				(merged.value_target * old_value_weight +
+				 record.value_target * record.value_weight) /
+				new_value_weight;
+		}
 		for (std::size_t candidate = 0; candidate < record.candidate_indices.size(); ++candidate) {
 			const int action = record.candidate_indices[candidate];
 			const auto existing =
@@ -815,10 +816,13 @@ std::vector<Position> aggregate_records(std::vector<Position> records, nlohmann:
 			} else {
 				const auto index = existing - merged.candidate_indices.begin();
 				merged.candidate_q[index] =
-					(merged.candidate_q[index] * old_count + record.candidate_q[candidate]) /
-					new_count;
+					(merged.candidate_q[index] * old_policy_weight +
+					 record.candidate_q[candidate] * record.policy_weight) /
+					std::max(1e-8F, new_policy_weight);
 			}
 		}
+		merged.policy_weight = new_policy_weight;
+		merged.value_weight = new_value_weight;
 		merged.aggregate_count += 1;
 	}
 	for (auto &record : output) {
@@ -856,6 +860,8 @@ nlohmann::json write_fcpi_h5(const std::filesystem::path &path, std::vector<Posi
 	std::vector<float> policy(count * legal_width, 0.0F);
 	std::vector<std::uint8_t> legal_counts(count);
 	std::vector<float> values(count);
+	std::vector<float> policy_weights(count);
+	std::vector<float> value_weights(count);
 	std::vector<std::int32_t> candidates(count * candidate_width, 0);
 	std::vector<float> candidate_q(count * candidate_width, 0.0F);
 	std::vector<std::uint8_t> candidate_counts(count);
@@ -865,6 +871,8 @@ nlohmann::json write_fcpi_h5(const std::filesystem::path &path, std::vector<Posi
 		legal_counts[row] = static_cast<std::uint8_t>(records[row].legal_indices.size());
 		candidate_counts[row] = static_cast<std::uint8_t>(records[row].candidate_indices.size());
 		values[row] = records[row].value_target;
+		policy_weights[row] = records[row].policy_weight;
+		value_weights[row] = records[row].value_weight;
 		for (std::size_t column = 0; column < records[row].legal_indices.size(); ++column) {
 			legal[row * legal_width + column] = records[row].legal_indices[column];
 			priors[row * legal_width + column] = records[row].legal_prior[column];
@@ -893,6 +901,10 @@ nlohmann::json write_fcpi_h5(const std::filesystem::path &path, std::vector<Posi
 	write_dataset(file, "legal_counts", H5T_STD_U8LE, H5T_NATIVE_UINT8, {count},
 				  legal_counts.data());
 	write_dataset(file, "value_targets", H5T_IEEE_F32LE, H5T_NATIVE_FLOAT, {count}, values.data());
+	write_dataset(file, "policy_weights", H5T_IEEE_F32LE, H5T_NATIVE_FLOAT, {count},
+				  policy_weights.data());
+	write_dataset(file, "value_weights", H5T_IEEE_F32LE, H5T_NATIVE_FLOAT, {count},
+				  value_weights.data());
 	write_dataset(file, "candidate_indices", H5T_STD_I32LE, H5T_NATIVE_INT32,
 				  {count, candidate_width}, candidates.data());
 	write_dataset(file, "candidate_q", H5T_IEEE_F32LE, H5T_NATIVE_FLOAT, {count, candidate_width},
@@ -907,7 +919,7 @@ nlohmann::json write_fcpi_h5(const std::filesystem::path &path, std::vector<Posi
 	};
 }
 
-// Fine-tune P/V with policy CE, value Huber, KL anchoring, and entropy regularization.
+// Fine-tune Policy on every expanded tree node and Value only on real self-play roots.
 nlohmann::json train_candidate(const std::filesystem::path &source,
 							   const std::filesystem::path &candidate, Model model,
 							   const torch::Device &device, std::vector<Position> &records,
@@ -922,7 +934,7 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 	std::mt19937_64 rng(options.seed);
 	std::int64_t steps = 0;
 	auto metric_totals =
-		torch::zeros({5}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+		torch::zeros({3}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
 	for (int epoch = 0; epoch < std::max(0, options.epochs); ++epoch) {
 		std::shuffle(order.begin(), order.end(), rng);
 		for (std::size_t begin = 0; begin < order.size(); begin += std::max(1, options.batch_size)) {
@@ -948,33 +960,36 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 				decode_states(packed.data(), batch, pin_memory).to(device, true);
 			auto legal =
 				torch::zeros({batch, static_cast<std::int64_t>(width)}, int_options);
-			auto priors =
-				torch::zeros({batch, static_cast<std::int64_t>(width)}, float_options);
 			auto targets =
 				torch::zeros({batch, static_cast<std::int64_t>(width)}, float_options);
 			auto counts = torch::zeros({batch}, int_options);
 			auto values = torch::zeros({batch}, float_options);
+			auto policy_weights = torch::zeros({batch}, float_options);
+			auto value_weights = torch::zeros({batch}, float_options);
 			auto legal_access = legal.accessor<std::int64_t, 2>();
-			auto prior_access = priors.accessor<float, 2>();
 			auto target_access = targets.accessor<float, 2>();
 			auto count_access = counts.accessor<std::int64_t, 1>();
 			auto value_access = values.accessor<float, 1>();
+			auto policy_weight_access = policy_weights.accessor<float, 1>();
+			auto value_weight_access = value_weights.accessor<float, 1>();
 			for (std::size_t index = begin; index < end; ++index) {
 				const auto &record = records[order[index]];
 				const auto row = static_cast<std::int64_t>(index - begin);
 				count_access[row] = record.legal_indices.size();
 				value_access[row] = record.value_target;
+				policy_weight_access[row] = record.policy_weight;
+				value_weight_access[row] = record.value_weight;
 				for (std::size_t column = 0; column < record.legal_indices.size(); ++column) {
 					legal_access[row][column] = record.legal_indices[column];
-					prior_access[row][column] = record.legal_prior[column];
 					target_access[row][column] = record.policy_target[column];
 				}
 			}
 			legal = legal.to(device, true);
-			priors = priors.to(device, true);
 			targets = targets.to(device, true);
 			counts = counts.to(device, true);
 			values = values.to(device, true);
+			policy_weights = policy_weights.to(device, true);
+			value_weights = value_weights.to(device, true);
 
 			optimizer.zero_grad();
 			torch::Tensor logits;
@@ -991,39 +1006,33 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 			auto log_probability = torch::log_softmax(selected, 1);
 			auto masked_targets = targets * mask;
 			masked_targets = masked_targets / masked_targets.sum(1, true).clamp_min(1e-8);
-			auto masked_priors = priors.clamp_min(1e-8) * mask;
-			masked_priors = masked_priors / masked_priors.sum(1, true).clamp_min(1e-8);
-			auto probabilities = torch::exp(log_probability);
-			auto policy_loss = -(masked_targets * log_probability).sum(1).mean();
-			auto kl =
-				(probabilities * (log_probability - torch::log(masked_priors.clamp_min(1e-8))))
-					.sum(1)
-					.mean();
-			auto entropy = -(probabilities * log_probability).sum(1).mean();
-			auto value_loss = torch::nn::functional::smooth_l1_loss(predicted.squeeze(1), values);
-			auto loss = options.policy_weight * policy_loss + options.value_weight * value_loss +
-						options.kl_weight * kl - options.entropy_weight * entropy;
+			auto policy_errors = -(masked_targets * log_probability).sum(1);
+			auto policy_loss =
+				(policy_errors * policy_weights).sum() / policy_weights.sum().clamp_min(1e-8);
+			auto value_errors = torch::nn::functional::smooth_l1_loss(
+				predicted.squeeze(1), values,
+				torch::nn::functional::SmoothL1LossFuncOptions().reduction(torch::kNone));
+			auto value_loss =
+				(value_errors * value_weights).sum() / value_weights.sum().clamp_min(1.0);
+			auto loss = options.policy_weight * policy_loss + options.value_weight * value_loss;
 			loss.backward();
 			if (options.grad_clip > 0.0) {
 				torch::nn::utils::clip_grad_norm_(model->parameters(), options.grad_clip);
 			}
 			optimizer.step();
 			++steps;
-			metric_totals.add_(torch::stack({loss.detach(), policy_loss.detach(),
-											value_loss.detach(), kl.detach(),
-											entropy.detach()}));
+			metric_totals.add_(
+				torch::stack({loss.detach(), policy_loss.detach(), value_loss.detach()}));
 			if (options.log_every > 0 && (steps == 1 || steps % options.log_every == 0)) {
 				auto metrics =
-					torch::stack({policy_loss.detach(), value_loss.detach(), kl.detach(),
-								  entropy.detach(), loss.detach()})
+					torch::stack({policy_loss.detach(), value_loss.detach(), loss.detach()})
 						.to(torch::kCPU)
 						.contiguous();
 				auto metric_values = metrics.accessor<float, 1>();
 				std::cout << "fcpi train: step=" << steps
 						  << " policy=" << metric_values[0]
-						  << " value=" << metric_values[1] << " kl=" << metric_values[2]
-						  << " entropy=" << metric_values[3]
-						  << " loss=" << metric_values[4] << std::endl;
+						  << " value=" << metric_values[1]
+						  << " loss=" << metric_values[2] << std::endl;
 			}
 			if (options.train_max_steps > 0 && steps >= options.train_max_steps) {
 				break;
@@ -1048,8 +1057,6 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 			 {"loss", metric_values[0] / divisor},
 			 {"policy", metric_values[1] / divisor},
 			 {"value", metric_values[2] / divisor},
-			 {"kl", metric_values[3] / divisor},
-			 {"entropy", metric_values[4] / divisor},
 		 }},
 	};
 }
@@ -1096,15 +1103,12 @@ void run_fcpi(const FcpiOptions &options) {
 		auto data_summary = write_fcpi_h5(data_path, records);
 		data_summary["sampling"] = sampling;
 		data_summary["counterfactual"] = {
-			{"branches", target_summary.branches},
-			{"reply_topk", options.counterfactual_reply_topk},
-			{"reply_temperature", options.counterfactual_reply_temperature},
-			{"reply_evaluations", target_summary.reply_evaluations},
-			{"average_depth",
-			 target_summary.branches > 0
-				 ? static_cast<double>(target_summary.branch_plies) / target_summary.branches
-				 : 0.0},
-			{"terminal_branches", target_summary.terminal_branches},
+			{"budget_per_root", options.counterfactual_budget},
+			{"trees", target_summary.trees},
+			{"decision_nodes", target_summary.decision_nodes},
+			{"evaluated_edges", target_summary.evaluated_edges},
+			{"terminal_edges", target_summary.terminal_edges},
+			{"max_depth", target_summary.max_depth},
 		};
 		const auto candidate = model_dir / ("candidate_iter_" + zero_pad(iteration, 3) + ".pth");
 		auto train_summary = train_candidate(current, candidate, model, device, records, options);

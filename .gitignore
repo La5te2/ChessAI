@@ -20,4 +20,5 @@ backup/
 /api/nlohmann/
 /api/downloads/
 /api/ninja/
+/api/gui/
 /build/

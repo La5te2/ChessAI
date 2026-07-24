@@ -26,28 +26,15 @@ struct FcpiOptions {
 	int max_book_positions = 50000;
 	int inference_batch_size = 64;
 	int target_records_per_batch = 256;
-	int counterfactual_topk = 8;
-	int opponent_reply_topk = 4;
-	double opponent_reply_temperature = 0.2;
-	int counterfactual_min_plies = 2;
-	int counterfactual_max_plies = 6;
-	double counterfactual_target_average_plies = 4.0;
-	double counterfactual_lambda = 0.85;
+	int counterfactual_budget = 24;
 	double td_lambda = 0.85;
 	double behavior_temperature = 0.85;
 	double uniform_mix = 0.02;
-	double behavior_advantage_weight = 0.5;
-	double policy_temperature = 0.25;
-	double prior_power = 1.0;
-	double successor_weight = 0.75;
-	double played_return_weight = 0.5;
 	double policy_weight = 1.0;
 	double value_weight = 1.0;
 	double dueling_q_weight = 0.5;
 	double dynamics_weight = 0.25;
 	double imagined_value_weight = 0.25;
-	double kl_weight = 0.05;
-	double entropy_weight = 0.001;
 	int epochs = 15;
 	std::int64_t train_max_steps = 2000;
 	int batch_size = 256;
@@ -58,16 +45,6 @@ struct FcpiOptions {
 	int log_every = 50;
 	std::uint64_t seed = 2026;
 };
-
-struct OpponentReplyInput {
-	float prior = 0.0F;
-	float advantage = 0.0F;
-	float root_value = 0.0F;
-};
-
-/// Computes Melano's P/A-regularized soft-min weights over exact opponent replies.
-std::vector<float> opponent_reply_weights(const std::vector<OpponentReplyInput> &replies,
-										  double advantage_weight, double temperature);
 
 /// Runs all configured FCPI iterations and advances current.pth only after arena acceptance.
 void run_fcpi(const FcpiOptions &options);

@@ -31,6 +31,18 @@ struct EngineOptions {
 	int score_scale = 1000;
 };
 
+// Resolve the explicitly packaged Melano checkpoint beside the executable without
+// introducing a repository fallback or coupling the model name to the EXE name.
+std::filesystem::path sidecar_model_path(const char *argv0) {
+	std::filesystem::path executable = argv0 == nullptr ? std::filesystem::path() : argv0;
+	std::error_code error;
+	const auto absolute = std::filesystem::absolute(executable, error);
+	if (!error) {
+		executable = absolute;
+	}
+	return executable.parent_path() / "melano.pth";
+}
+
 // Remove surrounding ASCII whitespace from protocol input and option values.
 std::string trim(std::string value) {
 	const auto first = value.find_first_not_of(" \t\r\n");
@@ -414,7 +426,12 @@ EngineOptions options_from_args(int argc, char **argv) {
 	EngineOptions options;
 	options.model_path = args.get("model");
 	if (options.model_path.empty()) {
-		throw std::invalid_argument("--model is required");
+		options.model_path = sidecar_model_path(argc > 0 ? argv[0] : nullptr);
+		if (!std::filesystem::is_regular_file(options.model_path)) {
+			throw std::invalid_argument(
+				"--model is required when the sidecar checkpoint does not exist: " +
+				options.model_path.string());
+		}
 	}
 	options.device = args.get("device", options.device);
 	options.search.type = melano::parse_search_type(args.get("search-type", "only-mcts"));
