@@ -201,7 +201,12 @@ Model load_checkpoint(const std::filesystem::path &path, const torch::Device &de
 		throw std::runtime_error("model not found: " + path.string());
 	}
 	torch::serialize::InputArchive archive;
-	archive.load_from(path.string(), device);
+	try {
+		archive.load_from(path.string(), device);
+	} catch (const c10::Error &error) {
+		throw std::runtime_error("cannot read Melano checkpoint " + path.string() + ": " +
+								 error.what_without_backtrace());
+	}
 	torch::serialize::InputArchive model_archive;
 	torch::serialize::InputArchive arch_archive;
 	archive.read("model", model_archive);
