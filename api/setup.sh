@@ -13,8 +13,7 @@ cleanup() {
 		"${API_DIR}/zlib-unpack" \
 		"${API_DIR}/hdf5-src" \
 		"${API_DIR}/hdf5-build" \
-		"${API_DIR}/hdf5-unpack" \
-		"${DOWNLOADS}"
+		"${API_DIR}/hdf5-unpack"
 }
 trap cleanup EXIT
 
@@ -39,16 +38,29 @@ case ",${TORCH_VARIANTS}," in
 esac
 
 download() {
-  local url="$1"
-  local output="$2"
-  if command -v curl >/dev/null 2>&1; then
-    curl -fL --retry 3 "${url}" -o "${output}"
-  elif command -v wget >/dev/null 2>&1; then
-    wget -O "${output}" "${url}"
-  else
-    echo "curl or wget is required" >&2
-    exit 1
-  fi
+	local url="$1"
+	local output="$2"
+	if command -v curl >/dev/null 2>&1; then
+		local curl_options=(
+			--fail
+			--location
+			--show-error
+			--http1.1
+			--connect-timeout "${GADIDAE_CONNECT_TIMEOUT:-30}"
+			--retry "${GADIDAE_DOWNLOAD_RETRIES:-8}"
+			--retry-delay 2
+			--retry-all-errors
+		)
+		if [[ -s "${output}" ]]; then
+			curl_options+=(--continue-at -)
+		fi
+		curl "${curl_options[@]}" "${url}" -o "${output}"
+	elif command -v wget >/dev/null 2>&1; then
+		wget --continue -O "${output}" "${url}"
+	else
+		echo "curl or wget is required" >&2
+		exit 1
+	fi
 }
 
 if [[ "${GADIDAE_SKIP_TORCH:-0}" == "1" ]]; then
@@ -59,6 +71,7 @@ elif [[ ! -d "${API_DIR}/libtorch/share/cmake/Torch" ]]; then
   echo "Downloading LibTorch ${TORCH_VERSION} ${TORCH_VARIANT}..."
   download "${TORCH_URL}" "${TORCH_ZIP}"
   unzip -q -o "${TORCH_ZIP}" -d "${API_DIR}"
+  rm -f "${TORCH_ZIP}"
 else
   echo "LibTorch already installed."
 fi
@@ -145,6 +158,7 @@ cmake \
 	"-DEXPECTED_TORCH_VARIANT=${TORCH_VARIANT}" \
 	-P "${API_DIR}/verify.cmake"
 
+rm -rf -- "${DOWNLOADS}"
 echo
 echo "Gadus dependencies ready."
 echo "LibTorch variant: ${TORCH_VARIANT}"
