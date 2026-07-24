@@ -279,10 +279,12 @@ nlohmann::json evaluate_models(const ArenaOptions &options) {
 	};
 	write_pgn(options.pgn_output, records, options.candidate.filename().string(),
 			  options.baseline.filename().string());
-	std::cout << "arena: finished wins=" << wins << " draws=" << draws << " losses=" << losses
-			  << " net_wins=" << net_wins << " score=" << std::fixed << std::setprecision(3)
-			  << score << " elo_diff=" << std::showpos << std::setprecision(1)
-			  << summary["elo_diff"].get<double>() << std::noshowpos << std::endl;
+	std::ostringstream line;
+	line << "arena: finished wins=" << wins << " draws=" << draws << " losses=" << losses
+		 << " net_wins=" << net_wins << " score=" << std::fixed << std::setprecision(3) << score
+		 << " elo_diff=" << std::showpos << std::setprecision(1)
+		 << summary["elo_diff"].get<double>() << std::noshowpos;
+	std::cout << line.str() << std::endl;
 	return summary;
 }
 
