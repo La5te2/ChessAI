@@ -9,6 +9,7 @@ cd "${ROOT_DIR}"
 FCPI="${FCPI:-build/gadus/fcpi}"
 MODEL="${MODEL:-models/candidate2.pth}"
 DEVICE="${DEVICE:-cuda}"
+PRECISION="${PRECISION:-bf16}"
 
 ITERATIONS="${ITERATIONS:-5}"
 GAMES_PER_ITER="${GAMES_PER_ITER:-2000}"
@@ -76,7 +77,7 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 		"" \
 		"Environment overrides:" \
 		"  MODEL=models/candidate2.pth ITERATIONS=5 GAMES_PER_ITER=2000" \
-		"  BATCH_SIZE=1024 INFERENCE_BATCH_SIZE=512 EVAL_GAMES=400" \
+		"  PRECISION=bf16 BATCH_SIZE=1024 INFERENCE_BATCH_SIZE=512 EVAL_GAMES=400" \
 		"" \
 		"The process runs in the background. The launcher prints its run id, pid," \
 		"log path, tail command, and stop command."
@@ -109,6 +110,7 @@ COMMAND=(
 	"${FCPI}"
 	--model "${MODEL}"
 	--device "${DEVICE}"
+	--precision "${PRECISION}"
 	--iterations "${ITERATIONS}"
 	--games-per-iter "${GAMES_PER_ITER}"
 	--games-in-flight "${GAMES_IN_FLIGHT}"
@@ -168,7 +170,7 @@ mkdir -p data/runs
 LAUNCH_LOG="data/runs/.gadus_fcpi_$(date +%Y%m%d_%H%M%S)_$$.log"
 
 echo "Gadus FCPI launch"
-echo "model=${MODEL} device=${DEVICE} iterations=${ITERATIONS}"
+echo "model=${MODEL} device=${DEVICE} precision=${PRECISION} iterations=${ITERATIONS}"
 echo "self-play: games=${GAMES_PER_ITER} games_in_flight=${GAMES_IN_FLIGHT} max_plies=${MAX_PLIES}"
 echo "counterfactual: topk=${COUNTERFACTUAL_TOPK} opponent_topk=${OPPONENT_REPLY_TOPK} depth=${COUNTERFACTUAL_MIN_PLIES}-${COUNTERFACTUAL_MAX_PLIES}"
 echo "training: batch_size=${BATCH_SIZE} epochs=${EPOCHS} max_steps=${TRAIN_MAX_STEPS} lr=${LEARNING_RATE}"

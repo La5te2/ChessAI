@@ -7,6 +7,7 @@
 #include <limits>
 #include <memory>
 #include <stdexcept>
+#include <tuple>
 #include <unordered_set>
 #include <utility>
 
@@ -108,30 +109,86 @@ struct Searcher::Impl {
 		if (!model) {
 			throw std::invalid_argument("Gadus search requires a model");
 		}
+		validate_compute_precision(options.precision, device);
 		options.virtual_loss = std::max(0.0, options.virtual_loss);
 		model->to(device);
 		model->eval();
 	}
 
-	// Evaluate independent boards in one LibTorch batch and copy P/V outputs to host memory.
+	// Evaluate a batch and return only legal policy entries across the device boundary.
 	Evaluation evaluate(const std::vector<chess::Board> &boards) {
 		if (boards.empty()) {
 			return {};
 		}
+		std::vector<std::vector<int>> legal_actions(boards.size());
+		std::size_t legal_width = 1;
+		for (std::size_t row = 0; row < boards.size(); ++row) {
+			for (const auto &move : legal_moves(boards[row])) {
+				legal_actions[row].push_back(move_to_index(move));
+			}
+			legal_width = std::max(legal_width, legal_actions[row].size());
+		}
+
+		const bool pin_memory = device.is_cuda();
+		auto index_options =
+			torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
+		auto mask_options =
+			torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU);
+		if (pin_memory) {
+			index_options = index_options.pinned_memory(true);
+			mask_options = mask_options.pinned_memory(true);
+		}
+		auto legal_indices =
+			torch::zeros({static_cast<std::int64_t>(boards.size()),
+						  static_cast<std::int64_t>(legal_width)},
+						 index_options);
+		auto legal_mask =
+			torch::zeros({static_cast<std::int64_t>(boards.size()),
+						  static_cast<std::int64_t>(legal_width)},
+						 mask_options);
+		auto index_rows = legal_indices.accessor<std::int64_t, 2>();
+		auto mask_rows = legal_mask.accessor<bool, 2>();
+		for (std::size_t row = 0; row < legal_actions.size(); ++row) {
+			for (std::size_t column = 0; column < legal_actions[row].size(); ++column) {
+				index_rows[static_cast<std::int64_t>(row)]
+						  [static_cast<std::int64_t>(column)] =
+					legal_actions[row][column];
+				mask_rows[static_cast<std::int64_t>(row)]
+						 [static_cast<std::int64_t>(column)] = true;
+			}
+		}
+
 		torch::InferenceMode guard;
-		auto states = encode_boards(boards).to(device, true);
-		auto [logits, raw_values] = model->forward(states);
-		auto probabilities = torch::softmax(logits, 1).to(torch::kCPU).contiguous();
-		auto values = raw_values.reshape({-1}).to(torch::kCPU).contiguous();
+		auto states = encode_boards(boards, pin_memory).to(device, true);
+		auto device_indices = legal_indices.to(device, true);
+		auto device_mask = legal_mask.to(device, true);
+		torch::Tensor logits;
+		torch::Tensor raw_values;
+		{
+			AutocastGuard autocast(options.precision, device);
+			std::tie(logits, raw_values) = model->forward(states);
+		}
+		auto compact_logits = logits.to(torch::kFloat32).gather(1, device_indices);
+		compact_logits = compact_logits.masked_fill(
+			~device_mask, -std::numeric_limits<float>::infinity());
+		auto probabilities =
+			torch::softmax(compact_logits, 1).to(torch::kCPU).contiguous();
+		auto values = raw_values.reshape({-1})
+						  .to(torch::kFloat32)
+						  .to(torch::kCPU)
+						  .contiguous();
 
 		Evaluation output;
-		output.policies.resize(boards.size(), std::vector<float>(kActionSize));
+		output.policies.resize(boards.size(), std::vector<float>(kActionSize, 0.0F));
 		output.values.resize(boards.size());
 		auto probability_rows = probabilities.accessor<float, 2>();
 		auto value_rows = values.accessor<float, 1>();
 		for (std::size_t row = 0; row < boards.size(); ++row) {
-			std::copy_n(&probability_rows[static_cast<std::int64_t>(row)][0], kActionSize,
-						output.policies[row].begin());
+			for (std::size_t column = 0; column < legal_actions[row].size(); ++column) {
+				output.policies[row][legal_actions[row][column]] =
+					probability_rows[static_cast<std::int64_t>(row)]
+									[static_cast<std::int64_t>(column)];
+			}
 			output.values[row] = value_rows[static_cast<std::int64_t>(row)];
 		}
 		return output;

@@ -214,8 +214,13 @@ PackedState encode_state(const chess::Board &board) {
 }
 
 // Expand packed rank bits to the floating-point NCHW tensor consumed by convolutions.
-torch::Tensor decode_states(const std::uint8_t *packed, std::int64_t count) {
-	auto output = torch::zeros({count, kStatePlanes, 8, 8}, torch::kFloat32);
+torch::Tensor decode_states(const std::uint8_t *packed, std::int64_t count,
+							bool pinned_memory) {
+	auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+	if (pinned_memory) {
+		options = options.pinned_memory(true);
+	}
+	auto output = torch::zeros({count, kStatePlanes, 8, 8}, options);
 	auto accessor = output.accessor<float, 4>();
 	for (std::int64_t item = 0; item < count; ++item) {
 		const auto *state = packed + item * kStatePlanes * 8;
@@ -233,13 +238,14 @@ torch::Tensor decode_states(const std::uint8_t *packed, std::int64_t count) {
 }
 
 // Pack a live batch first, then use the same decoder as persisted training data.
-torch::Tensor encode_boards(const std::vector<chess::Board> &boards) {
+torch::Tensor encode_boards(const std::vector<chess::Board> &boards, bool pinned_memory) {
 	std::vector<std::uint8_t> packed(boards.size() * kStatePlanes * 8);
 	for (std::size_t index = 0; index < boards.size(); ++index) {
 		const auto state = encode_state(boards[index]);
 		std::copy(state.begin(), state.end(), packed.begin() + index * state.size());
 	}
-	return decode_states(packed.data(), static_cast<std::int64_t>(boards.size()));
+	return decode_states(packed.data(), static_cast<std::int64_t>(boards.size()),
+						 pinned_memory);
 }
 
 // Report any library-recognized terminal reason, including mate and rule draws.

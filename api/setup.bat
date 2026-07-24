@@ -40,7 +40,7 @@ if not defined TORCH_VARIANT_ALLOWED (
 if "%GADIDAE_SKIP_TORCH%"=="1" goto torch_ready
 if not exist "%API_DIR%libtorch\share\cmake\Torch" (
   set "TORCH_ZIP=%API_DIR%downloads\libtorch-%TORCH_VERSION%-%TORCH_VARIANT%-win.zip"
-  set "TORCH_URL=https://download.pytorch.org/libtorch/%TORCH_VARIANT%/libtorch-win-shared-with-deps-%TORCH_VERSION%%%2B%TORCH_VARIANT%.zip"
+  set "TORCH_URL=https://download.pytorch.org/libtorch/%TORCH_VARIANT%/%TORCH_WINDOWS_ARTIFACT%-%TORCH_VERSION%%%2B%TORCH_VARIANT%.zip"
   echo Downloading LibTorch %TORCH_VERSION% %TORCH_VARIANT%...
   curl.exe --fail --location --retry 3 --output "!TORCH_ZIP!" "!TORCH_URL!" || exit /b 1
   powershell -NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -Force '!TORCH_ZIP!' '%API_DIR%'" || exit /b 1

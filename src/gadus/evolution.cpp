@@ -289,6 +289,7 @@ std::vector<Position> collect_selfplay(Model model, const torch::Device &device,
 									   nlohmann::json &sampling_summary) {
 	SearchOptions closed;
 	closed.type = SearchType::Closed;
+	closed.precision = options.precision;
 	closed.mcts_sims = 0;
 	closed.mcts_batch_size = options.inference_batch_size;
 	Searcher evaluator(model, device, closed);
@@ -560,6 +561,7 @@ void construct_targets(std::vector<Position> &records, Model model, const torch:
 					   const FcpiOptions &options, TargetSummary &summary) {
 	SearchOptions closed;
 	closed.type = SearchType::Closed;
+	closed.precision = options.precision;
 	closed.mcts_sims = 0;
 	closed.mcts_batch_size = options.inference_batch_size;
 	Searcher evaluator(model, device, closed);
@@ -898,11 +900,8 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 	std::iota(order.begin(), order.end(), 0);
 	std::mt19937_64 rng(options.seed);
 	std::int64_t steps = 0;
-	double total_loss = 0.0;
-	double total_policy = 0.0;
-	double total_value = 0.0;
-	double total_kl = 0.0;
-	double total_entropy = 0.0;
+	auto metric_totals =
+		torch::zeros({5}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
 	for (int epoch = 0; epoch < std::max(0, options.epochs); ++epoch) {
 		std::shuffle(order.begin(), order.end(), rng);
 		for (std::size_t begin = 0; begin < order.size();
@@ -916,12 +915,25 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 				std::copy(records[order[index]].state.begin(), records[order[index]].state.end(),
 						  packed.begin() + (index - begin) * kStatePlanes * 8);
 			}
-			auto states = decode_states(packed.data(), batch).to(device, true);
-			auto legal = torch::zeros({batch, static_cast<std::int64_t>(width)}, torch::kInt64);
-			auto priors = torch::zeros({batch, static_cast<std::int64_t>(width)}, torch::kFloat32);
-			auto targets = torch::zeros({batch, static_cast<std::int64_t>(width)}, torch::kFloat32);
-			auto counts = torch::zeros({batch}, torch::kInt64);
-			auto values = torch::zeros({batch}, torch::kFloat32);
+			const bool pin_memory = device.is_cuda();
+			auto int_options =
+				torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
+			auto float_options =
+				torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+			if (pin_memory) {
+				int_options = int_options.pinned_memory(true);
+				float_options = float_options.pinned_memory(true);
+			}
+			auto states =
+				decode_states(packed.data(), batch, pin_memory).to(device, true);
+			auto legal =
+				torch::zeros({batch, static_cast<std::int64_t>(width)}, int_options);
+			auto priors =
+				torch::zeros({batch, static_cast<std::int64_t>(width)}, float_options);
+			auto targets =
+				torch::zeros({batch, static_cast<std::int64_t>(width)}, float_options);
+			auto counts = torch::zeros({batch}, int_options);
+			auto values = torch::zeros({batch}, float_options);
 			auto legal_access = legal.accessor<std::int64_t, 2>();
 			auto prior_access = priors.accessor<float, 2>();
 			auto target_access = targets.accessor<float, 2>();
@@ -945,8 +957,14 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 			values = values.to(device, true);
 
 			optimizer.zero_grad();
-			auto [logits, predicted] = model->forward(states);
-			auto selected = logits.gather(1, legal).to(torch::kFloat32);
+			torch::Tensor logits;
+			torch::Tensor predicted;
+			{
+				AutocastGuard autocast(options.precision, device);
+				std::tie(logits, predicted) = model->forward(states);
+			}
+			auto selected = logits.to(torch::kFloat32).gather(1, legal);
+			predicted = predicted.to(torch::kFloat32);
 			auto columns = torch::arange(static_cast<std::int64_t>(width), counts.options());
 			auto mask = columns.unsqueeze(0) < counts.unsqueeze(1);
 			selected = selected.masked_fill(~mask, -1e9);
@@ -971,17 +989,21 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 			}
 			optimizer.step();
 			++steps;
-			total_loss += loss.item<double>();
-			total_policy += policy_loss.item<double>();
-			total_value += value_loss.item<double>();
-			total_kl += kl.item<double>();
-			total_entropy += entropy.item<double>();
+			metric_totals.add_(torch::stack({loss.detach(), policy_loss.detach(),
+											value_loss.detach(), kl.detach(),
+											entropy.detach()}));
 			if (options.log_every > 0 && (steps == 1 || steps % options.log_every == 0)) {
+				auto metrics =
+					torch::stack({policy_loss.detach(), value_loss.detach(), kl.detach(),
+								  entropy.detach(), loss.detach()})
+						.to(torch::kCPU)
+						.contiguous();
+				auto metric_values = metrics.accessor<float, 1>();
 				std::cout << "fcpi train: step=" << steps
-						  << " policy=" << policy_loss.item<double>()
-						  << " value=" << value_loss.item<double>() << " kl=" << kl.item<double>()
-						  << " entropy=" << entropy.item<double>()
-						  << " loss=" << loss.item<double>() << std::endl;
+						  << " policy=" << metric_values[0]
+						  << " value=" << metric_values[1] << " kl=" << metric_values[2]
+						  << " entropy=" << metric_values[3]
+						  << " loss=" << metric_values[4] << std::endl;
 			}
 			if (options.train_max_steps > 0 && steps >= options.train_max_steps) {
 				break;
@@ -995,17 +1017,19 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 	load_checkpoint(source, torch::Device(torch::kCPU), &source_arch);
 	save_checkpoint_atomic(candidate, model, {source_arch.channels, source_arch.blocks});
 	const double divisor = static_cast<double>(std::max<std::int64_t>(1, steps));
+	auto final_metrics = metric_totals.to(torch::kCPU).contiguous();
+	auto metric_values = final_metrics.accessor<float, 1>();
 	return {
 		{"steps", steps},
 		{"epochs_requested", options.epochs},
 		{"candidate", candidate.string()},
 		{"metrics",
 		 {
-			 {"loss", total_loss / divisor},
-			 {"policy", total_policy / divisor},
-			 {"value", total_value / divisor},
-			 {"kl", total_kl / divisor},
-			 {"entropy", total_entropy / divisor},
+			 {"loss", metric_values[0] / divisor},
+			 {"policy", metric_values[1] / divisor},
+			 {"value", metric_values[2] / divisor},
+			 {"kl", metric_values[3] / divisor},
+			 {"entropy", metric_values[4] / divisor},
 		 }},
 	};
 }
@@ -1033,9 +1057,11 @@ void run_fcpi(const FcpiOptions &options) {
 	atomic_copy(options.model, initial);
 	atomic_copy(initial, current);
 	const auto device = resolve_device(options.device);
+	validate_compute_precision(options.precision, device);
 	std::cout << "fcpi run id: " << run_id << std::endl;
 	std::cout << "fcpi architecture: " << kArchType << std::endl;
 	std::cout << "fcpi formula: " << kFcpiFormula << std::endl;
+	std::cout << "fcpi precision: " << compute_precision_name(options.precision) << std::endl;
 	std::cout << "fcpi current model: " << current.string() << std::endl;
 	nlohmann::json summaries = nlohmann::json::array();
 
@@ -1065,6 +1091,7 @@ void run_fcpi(const FcpiOptions &options) {
 		arena_options.candidate = candidate;
 		arena_options.baseline = current;
 		arena_options.device = options.device;
+		arena_options.search.precision = options.precision;
 		arena_options.seed = options.seed + iteration;
 		auto arena_summary = evaluate_models(arena_options);
 		const bool accepted = arena_summary["accepted"].get<bool>();
@@ -1086,6 +1113,7 @@ void run_fcpi(const FcpiOptions &options) {
 		std::ofstream summary_file(data_dir / "summary.json");
 		summary_file << nlohmann::json({
 										   {"run_id", run_id},
+										   {"precision", compute_precision_name(options.precision)},
 										   {"initial_model", initial.string()},
 										   {"current_model", current.string()},
 										   {"summaries", summaries},

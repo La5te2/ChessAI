@@ -221,6 +221,7 @@ build/gadus/train \
 	--value-weight 0.25 \
 	--save-every 5000 \
 	--device cuda \
+	--precision bf16 \
 	--log-every 100 \
 	--seed 2026
 
@@ -228,6 +229,7 @@ build/gadus/search \
 	--model models/gadus.pth \
 	--fen "startpos" \
 	--device cuda \
+	--precision bf16 \
 	--search-type only-mcts \
 	--mcts-sims 1000 \
 	--mcts-min-sims 100 \
@@ -246,6 +248,7 @@ build/gadus/search \
 - `preprocess --max-games` 控制读取对局上限，`--chunk-size` 控制 HDF5 扩展单元，`--compression-level` 控制 deflate 等级，`--log-every` 控制对局进度输出。
 - `train` 每次创建新的 Gadus 模型。`--channels` 和 `--blocks` 决定结构，`--max-steps` 是本次训练步数上限，`--save-every` 控制原子 checkpoint 写入周期。
 - `search --fen startpos` 使用标准初始局面，也可传入完整 FEN。
+- `--precision` 可取 `fp32` 或 `bf16`，默认 `fp32`。`bf16` 仅用于 CUDA 前向计算，Policy softmax、训练损失和指标累加使用 FP32，checkpoint 参数保持 FP32。CUDA 输入批次使用 pinned memory，Search 只把合法动作的 Policy 从 GPU 传回 CPU。
 
 `closed` 直接按合法动作 Policy 排序。`only-mcts` 使用 batched leaf inference。设根视角下边 $(s,a)$ 的真实访问数为 $N(s,a)$，父节点访问数为 $N(s)$，平均回传价值为 $Q(s,a)$。动态探索系数为：
 
@@ -303,6 +306,7 @@ build/gadus/arena \
 	--candidate models/candidate.pth \
 	--baseline models/champion.pth \
 	--device cuda \
+	--precision bf16 \
 	--games 400 \
 	--games-in-flight 32 \
 	--max-plies 240 \
@@ -370,6 +374,7 @@ $$
 build/gadus/fcpi \
 	--model models/gadus.pth \
 	--device cuda \
+	--precision bf16 \
 	--iterations 10 \
 	--games-per-iter 1000 \
 	--games-in-flight 64 \
@@ -505,6 +510,14 @@ models/runs/<run-id>/
 ```
 
 candidate 达到 arena gate 后原子写入该 run 的 `current.pth`。
+
+针对 16 GiB RTX 4080 Super 的后台启动脚本为：
+
+```bash
+bash scripts/gadus_fcpi.sh
+```
+
+脚本默认使用 `PRECISION=bf16`、较大的批次与 batched games。可通过环境变量覆盖，例如 `PRECISION=fp32 BATCH_SIZE=512 bash scripts/gadus_fcpi.sh`。
 
 ## 5. Melano
 

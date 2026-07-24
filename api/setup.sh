@@ -55,7 +55,7 @@ if [[ "${GADIDAE_SKIP_TORCH:-0}" == "1" ]]; then
   echo "Skipping LibTorch setup."
 elif [[ ! -d "${API_DIR}/libtorch/share/cmake/Torch" ]]; then
   TORCH_ZIP="${DOWNLOADS}/libtorch-${TORCH_VERSION}-${TORCH_VARIANT}-linux.zip"
-  TORCH_URL="https://download.pytorch.org/libtorch/${TORCH_VARIANT}/libtorch-cxx11-abi-shared-with-deps-${TORCH_VERSION}%2B${TORCH_VARIANT}.zip"
+  TORCH_URL="https://download.pytorch.org/libtorch/${TORCH_VARIANT}/${TORCH_LINUX_ARTIFACT}-${TORCH_VERSION}%2B${TORCH_VARIANT}.zip"
   echo "Downloading LibTorch ${TORCH_VERSION} ${TORCH_VARIANT}..."
   download "${TORCH_URL}" "${TORCH_ZIP}"
   unzip -q -o "${TORCH_ZIP}" -d "${API_DIR}"

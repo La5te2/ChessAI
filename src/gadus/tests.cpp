@@ -1,8 +1,11 @@
 // Focused Gadus smoke tests for codecs, gradients, checkpoint round-trips, and search.
 
 #include <filesystem>
+#include <algorithm>
+#include <cmath>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <unordered_set>
 #include "gadus/checkpoint.hpp"
 #include "gadus/game.hpp"
@@ -45,6 +48,13 @@ void require_finite_gradients(const gadus::Model &model) {
 int main() {
 	try {
 		chess::Board board;
+		require(gadus::parse_compute_precision("fp32") == gadus::ComputePrecision::Fp32,
+				"fp32 precision parsing failed");
+		require(gadus::parse_compute_precision("bf16") == gadus::ComputePrecision::Bf16,
+				"bf16 precision parsing failed");
+		require(std::string(gadus::compute_precision_name(gadus::ComputePrecision::Bf16)) ==
+					"bf16",
+				"bf16 precision name mismatch");
 		require(board.hash() == 0x463b96181691fc9cULL, "Polyglot start-position hash mismatch");
 		const auto packed = gadus::encode_state(board);
 		require(packed[5 * 8] == 0x08, "white king state plane mismatch");
@@ -132,6 +142,16 @@ int main() {
 		require(gadus::index_to_move(gadus::move_to_index(closed_result.move), board) ==
 					closed_result.move,
 				"closed search selected an illegal move");
+		auto full_probabilities =
+			torch::softmax(reference.first, 1).squeeze(0).to(torch::kCPU).contiguous();
+		std::vector<float> full_policy(gadus::kActionSize);
+		std::copy_n(full_probabilities.data_ptr<float>(), gadus::kActionSize,
+					full_policy.begin());
+		const auto expected_policy = gadus::normalize_legal_policy(full_policy, board);
+		for (int action = 0; action < gadus::kActionSize; ++action) {
+			require(std::abs(closed_result.policy[action] - expected_policy[action]) < 1e-5F,
+					"compact legal-policy transfer changed closed search probabilities");
+		}
 
 		// Four simulations exercise selection, batched expansion, and value backup.
 		gadus::SearchOptions mcts_options = closed_options;

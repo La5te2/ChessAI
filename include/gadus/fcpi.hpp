@@ -6,12 +6,14 @@
 #include <filesystem>
 #include <string>
 #include "gadus/arena.hpp"
+#include "gadus/precision.hpp"
 
 namespace gadus {
 
 struct FcpiOptions {
 	std::filesystem::path model = "models/gadus.pth";
 	std::string device = "auto";
+	ComputePrecision precision = ComputePrecision::Fp32;
 	int iterations = 1;
 	int games_per_iter = 500;
 	int games_in_flight = 64;

@@ -26,12 +26,15 @@ int main(int argc, char **argv) {
 				<< "  --eval-opening-book <path|empty> --eval-search-type <closed|only-mcts>\n"
 				<< "  --eval-sims <n> --eval-mcts-batch-size <n> --eval-movetime-ms <ms>\n"
 				<< "  --eval-min-net-wins <n> --device <auto|cpu|cuda> --seed <n> --log-every "
-				   "<n>\n";
+				   "<n>\n"
+				<< "  --precision <fp32|bf16>\n";
 			return 0;
 		}
 		gadus::FcpiOptions options;
 		options.model = args.get("model", options.model.string());
 		options.device = args.get("device", options.device);
+		options.precision =
+			gadus::parse_compute_precision(args.get("precision", "fp32"));
 		options.iterations = args.get_int("iterations", options.iterations);
 		options.games_per_iter = args.get_int("games-per-iter", options.games_per_iter);
 		options.games_in_flight = args.get_int("games-in-flight", options.games_in_flight);
@@ -104,6 +107,7 @@ int main(int argc, char **argv) {
 			args.get_double("eval-repetition-policy-penalty", search.repetition_policy_penalty);
 		search.instant_mate_first =
 			args.get_bool("eval-instant-mate-first", search.instant_mate_first);
+		search.precision = options.precision;
 
 		gadus::run_fcpi(options);
 		return 0;

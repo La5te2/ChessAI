@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.24)
+cmake_minimum_required(VERSION 3.22)
 
 if(NOT DEFINED API_DIR)
 	get_filename_component(API_DIR "${CMAKE_CURRENT_LIST_DIR}" ABSOLUTE)

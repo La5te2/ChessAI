@@ -9,6 +9,7 @@
 #include <vector>
 #include "gadus/game.hpp"
 #include "gadus/model.hpp"
+#include "gadus/precision.hpp"
 
 namespace gadus {
 
@@ -16,6 +17,7 @@ enum class SearchType { Closed, OnlyMcts };
 
 struct SearchOptions {
 	SearchType type = SearchType::OnlyMcts;
+	ComputePrecision precision = ComputePrecision::Fp32;
 	int mcts_sims = 100;
 	int mcts_min_sims = 0;
 	int mcts_batch_size = 32;
