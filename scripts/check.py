@@ -26,15 +26,23 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def scalar_buffers(module) -> dict[str, int]:
-    buffers = dict(module.named_buffers())
-    missing = [name for name in REQUIRED_ARCH_FIELDS if name not in buffers]
+def scalar_fields(module) -> dict[str, int]:
+    parameters = dict(module.named_parameters())
+    if parameters:
+        raise ValueError(
+            "checkpoint arch metadata must be registered as buffers, not parameters"
+        )
+    fields = dict(module.named_buffers())
+    missing = [name for name in REQUIRED_ARCH_FIELDS if name not in fields]
     if missing:
         raise ValueError(f"checkpoint arch is missing fields: {', '.join(missing)}")
+    unexpected = sorted(set(fields) - set(REQUIRED_ARCH_FIELDS))
+    if unexpected:
+        raise ValueError(f"checkpoint arch has unexpected fields: {', '.join(unexpected)}")
 
     values = {}
     for name in REQUIRED_ARCH_FIELDS:
-        tensor = buffers[name]
+        tensor = fields[name]
         if tensor.numel() != 1:
             raise ValueError(f"checkpoint arch field is not scalar: {name}")
         values[name] = int(tensor.detach().cpu().item())
@@ -68,7 +76,7 @@ def inspect_model(path: Path) -> dict[str, object]:
         names = ", ".join(sorted(children)) or "<empty>"
         raise ValueError(f"checkpoint top level must contain only model and arch; found: {names}")
 
-    arch = scalar_buffers(children["arch"])
+    arch = scalar_fields(children["arch"])
     architecture, heads = ARCHITECTURES.get(
         arch["type_id"], (f"unknown(type_id={arch['type_id']})", "unknown")
     )

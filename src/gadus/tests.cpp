@@ -68,6 +68,12 @@ int main() {
 		require_move_codec(promotion);
 		chess::Board castling("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1");
 		require_move_codec(castling);
+		const auto king_side_castle = chess::uci::uciToMove(castling, "e1g1");
+		const auto queen_side_castle = chess::uci::uciToMove(castling, "e1c1");
+		require(gadus::move_to_index(king_side_castle) == 4 * 73 + 4 * 7 + 1,
+				"king-side castling policy index mismatch");
+		require(gadus::move_to_index(queen_side_castle) == 4 * 73 + 3 * 7 + 1,
+				"queen-side castling policy index mismatch");
 		chess::Board en_passant("8/8/8/3pP3/8/8/8/K6k w - d6 0 1");
 		require_move_codec(en_passant);
 

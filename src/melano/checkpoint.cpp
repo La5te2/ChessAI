@@ -153,7 +153,7 @@ torch::Tensor scalar(std::int64_t value) {
 // Read a required integer checkpoint field and normalize it to int64.
 std::int64_t read_scalar(torch::serialize::InputArchive &archive, const std::string &key) {
 	torch::Tensor value;
-	archive.read(key, value);
+	archive.read(key, value, true);
 	return value.item<std::int64_t>();
 }
 
@@ -184,10 +184,10 @@ void save_checkpoint_atomic(const std::filesystem::path &path, const Model &mode
 	torch::serialize::OutputArchive model_archive;
 	torch::serialize::OutputArchive arch_archive;
 	model->save(model_archive);
-	arch_archive.write("type_id", scalar(2));
-	arch_archive.write("channels", scalar(arch.channels));
-	arch_archive.write("blocks", scalar(arch.blocks));
-	arch_archive.write("action_size", scalar(kActionSize));
+	arch_archive.write("type_id", scalar(2), true);
+	arch_archive.write("channels", scalar(arch.channels), true);
+	arch_archive.write("blocks", scalar(arch.blocks), true);
+	arch_archive.write("action_size", scalar(kActionSize), true);
 	archive.write("model", model_archive);
 	archive.write("arch", arch_archive);
 	archive.save_to(temporary);

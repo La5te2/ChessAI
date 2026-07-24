@@ -91,10 +91,22 @@ std::vector<chess::Move> legal_moves(const chess::Board &board) {
 	return {moves.begin(), moves.end()};
 }
 
+// Normalize the library's king-to-rook castling representation to the king destination
+// used by the historical alphazero_64x73 training codec.
+int policy_destination(const chess::Move &move) {
+	if (move.typeOf() != chess::Move::CASTLING) {
+		return move.to().index();
+	}
+	const int from = move.from().index();
+	const int rank = from / 8;
+	const bool king_side = move.to().index() > from;
+	return rank * 8 + (king_side ? 6 : 2);
+}
+
 // Encode underpromotions separately, then sliding rays and knight jumps in 73 planes.
 int move_to_index(const chess::Move &move) {
 	const int from = move.from().index();
-	const int to = move.to().index();
+	const int to = policy_destination(move);
 	const int from_rank = from / 8;
 	const int from_file = from % 8;
 	const int to_rank = to / 8;
