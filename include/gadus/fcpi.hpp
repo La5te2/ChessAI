@@ -11,7 +11,7 @@
 namespace gadus {
 
 struct FcpiOptions {
-	std::filesystem::path model = "models/gadus.pth";
+	std::filesystem::path model = "models/gadus/gadus.pth";
 	std::string device = "auto";
 	ComputePrecision precision = ComputePrecision::Fp32;
 	int iterations = 1;

@@ -15,7 +15,8 @@ int main(int argc, char **argv) {
 					  << "  --dueling-q-weight <x> --dynamics-weight <x> "
 						 "--imagined-value-weight <x>\n"
 					  << "  --save-every <steps> --log-every <steps> --seed <n> --device "
-						 "<auto|cpu|cuda>\n";
+						 "<auto|cpu|cuda>\n"
+					  << "  --precision <fp32|bf16>\n";
 			return 0;
 		}
 		melano::TrainOptions options;
@@ -38,6 +39,8 @@ int main(int argc, char **argv) {
 		options.log_every = args.get_int("log-every", options.log_every);
 		options.seed = static_cast<std::uint64_t>(args.get_int64("seed", options.seed));
 		options.device = args.get("device", options.device);
+		options.precision =
+			melano::parse_compute_precision(args.get("precision", "fp32"));
 		melano::train_supervised(options);
 		return 0;
 	} catch (const std::exception &error) {

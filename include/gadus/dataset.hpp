@@ -68,7 +68,7 @@ void preprocess_pgn(const PreprocessOptions &options);
 
 struct TrainOptions {
 	std::filesystem::path data = "data/games.gadus.h5";
-	std::filesystem::path output = "models/gadus.pth";
+	std::filesystem::path output = "models/gadus/gadus.pth";
 	int channels = 128;
 	int blocks = 10;
 	int epochs = 10;

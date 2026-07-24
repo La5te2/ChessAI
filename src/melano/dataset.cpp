@@ -537,8 +537,9 @@ SupervisedH5 &SupervisedH5::operator=(SupervisedH5 &&other) noexcept {
 // Expose validated immutable metadata without another HDF5 call.
 const DatasetInfo &SupervisedH5::info() const noexcept { return impl_->info; }
 
-// Read sorted HDF5 rows into owned state, move, value, and advantage tensors.
-SupervisedBatch SupervisedH5::read(const std::vector<std::int64_t> &requested) const {
+// Read sorted HDF5 rows into owned, optionally pinned state and target tensors.
+SupervisedBatch SupervisedH5::read(const std::vector<std::int64_t> &requested,
+								  bool pinned_memory) const {
 	if (requested.empty())
 		throw std::invalid_argument("cannot read an empty HDF5 batch");
 	auto indices = requested;
@@ -551,10 +552,22 @@ SupervisedBatch SupervisedH5::read(const std::vector<std::int64_t> &requested) c
 	std::vector<std::uint8_t> packed(batch * kStateFeatures);
 	std::vector<std::uint8_t> packed_next(batch * kStateFeatures);
 	std::vector<std::uint16_t> moves(batch);
-	std::vector<float> values(batch);
-	std::vector<float> next_values(batch);
 	std::vector<std::uint16_t> advantage_moves(batch);
-	std::vector<float> advantage_values(batch);
+	auto index_options =
+		torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
+	auto float_options =
+		torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+	if (pinned_memory) {
+		index_options = index_options.pinned_memory(true);
+		float_options = float_options.pinned_memory(true);
+	}
+	auto move_tensor = torch::empty({static_cast<std::int64_t>(batch)}, index_options);
+	auto value_tensor = torch::empty({static_cast<std::int64_t>(batch)}, float_options);
+	auto next_value_tensor = torch::empty({static_cast<std::int64_t>(batch)}, float_options);
+	auto advantage_move_tensor =
+		torch::empty({static_cast<std::int64_t>(batch)}, index_options);
+	auto advantage_value_tensor =
+		torch::empty({static_cast<std::int64_t>(batch)}, float_options);
 
 	const hid_t state_space = require_id(H5Dget_space(impl_->states), "get states selection");
 	select_rows(state_space, indices, 2);
@@ -578,13 +591,14 @@ SupervisedBatch SupervisedH5::read(const std::vector<std::int64_t> &requested) c
 
 	for (const auto &[dataset, type, destination] : {
 			 std::tuple<hid_t, hid_t, void *>{impl_->moves, H5T_NATIVE_UINT16, moves.data()},
-			 std::tuple<hid_t, hid_t, void *>{impl_->values, H5T_NATIVE_FLOAT, values.data()},
+			 std::tuple<hid_t, hid_t, void *>{impl_->values, H5T_NATIVE_FLOAT,
+												value_tensor.data_ptr<float>()},
 			 std::tuple<hid_t, hid_t, void *>{impl_->next_values, H5T_NATIVE_FLOAT,
-												next_values.data()},
+												next_value_tensor.data_ptr<float>()},
 			 std::tuple<hid_t, hid_t, void *>{impl_->advantage_moves, H5T_NATIVE_UINT16,
 												advantage_moves.data()},
 			 std::tuple<hid_t, hid_t, void *>{impl_->advantage_values, H5T_NATIVE_FLOAT,
-												advantage_values.data()},
+												advantage_value_tensor.data_ptr<float>()},
 		 }) {
 		const hid_t space = require_id(H5Dget_space(dataset), "get scalar selection");
 		select_rows(space, indices, 1);
@@ -595,23 +609,21 @@ SupervisedBatch SupervisedH5::read(const std::vector<std::int64_t> &requested) c
 		H5Sclose(memory);
 		H5Sclose(space);
 	}
+	auto *move_destination = move_tensor.data_ptr<std::int64_t>();
+	auto *advantage_move_destination = advantage_move_tensor.data_ptr<std::int64_t>();
+	for (std::size_t index = 0; index < moves.size(); ++index) {
+		move_destination[index] = moves[index];
+		advantage_move_destination[index] = advantage_moves[index];
+	}
 
 	return {
-		decode_states(packed.data(), static_cast<std::int64_t>(batch)),
-		decode_states(packed_next.data(), static_cast<std::int64_t>(batch)),
-		torch::from_blob(moves.data(), {static_cast<std::int64_t>(batch)}, torch::kUInt16)
-			.clone()
-			.to(torch::kInt64),
-		torch::from_blob(values.data(), {static_cast<std::int64_t>(batch)}, torch::kFloat32)
-			.clone(),
-		torch::from_blob(next_values.data(), {static_cast<std::int64_t>(batch)}, torch::kFloat32)
-			.clone(),
-		torch::from_blob(advantage_moves.data(), {static_cast<std::int64_t>(batch)}, torch::kUInt16)
-			.clone()
-			.to(torch::kInt64),
-		torch::from_blob(advantage_values.data(), {static_cast<std::int64_t>(batch)},
-							 torch::kFloat32)
-			.clone(),
+		decode_states(packed.data(), static_cast<std::int64_t>(batch), pinned_memory),
+		decode_states(packed_next.data(), static_cast<std::int64_t>(batch), pinned_memory),
+		std::move(move_tensor),
+		std::move(value_tensor),
+		std::move(next_value_tensor),
+		std::move(advantage_move_tensor),
+		std::move(advantage_value_tensor),
 	};
 }
 
@@ -647,6 +659,7 @@ void preprocess_pgn(const PreprocessOptions &options) {
 void train_supervised(const TrainOptions &options) {
 	torch::manual_seed(static_cast<std::int64_t>(options.seed));
 	const auto device = resolve_device(options.device);
+	validate_compute_precision(options.precision, device);
 	SupervisedH5 data(options.data);
 	auto model = Model(options.channels, options.blocks);
 	model->to(device);
@@ -664,22 +677,20 @@ void train_supervised(const TrainOptions &options) {
 			  << " out=" << options.output.string() << " arch_type=" << kArchType
 			  << " device=" << device.str() << " epochs=" << options.epochs
 			  << " batch_size=" << options.batch_size << " max_steps=" << options.max_steps
+			  << " precision=" << compute_precision_name(options.precision)
 			  << std::endl;
 	std::cout << "created model: channels=" << options.channels << " blocks=" << options.blocks
 			  << " parameters=" << parameter_count(model) << std::endl;
 
 	for (int epoch = 0; epoch < options.epochs && !stop; ++epoch) {
 		std::shuffle(order.begin(), order.end(), rng);
-		double policy_total = 0.0;
-		double value_total = 0.0;
-		double dueling_q_total = 0.0;
-		double dynamics_total = 0.0;
-		double imagined_value_total = 0.0;
+		auto metric_totals =
+			torch::zeros({5}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
 		std::int64_t batches = 0;
 		for (std::int64_t begin = 0; begin < data.info().length; begin += options.batch_size) {
 			const auto end = std::min<std::int64_t>(begin + options.batch_size, data.info().length);
 			std::vector<std::int64_t> indices(order.begin() + begin, order.begin() + end);
-			auto batch = data.read(indices);
+			auto batch = data.read(indices, device.is_cuda());
 			auto states = batch.states.to(device, true);
 			auto next_states = batch.next_states.to(device, true);
 			auto moves = batch.moves.to(device, true);
@@ -689,33 +700,45 @@ void train_supervised(const TrainOptions &options) {
 			auto advantage_values = batch.advantage_values.to(device, true);
 			optimizer.zero_grad();
 
-			auto tokens = model->encode(states);
-			auto output = model->predict(tokens);
-			auto policy_loss = torch::nn::functional::cross_entropy(output.policy, moves);
-			auto predicted_value = output.value.squeeze(1);
+			torch::Tensor tokens;
+			torch::Tensor predicted_next;
+			torch::Tensor target_next;
+			ModelOutput output;
+			ModelOutput imagined;
+			{
+				AutocastGuard autocast(options.precision, device);
+				tokens = model->encode(states);
+				output = model->predict(tokens);
+				predicted_next = model->transition(tokens, moves);
+				{
+					torch::NoGradGuard no_grad;
+					target_next = model->encode(next_states).detach();
+				}
+				imagined = model->predict(predicted_next);
+			}
+			auto policy_loss =
+				torch::nn::functional::cross_entropy(output.policy.to(torch::kFloat32), moves);
+			auto predicted_value = output.value.squeeze(1).to(torch::kFloat32);
 			auto value_loss = torch::mse_loss(predicted_value, values);
-			auto selected_advantage = output.advantages.gather(1, advantage_moves.unsqueeze(1)).squeeze(1);
+			auto selected_advantage = output.advantages.to(torch::kFloat32)
+										  .gather(1, advantage_moves.unsqueeze(1))
+										  .squeeze(1);
 			auto dueling_q_loss = torch::zeros({}, states.options().dtype(torch::kFloat32));
 			if (data.info().has_comments) {
 				auto predicted_q = torch::clamp(predicted_value + selected_advantage, -1.0, 1.0);
 				auto target_q = torch::clamp(values + advantage_values, -1.0, 1.0);
 				dueling_q_loss = torch::mse_loss(predicted_q, target_q);
 			}
-			auto predicted_next = model->transition(tokens, moves);
-			torch::Tensor target_next;
-			{
-				torch::NoGradGuard no_grad;
-				target_next = model->encode(next_states).detach();
-			}
 			// Cosine consistency avoids making latent scale itself a learning target.
-			auto predicted_unit = predicted_next /
-				predicted_next.square().sum(-1, true).sqrt().clamp_min(1e-8);
-			auto target_unit =
-				target_next / target_next.square().sum(-1, true).sqrt().clamp_min(1e-8);
+			auto predicted_next_fp32 = predicted_next.to(torch::kFloat32);
+			auto target_next_fp32 = target_next.to(torch::kFloat32);
+			auto predicted_unit = predicted_next_fp32 /
+				predicted_next_fp32.square().sum(-1, true).sqrt().clamp_min(1e-8);
+			auto target_unit = target_next_fp32 /
+				target_next_fp32.square().sum(-1, true).sqrt().clamp_min(1e-8);
 			auto dynamics_loss = 1.0 - (predicted_unit * target_unit).sum(-1).mean();
-			auto imagined = model->predict(predicted_next);
 			auto imagined_value_loss =
-				torch::mse_loss(imagined.value.squeeze(1), next_values);
+				torch::mse_loss(imagined.value.squeeze(1).to(torch::kFloat32), next_values);
 			auto loss = policy_loss + options.value_weight * value_loss +
 					options.dueling_q_weight * dueling_q_loss +
 					options.dynamics_weight * dynamics_loss +
@@ -725,20 +748,25 @@ void train_supervised(const TrainOptions &options) {
 
 			++global_step;
 			++batches;
-			policy_total += policy_loss.item<double>();
-			value_total += value_loss.item<double>();
-			dueling_q_total += dueling_q_loss.item<double>();
-			dynamics_total += dynamics_loss.item<double>();
-			imagined_value_total += imagined_value_loss.item<double>();
+			metric_totals.add_(
+				torch::stack({policy_loss.detach(), value_loss.detach(), dueling_q_loss.detach(),
+							  dynamics_loss.detach(), imagined_value_loss.detach()}));
 			if (options.log_every > 0 &&
 				(global_step == 1 || global_step % options.log_every == 0)) {
+				auto metrics =
+					torch::stack({policy_loss.detach(), value_loss.detach(),
+								  dueling_q_loss.detach(), dynamics_loss.detach(),
+								  imagined_value_loss.detach(), loss.detach()})
+						.to(torch::kCPU)
+						.contiguous();
+				auto metric_values = metrics.accessor<float, 1>();
 				std::cout << "train step: epoch=" << epoch << " global_step=" << global_step
-						  << " policy=" << policy_loss.item<double>()
-						  << " value=" << value_loss.item<double>()
-						  << " dueling_q=" << dueling_q_loss.item<double>()
-						  << " dynamics=" << dynamics_loss.item<double>()
-						  << " imagined_value=" << imagined_value_loss.item<double>()
-						  << " loss=" << loss.item<double>() << std::endl;
+						  << " policy=" << metric_values[0]
+						  << " value=" << metric_values[1]
+						  << " dueling_q=" << metric_values[2]
+						  << " dynamics=" << metric_values[3]
+						  << " imagined_value=" << metric_values[4]
+						  << " loss=" << metric_values[5] << std::endl;
 			}
 			if (options.save_every > 0 && global_step % options.save_every == 0) {
 				save_checkpoint_atomic(options.output, model,
@@ -752,13 +780,15 @@ void train_supervised(const TrainOptions &options) {
 			}
 		}
 		save_checkpoint_atomic(options.output, model, {options.channels, options.blocks});
+		auto epoch_metrics = metric_totals.to(torch::kCPU).contiguous();
+		auto epoch_values = epoch_metrics.accessor<float, 1>();
 		std::cout << "epoch=" << epoch << ", steps=" << global_step
-				  << ", policy=" << policy_total / std::max<std::int64_t>(1, batches)
-				  << ", value=" << value_total / std::max<std::int64_t>(1, batches)
-				  << ", dueling_q=" << dueling_q_total / std::max<std::int64_t>(1, batches)
-				  << ", dynamics=" << dynamics_total / std::max<std::int64_t>(1, batches)
-				  << ", imagined_value="
-				  << imagined_value_total / std::max<std::int64_t>(1, batches)
+				  << ", policy=" << epoch_values[0] / std::max<std::int64_t>(1, batches)
+				  << ", value=" << epoch_values[1] / std::max<std::int64_t>(1, batches)
+				  << ", dueling_q=" << epoch_values[2] / std::max<std::int64_t>(1, batches)
+				  << ", dynamics=" << epoch_values[3] / std::max<std::int64_t>(1, batches)
+				  << ", imagined_value=" << epoch_values[4] /
+												 std::max<std::int64_t>(1, batches)
 				  << std::endl;
 	}
 	std::cout << "training finished: " << options.output.string() << std::endl;

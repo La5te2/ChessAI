@@ -22,7 +22,7 @@ int main(int argc, char **argv) {
 				<< "  --instant-mate-first <0|1> --root-topn <n>\n";
 			return 0;
 		}
-		const auto model_path = args.get("model", "models/gadus.pth");
+		const auto model_path = args.get("model", "models/gadus/gadus.pth");
 		const auto device = gadus::resolve_device(args.get("device", "auto"));
 		gadus::SearchOptions options;
 		options.precision =

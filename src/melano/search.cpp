@@ -13,7 +13,8 @@ int main(int argc, char **argv) {
 		if (args.has("help")) {
 			std::cout
 				<< "Usage: search --model <melano.pth> [--fen <fen>] [options]\n"
-				<< "  --device <auto|cpu|cuda> --search-type <closed|only-mcts>\n"
+				<< "  --device <auto|cpu|cuda> --precision <fp32|bf16>\n"
+				<< "  --search-type <closed|only-mcts>\n"
 				<< "  --mcts-sims <n> --mcts-min-sims <n> --mcts-batch-size <n> --movetime-ms "
 				   "<ms>\n"
 				<< "  --c-puct <x> --c-puct-base <x> --c-puct-factor <x> --fpu-reduction <x>\n"
@@ -24,6 +25,8 @@ int main(int argc, char **argv) {
 		const auto model_path = args.get("model", "models/melano.pth");
 		const auto device = melano::resolve_device(args.get("device", "auto"));
 		melano::SearchOptions options;
+		options.precision =
+			melano::parse_compute_precision(args.get("precision", "fp32"));
 		options.type = melano::parse_search_type(args.get("search-type", "only-mcts"));
 		options.mcts_sims = args.get_int("mcts-sims", options.mcts_sims);
 		options.mcts_min_sims = args.get_int("mcts-min-sims", options.mcts_min_sims);

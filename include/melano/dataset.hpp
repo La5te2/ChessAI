@@ -8,6 +8,7 @@
 #include <vector>
 #include <torch/types.h>
 #include "melano/game.hpp"
+#include "melano/precision.hpp"
 
 namespace melano {
 
@@ -48,7 +49,8 @@ class SupervisedH5 {
 	/// Returns immutable schema and row-count metadata.
 	const DatasetInfo &info() const noexcept;
 	/// Reads arbitrary rows and decodes state, move, value, and advantage tensors.
-	SupervisedBatch read(const std::vector<std::int64_t> &indices) const;
+	SupervisedBatch read(const std::vector<std::int64_t> &indices,
+						 bool pinned_memory = false) const;
 
 	private:
 	struct Impl;
@@ -86,6 +88,7 @@ struct TrainOptions {
 	int log_every = 100;
 	std::uint64_t seed = 2026;
 	std::string device = "auto";
+	ComputePrecision precision = ComputePrecision::Fp32;
 };
 
 /// Trains a new Melano model from scratch and atomically writes the final checkpoint.

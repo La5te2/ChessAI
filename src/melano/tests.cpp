@@ -48,6 +48,14 @@ void require_finite_gradients(const melano::Model &model) {
 // Exercise the complete minimal Melano inference/training/checkpoint/search surface.
 int main() {
 	try {
+		require(melano::parse_compute_precision("fp32") == melano::ComputePrecision::Fp32,
+				"fp32 precision parsing failed");
+		require(melano::parse_compute_precision("bf16") == melano::ComputePrecision::Bf16,
+				"bf16 precision parsing failed");
+		require(std::string(melano::compute_precision_name(melano::ComputePrecision::Bf16)) ==
+					"bf16",
+				"bf16 precision name mismatch");
+
 		chess::Board board;
 		require(board.hash() == 0x463b96181691fc9cULL, "Polyglot start-position hash mismatch");
 		const auto packed = melano::encode_state(board);
@@ -70,8 +78,32 @@ int main() {
 				"king-side castling policy index mismatch");
 		require(melano::move_to_index(queen_side_castle) == 4 * 64 + 2,
 				"queen-side castling policy index mismatch");
+		chess::Board black_castling("r3k2r/8/8/8/8/8/8/R3K2R b KQkq - 0 1");
+		require_move_codec(black_castling);
+		const auto black_king_side = chess::uci::uciToMove(black_castling, "e8g8");
+		const auto black_queen_side = chess::uci::uciToMove(black_castling, "e8c8");
+		require(melano::move_to_index(black_king_side) == 60 * 64 + 62,
+				"black king-side castling policy index mismatch");
+		require(melano::move_to_index(black_queen_side) == 60 * 64 + 58,
+				"black queen-side castling policy index mismatch");
+		chess::Board black_promotion("k6K/8/8/8/8/8/p7/8 b - - 0 1");
+		require_move_codec(black_promotion);
 		chess::Board en_passant("8/8/8/3pP3/8/8/8/K6k w - d6 0 1");
 		require_move_codec(en_passant);
+		chess::Board black_en_passant("8/8/8/8/3pP3/8/8/K6k b - e3 0 1");
+		require_move_codec(black_en_passant);
+
+		// Exercise both colors and varied tactical states beyond hand-picked special moves.
+		chess::Board walk;
+		for (int ply = 0; ply < 256; ++ply) {
+			if (melano::game_is_over(walk)) {
+				walk = chess::Board();
+			}
+			require_move_codec(walk);
+			const auto moves = melano::legal_moves(walk);
+			require(!moves.empty(), "non-terminal codec walk has no legal moves");
+			walk.makeMove(moves[(static_cast<std::size_t>(ply) * 37 + 11) % moves.size()]);
+		}
 
 		chess::Board checkmate("7k/6Q1/6K1/8/8/8/8/8 b - - 0 1");
 		require(melano::game_is_over(checkmate), "checkmate was not detected");
@@ -127,6 +159,18 @@ int main() {
 			melano::SupervisedH5 supervised(h5);
 			require(supervised.info().length == 2, "annotated PGN row count mismatch");
 			const auto supervised_batch = supervised.read({0, 1});
+			const auto expected_initial = melano::encode_boards({board}).index({0});
+			require(torch::equal(supervised_batch.states.index({0}), expected_initial),
+					"HDF5 initial state differs from live state codec");
+			auto after_e4 = board;
+			const auto e4 = chess::uci::uciToMove(after_e4, "e2e4");
+			after_e4.makeMove(e4);
+			const auto expected_after_e4 = melano::encode_boards({after_e4}).index({0});
+			require(torch::equal(supervised_batch.next_states.index({0}), expected_after_e4),
+					"HDF5 successor state differs from live state codec");
+			require(supervised_batch.moves.index({0}).item<std::int64_t>() ==
+						melano::move_to_index(e4),
+					"HDF5 policy target differs from live move codec");
 			const float expected_successor = -static_cast<float>(std::tanh(0.60 / 3.0));
 			require(std::abs(supervised_batch.values.index({0}).item<float>()) < 1e-6F,
 					"first unanchored value must remain neutral");

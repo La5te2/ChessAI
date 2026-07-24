@@ -180,21 +180,29 @@ PackedState encode_state(const chess::Board &board) {
 	return packed;
 }
 
-// Copy compact byte tokens to int64 indices expected by LibTorch embedding layers.
-torch::Tensor decode_states(const std::uint8_t *packed, std::int64_t count) {
-	auto bytes = torch::from_blob(const_cast<std::uint8_t *>(packed), {count, kStateFeatures},
-								torch::TensorOptions().dtype(torch::kUInt8));
-	return bytes.to(torch::kInt64).clone();
+// Expand compact byte tokens into optionally pinned int64 embedding indices.
+torch::Tensor decode_states(const std::uint8_t *packed, std::int64_t count,
+							bool pinned_memory) {
+	auto options = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
+	if (pinned_memory) {
+		options = options.pinned_memory(true);
+	}
+	auto output = torch::empty({count, kStateFeatures}, options);
+	auto *destination = output.data_ptr<std::int64_t>();
+	std::transform(packed, packed + count * kStateFeatures, destination,
+				   [](std::uint8_t value) { return static_cast<std::int64_t>(value); });
+	return output;
 }
 
 // Encode live positions through exactly the same representation used by HDF5 rows.
-torch::Tensor encode_boards(const std::vector<chess::Board> &boards) {
+torch::Tensor encode_boards(const std::vector<chess::Board> &boards, bool pinned_memory) {
 	std::vector<std::uint8_t> packed(boards.size() * kStateFeatures);
 	for (std::size_t index = 0; index < boards.size(); ++index) {
 		const auto state = encode_state(boards[index]);
 		std::copy(state.begin(), state.end(), packed.begin() + index * state.size());
 	}
-	return decode_states(packed.data(), static_cast<std::int64_t>(boards.size()));
+	return decode_states(packed.data(), static_cast<std::int64_t>(boards.size()),
+						 pinned_memory);
 }
 
 // Report any library-recognized terminal reason, including mate and rule draws.

@@ -11,7 +11,8 @@ int main(int argc, char **argv) {
 		if (args.has("help")) {
 			std::cout
 				<< "Usage: arena --candidate <model> --baseline <model> [options]\n"
-				<< "  --device <auto|cpu|cuda> --games <n> --games-in-flight <n> --max-plies <n>\n"
+				<< "  --device <auto|cpu|cuda> --precision <fp32|bf16>\n"
+				<< "  --games <n> --games-in-flight <n> --max-plies <n>\n"
 				<< "  --opening-book <path|empty> --book-plies <n> --max-book-positions <n>\n"
 				<< "  --search-type <closed|only-mcts> --sims <n> --mcts-min-sims <n>\n"
 				<< "  --mcts-batch-size <n> --movetime-ms <ms> --c-puct <x> --c-puct-base <x>\n"
@@ -36,6 +37,8 @@ int main(int argc, char **argv) {
 		options.pgn_output = args.get("pgn-output", options.pgn_output.string());
 
 		auto &search = options.search;
+		search.precision =
+			melano::parse_compute_precision(args.get("precision", "fp32"));
 		search.type = melano::parse_search_type(args.get("search-type", "only-mcts"));
 		search.mcts_sims = args.get_int("sims", search.mcts_sims);
 		search.mcts_min_sims = args.get_int("mcts-min-sims", search.mcts_min_sims);

@@ -121,21 +121,71 @@ struct Searcher::Impl {
 			throw std::invalid_argument("Melano search requires a model");
 		}
 		options.virtual_loss = std::max(0.0, options.virtual_loss);
+		validate_compute_precision(options.precision, device);
 		model->to(device);
 		model->eval();
 	}
 
-	// Copy P/V/A outputs to host memory and optionally retain one device latent per row.
-	Evaluation collect(ModelOutput prediction, const torch::Tensor &latents = {}) {
-		auto probabilities = torch::softmax(prediction.policy, 1).to(torch::kCPU).contiguous();
-		auto values = prediction.value.reshape({-1}).to(torch::kCPU).contiguous();
-		auto advantages = prediction.advantages.to(torch::kCPU).contiguous();
+	// Gather only legal P/A entries before crossing the device boundary.
+	Evaluation collect(ModelOutput prediction, const std::vector<chess::Board> &boards,
+					   const torch::Tensor &latents = {}) {
+		std::vector<std::vector<int>> legal_actions(boards.size());
+		std::size_t legal_width = 1;
+		for (std::size_t row = 0; row < boards.size(); ++row) {
+			for (const auto &move : legal_moves(boards[row])) {
+				legal_actions[row].push_back(move_to_index(move));
+			}
+			legal_width = std::max(legal_width, legal_actions[row].size());
+		}
+
+		const bool pin_memory = device.is_cuda();
+		auto index_options =
+			torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
+		auto mask_options =
+			torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU);
+		if (pin_memory) {
+			index_options = index_options.pinned_memory(true);
+			mask_options = mask_options.pinned_memory(true);
+		}
+		auto legal_indices =
+			torch::zeros({static_cast<std::int64_t>(boards.size()),
+						  static_cast<std::int64_t>(legal_width)},
+						 index_options);
+		auto legal_mask =
+			torch::zeros({static_cast<std::int64_t>(boards.size()),
+						  static_cast<std::int64_t>(legal_width)},
+						 mask_options);
+		auto index_rows = legal_indices.accessor<std::int64_t, 2>();
+		auto mask_rows = legal_mask.accessor<bool, 2>();
+		for (std::size_t row = 0; row < legal_actions.size(); ++row) {
+			for (std::size_t column = 0; column < legal_actions[row].size(); ++column) {
+				index_rows[static_cast<std::int64_t>(row)]
+						  [static_cast<std::int64_t>(column)] = legal_actions[row][column];
+				mask_rows[static_cast<std::int64_t>(row)]
+						 [static_cast<std::int64_t>(column)] = true;
+			}
+		}
+		auto device_indices = legal_indices.to(device, true);
+		auto device_mask = legal_mask.to(device, true);
+		auto compact_logits = prediction.policy.to(torch::kFloat32).gather(1, device_indices);
+		compact_logits = compact_logits.masked_fill(
+			~device_mask, -std::numeric_limits<float>::infinity());
+		auto probabilities =
+			torch::softmax(compact_logits, 1).to(torch::kCPU).contiguous();
+		auto values = prediction.value.reshape({-1})
+						  .to(torch::kFloat32)
+						  .to(torch::kCPU)
+						  .contiguous();
+		auto advantages = prediction.advantages.to(torch::kFloat32)
+							  .gather(1, device_indices)
+							  .to(torch::kCPU)
+							  .contiguous();
 		const auto rows = static_cast<std::size_t>(values.size(0));
 
 		Evaluation output;
-		output.policies.resize(rows, std::vector<float>(kActionSize));
+		output.policies.resize(rows, std::vector<float>(kActionSize, 0.0F));
 		output.values.resize(rows);
-		output.advantages.resize(rows, std::vector<float>(kActionSize));
+		output.advantages.resize(rows, std::vector<float>(kActionSize, 0.0F));
 		if (latents.defined()) {
 			output.latents.reserve(rows);
 		}
@@ -143,11 +193,16 @@ struct Searcher::Impl {
 		auto value_rows = values.accessor<float, 1>();
 		auto advantage_rows = advantages.accessor<float, 2>();
 		for (std::size_t row = 0; row < rows; ++row) {
-			std::copy_n(&probability_rows[static_cast<std::int64_t>(row)][0], kActionSize,
-						output.policies[row].begin());
 			output.values[row] = value_rows[static_cast<std::int64_t>(row)];
-			std::copy_n(&advantage_rows[static_cast<std::int64_t>(row)][0], kActionSize,
-						output.advantages[row].begin());
+			for (std::size_t column = 0; column < legal_actions[row].size(); ++column) {
+				const int action = legal_actions[row][column];
+				output.policies[row][action] =
+					probability_rows[static_cast<std::int64_t>(row)]
+									[static_cast<std::int64_t>(column)];
+				output.advantages[row][action] =
+					advantage_rows[static_cast<std::int64_t>(row)]
+								  [static_cast<std::int64_t>(column)];
+			}
 			if (latents.defined()) {
 				output.latents.push_back(
 					latents.index({static_cast<std::int64_t>(row)}).contiguous());
@@ -162,14 +217,22 @@ struct Searcher::Impl {
 			return {};
 		}
 		torch::InferenceMode guard;
-		auto states = encode_boards(boards).to(device, true);
-		auto latents = model->encode(states);
-		return collect(model->predict(latents), latents);
+		const bool pin_memory = device.is_cuda();
+		auto states = encode_boards(boards, pin_memory).to(device, true);
+		torch::Tensor latents;
+		ModelOutput prediction;
+		{
+			AutocastGuard autocast(options.precision, device);
+			latents = model->encode(states);
+			prediction = model->predict(latents);
+		}
+		return collect(std::move(prediction), boards, latents);
 	}
 
 	// Predict odd-depth leaves from their exact even-depth parent anchors.
 	Evaluation evaluate_latent(const std::vector<torch::Tensor> &parents,
-							   const std::vector<std::int64_t> &actions) {
+							   const std::vector<std::int64_t> &actions,
+							   const std::vector<chess::Board> &boards) {
 		if (parents.empty()) {
 			return {};
 		}
@@ -180,8 +243,13 @@ struct Searcher::Impl {
 		auto parent_batch = torch::stack(parents);
 		auto action_batch =
 			torch::tensor(actions, torch::TensorOptions().dtype(torch::kInt64).device(device));
-		auto successors = model->transition(parent_batch, action_batch);
-		return collect(model->predict(successors));
+		ModelOutput prediction;
+		{
+			AutocastGuard autocast(options.precision, device);
+			auto successors = model->transition(parent_batch, action_batch);
+			prediction = model->predict(successors);
+		}
+		return collect(std::move(prediction), boards);
 	}
 
 	// Expand legal edges and derive each current-player Q prior as clamp(V(s)+A(s,a)).
@@ -619,8 +687,10 @@ struct Searcher::Impl {
 					if (!latent_rows.empty()) {
 						std::vector<torch::Tensor> parent_latents;
 						std::vector<std::int64_t> actions;
+						std::vector<chess::Board> leaf_boards;
 						parent_latents.reserve(latent_rows.size());
 						actions.reserve(latent_rows.size());
+						leaf_boards.reserve(latent_rows.size());
 						for (const auto index : latent_rows) {
 							const auto &leaf = selected[index];
 							if (leaf.path.size() < 2) {
@@ -634,8 +704,10 @@ struct Searcher::Impl {
 							}
 							parent_latents.push_back(parent->anchor_latent);
 							actions.push_back(move_to_index(leaf.leaf->move));
+							leaf_boards.push_back(leaf.board);
 						}
-						const auto evaluation = evaluate_latent(parent_latents, actions);
+						const auto evaluation =
+							evaluate_latent(parent_latents, actions, leaf_boards);
 						std::unordered_set<std::size_t> evaluated_states;
 						for (std::size_t row = 0; row < latent_rows.size(); ++row) {
 							const auto index = latent_rows[row];

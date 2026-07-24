@@ -9,7 +9,7 @@ blackMovetimeMs = 60000
 
 whiteUci = "python.exe scripts\uci.py" & _
   " --arch gadus" & _
-  " --model models\current6.pth" & _
+  " --model models\gadus\candidate1.pth" & _
   " --device cpu" & _
   " --search-type only-mcts" & _
   " --mcts-sims 3000" & _
@@ -24,7 +24,7 @@ whiteUci = "python.exe scripts\uci.py" & _
 
 blackUci = "python.exe scripts\uci.py" & _
   " --arch gadus" & _
-  " --model models\candidate1.pth" & _
+  " --model models\gadus\current6.pth" & _
   " --device cpu" & _
   " --search-type only-mcts" & _
   " --mcts-sims 3000" & _

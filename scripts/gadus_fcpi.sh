@@ -7,7 +7,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 
 FCPI="${FCPI:-build/gadus/fcpi}"
-MODEL="${MODEL:-models/candidate2.pth}"
+MODEL="${MODEL:-models/gadus/candidate2.pth}"
 DEVICE="${DEVICE:-cuda}"
 PRECISION="${PRECISION:-bf16}"
 
@@ -76,7 +76,7 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 		"usage: bash scripts/gadus_fcpi.sh" \
 		"" \
 		"Environment overrides:" \
-		"  MODEL=models/candidate2.pth ITERATIONS=5 GAMES_PER_ITER=2000" \
+		"  MODEL=models/gadus/candidate2.pth ITERATIONS=5 GAMES_PER_ITER=2000" \
 		"  PRECISION=bf16 BATCH_SIZE=1024 INFERENCE_BATCH_SIZE=512 EVAL_GAMES=400" \
 		"" \
 		"The process runs in the background. The launcher prints its run id, pid," \
