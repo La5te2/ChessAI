@@ -261,7 +261,13 @@ class StadiumBoardState:
         game.headers["Black"] = self.black_name
         game.headers["Result"] = self.result_override
         game.headers["Termination"] = self.termination
-        return str(game)
+        exporter = chess.pgn.StringExporter(
+            headers=True,
+            variations=False,
+            comments=False,
+            columns=80,
+        )
+        return game.accept(exporter).strip()
 
     def pgn_movetext(self) -> str:
         game = chess.pgn.Game.from_board(self.board)

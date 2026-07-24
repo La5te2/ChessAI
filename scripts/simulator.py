@@ -539,7 +539,13 @@ class SimulatorState:
         game.headers["White"] = "Player"
         game.headers["Black"] = "Player"
         game.headers["Result"] = self.result() if self.game_over() else "*"
-        return str(game)
+        exporter = chess.pgn.StringExporter(
+            headers=True,
+            variations=False,
+            comments=False,
+            columns=80,
+        )
+        return game.accept(exporter).strip()
 
     def pgn_movetext(self) -> str:
         game = chess.pgn.Game.from_board(self.board)
