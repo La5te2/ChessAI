@@ -24,7 +24,7 @@ whiteUci = "python.exe scripts\uci.py" & _
 
 blackUci = "python.exe scripts\uci.py" & _
   " --arch gadus" & _
-  " --model models\gadus\current6.pth" & _
+  " --model models\gadus\candidate3.pth" & _
   " --device cpu" & _
   " --search-type only-mcts" & _
   " --mcts-sims 3000" & _
