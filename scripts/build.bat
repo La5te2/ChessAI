@@ -5,9 +5,8 @@ for %%I in ("%~dp0..") do set "ROOT_DIR=%%~fI"
 set "NINJA_DIR=%ROOT_DIR%\api\ninja"
 set "NINJA=%NINJA_DIR%\ninja.exe"
 set "TORCH_DIR=%ROOT_DIR%\api\libtorch"
-set "WORK_DIR=%ROOT_DIR%\.build-work"
-set "CRASH_DIR=%ROOT_DIR%\.crash"
 set "PUBLISH_DIR=%ROOT_DIR%\build"
+set "WORK_DIR=%PUBLISH_DIR%\.build-work"
 
 if not "%GADIDAE_TORCH_DIR%"=="" set "TORCH_DIR=%GADIDAE_TORCH_DIR%"
 if not exist "%NINJA%" (
@@ -36,14 +35,11 @@ if errorlevel 1 (
 )
 
 for %%I in ("%WORK_DIR%") do set "RESOLVED_WORK=%%~fI"
-for %%I in ("%CRASH_DIR%") do set "RESOLVED_CRASH=%%~fI"
 for %%I in ("%PUBLISH_DIR%") do set "RESOLVED_PUBLISH=%%~fI"
-if /i not "%RESOLVED_WORK%"=="%ROOT_DIR%\.build-work" exit /b 1
-if /i not "%RESOLVED_CRASH%"=="%ROOT_DIR%\.crash" exit /b 1
+if /i not "%RESOLVED_WORK%"=="%ROOT_DIR%\build\.build-work" exit /b 1
 if /i not "%RESOLVED_PUBLISH%"=="%ROOT_DIR%\build" exit /b 1
 
-if exist "%WORK_DIR%" rmdir /s /q "%WORK_DIR%"
-if exist "%CRASH_DIR%" rmdir /s /q "%CRASH_DIR%"
+if not exist "%PUBLISH_DIR%" mkdir "%PUBLISH_DIR%" || exit /b 1
 set "PATH=%NINJA_DIR%;%PATH%"
 set "VSLANG=1033"
 
@@ -51,7 +47,8 @@ cmake -S "%ROOT_DIR%" -B "%WORK_DIR%" -G Ninja -DCMAKE_BUILD_TYPE=Release -DGADI
 cmake --build "%WORK_DIR%" --parallel || goto :failed
 ctest --test-dir "%WORK_DIR%" --output-on-failure || goto :failed
 
-if exist "%PUBLISH_DIR%" rmdir /s /q "%PUBLISH_DIR%"
+if exist "%PUBLISH_DIR%\gadus" rmdir /s /q "%PUBLISH_DIR%\gadus"
+if exist "%PUBLISH_DIR%\melano" rmdir /s /q "%PUBLISH_DIR%\melano"
 mkdir "%PUBLISH_DIR%\gadus" || goto :failed
 mkdir "%PUBLISH_DIR%\melano" || goto :failed
 
@@ -65,23 +62,18 @@ for %%A in (gadus melano) do (
 	)
 )
 
-rmdir /s /q "%WORK_DIR%"
 echo Gadus build finished: %PUBLISH_DIR%\gadus
 echo Melano build finished: %PUBLISH_DIR%\melano
+echo Incremental build cache: %WORK_DIR%
 exit /b 0
 
 :failed
 set "ERROR_CODE=%ERRORLEVEL%"
 if "%ERROR_CODE%"=="0" set "ERROR_CODE=1"
 if exist "%WORK_DIR%" (
-	move "%WORK_DIR%" "%CRASH_DIR%" >nul
-	if errorlevel 1 (
-		echo Build failed. Diagnostic files retained in: %WORK_DIR%
-	) else (
-		echo Build failed. Diagnostic files retained in: %CRASH_DIR%
-		if exist "%CRASH_DIR%\Testing\Temporary\LastTest.log" (
-			echo CTest log: %CRASH_DIR%\Testing\Temporary\LastTest.log
-		)
+	echo Build failed. Diagnostic files retained in: %WORK_DIR%
+	if exist "%WORK_DIR%\Testing\Temporary\LastTest.log" (
+		echo CTest log: %WORK_DIR%\Testing\Temporary\LastTest.log
 	)
 )
 exit /b %ERROR_CODE%

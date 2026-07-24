@@ -21,5 +21,3 @@ backup/
 /api/downloads/
 /api/ninja/
 /build/
-/.build-work/
-/.crash/

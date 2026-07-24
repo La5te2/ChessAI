@@ -35,7 +35,7 @@ fi
 echo "opening generation start"
 echo "opening source: pgn=${PGN}"
 echo "opening output: output=${OUTPUT} min_fens=${MIN_FENS} book_plies=${BOOK_PLIES}"
-echo "opening teacher: uci=${UCI} uci_depth=${UCI_DEPTH} uci_movetime_ms=${UCI_MOVETIME_MS} uci_threads=${UCI_THREADS} uci_hash_mb=${UCI_HASH_MB}"
+echo "opening engine: uci=${UCI} uci_depth=${UCI_DEPTH} uci_movetime_ms=${UCI_MOVETIME_MS} uci_threads=${UCI_THREADS} uci_hash_mb=${UCI_HASH_MB}"
 echo "opening filter: max_abs_cp=${MAX_ABS_CP} log_every=${LOG_EVERY}"
 
 python scripts/opening_book.py \

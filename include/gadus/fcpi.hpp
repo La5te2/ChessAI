@@ -26,8 +26,8 @@ struct FcpiOptions {
 	int inference_batch_size = 64;
 	int target_records_per_batch = 256;
 	int counterfactual_topk = 6;
-	int opponent_reply_topk = 4;
-	double opponent_reply_temperature = 0.2;
+	int counterfactual_reply_topk = 4;
+	double counterfactual_reply_temperature = 0.2;
 	int counterfactual_min_plies = 2;
 	int counterfactual_max_plies = 6;
 	double counterfactual_target_average_plies = 4.0;

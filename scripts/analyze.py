@@ -1,22 +1,217 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
+import math
 import os
 import re
+import sqlite3
 import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, TextIO
 
 import chess
+import chess.engine
 import chess.pgn
 
-from teacher import UciTeacher, TeacherConfig, move_accuracy_from_regret
-
-
 MATE_CP_THRESHOLD = 90000
+MATE_SCORE_CP = 100000
+ANALYSIS_CACHE_NAMESPACE = "uci-pgn-analysis"
 UCI_BINARY = "stockfish.exe" if os.name == "nt" else "stockfish"
 UCI_PATH = str(Path(__file__).resolve().parent.parent / "models" / "stockfish" / UCI_BINARY)
+
+
+@dataclass(frozen=True)
+class UciConfig:
+    uci: str = UCI_PATH
+    depth: int = 14
+    movetime_ms: int = 0
+    multipv: int = 5
+    threads: int = 4
+    hash_mb: int = 512
+    cache_path: Optional[str] = None
+
+
+class AnalysisCache:
+    def __init__(self, path: Optional[str]):
+        self.connection = None
+        if path:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            self.connection = sqlite3.connect(path, timeout=60)
+            self.connection.execute(
+                "CREATE TABLE IF NOT EXISTS analysis_cache "
+                "(cache_key TEXT PRIMARY KEY, payload TEXT NOT NULL)"
+            )
+            self.connection.commit()
+
+    def get(self, key: str) -> Optional[Dict]:
+        if self.connection is None:
+            return None
+        row = self.connection.execute(
+            "SELECT payload FROM analysis_cache WHERE cache_key = ?", (key,)
+        ).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def put(self, key: str, payload: Dict) -> None:
+        if self.connection is None:
+            return
+        self.connection.execute(
+            "INSERT OR REPLACE INTO analysis_cache(cache_key, payload) VALUES (?, ?)",
+            (key, json.dumps(payload, ensure_ascii=False, separators=(",", ":"))),
+        )
+        self.connection.commit()
+
+    def close(self) -> None:
+        if self.connection is not None:
+            self.connection.close()
+            self.connection = None
+
+
+class UciAnalyzer:
+    def __init__(self, config: UciConfig):
+        self.config = config
+        if not os.path.exists(config.uci):
+            raise FileNotFoundError(f"UCI engine not found: {config.uci}")
+        self.engine = chess.engine.SimpleEngine.popen_uci(config.uci)
+        engine_options = {}
+        if config.threads > 0 and "Threads" in self.engine.options:
+            engine_options["Threads"] = int(config.threads)
+        if config.hash_mb > 0 and "Hash" in self.engine.options:
+            engine_options["Hash"] = int(config.hash_mb)
+        if engine_options:
+            self.engine.configure(engine_options)
+        self.cache = AnalysisCache(config.cache_path)
+
+    def close(self) -> None:
+        try:
+            self.engine.quit()
+        finally:
+            self.cache.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.close()
+
+    def _limit(self) -> chess.engine.Limit:
+        parameters = {}
+        if self.config.depth > 0:
+            parameters["depth"] = int(self.config.depth)
+        if self.config.movetime_ms > 0:
+            parameters["time"] = float(self.config.movetime_ms) / 1000.0
+        if not parameters:
+            parameters["depth"] = 10
+        return chess.engine.Limit(**parameters)
+
+    @staticmethod
+    def _score_cp(info: Dict, pov: chess.Color) -> Optional[int]:
+        score = info.get("score")
+        if score is None:
+            return None
+        try:
+            return int(score.pov(pov).score(mate_score=MATE_SCORE_CP))
+        except Exception:
+            return None
+
+    def _score_child_move(
+        self, board: chess.Board, move: chess.Move, pov: chess.Color
+    ) -> Optional[int]:
+        child = board.copy(stack=False)
+        child.push(move)
+        info = self.engine.analyse(child, self._limit())
+        return self._score_cp(info, pov)
+
+    def _cache_key(
+        self, board: chess.Board, played_move: Optional[chess.Move]
+    ) -> str:
+        raw = "|".join(
+            [
+                ANALYSIS_CACHE_NAMESPACE,
+                str(Path(self.config.uci).resolve()),
+                board.fen(),
+                played_move.uci() if played_move else "-",
+                str(self.config.depth),
+                str(self.config.movetime_ms),
+                str(self.config.multipv),
+                str(self.config.threads),
+                str(self.config.hash_mb),
+            ]
+        )
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def analyse(
+        self, board: chess.Board, played_move: Optional[chess.Move] = None
+    ) -> Dict:
+        if played_move is not None and played_move not in board.legal_moves:
+            raise ValueError(f"played move is illegal: {played_move.uci()}")
+
+        cache_key = self._cache_key(board, played_move)
+        cached = self.cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        mover = board.turn
+        legal_count = board.legal_moves.count()
+        multipv = max(1, min(int(self.config.multipv), legal_count))
+        infos = self.engine.analyse(board, self._limit(), multipv=multipv)
+        if isinstance(infos, dict):
+            infos = [infos]
+
+        rows = []
+        for info in infos:
+            pv = info.get("pv") or []
+            if not pv or pv[0] not in board.legal_moves:
+                continue
+            score = self._score_cp(info, mover)
+            if score is not None:
+                rows.append({"move": pv[0].uci(), "score_cp": int(score)})
+
+        if not rows:
+            legal = sorted(board.legal_moves, key=lambda move: move.uci())
+            payload = {
+                "move_scores_cp": {move.uci(): 0 for move in legal},
+                "best_move": legal[0].uci() if legal else None,
+                "best_score_cp": 0,
+                "played_score_cp": 0,
+                "regret_cp": 0,
+                "margin_cp": 0,
+            }
+            self.cache.put(cache_key, payload)
+            return payload
+
+        rows.sort(key=lambda row: (-row["score_cp"], row["move"]))
+        move_scores = {row["move"]: int(row["score_cp"]) for row in rows}
+        best_move = rows[0]["move"]
+        best_score = int(rows[0]["score_cp"])
+        margin = best_score - int(rows[1]["score_cp"]) if len(rows) > 1 else 300
+        played_score = best_score
+        if played_move is not None:
+            played_uci = played_move.uci()
+            if played_uci in move_scores:
+                played_score = int(move_scores[played_uci])
+            else:
+                child_score = self._score_child_move(board, played_move, mover)
+                if child_score is not None:
+                    played_score = int(child_score)
+
+        payload = {
+            "move_scores_cp": move_scores,
+            "best_move": best_move,
+            "best_score_cp": best_score,
+            "played_score_cp": played_score,
+            "regret_cp": max(0, best_score - played_score),
+            "margin_cp": max(0, margin),
+        }
+        self.cache.put(cache_key, payload)
+        return payload
+
+
+def move_accuracy_from_regret(regret_cp: float) -> float:
+    regret = max(0.0, float(regret_cp))
+    return float(max(0.0, min(100.0, 100.0 * math.exp(-regret / 350.0))))
 
 
 @dataclass
@@ -180,7 +375,7 @@ def row_comment(row: MoveRow) -> str:
 def analyse_game(
     game: chess.pgn.Game,
     game_number: int,
-    teacher: UciTeacher,
+    analyzer: UciAnalyzer,
     top_count: int,
     critical_threshold_cp: int,
     annotate_pgn: bool = False,
@@ -191,7 +386,7 @@ def analyse_game(
     node = game
 
     if annotate_pgn:
-        root_result = teacher.analyse(board, played_move=None)
+        root_result = analyzer.analyse(board, played_move=None)
         root_cp = white_cp_from_mover_cp(
             board,
             int(root_result.get("best_score_cp", 0)),
@@ -203,7 +398,7 @@ def analyse_game(
         prefix = side_prefix(board)
         played_san = board.san(move)
         played_label = move_with_prefix(prefix, played_san)
-        result = teacher.analyse(board, played_move=move)
+        result = analyzer.analyse(board, played_move=move)
 
         best_uci = str(result.get("best_move") or "")
         best_san = san_or_uci(board, best_uci)
@@ -437,7 +632,7 @@ def parse_args():
     parser.add_argument("--uci-multipv", type=int, default=5)
     parser.add_argument("--uci-threads", type=int, default=4)
     parser.add_argument("--uci-hash-mb", type=int, default=512)
-    parser.add_argument("--teacher-cache", default=None)
+    parser.add_argument("--analysis-cache", default=None)
     return parser.parse_args()
 
 
@@ -450,14 +645,14 @@ def main():
     out_path = output_path_for(str(input_path), args.output)
     os.makedirs(out_path.parent or ".", exist_ok=True)
 
-    config = TeacherConfig(
+    config = UciConfig(
         uci=args.uci,
         depth=args.uci_depth,
         movetime_ms=args.uci_movetime_ms,
         multipv=args.uci_multipv,
         threads=args.uci_threads,
         hash_mb=args.uci_hash_mb,
-        cache_path=args.teacher_cache,
+        cache_path=args.analysis_cache,
     )
 
     print(
@@ -486,14 +681,14 @@ def main():
     }
 
     with open(input_path, "r", encoding="utf-8", errors="ignore") as handle:
-        with UciTeacher(config) as teacher:
+        with UciAnalyzer(config) as analyzer:
             for game_number, game in enumerate(iter_games(handle), 1):
                 if not args.all_games and game_number != int(args.game_index):
                     continue
                 report, summary, annotated_game = analyse_game(
                     game=game,
                     game_number=game_number,
-                    teacher=teacher,
+                    analyzer=analyzer,
                     top_count=args.top_moves,
                     critical_threshold_cp=args.critical_threshold_cp,
                     annotate_pgn=args.pgn_comments,

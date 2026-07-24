@@ -27,7 +27,8 @@ namespace gadus {
 
 namespace {
 
-inline constexpr const char *kFcpiFormula = "gadus_soft_minimax_value_expansion_td_kl";
+inline constexpr const char *kFcpiFormula =
+	"gadus_gumbel_soft_bellman_beam_td_kl";
 
 // Format iteration numbers for stable, lexically sortable artifact names.
 std::string zero_pad(int value, int width) {
@@ -70,10 +71,11 @@ struct Branch {
 	bool terminal = false;
 };
 
-struct OpponentReply {
+struct SoftReply {
 	Branch *branch = nullptr;
 	chess::Board board;
 	float prior = 0.0F;
+	float child_value = 0.0F;
 	float root_value = 0.0F;
 	SearchResult evaluation;
 	bool terminal = false;
@@ -83,6 +85,7 @@ struct TargetSummary {
 	std::int64_t branches = 0;
 	std::int64_t branch_plies = 0;
 	std::int64_t terminal_branches = 0;
+	std::int64_t reply_evaluations = 0;
 	double residual_sum = 0.0;
 	std::int64_t residual_count = 0;
 };
@@ -263,23 +266,52 @@ std::vector<SearchResult> evaluate_chunks(Searcher &searcher,
 	return output;
 }
 
-// Select highest-scoring counterfactual actions while guaranteeing inclusion of the played move.
+// Keep Policy top-1 and the played action, then use Gumbel top-k without replacement
+// to expose plausible alternatives which a fixed Policy top-k would never inspect.
 std::vector<int> choose_candidates(const std::vector<int> &legal, const std::vector<float> &scores,
-								   int played, int topk) {
-	std::vector<std::size_t> order(legal.size());
-	std::iota(order.begin(), order.end(), 0);
-	std::stable_sort(order.begin(), order.end(), [&](std::size_t left, std::size_t right) {
-		return scores[left] > scores[right];
-	});
-	const std::size_t count = std::min<std::size_t>(std::max(1, topk), order.size());
+								   int played, int topk, std::mt19937_64 &rng) {
+	if (legal.empty() || legal.size() != scores.size()) {
+		throw std::invalid_argument("counterfactual candidates require aligned legal scores");
+	}
+	const std::size_t count =
+		std::min<std::size_t>(static_cast<std::size_t>(std::max(1, topk)), legal.size());
 	std::vector<int> selected;
-	for (std::size_t index = 0; index < count; ++index) {
-		selected.push_back(legal[order[index]]);
+	selected.reserve(count);
+	if (count == 1) {
+		selected.push_back(played);
+		return selected;
 	}
-	if (std::find(selected.begin(), selected.end(), played) == selected.end()) {
-		selected.back() = played;
+
+	const auto top = std::max_element(scores.begin(), scores.end()) - scores.begin();
+	selected.push_back(legal[static_cast<std::size_t>(top)]);
+	if (played != selected.front()) {
+		selected.push_back(played);
 	}
-	selected.erase(std::unique(selected.begin(), selected.end()), selected.end());
+
+	std::uniform_real_distribution<double> uniform(
+		std::nextafter(0.0, 1.0), std::nextafter(1.0, 0.0));
+	std::vector<std::pair<double, int>> proposals;
+	proposals.reserve(legal.size());
+	for (std::size_t index = 0; index < legal.size(); ++index) {
+		if (std::find(selected.begin(), selected.end(), legal[index]) != selected.end()) {
+			continue;
+		}
+		const double gumbel = -std::log(-std::log(uniform(rng)));
+		const double key =
+			std::log(std::clamp(static_cast<double>(scores[index]), 1e-12, 1.0)) + gumbel;
+		proposals.emplace_back(key, legal[index]);
+	}
+	std::stable_sort(proposals.begin(), proposals.end(),
+					 [](const auto &left, const auto &right) {
+						 return left.first > right.first;
+					 });
+	for (const auto &[key, action] : proposals) {
+		(void)key;
+		if (selected.size() >= count) {
+			break;
+		}
+		selected.push_back(action);
+	}
 	return selected;
 }
 
@@ -296,6 +328,7 @@ std::vector<Position> collect_selfplay(Model model, const torch::Device &device,
 	nlohmann::json starts;
 	const auto specs = make_sampling_specs(options, iteration, starts);
 	std::mt19937_64 rng(options.seed + iteration);
+	std::mt19937_64 proposal_rng(options.seed + iteration + 2'000'003);
 	std::vector<Trajectory> trajectories;
 	trajectories.reserve(specs.size());
 	int completed = 0;
@@ -361,8 +394,8 @@ std::vector<Position> collect_selfplay(Model model, const torch::Device &device,
 				position.legal_indices = legal;
 				position.legal_prior = prior;
 				position.played_index = played;
-				position.candidate_indices =
-					choose_candidates(legal, prior, played, options.counterfactual_topk);
+				position.candidate_indices = choose_candidates(
+					legal, prior, played, options.counterfactual_topk, proposal_rng);
 				trajectory.positions.push_back(std::move(position));
 				board.makeMove(moves[choice]);
 				const bool terminal = game_is_over(board);
@@ -477,38 +510,40 @@ void evaluate_frontier(std::vector<Branch *> branches, Searcher &evaluator,
 	}
 }
 
-// Aggregate several plausible opponent replies with a policy-regularized soft minimum.
-void apply_opponent_responses(std::vector<Branch> &branches, Searcher &evaluator,
-						  const FcpiOptions &options, TargetSummary &summary) {
-	const int reply_topk = std::max(1, options.opponent_reply_topk);
-	const double temperature = std::max(1e-4, options.opponent_reply_temperature);
-	std::vector<OpponentReply> replies;
+// Apply the same side-to-move soft Bellman backup at every depth. Each expansion
+// evaluates a local beam of replies, backs up their weighted root values, and
+// retains the highest-weight continuation so the tree grows linearly in depth.
+void apply_soft_replies(const std::vector<Branch *> &branches, Searcher &evaluator,
+						const FcpiOptions &options, TargetSummary &summary) {
+	const int reply_topk = std::max(1, options.counterfactual_reply_topk);
+	const double temperature = std::max(1e-4, options.counterfactual_reply_temperature);
+	std::vector<SoftReply> replies;
 	std::unordered_map<Branch *, std::vector<std::size_t>> reply_groups;
 	std::vector<chess::Board> pending_boards;
 	std::vector<std::size_t> pending_indices;
 
-	for (auto &branch : branches) {
-		if (branch.terminal || branch.depth != 1) {
+	for (auto *branch : branches) {
+		if (branch->terminal) {
 			continue;
 		}
-		auto moves = legal_moves(branch.board);
+		auto moves = legal_moves(branch->board);
 		std::stable_sort(moves.begin(), moves.end(), [&](const auto &left, const auto &right) {
-			return branch.policy[move_to_index(left)] > branch.policy[move_to_index(right)];
+			return branch->policy[move_to_index(left)] > branch->policy[move_to_index(right)];
 		});
 		moves.resize(std::min<std::size_t>(moves.size(), reply_topk));
 		for (const auto &move : moves) {
-			OpponentReply reply;
-			reply.branch = &branch;
-			reply.board = branch.board;
-			reply.prior = std::max(1e-12F, branch.policy[move_to_index(move)]);
+			SoftReply reply;
+			reply.branch = branch;
+			reply.board = branch->board;
+			reply.prior = std::max(1e-12F, branch->policy[move_to_index(move)]);
 			reply.board.makeMove(move);
 			reply.terminal = game_is_over(reply.board);
 			const std::size_t reply_index = replies.size();
-			reply_groups[&branch].push_back(reply_index);
+			reply_groups[branch].push_back(reply_index);
 			replies.push_back(std::move(reply));
 			if (replies.back().terminal) {
-				// Two plies restore the root player as side to move.
-				replies.back().root_value = terminal_value_side_to_move(replies.back().board);
+				replies.back().child_value =
+					terminal_value_side_to_move(replies.back().board);
 			} else {
 				pending_boards.push_back(replies.back().board);
 				pending_indices.push_back(reply_index);
@@ -520,7 +555,12 @@ void apply_opponent_responses(std::vector<Branch> &branches, Searcher &evaluator
 	for (std::size_t index = 0; index < pending_indices.size(); ++index) {
 		auto &reply = replies[pending_indices[index]];
 		reply.evaluation = evaluations[index];
-		reply.root_value = evaluations[index].value;
+		reply.child_value = evaluations[index].value;
+	}
+	for (auto &reply : replies) {
+		const int child_depth = reply.branch->depth + 1;
+		const float root_sign = child_depth % 2 == 0 ? 1.0F : -1.0F;
+		reply.root_value = root_sign * reply.child_value;
 	}
 
 	for (auto &[branch, indices] : reply_groups) {
@@ -528,24 +568,36 @@ void apply_opponent_responses(std::vector<Branch> &branches, Searcher &evaluator
 		logits.reserve(indices.size());
 		for (const auto index : indices) {
 			const auto &reply = replies[index];
-			// The opponent favors likely replies that minimize the root player's value.
-			logits.push_back(std::log(static_cast<double>(reply.prior)) -
-							 reply.root_value / temperature);
+			// The current side maximizes -V(child); alternating signs recover root value.
+			const double side_to_move_q = -static_cast<double>(reply.child_value);
+			logits.push_back(options.prior_power *
+								 std::log(static_cast<double>(reply.prior)) +
+							 side_to_move_q / temperature);
 		}
-		const auto response = stable_softmax(logits);
-		float soft_value = 0.0F;
+		const auto weights = stable_softmax(logits);
+		float soft_root_value = 0.0F;
+		float soft_side_value = 0.0F;
 		std::size_t continuation = 0;
 		for (std::size_t index = 0; index < indices.size(); ++index) {
-			soft_value += response[index] * replies[indices[index]].root_value;
-			if (response[index] > response[continuation]) {
+			const auto &reply = replies[indices[index]];
+			soft_root_value += weights[index] * reply.root_value;
+			soft_side_value += weights[index] * -reply.child_value;
+			if (weights[index] > weights[continuation]) {
 				continuation = index;
 			}
 		}
 		auto &selected = replies[indices[continuation]];
-		branch->estimates.push_back(std::clamp(soft_value, -1.0F, 1.0F));
+		const float previous_root = branch->estimates.back();
+		const float previous_side_value = branch->current_value;
+		branch->estimates.push_back(std::clamp(soft_root_value, -1.0F, 1.0F));
+		branch->last_residual = std::abs(previous_side_value - soft_side_value);
+		branch->last_change = std::abs(branch->estimates.back() - previous_root);
+		summary.residual_sum += branch->last_residual;
+		++summary.residual_count;
+		summary.reply_evaluations += static_cast<std::int64_t>(indices.size());
 		branch->board = selected.board;
-		branch->depth = 2;
-		branch->current_value = selected.root_value;
+		branch->depth += 1;
+		branch->current_value = selected.child_value;
 		branch->terminal = selected.terminal;
 		if (selected.terminal) {
 			branch->policy.clear();
@@ -556,7 +608,8 @@ void apply_opponent_responses(std::vector<Branch> &branches, Searcher &evaluator
 	}
 }
 
-// Adaptively extend candidate continuations, then improve policy from their estimated Q values.
+// Adaptively widen and deepen candidate continuations, then improve Policy from
+// symmetric soft Bellman estimates under a fixed best-first beam budget.
 void construct_targets(std::vector<Position> &records, Model model, const torch::Device &device,
 					   const FcpiOptions &options, TargetSummary &summary) {
 	SearchOptions closed;
@@ -572,8 +625,8 @@ void construct_targets(std::vector<Position> &records, Model model, const torch:
 				   static_cast<double>(max_plies));
 	std::cout << "fcpi counterfactual start: positions=" << records.size()
 			  << " target_average_plies=" << target_average
-			  << " opponent_reply_topk=" << options.opponent_reply_topk
-			  << " opponent_reply_temperature=" << options.opponent_reply_temperature << std::endl;
+			  << " reply_topk=" << options.counterfactual_reply_topk
+			  << " reply_temperature=" << options.counterfactual_reply_temperature << std::endl;
 
 	for (std::size_t subset_begin = 0; subset_begin < records.size();
 		 subset_begin += std::max(1, options.target_records_per_batch)) {
@@ -607,15 +660,10 @@ void construct_targets(std::vector<Position> &records, Model model, const torch:
 			all.push_back(&branch);
 		}
 		evaluate_frontier(all, evaluator, options);
-		if (options.opponent_reply_topk > 0 && max_plies >= 2) {
-			apply_opponent_responses(branches, evaluator, options, summary);
-		}
 		for (auto &branch : branches) {
 			if (!branch.terminal) {
-				branch.last_residual = branch.depth == 1
-					? std::abs(records[branch.record].root_value + branch.current_value)
-					: std::abs(branch.estimates.back() -
-							   branch.estimates[branch.estimates.size() - 2]);
+				branch.last_residual =
+					std::abs(records[branch.record].root_value + branch.current_value);
 				branch.last_change =
 					std::abs(branch.estimates.back() - records[branch.record].root_value);
 				summary.residual_sum += branch.last_residual;
@@ -676,35 +724,7 @@ void construct_targets(std::vector<Position> &records, Model model, const torch:
 								  std::min<std::int64_t>(remaining, expandable.size()));
 			}
 
-			std::unordered_map<Branch *, std::pair<float, float>> previous;
-			for (auto *branch : active) {
-				const auto moves = legal_moves(branch->board);
-				auto selected = std::max_element(moves.begin(), moves.end(),
-												 [&](const auto &left, const auto &right) {
-													 return branch->policy[move_to_index(left)] <
-															branch->policy[move_to_index(right)];
-												 });
-				previous.emplace(branch,
-								 std::pair(branch->current_value, branch->estimates.back()));
-				branch->board.makeMove(*selected);
-				branch->depth += 1;
-				branch->policy.clear();
-				if (game_is_over(branch->board)) {
-					const float sign = branch->depth % 2 == 0 ? 1.0F : -1.0F;
-					branch->current_value = terminal_value_side_to_move(branch->board);
-					branch->estimates.push_back(sign * branch->current_value);
-					branch->terminal = true;
-					++summary.terminal_branches;
-				}
-			}
-			evaluate_frontier(active, evaluator, options);
-			for (auto *branch : active) {
-				branch->last_residual = std::abs(previous.at(branch).first + branch->current_value);
-				branch->last_change =
-					std::abs(branch->estimates.back() - previous.at(branch).second);
-				summary.residual_sum += branch->last_residual;
-				++summary.residual_count;
-			}
+			apply_soft_replies(active, evaluator, options, summary);
 		}
 
 		for (auto &branch : branches) {
@@ -753,6 +773,7 @@ void construct_targets(std::vector<Position> &records, Model model, const torch:
 			  << (summary.branches > 0
 					  ? static_cast<double>(summary.branch_plies) / summary.branches
 					  : 0.0)
+			  << " reply_evaluations=" << summary.reply_evaluations
 			  << " terminal_branches=" << summary.terminal_branches << " mean_residual="
 			  << (summary.residual_count > 0 ? summary.residual_sum / summary.residual_count : 0.0)
 			  << std::endl;
@@ -904,8 +925,7 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 		torch::zeros({5}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
 	for (int epoch = 0; epoch < std::max(0, options.epochs); ++epoch) {
 		std::shuffle(order.begin(), order.end(), rng);
-		for (std::size_t begin = 0; begin < order.size();
-			 begin += std::max(1, options.batch_size)) {
+		for (std::size_t begin = 0; begin < order.size(); begin += std::max(1, options.batch_size)) {
 			const auto end = std::min(order.size(), begin + std::max(1, options.batch_size));
 			const std::int64_t batch = static_cast<std::int64_t>(end - begin);
 			std::size_t width = 1;
@@ -1077,8 +1097,9 @@ void run_fcpi(const FcpiOptions &options) {
 		data_summary["sampling"] = sampling;
 		data_summary["counterfactual"] = {
 			{"branches", target_summary.branches},
-			{"opponent_reply_topk", options.opponent_reply_topk},
-			{"opponent_reply_temperature", options.opponent_reply_temperature},
+			{"reply_topk", options.counterfactual_reply_topk},
+			{"reply_temperature", options.counterfactual_reply_temperature},
+			{"reply_evaluations", target_summary.reply_evaluations},
 			{"average_depth",
 			 target_summary.branches > 0
 				 ? static_cast<double>(target_summary.branch_plies) / target_summary.branches

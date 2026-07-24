@@ -26,7 +26,6 @@ src/
 	melano/
 scripts/
 	analyze.py
-	teacher.py
 	opening_book.py
 	gui.py
 	rules.py
@@ -36,6 +35,7 @@ scripts/
 	uci.py
 	build.bat
 	build.sh
+	run_opening.bat
 	run_opening.sh
 	run_simulator.vbs
 	run_stadium.vbs
@@ -101,7 +101,7 @@ Windows：
 
 ```powershell
 .\scripts\build.bat
-# cmake -S <根目录> -B <根目录>\.build-work -G Ninja
+# cmake -S <根目录> -B <根目录>\build\.build-work -G Ninja
 ```
 
 Linux：
@@ -110,7 +110,7 @@ Linux：
 bash scripts/build.sh
 ```
 
-构建脚本在临时目录完成 CMake、Ninja 和 CTest。成功后发布以下程序，并清理 CMake 元数据、测试程序、链接库和日志：
+构建脚本通过 CMake、Ninja 和 CTest 生成并验证以下程序：
 
 ```text
 build/gadus/preprocess
@@ -128,9 +128,9 @@ build/melano/fcpi
 build/melano/uci
 ```
 
-Windows 程序带 `.exe` 后缀。`build/` 顶层固定为 `gadus/` 与 `melano/`。
+Windows 程序带 `.exe` 后缀。`build/gadus/` 与 `build/melano/` 保存发布程序。
 
-构建期间使用 `.build-work/`。成功后该目录被清理。编译或 CTest 失败时，构建现场改名为 `.crash/`，CTest 日志位于 `.crash/Testing/Temporary/LastTest.log`。下一次构建开始时清理旧 `.crash/`。
+`build/.build-work/` 保存 CMake 与 Ninja 的增量构建状态。后续构建复用未变化目标的对象文件；编译或 CTest 失败时，诊断信息保留在该目录，CTest 日志位于 `build/.build-work/Testing/Temporary/LastTest.log`。
 
 每个命令入口支持 `--help`：
 
@@ -389,8 +389,8 @@ build/gadus/fcpi \
 	--inference-batch-size 64 \
 	--target-records-per-batch 256 \
 	--counterfactual-topk 6 \
-	--opponent-reply-topk 4 \
-	--opponent-reply-temperature 0.2 \
+	--counterfactual-reply-topk 4 \
+	--counterfactual-reply-temperature 0.2 \
 	--counterfactual-min-plies 2 \
 	--counterfactual-max-plies 6 \
 	--counterfactual-target-average-plies 4 \
@@ -450,21 +450,34 @@ $$
 G_t=-\left[(1-\lambda_{TD})V(s_{t+1})+\lambda_{TD}G_{t+1}\right]
 $$
 
-负号对应行棋方在每个 ply 的切换。候选动作 $a$ 执行后，Gadus 取对手 Policy 的前 $K_r$ 个应手。设 $Q_b$ 是执行应手 $b$ 后恢复到根行棋方视角的 Value，则对手响应分布为：
+负号对应行棋方在每个 ply 的切换。反事实候选始终包含实际走法与 Policy top-1，其余位置通过 Gumbel top-k 无放回采样得到：
 
 $$
-\rho(b\mid s,a)=\operatorname{softmax}_b\left(
-\log(P(b\mid s_a)+\varepsilon)-\frac{Q_b}{T_r}
+\operatorname{key}(a)=\log(P(a\mid s)+\varepsilon)+g_a,
+\qquad g_a\sim\operatorname{Gumbel}(0,1)
+$$
+
+固定 Policy top-k 容易永久忽略低先验候选，Gumbel 候选使这些动作能够在不同迭代中进入反事实集合，同时保持高先验动作更高的入选概率。
+
+树中每一层使用相同的 side-to-move soft Bellman backup。对当前节点 $u$ 的候选动作 $b$：
+
+$$
+Q_u(b)=-V(T(u,b))
+$$
+
+$$
+\mu(b\mid u)=\operatorname{softmax}_b\left(
+\alpha\log(P(b\mid u)+\varepsilon)+\frac{Q_u(b)}{T_r}
 \right)
 $$
 
-二层反事实值为：
-
 $$
-q^{(2)}(s,a)=\sum_b\rho(b\mid s,a)Q_b
+\widehat V(u)=\sum_b\mu(b\mid u)Q_u(b)
 $$
 
-$T_r$ 较小时接近对根行棋方不利的 minimax 应手，Policy 项保留对手真实会选择该应手的可能性。后续自适应展开沿 $\rho$ 最大的应手继续。候选动作由此得到不同深度的根视角估计 $q^{(1)},\ldots,q^{(D)}$，反事实深度混合为：
+同一公式由双方交替使用，根视角通过 ply 奇偶自动换号。每次局部展开评价 Policy 前 $K_r$ 个响应，将加权值回传，并沿 $\mu$ 最大的响应继续。全局 best-first beam 优先加深 Bellman residual 较大且仍有竞争力的根候选，因此评价量随 beam budget 近似线性增长，而非形成 $K_r^D$ 个完整节点。
+
+候选动作由此得到不同深度的根视角估计 $q^{(1)},\ldots,q^{(D)}$，反事实深度混合为：
 
 $$
 Q_{cf}=(1-\lambda_{cf})\sum_{d=1}^{D-1}
@@ -1048,9 +1061,9 @@ Windows 隐藏控制台启动：
 wscript.exe scripts\run_stadium.vbs
 ```
 
-## 9. UCI 教师机工具
+## 9. UCI 分析
 
-`teacher.py` 提供 UCI 招法评分、regret 与 SQLite cache。`analyze.py` 使用它生成 `.cmt` 分析和带局面评价的 PGN。
+`analyze.py` 直接连接 UCI 引擎，计算招法评分与 regret，并可使用 SQLite cache。它生成 `.cmt` 分析和带局面评价的 PGN。
 
 ```bash
 python scripts/analyze.py \
@@ -1058,6 +1071,7 @@ python scripts/analyze.py \
 	--uci models/stockfish/stockfish \
 	--uci-depth 16 \
 	--uci-multipv 8 \
+	--analysis-cache data/user-pgn/analysis.sqlite \
 	--pgn-comments
 ```
 
@@ -1067,6 +1081,10 @@ Windows 教师机路径使用 `models/stockfish/stockfish.exe`。
 
 ```bash
 bash scripts/run_opening.sh data/games.pgn 50000 data/openings.gen.bin
+```
+
+```powershell
+scripts\run_opening.bat data\games.pgn 50000 data\openings.gen.bin
 ```
 
 ```bash
@@ -1085,7 +1103,7 @@ python scripts/opening_book.py \
 
 ## 11. 验证
 
-`scripts/build.bat` 与 `scripts/build.sh` 在发布可执行文件前运行 CTest。测试失败时，构建停止并将现场保存在 `.crash/`。
+`scripts/build.bat` 与 `scripts/build.sh` 在发布可执行文件前运行 CTest。测试失败时构建停止，现场保留在 `build/.build-work/`。
 
 Gadus 测试覆盖 `gadus_18_planes`、普通走法与特殊走法编码、棋规、Policy/Value 输出形状、有限数值、反向传播和 checkpoint 往返。本地 Windows CPU 烟测覆盖单盘 PGN 生成 HDF5、一步监督训练、closed 搜索、batched MCTS、两盘 paired arena、PGN 输出以及一轮 FCPI 的采样、反事实展开、训练、arena gate 和 current 晋升。
 
