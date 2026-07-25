@@ -73,6 +73,23 @@ if not exist "%API_DIR%chess\chess.hpp" (
   powershell -NoProfile -ExecutionPolicy Bypass -Command "if ((Get-FileHash '%API_DIR%chess\chess.hpp' -Algorithm SHA256).Hash -ne '%CHESS_SHA256%') { throw 'chess.hpp checksum mismatch' }" || exit /b 1
 )
 
+call :download_source glfw "%GLFW_VERSION%" "https://github.com/glfw/glfw/archive/refs/tags/%GLFW_VERSION%.zip" "glfw-%GLFW_VERSION%" || exit /b 1
+call :download_source glm "%GLM_VERSION%" "https://github.com/g-truc/glm/archive/refs/tags/%GLM_VERSION%.zip" "glm-%GLM_VERSION%" || exit /b 1
+call :download_source imgui "%IMGUI_VERSION%" "https://github.com/ocornut/imgui/archive/refs/tags/v%IMGUI_VERSION%.zip" "imgui-%IMGUI_VERSION%" || exit /b 1
+call :download_source freetype "%FREETYPE_VERSION%" "https://github.com/freetype/freetype/archive/refs/tags/VER-%FREETYPE_VERSION%.zip" "freetype-VER-%FREETYPE_VERSION%" || exit /b 1
+call :download_source stb "%STB_REF%" "https://github.com/nothings/stb/archive/%STB_REF%.zip" "stb-%STB_REF%" || exit /b 1
+call :download_source glad-generator "%GLAD_VERSION%" "https://github.com/Dav1dde/glad/archive/refs/tags/v%GLAD_VERSION%.zip" "glad-%GLAD_VERSION%" || exit /b 1
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$path='%API_DIR%freetype\CMakeLists.txt'; $text=[IO.File]::ReadAllText($path); $text=$text.Replace('cmake_minimum_required(VERSION 3.0...3.5)','cmake_minimum_required(VERSION 3.10...3.31)'); [IO.File]::WriteAllText($path,$text,[Text.UTF8Encoding]::new($false))" || exit /b 1
+
+if not exist "%API_DIR%glad\include\glad\gl.h" (
+	echo Generating GLAD %GLAD_VERSION% for OpenGL 3.3 Core...
+	if not exist "%API_DIR%glad-python\jinja2" (
+		python -m pip install --disable-pip-version-check --no-cache-dir --target "%API_DIR%glad-python" "Jinja2==%JINJA2_VERSION%" "MarkupSafe==%MARKUPSAFE_VERSION%" || exit /b 1
+	)
+	set "PYTHONPATH=%API_DIR%glad-python;%API_DIR%glad-generator"
+	python -m glad --out-path "%API_DIR%glad" --api gl:core=3.3 --extensions "" --reproducible c --loader || exit /b 1
+)
+
 if not exist "%API_DIR%zlib\lib" (
   set "ZLIB_ZIP=%API_DIR%downloads\zlib-%ZLIB_VERSION%.zip"
   echo Downloading and building zlib %ZLIB_VERSION%...
@@ -109,8 +126,23 @@ echo LibTorch variant: %TORCH_VARIANT%
 echo Build: call "%ROOT_DIR%\scripts\build.bat"
 exit /b 0
 
+:download_source
+set "DEP_NAME=%~1"
+set "DEP_VERSION=%~2"
+set "DEP_URL=%~3"
+set "DEP_FOLDER=%~4"
+if exist "%API_DIR%!DEP_NAME!\CMakeLists.txt" exit /b 0
+if /i "!DEP_NAME!"=="stb" if exist "%API_DIR%!DEP_NAME!\stb_image.h" exit /b 0
+set "DEP_ZIP=%API_DIR%downloads\!DEP_NAME!-!DEP_VERSION!.zip"
+echo Downloading !DEP_NAME! !DEP_VERSION!...
+if not exist "!DEP_ZIP!" curl.exe --fail --location --retry 3 --output "!DEP_ZIP!" "!DEP_URL!" || exit /b 1
+if exist "%API_DIR%!DEP_NAME!-unpack" rmdir /s /q "%API_DIR%!DEP_NAME!-unpack"
+if exist "%API_DIR%!DEP_NAME!" rmdir /s /q "%API_DIR%!DEP_NAME!"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -Force '!DEP_ZIP!' '%API_DIR%!DEP_NAME!-unpack'; Move-Item -LiteralPath '%API_DIR%!DEP_NAME!-unpack\!DEP_FOLDER!' -Destination '%API_DIR%!DEP_NAME!'; Remove-Item -LiteralPath '%API_DIR%!DEP_NAME!-unpack' -Recurse -Force" || exit /b 1
+exit /b 0
+
 :cleanup
-for %%D in (zlib-src zlib-build zlib-unpack hdf5-src hdf5-build hdf5-unpack downloads) do (
+for %%D in (zlib-src zlib-build zlib-unpack hdf5-src hdf5-build hdf5-unpack glfw-unpack glm-unpack imgui-unpack freetype-unpack stb-unpack glad-generator-unpack downloads) do (
 	if exist "%API_DIR%%%D" rmdir /s /q "%API_DIR%%%D"
 )
 exit /b 0

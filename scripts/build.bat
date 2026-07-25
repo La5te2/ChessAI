@@ -49,8 +49,10 @@ ctest --test-dir "%WORK_DIR%" --output-on-failure || goto :failed
 
 if exist "%PUBLISH_DIR%\gadus" rmdir /s /q "%PUBLISH_DIR%\gadus"
 if exist "%PUBLISH_DIR%\melano" rmdir /s /q "%PUBLISH_DIR%\melano"
+if exist "%PUBLISH_DIR%\graphics" rmdir /s /q "%PUBLISH_DIR%\graphics"
 mkdir "%PUBLISH_DIR%\gadus" || goto :failed
 mkdir "%PUBLISH_DIR%\melano" || goto :failed
+mkdir "%PUBLISH_DIR%\graphics" || goto :failed
 
 for %%A in (gadus melano) do (
 	for %%F in (preprocess train search arena fcpi uci) do (
@@ -62,8 +64,12 @@ for %%A in (gadus melano) do (
 	)
 )
 
+if not exist "%WORK_DIR%\graphics\Gadidae.exe" goto :failed
+copy /y "%WORK_DIR%\graphics\Gadidae.exe" "%PUBLISH_DIR%\graphics\Gadidae.exe" >nul || goto :failed
+
 echo Gadus build finished: %PUBLISH_DIR%\gadus
 echo Melano build finished: %PUBLISH_DIR%\melano
+echo Gadidae graphics finished: %PUBLISH_DIR%\graphics
 echo Incremental build cache: %WORK_DIR%
 exit /b 0
 

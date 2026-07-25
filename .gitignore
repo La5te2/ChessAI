@@ -5,9 +5,6 @@ __pycache__/
 .env
 /api/*
 /build/*
-/gui/Gadidae
-/gui/Gadidae.exe
-/gui/*.spec
 !/api/patch.cmake
 !/api/setup.bat
 !/api/setup.sh

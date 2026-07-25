@@ -50,15 +50,18 @@ cmake \
 cmake --build "${WORK_DIR}" --parallel "$(nproc 2>/dev/null || echo 2)"
 ctest --test-dir "${WORK_DIR}" --output-on-failure
 
-rm -rf -- "${PUBLISH_DIR}/gadus" "${PUBLISH_DIR}/melano"
-mkdir -p "${PUBLISH_DIR}/gadus" "${PUBLISH_DIR}/melano"
+rm -rf -- "${PUBLISH_DIR}/gadus" "${PUBLISH_DIR}/melano" "${PUBLISH_DIR}/graphics"
+mkdir -p "${PUBLISH_DIR}/gadus" "${PUBLISH_DIR}/melano" "${PUBLISH_DIR}/graphics"
 for architecture in gadus melano; do
 	for executable in preprocess train search arena fcpi uci; do
 		test -x "${WORK_DIR}/${architecture}/${executable}"
 		cp "${WORK_DIR}/${architecture}/${executable}" "${PUBLISH_DIR}/${architecture}/"
 	done
 done
+test -x "${WORK_DIR}/graphics/Gadidae"
+cp "${WORK_DIR}/graphics/Gadidae" "${PUBLISH_DIR}/graphics/"
 
 echo "Gadus build finished: ${PUBLISH_DIR}/gadus"
 echo "Melano build finished: ${PUBLISH_DIR}/melano"
+echo "Gadidae graphics finished: ${PUBLISH_DIR}/graphics"
 echo "Incremental build cache: ${WORK_DIR}"

@@ -18,17 +18,20 @@ api/
 	zlib/
 	nlohmann/
 	chess/
-gui/
-	gadidae.py
-	package.bat
-	package.sh
-	Gadidae.exe
+	glfw/
+	glad/
+	glm/
+	imgui/
+	freetype/
+	stb/
 include/
 	gadus/
 	melano/
+	graphics/
 src/
 	gadus/
 	melano/
+	graphics/
 scripts/
 	analyze.py
 	opening_book.py
@@ -42,6 +45,7 @@ scripts/
 build/
 	gadus/
 	melano/
+	graphics/
 data/
 models/
 	gadidae/
@@ -55,8 +59,9 @@ models/
 - `tests.cpp`：每套架构的状态编码、特殊走法、棋规、网络前反向、数值范围与 checkpoint 往返测试。
 - `scripts/`：通用 UCI 工具、模型检查与构建启动脚本。
 - `api/`：仓库本地 C++ 依赖与安装脚本。
-- `gui/`：统一图形界面的 Python 源码、PyInstaller 打包脚本和平台可执行文件。
+- `include/graphics/`、`src/graphics/`：架构无关的原生 OpenGL 图形界面，通过 UCI 与引擎通信。
 - `build/gadus/`、`build/melano/`：可直接运行的架构程序与运行 DLL。
+- `build/graphics/`：原生 Gadidae 图形程序与图形运行库。
 - `data/`：PGN、HDF5、开局书、分析结果和运行数据。
 - `models/gadus/`：Gadus LibTorch checkpoint。
 - `models/gadidae/gadus/`、`models/gadidae/melano/`：可直接注册到 UCI 客户端的架构引擎、checkpoint 与运行库。
@@ -1031,51 +1036,49 @@ UCI 客户端可以直接注册 `models/gadidae/gadus/gadus.exe` 或 `models/gad
 
 ## 7. GUI
 
-`gui/gadidae.py` 将 Simulator 与 Stadium 合并为一个窗口。顶部模式控件在局面分析和单局可视化对战之间切换。切换模式时会结束当前分析进程或 UCI 对局线程。
+`Gadidae` 是基于 GLFW、OpenGL 3.3、GLAD、Dear ImGui 与 FreeType 的原生图形程序。Simulator 与 Stadium 共用一个窗口，并只通过 UCI 与 Gadus、Melano、Stockfish 或其他引擎通信。
 
-Simulator 接收任意完整 UCI 命令。Settings 使用 `Engine`、`Budget`、`MCTS`、`Decisions` 四个标签页：
+先完成依赖安装和构建：
 
 ```powershell
-python gui\gadidae.py `
+api\setup.bat
+scripts\build.bat
+```
+
+Linux 使用：
+
+```bash
+bash api/setup.sh
+bash scripts/build.sh
+```
+
+Windows 双击 `build/graphics/Gadidae.exe`，Linux 运行 `build/graphics/Gadidae`。程序默认进入 Simulator，顶部模式控件可切换到 Stadium。GUI 的 FreeType 压缩支持静态编译进可执行文件。
+
+Simulator 用于局面分析。Settings 的 `Engine` 区域填写 UCI 可执行文件、显示名称和设备，`Arguments` 区域填写进程参数、UCI options、时间或节点预算、MultiPV 行数与显示刷新间隔。也可以从命令行指定常用参数：
+
+```powershell
+build\graphics\Gadidae.exe `
 	--mode simulator `
 	--uci "models\gadidae\gadus\gadus.exe" `
 	--device cpu `
-	--search-type only-mcts `
-	--mcts-sims 1000 `
-	--movetime-ms 0 `
-	--progress-interval-ms 750 `
-	--root-topn 8
+	--movetime-ms 3000 `
+	--node-limit 0 `
+	--multipv 8 `
+	--theme dark
 ```
 
-Stadium 让两个任意 UCI 引擎进行一盘可视化对局。双方拥有独立命令、UCI options、movetime 和 MultiPV 行数。Settings 使用 `White`、`Black`、`Match` 三个标签页。
+Stadium 用于观看两个任意 UCI 引擎进行一盘对局。双方在 Settings 中拥有独立的可执行文件、设备、进程参数、UCI options、计算预算和 MultiPV，`Match` 区域设置显示延迟与最大 ply。可从命令行预填双方引擎：
 
 ```powershell
-python gui\gadidae.py `
+build\graphics\Gadidae.exe `
 	--mode stadium `
 	--white-uci "models\gadidae\gadus\gadus.exe" `
-	--black-uci "models\gadidae\melano\melano.exe" `
-	--white-movetime-ms 3000 `
-	--white-multipv 5 `
-	--black-movetime-ms 3000 `
-	--black-multipv 5 `
-	--max-plies 240
+	--black-uci "models\stockfish\stockfish.exe"
 ```
 
-安装 PyInstaller 后可生成无控制台的单文件程序。Windows：
+Appearance 提供 `Dark` 与 `Light` 应用主题、棋盘配色预设、颜色编辑和坐标开关。点击 Apply 后设置写入用户配置目录，后续启动会自动恢复。`--theme dark` 与 `--theme light` 可覆盖本次启动的主题。
 
-```powershell
-python -m pip install pyinstaller
-gui\package.bat
-```
-
-Linux：
-
-```bash
-python3 -m pip install pyinstaller
-bash gui/package.sh
-```
-
-Windows 输出 `gui/Gadidae.exe`，Linux 输出 `gui/Gadidae`。直接启动程序默认进入 Simulator，并可通过窗口顶部模式控件切换到 Stadium。UCI 引擎、模型和 LibTorch 运行库继续位于各自目录，由 GUI 通过 UCI 命令启动，不会被打入 GUI 程序。
+`UCI options` 使用 JSON object。图形程序按引擎公开的 option 名称进行匹配，未知名称会报告错误。`Device` 仅在目标引擎公开该 option 时设置，因此同一界面可直接运行 Stockfish 等通用 UCI 引擎。
 
 ## 8. UCI 分析
 

@@ -235,3 +235,90 @@ if(MSVC)
 	add_dependencies(melanotests torchruntime)
 endif()
 add_test(NAME melanotests COMMAND melanotests)
+
+# The native GUI owns no model implementation. It talks to Gadus, Melano, and
+# third-party engines through UCI and therefore links only graphics dependencies.
+set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
+add_subdirectory("${GADIDAE_API_DIR}/glfw" "${CMAKE_BINARY_DIR}/dependencies/glfw" EXCLUDE_FROM_ALL)
+
+set(FT_DISABLE_ZLIB ON CACHE BOOL "" FORCE)
+set(FT_DISABLE_BZIP2 ON CACHE BOOL "" FORCE)
+set(FT_DISABLE_PNG ON CACHE BOOL "" FORCE)
+set(FT_DISABLE_HARFBUZZ ON CACHE BOOL "" FORCE)
+set(FT_DISABLE_BROTLI ON CACHE BOOL "" FORCE)
+# FreeType checks the ambient ZLIB_FOUND value even when system zlib is
+# disabled. Hide the top-level package result so its built-in implementation
+# is compiled into freetype instead of leaking zlib.dll into the GUI runtime.
+set(GADIDAE_SAVED_ZLIB_FOUND "${ZLIB_FOUND}")
+set(ZLIB_FOUND FALSE)
+add_subdirectory("${GADIDAE_API_DIR}/freetype" "${CMAKE_BINARY_DIR}/dependencies/freetype" EXCLUDE_FROM_ALL)
+set(ZLIB_FOUND "${GADIDAE_SAVED_ZLIB_FOUND}")
+unset(GADIDAE_SAVED_ZLIB_FOUND)
+if(MSVC)
+	target_compile_options(freetype PRIVATE /utf-8)
+endif()
+
+add_library(gadidaeglad STATIC "${GADIDAE_API_DIR}/glad/src/gl.c")
+target_include_directories(gadidaeglad SYSTEM PUBLIC "${GADIDAE_API_DIR}/glad/include")
+if(UNIX AND NOT APPLE)
+	target_link_libraries(gadidaeglad PUBLIC ${CMAKE_DL_LIBS})
+endif()
+
+add_library(gadidaeimgui STATIC
+	"${GADIDAE_API_DIR}/imgui/imgui.cpp"
+	"${GADIDAE_API_DIR}/imgui/imgui_demo.cpp"
+	"${GADIDAE_API_DIR}/imgui/imgui_draw.cpp"
+	"${GADIDAE_API_DIR}/imgui/imgui_tables.cpp"
+	"${GADIDAE_API_DIR}/imgui/imgui_widgets.cpp"
+	"${GADIDAE_API_DIR}/imgui/backends/imgui_impl_glfw.cpp"
+	"${GADIDAE_API_DIR}/imgui/backends/imgui_impl_opengl3.cpp"
+	"${GADIDAE_API_DIR}/imgui/misc/cpp/imgui_stdlib.cpp"
+	"${GADIDAE_API_DIR}/imgui/misc/freetype/imgui_freetype.cpp"
+)
+target_include_directories(gadidaeimgui SYSTEM PUBLIC
+	"${GADIDAE_API_DIR}/imgui"
+	"${GADIDAE_API_DIR}/imgui/backends"
+	"${GADIDAE_API_DIR}/imgui/misc/cpp"
+	"${GADIDAE_API_DIR}/imgui/misc/freetype"
+)
+target_compile_definitions(gadidaeimgui PUBLIC IMGUI_ENABLE_FREETYPE)
+target_link_libraries(gadidaeimgui PUBLIC glfw freetype)
+
+add_executable(gadidaegraphics
+	src/graphics/main.cpp
+	src/graphics/application.cpp
+	src/graphics/uci.cpp
+)
+set_target_properties(gadidaegraphics PROPERTIES
+	OUTPUT_NAME "Gadidae"
+	RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/graphics"
+	ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/graphics"
+	LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/graphics"
+	PDB_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/graphics"
+)
+if(WIN32)
+	set_target_properties(gadidaegraphics PROPERTIES WIN32_EXECUTABLE TRUE)
+endif()
+target_include_directories(gadidaegraphics
+	PRIVATE "${CMAKE_SOURCE_DIR}/include"
+)
+target_include_directories(gadidaegraphics SYSTEM PRIVATE
+		"${GADIDAE_API_DIR}/chess"
+		"${GADIDAE_API_DIR}/nlohmann/include"
+		"${GADIDAE_API_DIR}/glm"
+		"${GADIDAE_API_DIR}/stb"
+)
+target_link_libraries(gadidaegraphics PRIVATE
+	gadidaeimgui
+	gadidaeglad
+	Threads::Threads
+)
+if(MSVC)
+	target_compile_options(gadidaegraphics PRIVATE /MP /W4 /permissive- /utf-8)
+	target_link_libraries(gadidaegraphics PRIVATE Comdlg32 Shell32)
+else()
+	target_compile_options(gadidaegraphics PRIVATE -Wall -Wextra -Wpedantic)
+endif()

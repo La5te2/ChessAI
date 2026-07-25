@@ -161,6 +161,19 @@ if(NOT actual_chess_sha256 STREQUAL locked_chess_sha256)
 		"chess-library checksum mismatch: expected ${locked_chess_sha256}, found ${actual_chess_sha256}")
 endif()
 
+foreach(gui_dependency
+		glfw/CMakeLists.txt
+		glm/CMakeLists.txt
+		imgui/imgui.h
+		freetype/CMakeLists.txt
+		stb/stb_image.h
+		glad/include/glad/gl.h
+		glad/src/gl.c)
+	if(NOT EXISTS "${API_DIR}/${gui_dependency}")
+		message(FATAL_ERROR "GUI dependency is missing: ${API_DIR}/${gui_dependency}")
+	endif()
+endforeach()
+
 if(WIN32)
 	set(ninja "${API_DIR}/ninja/ninja.exe")
 else()

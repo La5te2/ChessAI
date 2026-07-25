@@ -13,7 +13,13 @@ cleanup() {
 		"${API_DIR}/zlib-unpack" \
 		"${API_DIR}/hdf5-src" \
 		"${API_DIR}/hdf5-build" \
-		"${API_DIR}/hdf5-unpack"
+		"${API_DIR}/hdf5-unpack" \
+		"${API_DIR}/glfw-unpack" \
+		"${API_DIR}/glm-unpack" \
+		"${API_DIR}/imgui-unpack" \
+		"${API_DIR}/freetype-unpack" \
+		"${API_DIR}/stb-unpack" \
+		"${API_DIR}/glad-generator-unpack"
 }
 trap cleanup EXIT
 
@@ -168,6 +174,59 @@ if [[ ! -f "${API_DIR}/chess/chess.hpp" ]]; then
   download "https://raw.githubusercontent.com/Disservin/chess-library/${CHESS_REF}/include/chess.hpp" \
     "${API_DIR}/chess/chess.hpp"
   echo "${CHESS_SHA256}  ${API_DIR}/chess/chess.hpp" | sha256sum --check --status
+fi
+
+download_source() {
+	local name="$1"
+	local version="$2"
+	local url="$3"
+	local folder="$4"
+	local marker="${5:-CMakeLists.txt}"
+	if [[ -f "${API_DIR}/${name}/${marker}" ]]; then
+		return
+	fi
+	local archive="${DOWNLOADS}/${name}-${version}.tar.gz"
+	echo "Downloading ${name} ${version}..."
+	download "${url}" "${archive}"
+	rm -rf "${API_DIR:?}/${name}" "${API_DIR:?}/${name}-unpack"
+	mkdir -p "${API_DIR}/${name}-unpack"
+	tar -xzf "${archive}" -C "${API_DIR}/${name}-unpack"
+	mv "${API_DIR}/${name}-unpack/${folder}" "${API_DIR}/${name}"
+	rm -rf "${API_DIR:?}/${name}-unpack"
+}
+
+download_source glfw "${GLFW_VERSION}" \
+	"https://github.com/glfw/glfw/archive/refs/tags/${GLFW_VERSION}.tar.gz" \
+	"glfw-${GLFW_VERSION}"
+download_source glm "${GLM_VERSION}" \
+	"https://github.com/g-truc/glm/archive/refs/tags/${GLM_VERSION}.tar.gz" \
+	"glm-${GLM_VERSION}"
+download_source imgui "${IMGUI_VERSION}" \
+	"https://github.com/ocornut/imgui/archive/refs/tags/v${IMGUI_VERSION}.tar.gz" \
+	"imgui-${IMGUI_VERSION}"
+download_source freetype "${FREETYPE_VERSION}" \
+	"https://github.com/freetype/freetype/archive/refs/tags/VER-${FREETYPE_VERSION}.tar.gz" \
+	"freetype-VER-${FREETYPE_VERSION}"
+download_source stb "${STB_REF}" \
+	"https://github.com/nothings/stb/archive/${STB_REF}.tar.gz" \
+	"stb-${STB_REF}" "stb_image.h"
+download_source glad-generator "${GLAD_VERSION}" \
+	"https://github.com/Dav1dde/glad/archive/refs/tags/v${GLAD_VERSION}.tar.gz" \
+	"glad-${GLAD_VERSION}"
+sed -i \
+	's/cmake_minimum_required(VERSION 3\.0\.\.\.3\.5)/cmake_minimum_required(VERSION 3.10...3.31)/' \
+	"${API_DIR}/freetype/CMakeLists.txt"
+
+if [[ ! -f "${API_DIR}/glad/include/glad/gl.h" ]]; then
+	echo "Generating GLAD ${GLAD_VERSION} for OpenGL 3.3 Core..."
+	if [[ ! -d "${API_DIR}/glad-python/jinja2" ]]; then
+		python3 -m pip install --disable-pip-version-check --no-cache-dir \
+			--target "${API_DIR}/glad-python" \
+			"Jinja2==${JINJA2_VERSION}" "MarkupSafe==${MARKUPSAFE_VERSION}"
+	fi
+	PYTHONPATH="${API_DIR}/glad-python:${API_DIR}/glad-generator" \
+		python3 -m glad --out-path "${API_DIR}/glad" --api gl:core=3.3 \
+		--extensions "" --reproducible c --loader
 fi
 
 if [[ ! -d "${API_DIR}/zlib/lib" && ! -d "${API_DIR}/zlib/lib64" ]]; then
