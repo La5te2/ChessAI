@@ -2716,7 +2716,7 @@ def stadium_defaults_from_args(args):
 def use_repository_working_directory():
     """Keeps relative engine and model paths stable for source and packaged runs."""
     entry = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve()
-    project_root = entry.parents[2]
+    project_root = entry.parents[1]
     if (project_root / "scripts").is_dir() and (project_root / "models").is_dir():
         os.chdir(project_root)
 

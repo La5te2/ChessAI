@@ -13,15 +13,16 @@ Gadidae 是一个实验性国际象棋神经网络引擎项目。当前架构如
 api/
 	setup.bat
 	setup.sh
-	gui/
-		gadidae.py
-		build.bat
-		Gadidae.exe
 	libtorch/
 	hdf5/
 	zlib/
 	nlohmann/
 	chess/
+gui/
+	gadidae.py
+	package.bat
+	package.sh
+	Gadidae.exe
 include/
 	gadus/
 	melano/
@@ -53,7 +54,8 @@ models/
 - `preprocess.cpp`、`train.cpp`、`search.cpp`、`arena.cpp`、`fcpi.cpp`、`uci.cpp`：每套架构的六个命令入口。
 - `tests.cpp`：每套架构的状态编码、特殊走法、棋规、网络前反向、数值范围与 checkpoint 往返测试。
 - `scripts/`：通用 UCI 工具、模型检查与构建启动脚本。
-- `api/`：仓库本地 C++ 依赖与安装脚本。`api/gui/` 保存统一图形界面的 Python 源码、PyInstaller 构建脚本和 Windows EXE。
+- `api/`：仓库本地 C++ 依赖与安装脚本。
+- `gui/`：统一图形界面的 Python 源码、PyInstaller 打包脚本和平台可执行文件。
 - `build/gadus/`、`build/melano/`：可直接运行的架构程序与运行 DLL。
 - `data/`：PGN、HDF5、开局书、分析结果和运行数据。
 - `models/gadus/`：Gadus LibTorch checkpoint。
@@ -1026,12 +1028,12 @@ UCI 客户端可以直接注册 `models/gadidae/gadus.exe` 或 `models/gadidae/m
 
 ## 7. GUI
 
-`api/gui/gadidae.py` 将 Simulator 与 Stadium 合并为一个窗口。顶部模式控件在局面分析和单局可视化对战之间切换。切换模式时会结束当前分析进程或 UCI 对局线程。
+`gui/gadidae.py` 将 Simulator 与 Stadium 合并为一个窗口。顶部模式控件在局面分析和单局可视化对战之间切换。切换模式时会结束当前分析进程或 UCI 对局线程。
 
 Simulator 接收任意完整 UCI 命令。Settings 使用 `Engine`、`Budget`、`MCTS`、`Decisions` 四个标签页：
 
 ```powershell
-python api\gui\gadidae.py `
+python gui\gadidae.py `
 	--mode simulator `
 	--uci "models\gadidae\gadus.exe" `
 	--device cpu `
@@ -1045,7 +1047,7 @@ python api\gui\gadidae.py `
 Stadium 让两个任意 UCI 引擎进行一盘可视化对局。双方拥有独立命令、UCI options、movetime 和 MultiPV 行数。Settings 使用 `White`、`Black`、`Match` 三个标签页。
 
 ```powershell
-python api\gui\gadidae.py `
+python gui\gadidae.py `
 	--mode stadium `
 	--white-uci "models\gadidae\gadus.exe" `
 	--black-uci "models\gadidae\melano.exe" `
@@ -1056,14 +1058,21 @@ python api\gui\gadidae.py `
 	--max-plies 240
 ```
 
-安装 PyInstaller 后可生成无控制台的单文件 Windows 程序：
+安装 PyInstaller 后可生成无控制台的单文件程序。Windows：
 
 ```powershell
 python -m pip install pyinstaller
-api\gui\build.bat
+gui\package.bat
 ```
 
-输出为 `api/gui/Gadidae.exe`。双击 EXE 默认进入 Simulator，并可通过窗口顶部模式控件切换到 Stadium。UCI 引擎、模型和 LibTorch 运行库继续位于各自目录，由 GUI 通过 UCI 命令启动，不会被打入 GUI EXE。
+Linux：
+
+```bash
+python3 -m pip install pyinstaller
+bash gui/package.sh
+```
+
+Windows 输出 `gui/Gadidae.exe`，Linux 输出 `gui/Gadidae`。直接启动程序默认进入 Simulator，并可通过窗口顶部模式控件切换到 Stadium。UCI 引擎、模型和 LibTorch 运行库继续位于各自目录，由 GUI 通过 UCI 命令启动，不会被打入 GUI 程序。
 
 ## 8. UCI 分析
 
