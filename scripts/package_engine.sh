@@ -26,7 +26,7 @@ if [[ ! -f "$MODEL_ARG" ]]; then
 fi
 MODEL="$(realpath "$MODEL_ARG")"
 UCI="$ROOT/build/$ARCH/uci"
-OUTPUT="$ROOT/models/gadidae"
+OUTPUT="$ROOT/models/gadidae/$ARCH"
 LIB_OUTPUT="$OUTPUT/lib"
 BINARY="$OUTPUT/$ARCH.bin"
 LAUNCHER="$OUTPUT/$ARCH"

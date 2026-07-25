@@ -16,7 +16,7 @@ pushd "%ROOT%" || exit /b 1
 
 for %%I in ("%MODEL_ARG%") do set "MODEL=%%~fI"
 set "UCI=%ROOT%\build\%ARCH%\uci.exe"
-set "OUTPUT=%ROOT%\models\gadidae"
+set "OUTPUT=%ROOT%\models\gadidae\%ARCH%"
 
 if not exist "%MODEL%" (
 	echo Model not found: %MODEL%

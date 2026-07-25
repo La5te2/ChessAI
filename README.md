@@ -59,7 +59,7 @@ models/
 - `build/gadus/`、`build/melano/`：可直接运行的架构程序与运行 DLL。
 - `data/`：PGN、HDF5、开局书、分析结果和运行数据。
 - `models/gadus/`：Gadus LibTorch checkpoint。
-- `models/gadidae/`：可直接注册到 UCI 客户端的 Gadus/Melano 引擎、架构 checkpoint 与共享运行库。
+- `models/gadidae/gadus/`、`models/gadidae/melano/`：可直接注册到 UCI 客户端的架构引擎、checkpoint 与运行库。
 - `models/stockfish/`：UCI 教师机。
 
 Gadus 与 Melano 的数据定义、数学公式和运行方法分别写在第 4、5 节。
@@ -997,7 +997,7 @@ UCI 输出包含 MultiPV、side-to-move `score cp`、节点数、NPS、耗时和
 
 ### 6.1 Gadidae 引擎目录
 
-Windows 可将指定 checkpoint 包装到共享的 `models/gadidae/` UCI 引擎目录：
+Windows 可将指定 checkpoint 包装到对应的 `models/gadidae/<architecture>/` UCI 引擎目录：
 
 ```powershell
 scripts\package_engine.bat gadus models\gadus\candidate3.pth
@@ -1015,16 +1015,19 @@ Gadus UCI 在缺少 `--model` 时只读取自身目录中的 `gadus.pth`，Melan
 
 ```text
 models/gadidae/
-	gadus.exe
-	gadus.pth
-	melano.exe
-	melano.pth
-	LibTorch DLLs
+	gadus/
+		gadus.exe
+		gadus.pth
+		LibTorch DLLs
+	melano/
+		melano.exe
+		melano.pth
+		LibTorch DLLs
 ```
 
-Linux 使用 `gadus`、`melano` launcher，架构二进制分别为 `gadus.bin` 与 `melano.bin`，共享库位于 `models/gadidae/lib/`。重复打包同一架构会更新对应 checkpoint、UCI 程序和共享运行库。
+Linux 在各架构目录内使用 `gadus`、`melano` launcher，架构二进制分别为 `gadus.bin` 与 `melano.bin`，运行库位于各自的 `lib/`。重复打包同一架构会更新对应 checkpoint、UCI 程序和运行库。
 
-UCI 客户端可以直接注册 `models/gadidae/gadus.exe` 或 `models/gadidae/melano.exe`，无需填写命令行参数。Linux 注册对应的 `gadus` 或 `melano` launcher。
+UCI 客户端可以直接注册 `models/gadidae/gadus/gadus.exe` 或 `models/gadidae/melano/melano.exe`，无需填写命令行参数。Linux 注册对应架构目录内的 `gadus` 或 `melano` launcher。
 
 ## 7. GUI
 
@@ -1035,7 +1038,7 @@ Simulator 接收任意完整 UCI 命令。Settings 使用 `Engine`、`Budget`、
 ```powershell
 python gui\gadidae.py `
 	--mode simulator `
-	--uci "models\gadidae\gadus.exe" `
+	--uci "models\gadidae\gadus\gadus.exe" `
 	--device cpu `
 	--search-type only-mcts `
 	--mcts-sims 1000 `
@@ -1049,8 +1052,8 @@ Stadium 让两个任意 UCI 引擎进行一盘可视化对局。双方拥有独�
 ```powershell
 python gui\gadidae.py `
 	--mode stadium `
-	--white-uci "models\gadidae\gadus.exe" `
-	--black-uci "models\gadidae\melano.exe" `
+	--white-uci "models\gadidae\gadus\gadus.exe" `
+	--black-uci "models\gadidae\melano\melano.exe" `
 	--white-movetime-ms 3000 `
 	--white-multipv 5 `
 	--black-movetime-ms 3000 `
