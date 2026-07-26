@@ -1,7 +1,10 @@
 // Implements the native OpenGL Gadidae interface. Simulator and Stadium share
 // one renderer and chess state while communicating with engines only through UCI.
 #include "graphics/application.hpp"
+#include "graphics/game.hpp"
 #include "graphics/pieces.hpp"
+#include "graphics/simulator.hpp"
+#include "graphics/stadium.hpp"
 #include "graphics/uci.hpp"
 #include <glad/gl.h>
 #define GLFW_INCLUDE_NONE
@@ -123,300 +126,6 @@ std::filesystem::path settings_path() {
 	return std::filesystem::current_path() / "gadidae-gui.json";
 }
 
-/// Escapes a PGN tag value according to the PGN string syntax.
-std::string escape_pgn(std::string value) {
-	std::string escaped;
-	for(const char ch : value) {
-		if(ch == '\\' || ch == '"') {
-			escaped.push_back('\\');
-		}
-		escaped.push_back(ch);
-	}
-	return escaped;
-}
-
-/// Wraps PGN movetext at a stable column width without splitting tokens.
-std::string wrap_movetext(const std::string &text, std::size_t width = 80) {
-	std::istringstream input(text);
-	std::ostringstream output;
-	std::size_t column = 0;
-	for(std::string token; input >> token;) {
-		const std::size_t required = token.size() + (column == 0 ? 0 : 1);
-		if(column > 0 && column + required > width) {
-			output << '\n';
-			column = 0;
-		}
-		if(column > 0) {
-			output << ' ';
-			++column;
-		}
-		output << token;
-		column += token.size();
-	}
-	return output.str();
-}
-
-/// Owns a legal chess position and the SAN/UCI history needed by both GUI modes.
-class GameState {
-public:
-	GameState() {
-		reset("startpos");
-	}
-
-	/// Replaces the game with a validated start position and clears history.
-	void reset(const std::string &fen) {
-		start_fen_ = fen.empty() || fen == "startpos"
-						 ? std::string(chess::constants::STARTPOS)
-						 : fen;
-		board_ = chess::Board(start_fen_);
-		moves_.clear();
-		san_.clear();
-	}
-
-	/// Returns the current board.
-	const chess::Board &board() const {
-		return board_;
-	}
-
-	/// Returns a mutable board for protocol conversion helpers.
-	chess::Board &board() {
-		return board_;
-	}
-
-	/// Returns the initial FEN from which PGN numbering and replay begin.
-	const std::string &start_fen() const {
-		return start_fen_;
-	}
-
-	/// Generates all legal moves from the current position.
-	std::vector<chess::Move> legal_moves() const {
-		chess::Movelist moves;
-		chess::movegen::legalmoves(moves, board_);
-		return {moves.begin(), moves.end()};
-	}
-
-	/// Generates legal moves starting on one selected square.
-	std::vector<chess::Move> legal_moves_from(int square) const {
-		std::vector<chess::Move> result;
-		for(const auto &move : legal_moves()) {
-			if(move.from().index() == square) {
-				result.push_back(move);
-			}
-		}
-		return result;
-	}
-
-	/// Applies a legal move and records its SAN before mutating the board.
-	void make_move(const chess::Move &move) {
-		const auto legal = legal_moves();
-		if(std::find(legal.begin(), legal.end(), move) == legal.end()) {
-			throw std::invalid_argument("illegal move");
-		}
-		san_.push_back(chess::uci::moveToSan(board_, move));
-		moves_.push_back(move);
-		board_.makeMove(move);
-	}
-
-	/// Converts and applies a UCI move in the current position.
-	void make_uci(const std::string &uci) {
-		make_move(chess::uci::uciToMove(board_, uci));
-	}
-
-	/// Removes the most recent move while preserving chess-library repetition state.
-	bool undo() {
-		if(moves_.empty()) {
-			return false;
-		}
-		board_.unmakeMove(moves_.back());
-		moves_.pop_back();
-		san_.pop_back();
-		return true;
-	}
-
-	/// Reports whether a rules-defined terminal condition has been reached.
-	bool over() const {
-		return board_.isGameOver().first != chess::GameResultReason::NONE;
-	}
-
-	/// Formats a PGN result from the absolute winner.
-	std::string result() const {
-		const auto outcome = board_.isGameOver();
-		if(outcome.first == chess::GameResultReason::NONE) {
-			return "*";
-		}
-		if(outcome.second == chess::GameResult::DRAW) {
-			return "1/2-1/2";
-		}
-		const bool side_wins = outcome.second == chess::GameResult::WIN;
-		const bool white_wins =
-			side_wins == (board_.sideToMove() == chess::Color::WHITE);
-		return white_wins ? "1-0" : "0-1";
-	}
-
-	/// Converts the rules-defined terminal reason into a PGN-friendly label.
-	std::string termination() const {
-		switch(board_.isGameOver().first) {
-		case chess::GameResultReason::CHECKMATE:
-			return "checkmate";
-		case chess::GameResultReason::STALEMATE:
-			return "stalemate";
-		case chess::GameResultReason::INSUFFICIENT_MATERIAL:
-			return "insufficient material";
-		case chess::GameResultReason::FIFTY_MOVE_RULE:
-			return "fifty-move rule";
-		case chess::GameResultReason::THREEFOLD_REPETITION:
-			return "threefold repetition";
-		default:
-			return over() ? "game over" : "";
-		}
-	}
-
-	/// Returns the number of played half-moves.
-	std::size_t plies() const {
-		return moves_.size();
-	}
-
-	/// Reconstructs one historical position without mutating the live game.
-	GameState position_at(std::size_t ply) const {
-		if(ply > moves_.size()) {
-			throw std::out_of_range("history ply exceeds the current game");
-		}
-		GameState position = *this;
-		while(position.plies() > ply) {
-			position.undo();
-		}
-		return position;
-	}
-
-	/// Returns the last move for board highlighting.
-	std::optional<chess::Move> last_move() const {
-		if(moves_.empty()) {
-			return std::nullopt;
-		}
-		return moves_.back();
-	}
-
-	/// Formats compact movetext without PGN headers.
-	std::string movetext() const {
-		std::ostringstream text;
-		for(std::size_t index = 0; index < san_.size(); ++index) {
-			if(index % 2 == 0) {
-				if(index > 0) {
-					text << ' ';
-				}
-				text << (index / 2 + 1) << ". ";
-			} else {
-				text << ' ';
-			}
-			text << san_[index];
-		}
-		if(!san_.empty()) {
-			text << ' ';
-		}
-		text << result();
-		return wrap_movetext(text.str());
-	}
-
-	/// Creates a complete, wrapped PGN document with optional engine names.
-	std::string pgn(const std::string &white = "White",
-					const std::string &black = "Black") const {
-		std::ostringstream output;
-		output << "[Event \"Gadidae\"]\n"
-			   << "[Site \"?\"]\n"
-			   << "[Date \"????.??.??\"]\n"
-			   << "[Round \"?\"]\n"
-			   << "[White \"" << escape_pgn(white) << "\"]\n"
-			   << "[Black \"" << escape_pgn(black) << "\"]\n"
-			   << "[Result \"" << result() << "\"]\n";
-		if(start_fen_ != chess::constants::STARTPOS) {
-			output << "[SetUp \"1\"]\n[FEN \"" << escape_pgn(start_fen_) << "\"]\n";
-		}
-		if(over()) {
-			output << "[Termination \"" << escape_pgn(termination()) << "\"]\n";
-		}
-		output << '\n' << movetext() << '\n';
-		return output.str();
-	}
-
-	/// Imports the main line of a PGN document and ignores comments and variations.
-	void import_pgn(const std::string &document) {
-		std::string fen = "startpos";
-		std::istringstream lines(document);
-		std::string movetext_source;
-		for(std::string line; std::getline(lines, line);) {
-			if(line.rfind("[FEN \"", 0) == 0) {
-				const auto end = line.rfind("\"]");
-				if(end != std::string::npos && end > 6) {
-					fen = line.substr(6, end - 6);
-				}
-			} else if(line.empty() || line.front() != '[') {
-				movetext_source += line + '\n';
-			}
-		}
-		reset(fen);
-
-		std::string clean;
-		int variation_depth = 0;
-		bool brace_comment = false;
-		bool line_comment = false;
-		for(const char ch : movetext_source) {
-			if(line_comment) {
-				if(ch == '\n') {
-					line_comment = false;
-					clean.push_back(' ');
-				}
-				continue;
-			}
-			if(brace_comment) {
-				if(ch == '}') {
-					brace_comment = false;
-					clean.push_back(' ');
-				}
-				continue;
-			}
-			if(ch == ';') {
-				line_comment = true;
-			} else if(ch == '{') {
-				brace_comment = true;
-			} else if(ch == '(') {
-				++variation_depth;
-			} else if(ch == ')' && variation_depth > 0) {
-				--variation_depth;
-			} else if(variation_depth == 0) {
-				clean.push_back(ch);
-			}
-		}
-
-		std::istringstream tokens(clean);
-		for(std::string token; tokens >> token;) {
-			if(token[0] == '$' || token == "1-0" || token == "0-1" ||
-			   token == "1/2-1/2" || token == "*") {
-				continue;
-			}
-			const auto dot = token.find_last_of('.');
-			if(dot != std::string::npos) {
-				token = token.substr(dot + 1);
-				if(token.empty()) {
-					continue;
-				}
-			}
-			while(!token.empty() && (token.back() == '!' || token.back() == '?')) {
-				token.pop_back();
-			}
-			if(token.empty()) {
-				continue;
-			}
-			make_move(chess::uci::parseSan(board_, token));
-		}
-	}
-
-private:
-	chess::Board board_;
-	std::string start_fen_;
-	std::vector<chess::Move> moves_;
-	std::vector<std::string> san_;
-};
-
 /// Mutable board colors and presentation preferences stored with the GUI config.
 struct Appearance {
 	ImVec4 light = color_vector(color32(0.91F, 0.93F, 0.91F));
@@ -432,23 +141,37 @@ struct Appearance {
 
 struct BoardLayout {
 	float board_size = 0.0F;
-	float right_width = 0.0F;
+	float minimum_board_size = 0.0F;
+	float maximum_board_size = 0.0F;
+	float splitter_width = 8.0F;
 };
 
-/// Fits the board and right panel inside the current content region at every font size.
-BoardLayout board_layout(float available_width, float available_height) {
-	const float right_minimum = std::min(410.0F, available_width * 0.46F);
-	const float right_maximum = std::min(610.0F, available_width * 0.52F);
-	const float right_width =
-		std::clamp(available_width * 0.39F, right_minimum,
-				   std::max(right_minimum, right_maximum));
+/// Pixel heights assigned to the three vertically resizable right-side panels.
+struct RightPanelHeights {
+	std::array<float, 3> values{};
+	float content_height = 0.0F;
+
+	float operator[](std::size_t index) const {
+		return values[index];
+	}
+};
+
+/// Fits a user-sized square board beside a readable right panel.
+BoardLayout board_layout(float available_width, float available_height,
+						 float board_fraction) {
+	constexpr float splitter_width = 8.0F;
+	const float right_minimum = std::min(360.0F, available_width * 0.42F);
 	const float bottom_controls =
 		ImGui::GetFrameHeight() + ImGui::GetStyle().ItemSpacing.y * 2.0F +
 		ImGui::GetStyle().WindowPadding.y * 2.0F + 4.0F;
-	const float board_size =
+	const float maximum_board_size =
 		std::max(1.0F, std::min(available_height - bottom_controls,
-							   available_width - right_width - 16.0F));
-	return {board_size, right_width};
+							   available_width - right_minimum - splitter_width));
+	const float minimum_board_size = std::min(280.0F, maximum_board_size);
+	const float board_size =
+		std::clamp(available_width * board_fraction, minimum_board_size,
+				   maximum_board_size);
+	return {board_size, minimum_board_size, maximum_board_size, splitter_width};
 }
 
 /// Selects application chrome independently from chessboard colors.
@@ -459,6 +182,7 @@ enum class MenuCommand : unsigned int {
 	ImportPgn = 40001,
 	SavePgn,
 	SetFen,
+	Reset,
 	Undo,
 	Flip,
 	Start,
@@ -509,15 +233,6 @@ void read_engine_json(const nlohmann::json &json, EngineConfig &config) {
 	config.multipv = json.value("multipv", config.multipv);
 	config.progress_interval_ms =
 		json.value("progress_interval_ms", config.progress_interval_ms);
-}
-
-/// Compares every launch, protocol, and search field that affects a live UCI engine.
-bool same_engine_config(const EngineConfig &left, const EngineConfig &right) {
-	return left.path == right.path && left.name == right.name &&
-		   left.device == right.device && left.arguments == right.arguments &&
-		   left.options == right.options && left.movetime_ms == right.movetime_ms &&
-		   left.node_limit == right.node_limit && left.multipv == right.multipv &&
-		   left.progress_interval_ms == right.progress_interval_ms;
 }
 
 /// Validates additional setoption values while reserving fields managed by the GUI.
@@ -955,19 +670,17 @@ public:
 
 	/// Stops every engine before the OpenGL context is destroyed.
 	~Application() {
-		simulator_engine_.close();
-		white_engine_.close();
-		black_engine_.close();
+		stadiums_.stop_all();
 	}
 
 	/// Returns the minimal dynamic state required by the platform menu.
 	MenuState menu_state() const {
 		return {
 			.simulator = mode_ == Mode::Simulator,
-			.can_undo = simulator_.plies() > 0,
-			.analysis_running = analysis_open_,
-			.stadium_running = stadium_running_,
-			.stadium_paused = stadium_paused_,
+			.can_undo = simulator_.game().plies() > 0,
+			.analysis_running = simulator_.analysis_open(),
+			.stadium_running = stadium().running(),
+			.stadium_paused = stadium().paused(),
 		};
 	}
 
@@ -981,14 +694,20 @@ public:
 			break;
 		case MenuCommand::SavePgn:
 			if(mode_ == Mode::Simulator) {
-				save_pgn(simulator_, "White", "Black");
+				save_pgn(simulator_.game(), "White", "Black");
 			} else {
-				save_pgn(stadium_, stadium_white_name(), stadium_black_name());
+				save_pgn(stadium().game(), stadium().white_name(),
+						 stadium().black_name());
 			}
 			break;
 		case MenuCommand::SetFen:
-			if(mode_ != Mode::Stadium || !stadium_running_) {
+			if(mode_ != Mode::Stadium || !stadium().running()) {
 				open_position_editor();
+			}
+			break;
+		case MenuCommand::Reset:
+			if(mode_ != Mode::Stadium || !stadium().running()) {
+				reset_active_board();
 			}
 			break;
 		case MenuCommand::Undo:
@@ -1001,10 +720,10 @@ public:
 			break;
 		case MenuCommand::Start:
 			if(mode_ == Mode::Simulator) {
-				if(!analysis_open_) {
+				if(!simulator_.analysis_open()) {
 					toggle_simulator_analysis();
 				}
-			} else if(!stadium_running_) {
+			} else if(!stadium().running()) {
 				start_stadium();
 			}
 			break;
@@ -1015,10 +734,10 @@ public:
 			break;
 		case MenuCommand::Stop:
 			if(mode_ == Mode::Simulator) {
-				if(analysis_open_) {
+				if(simulator_.analysis_open()) {
 					toggle_simulator_analysis();
 				}
-			} else if(stadium_running_) {
+			} else if(stadium().running()) {
 				stop_stadium();
 			}
 			break;
@@ -1057,7 +776,7 @@ public:
 		window_flags |= ImGuiWindowFlags_MenuBar;
 #endif
 		const auto root_padding = ImGui::GetStyle().WindowPadding;
-		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {root_padding.x, 0.0F});
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {root_padding.x, 1.0F});
 		ImGui::Begin("GadidaeRoot", nullptr, window_flags);
 		ImGui::PopStyleVar();
 #ifndef _WIN32
@@ -1101,23 +820,24 @@ private:
 				}
 				appearance_.piece_style = *style;
 			} else if(argument == "--uci") {
-				simulator_config_.path = value();
+				simulator_.config().path = value();
 			} else if(argument == "--arguments") {
-				simulator_config_.arguments = value();
+				simulator_.config().arguments = value();
 			} else if(argument == "--device") {
-				simulator_config_.device = value();
+				simulator_.config().device = value();
 			} else if(argument == "--movetime-ms") {
-				simulator_config_.movetime_ms = std::stoi(value());
+				simulator_.config().movetime_ms = std::stoi(value());
 			} else if(argument == "--node-limit") {
-				simulator_config_.node_limit = std::stoull(value());
+				simulator_.config().node_limit = std::stoull(value());
 			} else if(argument == "--multipv") {
-				simulator_config_.multipv = std::stoi(value());
+				simulator_.config().multipv = std::stoi(value());
 			} else if(argument == "--fen") {
-				simulator_.reset(value());
+				simulator_.set_start_fen(value());
+				simulator_.reset();
 			} else if(argument == "--white-uci") {
-				white_config_.path = value();
+				stadium().white_config().path = value();
 			} else if(argument == "--black-uci") {
-				black_config_.path = value();
+				stadium().black_config().path = value();
 			}
 		}
 	}
@@ -1132,16 +852,17 @@ private:
 			std::ifstream input(path);
 			const auto json = nlohmann::json::parse(input);
 			if(json.contains("simulator")) {
-				read_engine_json(json["simulator"], simulator_config_);
+				read_engine_json(json["simulator"], simulator_.config());
 			}
 			if(json.contains("white")) {
-				read_engine_json(json["white"], white_config_);
+				read_engine_json(json["white"], stadium().white_config());
 			}
 			if(json.contains("black")) {
-				read_engine_json(json["black"], black_config_);
+				read_engine_json(json["black"], stadium().black_config());
 			}
-			delay_ms_ = json.value("delay_ms", delay_ms_);
-			max_plies_ = json.value("max_plies", max_plies_);
+			stadium().set_match_limits(
+				json.value("delay_ms", stadium().display_delay_ms()),
+				json.value("max_plies", stadium().max_plies()));
 			flipped_ = json.value("flipped", flipped_);
 			const auto appearance = json.value("appearance", nlohmann::json::object());
 			auto read_color = [&](const char *name, ImVec4 &target) {
@@ -1185,12 +906,12 @@ private:
 			return nlohmann::json::array({color.x, color.y, color.z, color.w});
 		};
 		const nlohmann::json json = {
-			{"simulator", engine_json(simulator_config_)},
-			{"white", engine_json(white_config_)},
-			{"black", engine_json(black_config_)},
+			{"simulator", engine_json(simulator_.config())},
+			{"white", engine_json(stadium().white_config())},
+			{"black", engine_json(stadium().black_config())},
 			{"theme", theme_ == Theme::Light ? "light" : "dark"},
-			{"delay_ms", delay_ms_},
-			{"max_plies", max_plies_},
+			{"delay_ms", stadium().display_delay_ms()},
+			{"max_plies", stadium().max_plies()},
 			{"flipped", flipped_},
 			{"appearance",
 			 {{"light", color_json(appearance_.light)},
@@ -1221,23 +942,27 @@ private:
 			return;
 		}
 		if(ImGui::BeginMenu("File")) {
-			if(mode_ == Mode::Simulator && ImGui::MenuItem("Import PGN...")) {
+			if(mode_ == Mode::Simulator && ImGui::MenuItem("Import PGN")) {
 				handle_menu_command(MenuCommand::ImportPgn);
 			}
-			if(ImGui::MenuItem("Save PGN...")) {
+			if(ImGui::MenuItem("Save PGN")) {
 				handle_menu_command(MenuCommand::SavePgn);
 			}
 			ImGui::EndMenu();
 		}
 		if(ImGui::BeginMenu("Board")) {
-			const bool position_locked = mode_ == Mode::Stadium && stadium_running_;
+			const bool position_locked =
+				mode_ == Mode::Stadium && stadium().running();
 			ImGui::BeginDisabled(position_locked);
-			if(ImGui::MenuItem("Set FEN...")) {
+			if(ImGui::MenuItem("FEN")) {
 				handle_menu_command(MenuCommand::SetFen);
+			}
+			if(ImGui::MenuItem("Reset")) {
+				handle_menu_command(MenuCommand::Reset);
 			}
 			ImGui::EndDisabled();
 			if(mode_ == Mode::Simulator) {
-				ImGui::BeginDisabled(simulator_.plies() == 0);
+				ImGui::BeginDisabled(simulator_.game().plies() == 0);
 				if(ImGui::MenuItem("Undo")) {
 					handle_menu_command(MenuCommand::Undo);
 				}
@@ -1259,7 +984,7 @@ private:
 		}
 		if(ImGui::BeginMenu("Run")) {
 			if(mode_ == Mode::Simulator) {
-				ImGui::BeginDisabled(analysis_open_);
+				ImGui::BeginDisabled(simulator_.analysis_open());
 				if(ImGui::MenuItem("Start")) {
 					handle_menu_command(MenuCommand::Start);
 				}
@@ -1267,19 +992,19 @@ private:
 				ImGui::BeginDisabled();
 				ImGui::MenuItem("Pause");
 				ImGui::EndDisabled();
-				ImGui::BeginDisabled(!analysis_open_);
+				ImGui::BeginDisabled(!simulator_.analysis_open());
 				if(ImGui::MenuItem("Stop")) {
 					handle_menu_command(MenuCommand::Stop);
 				}
 				ImGui::EndDisabled();
 			} else {
-				ImGui::BeginDisabled(stadium_running_);
+				ImGui::BeginDisabled(stadium().running());
 				if(ImGui::MenuItem("Start")) {
 					handle_menu_command(MenuCommand::Start);
 				}
 				ImGui::EndDisabled();
-				ImGui::BeginDisabled(!stadium_running_);
-				if(ImGui::MenuItem(stadium_paused_ ? "Resume" : "Pause")) {
+				ImGui::BeginDisabled(!stadium().running());
+				if(ImGui::MenuItem(stadium().paused() ? "Resume" : "Pause")) {
 					handle_menu_command(MenuCommand::Pause);
 				}
 				if(ImGui::MenuItem("Stop")) {
@@ -1290,7 +1015,7 @@ private:
 			ImGui::EndMenu();
 		}
 		if(ImGui::BeginMenu("Tools")) {
-			if(ImGui::MenuItem("Settings...")) {
+			if(ImGui::MenuItem("Settings")) {
 				handle_menu_command(MenuCommand::Settings);
 			}
 			ImGui::EndMenu();
@@ -1298,15 +1023,11 @@ private:
 		ImGui::EndMenuBar();
 	}
 
-	/// Switches the visible workspace and stops work owned by the previous mode.
+	/// Switches only the visible workspace while background sessions keep running.
 	void set_mode(Mode mode) {
 		if(mode_ == mode) {
 			return;
 		}
-		if(mode_ == Mode::Stadium) {
-			stop_stadium();
-		}
-		simulator_engine_.stop_search();
 		mode_ = mode;
 		selected_square_.reset();
 		legal_targets_.clear();
@@ -1317,13 +1038,14 @@ private:
 		if(update_state) {
 			ensure_simulator_analysis();
 		}
-		const auto &visible = visible_simulator();
+		const auto &visible = simulator_.visible_game();
 		const float available_height = ImGui::GetContentRegionAvail().y;
 		const float available_width = ImGui::GetContentRegionAvail().x;
-		const auto layout = board_layout(available_width, available_height);
+		const auto layout =
+			board_layout(available_width, available_height, simulator_board_fraction_);
 
 		ImGui::BeginChild("simulator-left", {layout.board_size, 0.0F});
-		const bool viewing_history = simulator_view_ply_.has_value();
+		const bool viewing_history = simulator_.viewing_history();
 		if(const auto square =
 			   draw_board(visible, layout.board_size, flipped_, appearance_,
 						  viewing_history ? std::nullopt : selected_square_,
@@ -1332,82 +1054,51 @@ private:
 		   square && !viewing_history) {
 			handle_simulator_square(*square);
 		}
-		if(render_history_slider("simulator-history", simulator_, simulator_view_ply_,
-								 simulator_preview_)) {
+		if(const auto ply = render_history_slider(
+			   "simulator-history", simulator_.game(), simulator_.viewed_ply())) {
+			simulator_.view_ply(*ply);
 			selected_square_.reset();
 			legal_targets_.clear();
-			invalidate_simulator_analysis();
 		}
 		ImGui::EndChild();
-		ImGui::SameLine();
-		ImGui::BeginChild("simulator-right", {0.0F, 0.0F});
+		ImGui::SameLine(0.0F, 0.0F);
+		render_board_splitter("simulator-board-splitter", layout, available_width,
+							  available_height, simulator_board_fraction_);
+		ImGui::SameLine(0.0F, 0.0F);
+		ImGui::BeginChild("simulator-right", {0.0F, 0.0F},
+						  ImGuiChildFlags_None,
+						  ImGuiWindowFlags_NoScrollbar |
+							  ImGuiWindowFlags_NoScrollWithMouse);
+		const auto panel_heights =
+			right_panel_heights(ImGui::GetContentRegionAvail().y,
+								simulator_panel_ratios_);
 		ImGui::TextUnformatted("Suggested moves");
-		analysis_table(simulator_display_, visible_simulator().board().getFen(),
-					   available_height * 0.32F);
-		ImGui::Spacing();
+		analysis_table(simulator_.display(),
+					   simulator_.visible_game().board().getFen(),
+					   panel_heights[0]);
+		render_panel_splitter("simulator-panel-splitter-1", simulator_panel_ratios_,
+							  0, panel_heights.content_height);
 		ImGui::TextUnformatted("Engine analysis");
-		render_engine_summary(simulator_display_, available_height * 0.18F);
-		ImGui::Spacing();
+		render_engine_summary(simulator_.display(), panel_heights[1]);
+		render_panel_splitter("simulator-panel-splitter-2", simulator_panel_ratios_,
+							  1, panel_heights.content_height);
 		ImGui::TextUnformatted("Board state");
-		render_board_state(visible_simulator(), available_height * 0.32F);
+		render_board_state(simulator_.visible_game(), panel_heights[2]);
 		ImGui::EndChild();
 	}
 
 	/// Starts or refreshes simulator analysis only when its FEN changes.
 	void ensure_simulator_analysis() {
-		if(!analysis_open_ || simulator_config_.path.empty()) {
-			return;
-		}
-		const std::string fen = visible_simulator().board().getFen();
 		try {
-			if(!simulator_engine_.ready()) {
-				const auto startup = simulator_engine_.snapshot();
-				if(!startup.error.empty()) {
-					throw std::runtime_error(startup.error);
-				}
-				if(!simulator_engine_.starting()) {
-					simulator_engine_.start_async(simulator_config_);
-					simulator_display_ = {};
-					simulator_display_.engine_name = "Loading engine";
-					status_ = "Loading UCI engine";
-				}
-				return;
-			}
-			status_ = "Ready";
-			if(simulator_analysis_fen_ != fen) {
-				simulator_engine_.analyse(
-					fen, simulator_config_.movetime_ms == 0 &&
-							 simulator_config_.node_limit == 0);
-				simulator_analysis_fen_ = fen;
-				simulator_last_display_ = Clock::time_point{};
-			}
-			const auto now = Clock::now();
-			if(simulator_last_display_ == Clock::time_point{} ||
-			   now - simulator_last_display_ >=
-				   std::chrono::milliseconds(
-					   std::max(50, simulator_config_.progress_interval_ms)) ||
-			   simulator_engine_.snapshot().finished) {
-				simulator_display_ = simulator_engine_.snapshot();
-				simulator_last_display_ = now;
-			}
+			simulator_.update_analysis();
 		} catch(const std::exception &error) {
 			show_error(error.what());
-			analysis_open_ = false;
-			simulator_engine_.close();
 		}
-	}
-
-	/// Discards analysis tied to the previous position before the UI renders a new FEN.
-	void invalidate_simulator_analysis() {
-		simulator_engine_.stop_search();
-		simulator_analysis_fen_.clear();
-		simulator_display_ = {};
-		simulator_last_display_ = Clock::time_point{};
 	}
 
 	/// Handles piece selection, legal destinations, and default queen promotion.
 	void handle_simulator_square(int square) {
-		const auto piece = simulator_.board().at(chess::Square(square));
+		const auto piece = simulator_.game().board().at(chess::Square(square));
 		if(selected_square_) {
 			std::vector<chess::Move> matching;
 			for(const auto &move : legal_targets_) {
@@ -1424,17 +1115,15 @@ private:
 					}
 				}
 				simulator_.make_move(selected);
-				simulator_view_ply_.reset();
 				selected_square_.reset();
 				legal_targets_.clear();
-				invalidate_simulator_analysis();
 				return;
 			}
 		}
 		if(piece != chess::Piece::NONE &&
-		   piece.color() == simulator_.board().sideToMove()) {
+		   piece.color() == simulator_.game().board().sideToMove()) {
 			selected_square_ = square;
-			legal_targets_ = simulator_.legal_moves_from(square);
+			legal_targets_ = simulator_.game().legal_moves_from(square);
 		} else {
 			selected_square_.reset();
 			legal_targets_.clear();
@@ -1476,221 +1165,244 @@ private:
 
 	/// Renders one visible UCI match with live analysis for the side to move.
 	void render_stadium() {
-		const auto &visible = visible_stadium();
+		const auto &visible = stadium().visible_game();
 		const float available_height = ImGui::GetContentRegionAvail().y;
 		const float available_width = ImGui::GetContentRegionAvail().x;
-		const auto layout = board_layout(available_width, available_height);
+		const auto layout =
+			board_layout(available_width, available_height, stadium_board_fraction_);
 		ImGui::BeginChild("stadium-left", {layout.board_size, 0.0F});
 		draw_board(visible, layout.board_size, flipped_, appearance_, std::nullopt, {},
 				   "stadium");
-		render_history_slider("stadium-history", stadium_, stadium_view_ply_,
-							  stadium_preview_);
+		if(const auto ply = render_history_slider(
+			   "stadium-history", stadium().game(), stadium().viewed_ply())) {
+			stadium().view_ply(*ply);
+		}
 		ImGui::EndChild();
-		ImGui::SameLine();
-		ImGui::BeginChild("stadium-right", {0.0F, 0.0F});
-		const bool white_turn = stadium_.board().sideToMove() == chess::Color::WHITE;
+		ImGui::SameLine(0.0F, 0.0F);
+		render_board_splitter("stadium-board-splitter", layout, available_width,
+							  available_height, stadium_board_fraction_);
+		ImGui::SameLine(0.0F, 0.0F);
+		ImGui::BeginChild("stadium-right", {0.0F, 0.0F},
+						  ImGuiChildFlags_None,
+						  ImGuiWindowFlags_NoScrollbar |
+							  ImGuiWindowFlags_NoScrollWithMouse);
+		const auto panel_heights =
+			right_panel_heights(ImGui::GetContentRegionAvail().y,
+								stadium_panel_ratios_);
+		const bool white_turn =
+			stadium().game().board().sideToMove() == chess::Color::WHITE;
 		ImGui::Text("%s to move",
-					white_turn ? stadium_white_name().c_str()
-							   : stadium_black_name().c_str());
-		analysis_table(stadium_display_, stadium_.board().getFen(),
-					   available_height * 0.37F);
-		ImGui::Spacing();
+					white_turn ? stadium().white_name().c_str()
+							   : stadium().black_name().c_str());
+		analysis_table(stadium().display(), stadium().game().board().getFen(),
+					   panel_heights[0]);
+		render_panel_splitter("stadium-panel-splitter-1", stadium_panel_ratios_, 0,
+							  panel_heights.content_height);
 		ImGui::TextUnformatted("Match");
-		if(ImGui::BeginChild("match-state", {0.0F, available_height * 0.18F},
+		if(ImGui::BeginChild("match-state", {0.0F, panel_heights[1]},
 							 ImGuiChildFlags_Borders)) {
-			ImGui::Text("%s  vs  %s", stadium_white_name().c_str(),
-						stadium_black_name().c_str());
-			ImGui::Text("State: %s", stadium_status_.c_str());
-			ImGui::Text("Ply: %zu / %d", stadium_.plies(), max_plies_);
-			ImGui::Text("Result: %s", stadium_.result().c_str());
-			if(!stadium_.termination().empty()) {
-				ImGui::Text("Termination: %s", stadium_.termination().c_str());
+			ImGui::Text("%s  vs  %s", stadium().white_name().c_str(),
+						stadium().black_name().c_str());
+			ImGui::Text("State: %s", stadium().status().c_str());
+			ImGui::Text("Ply: %zu / %d", stadium().game().plies(),
+						stadium().max_plies());
+			ImGui::Text("Result: %s", stadium().game().result().c_str());
+			if(!stadium().game().termination().empty()) {
+				ImGui::Text("Termination: %s",
+							stadium().game().termination().c_str());
 			}
 		}
 		ImGui::EndChild();
-		ImGui::Spacing();
+		render_panel_splitter("stadium-panel-splitter-2", stadium_panel_ratios_, 1,
+							  panel_heights.content_height);
 		ImGui::TextUnformatted("Moves");
-		render_board_state(visible_stadium(), available_height * 0.26F);
+		render_board_state(stadium().visible_game(), panel_heights[2]);
 		ImGui::EndChild();
 	}
 
 	/// Launches both UCI engines and initializes a fresh visible match.
 	void start_stadium() {
 		try {
-			if(white_config_.path.empty() || black_config_.path.empty()) {
-				throw std::invalid_argument("Stadium requires two UCI engine paths");
-			}
-			stop_stadium();
-			stadium_.reset(stadium_fen_input_.empty() ? "startpos" : stadium_fen_input_);
-			stadium_view_ply_.reset();
-			white_engine_.start_async(white_config_);
-			black_engine_.start_async(black_config_);
-			stadium_running_ = true;
-			stadium_paused_ = false;
-			stadium_turn_started_ = false;
-			stadium_display_ = {};
-			next_stadium_turn_ = Clock::now();
-			stadium_status_ = "Loading engines";
+			stadium().start();
 		} catch(const std::exception &error) {
-			stop_stadium();
+			stadium().stop();
 			show_error(error.what());
 		}
 	}
 
 	/// Stops the match and guarantees both UCI child processes are gone.
 	void stop_stadium() {
-		white_engine_.close();
-		black_engine_.close();
-		stadium_running_ = false;
-		stadium_paused_ = false;
-		stadium_turn_started_ = false;
-		if(stadium_status_ == "Running" || stadium_status_ == "Paused") {
-			stadium_status_ = "Stopped";
-		}
+		stadium().stop();
 	}
 
-	/// Advances Stadium's non-blocking turn state machine once per frame.
+	/// Advances every background Stadium session independently of the visible mode.
 	void update_stadium() {
-		if(!stadium_running_ || stadium_paused_) {
-			return;
-		}
-		try {
-			if(white_engine_.starting() || black_engine_.starting()) {
-				stadium_status_ = "Loading engines";
-				return;
-			}
-			if(!white_engine_.ready() || !black_engine_.ready()) {
-				const auto white = white_engine_.snapshot();
-				const auto black = black_engine_.snapshot();
-				if(!white.error.empty()) {
-					throw std::runtime_error("White engine: " + white.error);
-				}
-				if(!black.error.empty()) {
-					throw std::runtime_error("Black engine: " + black.error);
-				}
-				throw std::runtime_error("UCI engine initialization failed");
-			}
-			if(stadium_status_ == "Loading engines") {
-				stadium_status_ = "Running";
-			}
-			if(stadium_.over()) {
-				stadium_status_ = stadium_.termination();
-				stop_stadium();
-				return;
-			}
-			if(stadium_.plies() >= static_cast<std::size_t>(max_plies_)) {
-				stadium_status_ = "Maximum plies reached";
-				stop_stadium();
-				return;
-			}
-			const auto now = Clock::now();
-			if(!stadium_turn_started_) {
-				if(now < next_stadium_turn_) {
-					return;
-				}
-				stadium_root_fen_ = stadium_.board().getFen();
-				stadium_generation_ =
-					active_stadium_engine().analyse(stadium_root_fen_, false);
-				stadium_turn_started_ = true;
-				stadium_display_ = active_stadium_engine().snapshot();
-				stadium_last_display_ = Clock::time_point{};
-				return;
-			}
-			const auto snapshot = active_stadium_engine().snapshot();
-			const auto interval =
-				std::max(50, active_stadium_config().progress_interval_ms);
-			if(stadium_last_display_ == Clock::time_point{} ||
-			   now - stadium_last_display_ >= std::chrono::milliseconds(interval) ||
-			   snapshot.finished) {
-				stadium_display_ = snapshot;
-				stadium_last_display_ = now;
-			}
-			if(snapshot.generation != stadium_generation_ || !snapshot.finished) {
-				return;
-			}
-			if(snapshot.bestmove.empty()) {
-				throw std::runtime_error("UCI engine returned no legal bestmove");
-			}
-			stadium_.make_uci(snapshot.bestmove);
-			stadium_turn_started_ = false;
-			next_stadium_turn_ = now + std::chrono::milliseconds(delay_ms_);
-		} catch(const std::exception &error) {
-			show_error(error.what());
-			stadium_status_ = "Error";
-			stop_stadium();
+		stadiums_.update_all();
+		for(auto &error : stadiums_.take_errors()) {
+			show_error(std::move(error));
 		}
 	}
 
-	/// Returns the engine whose color matches the current position.
-	UciEngine &active_stadium_engine() {
-		return stadium_.board().sideToMove() == chess::Color::WHITE ? white_engine_
-																	 : black_engine_;
+	/// Returns the Stadium session selected for presentation and direct commands.
+	StadiumSession &stadium() {
+		return stadiums_.active();
 	}
 
-	/// Returns search settings for the current side to move.
-	const EngineConfig &active_stadium_config() const {
-		return stadium_.board().sideToMove() == chess::Color::WHITE ? white_config_
-																	 : black_config_;
+	const StadiumSession &stadium() const {
+		return stadiums_.active();
 	}
 
-	/// Returns a stable white player label.
-	std::string stadium_white_name() const {
-		if(!white_config_.name.empty()) {
-			return white_config_.name;
+	/// Resizes the square board and right panel within a fixed application window.
+	void render_board_splitter(const char *identifier, const BoardLayout &layout,
+							   float available_width, float available_height,
+							   float &board_fraction) {
+		ImGui::PushID(identifier);
+		ImGui::InvisibleButton("##splitter",
+							   {layout.splitter_width, available_height});
+		const bool hovered = ImGui::IsItemHovered();
+		const bool active = ImGui::IsItemActive();
+		if(hovered || active) {
+			ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
 		}
-		const auto reported = white_engine_.display_name();
-		return reported.empty() ? "White" : reported;
-	}
-
-	/// Returns a stable black player label.
-	std::string stadium_black_name() const {
-		if(!black_config_.name.empty()) {
-			return black_config_.name;
+		if(active) {
+			const float requested =
+				std::clamp(layout.board_size + ImGui::GetIO().MouseDelta.x,
+						   layout.minimum_board_size, layout.maximum_board_size);
+			board_fraction = requested / std::max(1.0F, available_width);
 		}
-		const auto reported = black_engine_.display_name();
-		return reported.empty() ? "Black" : reported;
+		const ImVec2 minimum = ImGui::GetItemRectMin();
+		const ImVec2 maximum = ImGui::GetItemRectMax();
+		const float x = (minimum.x + maximum.x) * 0.5F;
+		ImGui::GetWindowDrawList()->AddLine(
+			{x, minimum.y + 4.0F}, {x, maximum.y - 4.0F},
+			ImGui::GetColorU32(active ? ImGuiCol_SeparatorActive
+									 : hovered ? ImGuiCol_SeparatorHovered
+											   : ImGuiCol_Separator),
+			active ? 2.0F : 1.0F);
+		ImGui::PopID();
 	}
 
-	/// Returns the selected Simulator history position or the current live board.
-	const GameState &visible_simulator() const {
-		return simulator_view_ply_ ? simulator_preview_ : simulator_;
+	/// Converts normalized panel ratios into child heights after headers and splitters.
+	RightPanelHeights right_panel_heights(
+		float available_height, const std::array<float, 3> &ratios) const {
+		constexpr float splitter_height = 8.0F;
+		const float headers = ImGui::GetTextLineHeightWithSpacing() * 3.0F;
+		const float content_height =
+			std::max(3.0F, available_height - headers - splitter_height * 2.0F);
+		const float sum = std::max(0.001F, ratios[0] + ratios[1] + ratios[2]);
+		return {
+			.values = {
+				content_height * ratios[0] / sum,
+				content_height * ratios[1] / sum,
+				content_height * ratios[2] / sum,
+			},
+			.content_height = content_height,
+		};
 	}
 
-	/// Returns the selected Stadium history position or the current live board.
-	const GameState &visible_stadium() const {
-		return stadium_view_ply_ ? stadium_preview_ : stadium_;
+	/// Resizes two adjacent right-side panels while preserving their combined height.
+	void render_panel_splitter(const char *identifier,
+							   std::array<float, 3> &ratios, std::size_t first,
+							   float content_height) {
+		constexpr float splitter_height = 8.0F;
+		ImGui::PushID(identifier);
+		ImGui::InvisibleButton("##splitter", {-1.0F, splitter_height});
+		const bool hovered = ImGui::IsItemHovered();
+		const bool active = ImGui::IsItemActive();
+		if(hovered || active) {
+			ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+		}
+		if(active && first + 1 < ratios.size()) {
+			const float pair = ratios[first] + ratios[first + 1];
+			const float minimum =
+				std::min(pair * 0.45F, 80.0F / std::max(1.0F, content_height));
+			const float resized =
+				std::clamp(ratios[first] +
+							   ImGui::GetIO().MouseDelta.y /
+								   std::max(1.0F, content_height),
+						   minimum, pair - minimum);
+			ratios[first + 1] = pair - resized;
+			ratios[first] = resized;
+		}
+		const ImVec2 minimum = ImGui::GetItemRectMin();
+		const ImVec2 maximum = ImGui::GetItemRectMax();
+		const float y = (minimum.y + maximum.y) * 0.5F;
+		ImGui::GetWindowDrawList()->AddLine(
+			{minimum.x + 4.0F, y}, {maximum.x - 4.0F, y},
+			ImGui::GetColorU32(active ? ImGuiCol_SeparatorActive
+									 : hovered ? ImGuiCol_SeparatorHovered
+											   : ImGuiCol_Separator),
+			active ? 2.0F : 1.0F);
+		ImGui::PopID();
 	}
 
 	/// Moves a read-only history pointer while preserving the complete live game.
-	bool render_history_slider(const char *identifier, const GameState &live,
-							   std::optional<std::size_t> &view_ply,
-							   GameState &preview) {
+	std::optional<std::size_t> render_history_slider(
+		const char *identifier, const GameState &live,
+		std::optional<std::size_t> view_ply) {
 		ImGui::Spacing();
 		const int maximum = static_cast<int>(live.plies());
 		int position =
 			view_ply ? std::min(static_cast<int>(*view_ply), maximum) : maximum;
-		const bool at_live = !view_ply || position == maximum;
-		ImGui::AlignTextToFramePadding();
-		ImGui::Text("%s  %d / %d", at_live ? "Live" : "Position", position, maximum);
-		ImGui::SameLine();
 		ImGui::PushID(identifier);
-		ImGui::SetNextItemWidth(-1.0F);
-		ImGui::BeginDisabled(maximum == 0);
-		const bool changed = ImGui::SliderInt(
-			"##position", &position, 0, std::max(1, maximum), "",
-			ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_NoInput);
-		ImGui::EndDisabled();
+		const float width = std::max(1.0F, ImGui::GetContentRegionAvail().x);
+		const float height = ImGui::GetFrameHeight();
+		ImGui::InvisibleButton("##position", {width, height},
+							   ImGuiButtonFlags_MouseButtonLeft);
+		const ImVec2 minimum = ImGui::GetItemRectMin();
+		const ImVec2 maximum_point = ImGui::GetItemRectMax();
+		const float knob_radius = std::max(6.0F, height * 0.24F);
+		const float track_left = minimum.x + knob_radius;
+		const float track_right = maximum_point.x - knob_radius;
+		const float pointer_ratio = std::clamp(
+			(ImGui::GetIO().MousePos.x - track_left) /
+				std::max(1.0F, track_right - track_left),
+			0.0F, 1.0F);
+		bool changed = false;
+		if(maximum > 0 && ImGui::IsItemActive()) {
+			const int selected =
+				std::clamp(static_cast<int>(std::lround(pointer_ratio * maximum)), 0,
+						   maximum);
+			if(selected != position) {
+				position = selected;
+				changed = true;
+			}
+		}
+		if(ImGui::IsItemHovered()) {
+			ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+		}
+
+		const auto &style = ImGui::GetStyle();
+		const float center_y = (minimum.y + maximum_point.y) * 0.5F;
+		const float position_ratio = maximum > 0
+			? static_cast<float>(position) / static_cast<float>(maximum)
+			: 1.0F;
+		const float visual_ratio =
+			maximum > 0 && ImGui::IsItemActive() ? pointer_ratio : position_ratio;
+		const float knob_x =
+			track_left + (track_right - track_left) * visual_ratio;
+		auto *draw = ImGui::GetWindowDrawList();
+		const ImU32 track_color = ImGui::GetColorU32(ImGuiCol_FrameBg);
+		const ImU32 fill_color = ImGui::GetColorU32(
+			maximum == 0 ? ImGuiCol_TextDisabled : ImGuiCol_SliderGrab);
+		const ImU32 knob_color = ImGui::GetColorU32(
+			ImGui::IsItemActive() ? ImGuiCol_SliderGrabActive : ImGuiCol_SliderGrab);
+		const float track_half = std::max(2.0F, height * 0.09F);
+		draw->AddRectFilled({track_left, center_y - track_half},
+							{track_right, center_y + track_half}, track_color,
+							track_half);
+		draw->AddRectFilled({track_left, center_y - track_half},
+							{knob_x, center_y + track_half}, fill_color,
+							track_half);
+		draw->AddCircleFilled({knob_x, center_y}, knob_radius, knob_color, 24);
+		draw->AddCircle({knob_x, center_y}, knob_radius,
+						ImGui::GetColorU32(ImGuiCol_Border), 24,
+						std::max(1.0F, style.FrameBorderSize));
 		ImGui::PopID();
 		if(!changed) {
-			return false;
+			return std::nullopt;
 		}
-		if(position >= maximum) {
-			view_ply.reset();
-		} else {
-			view_ply = static_cast<std::size_t>(position);
-			preview = live.position_at(*view_ply);
-		}
-		return true;
+		return static_cast<std::size_t>(position);
 	}
 
 	/// Opens the settings editor with mode-specific engine and match values.
@@ -1699,12 +1411,12 @@ private:
 		appearance_edit_ = appearance_;
 		theme_edit_ = theme_;
 		if(mode == Mode::Simulator) {
-			simulator_edit_ = simulator_config_;
+			simulator_edit_ = simulator_.config();
 		} else {
-			white_edit_ = white_config_;
-			black_edit_ = black_config_;
-			delay_edit_ = delay_ms_;
-			max_plies_edit_ = max_plies_;
+			white_edit_ = stadium().white_config();
+			black_edit_ = stadium().black_config();
+			delay_edit_ = stadium().display_delay_ms();
+			max_plies_edit_ = stadium().max_plies();
 		}
 		settings_open_ = true;
 	}
@@ -1718,11 +1430,8 @@ private:
 				std::ostringstream document;
 				document << input.rdbuf();
 				simulator_.import_pgn(document.str());
-				simulator_fen_input_ = simulator_.start_fen();
-				simulator_view_ply_.reset();
 				selected_square_.reset();
 				legal_targets_.clear();
-				invalidate_simulator_analysis();
 			} catch(const std::exception &error) {
 				show_error(error.what());
 			}
@@ -1732,63 +1441,63 @@ private:
 	/// Removes one Simulator move and resets its non-destructive history pointer.
 	void undo_simulator() {
 		if(simulator_.undo()) {
-			simulator_view_ply_.reset();
 			selected_square_.reset();
 			legal_targets_.clear();
-			invalidate_simulator_analysis();
 		}
 	}
 
 	/// Starts or stops live Simulator analysis.
 	void toggle_simulator_analysis() {
-		analysis_open_ = !analysis_open_;
-		if(!analysis_open_) {
-			simulator_engine_.stop_search();
-			simulator_display_ = {};
+		if(simulator_.analysis_open()) {
+			simulator_.stop_analysis();
 		} else {
-			invalidate_simulator_analysis();
+			simulator_.start_analysis();
 		}
 	}
 
 	/// Pauses or resumes Stadium without destroying either engine process.
 	void toggle_stadium_pause() {
-		if(!stadium_running_) {
-			return;
-		}
-		stadium_paused_ = !stadium_paused_;
-		if(stadium_paused_) {
-			active_stadium_engine().stop_search();
-			stadium_turn_started_ = false;
-			stadium_status_ = "Paused";
-		} else {
-			next_stadium_turn_ = Clock::now();
-			stadium_status_ = "Running";
-		}
+		stadium().toggle_pause();
 	}
 
 	/// Opens a focused FEN editor for the active mode.
 	void open_position_editor() {
 		position_mode_ = mode_;
 		position_edit_ = mode_ == Mode::Simulator
-							 ? simulator_.board().getFen()
-							 : stadium_fen_input_;
+							 ? simulator_.start_fen()
+							 : stadium().start_fen();
 		position_editor_open_ = true;
 	}
 
-	/// Applies a FEN to Simulator or the next Stadium match.
+	/// Resets the active board from its configured start FEN.
+	void reset_active_board() {
+		try {
+			if(mode_ == Mode::Simulator) {
+				simulator_.reset();
+				selected_square_.reset();
+				legal_targets_.clear();
+			} else {
+				stadium().reset();
+			}
+		} catch(const std::exception &error) {
+			show_error(error.what());
+		}
+	}
+
+	/// Validates and stores the start FEN without changing the current board.
 	void render_position_editor() {
 		if(position_editor_open_) {
-			ImGui::OpenPopup("Set FEN");
+			ImGui::OpenPopup("FEN");
 			position_editor_open_ = false;
 		}
-		ImGui::SetNextWindowSize({680.0F, 0.0F}, ImGuiCond_Appearing);
-		if(!ImGui::BeginPopupModal("Set FEN", nullptr,
-								   ImGuiWindowFlags_AlwaysAutoResize |
+		ImGui::SetNextWindowSize({680.0F, 210.0F}, ImGuiCond_Appearing);
+		if(!ImGui::BeginPopupModal("FEN", nullptr,
+								   ImGuiWindowFlags_NoResize |
 									   ImGuiWindowFlags_NoSavedSettings)) {
 			return;
 		}
 		ImGui::TextUnformatted(position_mode_ == Mode::Simulator
-								  ? "Simulator position"
+								  ? "Simulator start position"
 								  : "Stadium start position");
 		ImGui::SetNextItemWidth(-1.0F);
 		const bool submitted = ImGui::InputTextWithHint(
@@ -1797,20 +1506,15 @@ private:
 		if(ImGui::Button("Apply", {100.0F, 0.0F}) || submitted) {
 			try {
 				const std::string fen = position_edit_.empty() ? "startpos" : position_edit_;
+				GameState validation;
+				validation.reset(fen);
+				static_cast<void>(validation);
 				if(position_mode_ == Mode::Simulator) {
-					simulator_.reset(fen);
-					simulator_fen_input_ = fen;
-					simulator_view_ply_.reset();
-					selected_square_.reset();
-					legal_targets_.clear();
-					invalidate_simulator_analysis();
+					simulator_.set_start_fen(fen);
 				} else {
-					stadium_.reset(fen);
-					stadium_fen_input_ = fen;
-					stadium_view_ply_.reset();
-					stadium_display_ = {};
-					stadium_status_ = "Ready";
+					stadium().set_start_fen(fen);
 				}
+				status_ = "Start FEN updated";
 				ImGui::CloseCurrentPopup();
 			} catch(const std::exception &error) {
 				show_error(error.what());
@@ -1829,7 +1533,12 @@ private:
 		ImGui::SeparatorText("Engine");
 		std::string path = config.path.string();
 		ImGui::TextUnformatted("Executable");
-		ImGui::SetNextItemWidth(-82.0F);
+		const float browse_width =
+			ImGui::CalcTextSize("Browse").x + ImGui::GetStyle().FramePadding.x * 2.0F;
+		const float path_width =
+			std::max(80.0F, ImGui::GetContentRegionAvail().x - browse_width -
+							 ImGui::GetStyle().ItemSpacing.x);
+		ImGui::SetNextItemWidth(path_width);
 		if(ImGui::InputText("##path", &path)) {
 			config.path = path;
 		}
@@ -1986,24 +1695,10 @@ private:
 				}
 				static_cast<void>(primary_options);
 				if(settings_mode_ == Mode::Simulator) {
-					const bool engine_changed =
-						!same_engine_config(simulator_config_, simulator_edit_);
-					simulator_config_ = simulator_edit_;
-					if(engine_changed) {
-						simulator_engine_.close();
-						invalidate_simulator_analysis();
-					}
+					simulator_.set_config(simulator_edit_);
 				} else {
-					const bool engines_changed =
-						!same_engine_config(white_config_, white_edit_) ||
-						!same_engine_config(black_config_, black_edit_);
-					if(engines_changed) {
-						stop_stadium();
-					}
-					white_config_ = white_edit_;
-					black_config_ = black_edit_;
-					delay_ms_ = delay_edit_;
-					max_plies_ = max_plies_edit_;
+					stadium().set_configs(white_edit_, black_edit_);
+					stadium().set_match_limits(delay_edit_, max_plies_edit_);
 				}
 				appearance_ = appearance_edit_;
 				theme_ = theme_edit_;
@@ -2064,16 +1759,8 @@ private:
 	Mode mode_ = Mode::Simulator;
 	Mode settings_mode_ = Mode::Simulator;
 	Mode position_mode_ = Mode::Simulator;
-	GameState simulator_;
-	GameState stadium_;
-	GameState simulator_preview_;
-	GameState stadium_preview_;
-	UciEngine simulator_engine_;
-	UciEngine white_engine_;
-	UciEngine black_engine_;
-	EngineConfig simulator_config_;
-	EngineConfig white_config_;
-	EngineConfig black_config_;
+	SimulatorWorkspace simulator_;
+	StadiumWorkspace stadiums_;
 	EngineConfig simulator_edit_;
 	EngineConfig white_edit_;
 	EngineConfig black_edit_;
@@ -2081,32 +1768,17 @@ private:
 	Appearance appearance_edit_;
 	Theme theme_ = Theme::Dark;
 	Theme theme_edit_ = Theme::Dark;
+	float simulator_board_fraction_ = 0.60F;
+	float stadium_board_fraction_ = 0.60F;
+	std::array<float, 3> simulator_panel_ratios_ = {0.42F, 0.23F, 0.35F};
+	std::array<float, 3> stadium_panel_ratios_ = {0.42F, 0.23F, 0.35F};
 	bool flipped_ = false;
-	bool analysis_open_ = true;
 	bool settings_open_ = false;
 	bool position_editor_open_ = false;
 	bool error_open_ = false;
-	std::optional<std::size_t> simulator_view_ply_;
-	std::optional<std::size_t> stadium_view_ply_;
 	std::optional<int> selected_square_;
 	std::vector<chess::Move> legal_targets_;
-	std::string simulator_fen_input_ = "startpos";
 	std::string position_edit_ = "startpos";
-	std::string simulator_analysis_fen_;
-	AnalysisSnapshot simulator_display_;
-	Clock::time_point simulator_last_display_{};
-	bool stadium_running_ = false;
-	bool stadium_paused_ = false;
-	bool stadium_turn_started_ = false;
-	std::uint64_t stadium_generation_ = 0;
-	std::string stadium_fen_input_ = "startpos";
-	std::string stadium_root_fen_;
-	std::string stadium_status_ = "Ready";
-	AnalysisSnapshot stadium_display_;
-	Clock::time_point stadium_last_display_{};
-	Clock::time_point next_stadium_turn_{};
-	int delay_ms_ = 250;
-	int max_plies_ = 240;
 	int delay_edit_ = 250;
 	int max_plies_edit_ = 240;
 	std::string status_ = "Ready";
@@ -2134,12 +1806,17 @@ public:
 			destroy_menus();
 			throw std::runtime_error("could not create the native menu");
 		}
+		remove_check_column(file_menu_);
+		remove_check_column(board_menu_);
+		remove_check_column(run_menu_);
+		remove_check_column(tools_menu_);
 
-		append_item(file_menu_, MenuCommand::ImportPgn, L"Import PGN...");
-		append_item(file_menu_, MenuCommand::SavePgn, L"Save PGN...");
+		append_item(file_menu_, MenuCommand::ImportPgn, L"Import PGN");
+		append_item(file_menu_, MenuCommand::SavePgn, L"Save PGN");
 		append_popup(menu_, file_menu_, L"File");
 
-		append_item(board_menu_, MenuCommand::SetFen, L"Set FEN...");
+		append_item(board_menu_, MenuCommand::SetFen, L"FEN");
+		append_item(board_menu_, MenuCommand::Reset, L"Reset");
 		append_item(board_menu_, MenuCommand::Undo, L"Undo");
 		AppendMenuW(board_menu_, MF_SEPARATOR, 0, nullptr);
 		append_item(board_menu_, MenuCommand::Flip, L"Flip");
@@ -2154,7 +1831,7 @@ public:
 		append_item(run_menu_, MenuCommand::Stop, L"Stop");
 		append_popup(menu_, run_menu_, L"Run");
 
-		append_item(tools_menu_, MenuCommand::Settings, L"Settings...");
+		append_item(tools_menu_, MenuCommand::Settings, L"Settings");
 		append_popup(menu_, tools_menu_, L"Tools");
 
 		if(!SetMenu(window_, menu_)) {
@@ -2203,6 +1880,7 @@ public:
 		}
 		enable(MenuCommand::ImportPgn, state.simulator);
 		enable(MenuCommand::SetFen, state.simulator || !state.stadium_running);
+		enable(MenuCommand::Reset, state.simulator || !state.stadium_running);
 		enable(MenuCommand::Undo, state.simulator && state.can_undo);
 		enable(MenuCommand::Start,
 			   state.simulator ? !state.analysis_running : !state.stadium_running);
@@ -2228,6 +1906,20 @@ private:
 	/// Converts the shared command enum to the identifier carried by WM_COMMAND.
 	static UINT command_id(MenuCommand command) {
 		return static_cast<UINT>(command);
+	}
+
+	/// Removes the unused checkmark gutter from menus that contain only commands.
+	static void remove_check_column(HMENU menu) {
+		MENUINFO information{};
+		information.cbSize = sizeof(information);
+		information.fMask = MIM_STYLE;
+		if(!GetMenuInfo(menu, &information)) {
+			throw std::runtime_error("could not read native menu style");
+		}
+		information.dwStyle |= MNS_NOCHECK;
+		if(!SetMenuInfo(menu, &information)) {
+			throw std::runtime_error("could not update native menu style");
+		}
 	}
 
 	/// Appends one command to a native popup menu.
@@ -2257,6 +1949,7 @@ private:
 		case MenuCommand::SavePgn:
 			return file_menu_;
 		case MenuCommand::SetFen:
+		case MenuCommand::Reset:
 		case MenuCommand::Undo:
 		case MenuCommand::Flip:
 			return board_menu_;

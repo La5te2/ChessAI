@@ -7,6 +7,30 @@ TORCH_DIR="${GADIDAE_TORCH_DIR:-${ROOT_DIR}/api/libtorch}"
 PUBLISH_DIR="${ROOT_DIR}/build"
 WORK_DIR="${PUBLISH_DIR}/.build-work"
 
+resolve_graphics_mode() {
+	case "${GADIDAE_BUILD_GRAPHICS:-auto}" in
+		1|ON|on|true)
+			echo "ON"
+			;;
+		0|OFF|off|false)
+			echo "OFF"
+			;;
+		auto)
+			if [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" ]]; then
+				echo "ON"
+			else
+				echo "OFF"
+			fi
+			;;
+		*)
+			echo "GADIDAE_BUILD_GRAPHICS must be auto, 0, or 1." >&2
+			exit 1
+			;;
+	esac
+}
+
+BUILD_GRAPHICS="$(resolve_graphics_mode)"
+
 report_failure() {
 	local status=$?
 	trap - EXIT
@@ -31,6 +55,7 @@ fi
 cmake \
 	"-DAPI_DIR=${ROOT_DIR}/api" \
 	"-DTORCH_DIR=${TORCH_DIR}" \
+	"-DVERIFY_GUI=${BUILD_GRAPHICS}" \
 	-P "${ROOT_DIR}/api/verify.cmake"
 if [[ "${PUBLISH_DIR}" != "${ROOT_DIR}/build" ]]; then
 	exit 1
@@ -46,22 +71,30 @@ cmake \
 	-B "${WORK_DIR}" \
 	-G Ninja \
 	-DCMAKE_BUILD_TYPE=Release \
+	"-DGADIDAE_BUILD_GRAPHICS=${BUILD_GRAPHICS}" \
 	"-DGADIDAE_TORCH_DIR=${TORCH_DIR}"
 cmake --build "${WORK_DIR}" --parallel "$(nproc 2>/dev/null || echo 2)"
 ctest --test-dir "${WORK_DIR}" --output-on-failure
 
 rm -rf -- "${PUBLISH_DIR}/gadus" "${PUBLISH_DIR}/melano" "${PUBLISH_DIR}/graphics"
-mkdir -p "${PUBLISH_DIR}/gadus" "${PUBLISH_DIR}/melano" "${PUBLISH_DIR}/graphics"
+mkdir -p "${PUBLISH_DIR}/gadus" "${PUBLISH_DIR}/melano"
 for architecture in gadus melano; do
 	for executable in preprocess train search arena fcpi uci; do
 		test -x "${WORK_DIR}/${architecture}/${executable}"
 		cp "${WORK_DIR}/${architecture}/${executable}" "${PUBLISH_DIR}/${architecture}/"
 	done
 done
-test -x "${WORK_DIR}/graphics/Gadidae"
-cp "${WORK_DIR}/graphics/Gadidae" "${PUBLISH_DIR}/graphics/"
+if [[ "${BUILD_GRAPHICS}" == "ON" ]]; then
+	mkdir -p "${PUBLISH_DIR}/graphics"
+	test -x "${WORK_DIR}/graphics/Gadidae"
+	cp "${WORK_DIR}/graphics/Gadidae" "${PUBLISH_DIR}/graphics/"
+fi
 
 echo "Gadus build finished: ${PUBLISH_DIR}/gadus"
 echo "Melano build finished: ${PUBLISH_DIR}/melano"
-echo "Gadidae graphics finished: ${PUBLISH_DIR}/graphics"
+if [[ "${BUILD_GRAPHICS}" == "ON" ]]; then
+	echo "Gadidae graphics finished: ${PUBLISH_DIR}/graphics"
+else
+	echo "Gadidae graphics skipped for this headless build."
+fi
 echo "Incremental build cache: ${WORK_DIR}"

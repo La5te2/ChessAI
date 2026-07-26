@@ -86,7 +86,7 @@ Python 公共脚本：
 python -m pip install -r requirements.txt
 ```
 
-C++ 依赖安装到 `api/`：LibTorch、HDF5、zlib、nlohmann-json、chess-library 与 Ninja。`api/versions.env` 是 Windows 与 Linux 共用的依赖版本锁。安装脚本在 `nvidia-smi` 能查询 GPU compute capability 时选择 LibTorch CUDA `cu126`，其余环境选择 CPU 包，也可通过 `GADIDAE_TORCH_VARIANT=cpu|cu126` 指定。已有 LibTorch 安装可通过 `GADIDAE_TORCH_DIR` 指向其根目录。`setup.bat/.sh` 在安装结束时验证实际依赖，`build.bat/.sh` 在配置前再次验证，CMake 对 LibTorch、HDF5 与 zlib 使用精确版本约束。版本、variant 或 chess-library 校验和不匹配时立即停止。下载过程显示进度、速度和 ETA，成功后清理压缩包、源码和依赖构建目录。
+C++ 依赖安装到 `api/`：LibTorch、HDF5、zlib、nlohmann-json、chess-library 与 Ninja。图形构建同时安装 GLFW、GLM、Dear ImGui、FreeType、STB 与 GLAD。`api/versions.env` 是 Windows 与 Linux 共用的依赖版本锁。安装脚本在 `nvidia-smi` 能查询 GPU compute capability 时选择 LibTorch CUDA `cu126`，其余环境选择 CPU 包，也可通过 `GADIDAE_TORCH_VARIANT=cpu|cu126` 指定。已有 LibTorch 安装可通过 `GADIDAE_TORCH_DIR` 指向其根目录。`setup.bat/.sh` 在安装结束时验证实际依赖，`build.bat/.sh` 在配置前再次验证，CMake 对 LibTorch、HDF5 与 zlib 使用精确版本约束。版本、variant 或 chess-library 校验和不匹配时立即停止。下载过程显示进度、速度和 ETA，成功后清理压缩包、源码和依赖构建目录。
 
 Windows：
 
@@ -100,8 +100,20 @@ $env:GADIDAE_TORCH_VARIANT = "cpu"
 Linux：
 
 ```bash
+sudo apt install build-essential cmake curl unzip tar python3 python3-pip
+```
+
+图形构建还需要 X11 开发环境：
+
+```bash
+sudo apt install xorg-dev
+```
+
+```bash
 GADIDAE_TORCH_VARIANT=cu126 bash api/setup.sh
 ```
+
+`setup.sh` 与 `build.sh` 默认根据 `DISPLAY` 或 `WAYLAND_DISPLAY` 判断当前 Linux 是否具有图形会话。纯命令行服务器会跳过 GLFW、OpenGL 图形依赖和 `Gadidae` GUI，同时保留 Gadus、Melano 的完整命令行训练、搜索、竞技场、FCPI 与 UCI 链路。可使用 `GADIDAE_BUILD_GRAPHICS=0` 明确选择命令行构建，或使用 `GADIDAE_BUILD_GRAPHICS=1` 在无图形会话的构建机上强制编译 GUI。
 
 ## 3. 构建
 
@@ -116,6 +128,13 @@ Linux：
 
 ```bash
 bash scripts/build.sh
+```
+
+纯命令行服务器也可显式运行：
+
+```bash
+GADIDAE_BUILD_GRAPHICS=0 bash api/setup.sh
+GADIDAE_BUILD_GRAPHICS=0 bash scripts/build.sh
 ```
 
 构建脚本通过 CMake、Ninja 和 CTest 生成并验证以下程序：
@@ -1120,11 +1139,11 @@ scripts\build.bat
 Linux 使用：
 
 ```bash
-bash api/setup.sh
-bash scripts/build.sh
+GADIDAE_BUILD_GRAPHICS=1 bash api/setup.sh
+GADIDAE_BUILD_GRAPHICS=1 bash scripts/build.sh
 ```
 
-Windows 双击 `build/graphics/Gadidae.exe`，Linux 运行 `build/graphics/Gadidae`。程序默认进入 Simulator，顶部模式控件可切换到 Stadium。GUI 的 FreeType 压缩支持静态编译进可执行文件。
+Windows 双击 `build/graphics/Gadidae.exe`，具有 X11 或 Wayland 图形会话的 Linux 运行 `build/graphics/Gadidae`。程序默认进入 Simulator，顶部模式控件可切换到 Stadium。GUI 的 FreeType 压缩支持静态编译进可执行文件。SSH 服务器需要 X11 forwarding、远程桌面或其他可见显示服务才能实际操作 GUI；`xvfb-run` 适合自动化启动测试，无法提供可交互画面。
 
 Simulator 用于局面分析。Settings 的 `Engine` 区域填写 UCI 可执行文件、显示名称和设备，`Launch` 区域填写启动进程时附加的命令行参数，`Search` 区域填写时间或节点预算、MultiPV 行数与显示刷新间隔。`Additional UCI options` 在握手完成后发送额外的 `setoption` 命令。也可以从命令行指定常用参数：
 

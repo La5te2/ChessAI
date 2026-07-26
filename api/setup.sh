@@ -32,6 +32,30 @@ fi
 source "${VERSION_FILE}"
 mkdir -p "${DOWNLOADS}"
 
+resolve_graphics_mode() {
+	case "${GADIDAE_BUILD_GRAPHICS:-auto}" in
+		1|ON|on|true)
+			echo "ON"
+			;;
+		0|OFF|off|false)
+			echo "OFF"
+			;;
+		auto)
+			if [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" ]]; then
+				echo "ON"
+			else
+				echo "OFF"
+			fi
+			;;
+		*)
+			echo "GADIDAE_BUILD_GRAPHICS must be auto, 0, or 1." >&2
+			exit 1
+			;;
+	esac
+}
+
+BUILD_GRAPHICS="$(resolve_graphics_mode)"
+
 TORCH_VARIANT="cpu"
 if nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits >/dev/null 2>&1; then
 	TORCH_VARIANT="${TORCH_GPU_VARIANT}"
@@ -197,38 +221,40 @@ download_source() {
 	rm -rf "${API_DIR:?}/${name}-unpack"
 }
 
-download_source glfw "${GLFW_VERSION}" \
-	"https://github.com/glfw/glfw/archive/refs/tags/${GLFW_VERSION}.tar.gz" \
-	"glfw-${GLFW_VERSION}"
-download_source glm "${GLM_VERSION}" \
-	"https://github.com/g-truc/glm/archive/refs/tags/${GLM_VERSION}.tar.gz" \
-	"glm-${GLM_VERSION}"
-download_source imgui "${IMGUI_VERSION}" \
-	"https://github.com/ocornut/imgui/archive/refs/tags/v${IMGUI_VERSION}.tar.gz" \
-	"imgui-${IMGUI_VERSION}"
-download_source freetype "${FREETYPE_VERSION}" \
-	"https://github.com/freetype/freetype/archive/refs/tags/VER-${FREETYPE_VERSION}.tar.gz" \
-	"freetype-VER-${FREETYPE_VERSION}"
-download_source stb "${STB_REF}" \
-	"https://github.com/nothings/stb/archive/${STB_REF}.tar.gz" \
-	"stb-${STB_REF}" "stb_image.h"
-sed -i \
-	's/cmake_minimum_required(VERSION 3\.0\.\.\.3\.5)/cmake_minimum_required(VERSION 3.10...3.31)/' \
-	"${API_DIR}/freetype/CMakeLists.txt"
+if [[ "${BUILD_GRAPHICS}" == "ON" ]]; then
+	download_source glfw "${GLFW_VERSION}" \
+		"https://github.com/glfw/glfw/archive/refs/tags/${GLFW_VERSION}.tar.gz" \
+		"glfw-${GLFW_VERSION}"
+	download_source glm "${GLM_VERSION}" \
+		"https://github.com/g-truc/glm/archive/refs/tags/${GLM_VERSION}.tar.gz" \
+		"glm-${GLM_VERSION}"
+	download_source imgui "${IMGUI_VERSION}" \
+		"https://github.com/ocornut/imgui/archive/refs/tags/v${IMGUI_VERSION}.tar.gz" \
+		"imgui-${IMGUI_VERSION}"
+	download_source freetype "${FREETYPE_VERSION}" \
+		"https://github.com/freetype/freetype/archive/refs/tags/VER-${FREETYPE_VERSION}.tar.gz" \
+		"freetype-VER-${FREETYPE_VERSION}"
+	download_source stb "${STB_REF}" \
+		"https://github.com/nothings/stb/archive/${STB_REF}.tar.gz" \
+		"stb-${STB_REF}" "stb_image.h"
+	sed -i \
+		's/cmake_minimum_required(VERSION 3\.0\.\.\.3\.5)/cmake_minimum_required(VERSION 3.10...3.31)/' \
+		"${API_DIR}/freetype/CMakeLists.txt"
 
-if [[ ! -f "${API_DIR}/glad/include/glad/gl.h" ]]; then
-	echo "Generating GLAD ${GLAD_VERSION} for OpenGL 3.3 Core..."
-	download_source glad-generator "${GLAD_VERSION}" \
-		"https://github.com/Dav1dde/glad/archive/refs/tags/v${GLAD_VERSION}.tar.gz" \
-		"glad-${GLAD_VERSION}"
-	if [[ ! -d "${API_DIR}/glad-python/jinja2" ]]; then
-		python3 -m pip install --disable-pip-version-check --no-cache-dir \
-			--target "${API_DIR}/glad-python" \
-			"Jinja2==${JINJA2_VERSION}" "MarkupSafe==${MARKUPSAFE_VERSION}"
+	if [[ ! -f "${API_DIR}/glad/include/glad/gl.h" ]]; then
+		echo "Generating GLAD ${GLAD_VERSION} for OpenGL 3.3 Core..."
+		download_source glad-generator "${GLAD_VERSION}" \
+			"https://github.com/Dav1dde/glad/archive/refs/tags/v${GLAD_VERSION}.tar.gz" \
+			"glad-${GLAD_VERSION}"
+		if [[ ! -d "${API_DIR}/glad-python/jinja2" ]]; then
+			python3 -m pip install --disable-pip-version-check --no-cache-dir \
+				--target "${API_DIR}/glad-python" \
+				"Jinja2==${JINJA2_VERSION}" "MarkupSafe==${MARKUPSAFE_VERSION}"
+		fi
+		PYTHONPATH="${API_DIR}/glad-python:${API_DIR}/glad-generator" \
+			python3 -m glad --out-path "${API_DIR}/glad" --api gl:core=3.3 \
+			--extensions "" --reproducible c --loader
 	fi
-	PYTHONPATH="${API_DIR}/glad-python:${API_DIR}/glad-generator" \
-		python3 -m glad --out-path "${API_DIR}/glad" --api gl:core=3.3 \
-		--extensions "" --reproducible c --loader
 fi
 
 if [[ ! -d "${API_DIR}/zlib/lib" && ! -d "${API_DIR}/zlib/lib64" ]]; then
@@ -280,10 +306,12 @@ cmake \
 	"-DAPI_DIR=${API_DIR}" \
 	"-DTORCH_DIR=${API_DIR}/libtorch" \
 	"-DEXPECTED_TORCH_VARIANT=${TORCH_VARIANT}" \
+	"-DVERIFY_GUI=${BUILD_GRAPHICS}" \
 	-P "${API_DIR}/verify.cmake"
 
 rm -rf -- "${DOWNLOADS}"
 echo
-echo "Gadus dependencies ready."
+echo "Gadidae dependencies ready."
 echo "LibTorch variant: ${TORCH_VARIANT}"
+echo "Graphics: ${BUILD_GRAPHICS}"
 echo "Build: bash \"${ROOT_DIR}/scripts/build.sh\""

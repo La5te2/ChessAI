@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.22)
 
 project(GadidaeCpp LANGUAGES C CXX)
 
+option(GADIDAE_BUILD_GRAPHICS "Build the GLFW/OpenGL desktop application" ON)
+
 if(MSVC AND CMAKE_GENERATOR MATCHES "Ninja")
 	set(CMAKE_CL_SHOWINCLUDES_PREFIX "注意: 包含文件:  ")
 endif()
@@ -237,6 +239,7 @@ if(MSVC)
 endif()
 add_test(NAME melanotests COMMAND melanotests)
 
+if(GADIDAE_BUILD_GRAPHICS)
 # The native GUI owns no model implementation. It talks to Gadus, Melano, and
 # third-party engines through UCI and therefore links only graphics dependencies.
 set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
@@ -291,7 +294,10 @@ target_link_libraries(gadidaeimgui PUBLIC glfw freetype)
 add_executable(gadidaegraphics
 	src/graphics/main.cpp
 	src/graphics/application.cpp
+	src/graphics/game.cpp
 	src/graphics/pieces.cpp
+	src/graphics/simulator.cpp
+	src/graphics/stadium.cpp
 	src/graphics/uci.cpp
 )
 set_target_properties(gadidaegraphics PROPERTIES
@@ -322,4 +328,5 @@ if(MSVC)
 	target_link_libraries(gadidaegraphics PRIVATE Comdlg32 Shell32 User32)
 else()
 	target_compile_options(gadidaegraphics PRIVATE -Wall -Wextra -Wpedantic)
+endif()
 endif()

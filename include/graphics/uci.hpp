@@ -27,6 +27,8 @@ struct EngineConfig {
 	std::uint64_t node_limit = 0;
 	int multipv = 8;
 	int progress_interval_ms = 750;
+
+	bool operator==(const EngineConfig &) const = default;
 };
 
 /// One MultiPV row reported by an engine for the current position.
