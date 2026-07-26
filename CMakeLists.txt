@@ -319,7 +319,7 @@ target_link_libraries(gadidaegraphics PRIVATE
 )
 if(MSVC)
 	target_compile_options(gadidaegraphics PRIVATE /MP /W4 /permissive- /utf-8)
-	target_link_libraries(gadidaegraphics PRIVATE Comdlg32 Shell32)
+	target_link_libraries(gadidaegraphics PRIVATE Comdlg32 Shell32 User32)
 else()
 	target_compile_options(gadidaegraphics PRIVATE -Wall -Wextra -Wpedantic)
 endif()

@@ -5,7 +5,14 @@
 #include "graphics/uci.hpp"
 #include <glad/gl.h>
 #define GLFW_INCLUDE_NONE
+#ifdef _WIN32
+#define NOMINMAX
+#define GLFW_EXPOSE_NATIVE_WIN32
+#endif
 #include <GLFW/glfw3.h>
+#ifdef _WIN32
+#include <GLFW/glfw3native.h>
+#endif
 #include <chess.hpp>
 #include <imgui.h>
 #include <imgui_impl_glfw.h>
@@ -28,7 +35,6 @@
 #include <thread>
 #include <vector>
 #ifdef _WIN32
-#define NOMINMAX
 #include <windows.h>
 #include <commdlg.h>
 #endif
@@ -270,6 +276,18 @@ public:
 		return moves_.size();
 	}
 
+	/// Reconstructs one historical position without mutating the live game.
+	GameState position_at(std::size_t ply) const {
+		if(ply > moves_.size()) {
+			throw std::out_of_range("history ply exceeds the current game");
+		}
+		GameState position = *this;
+		while(position.plies() > ply) {
+			position.undo();
+		}
+		return position;
+	}
+
 	/// Returns the last move for board highlighting.
 	std::optional<chess::Move> last_move() const {
 		if(moves_.empty()) {
@@ -435,6 +453,32 @@ BoardLayout board_layout(float available_width, float available_height) {
 
 /// Selects application chrome independently from chessboard colors.
 enum class Theme { Dark, Light };
+
+/// Stable commands shared by native and client-side menu implementations.
+enum class MenuCommand : unsigned int {
+	ImportPgn = 40001,
+	SavePgn,
+	SetFen,
+	Undo,
+	Flip,
+	Start,
+	Pause,
+	Stop,
+	SimulatorMode,
+	StadiumMode,
+	Settings,
+};
+
+/// Exposes only the state needed to enable and label application menus.
+struct MenuState {
+	bool simulator = true;
+	bool can_undo = false;
+	bool analysis_running = false;
+	bool stadium_running = false;
+	bool stadium_paused = false;
+
+	bool operator==(const MenuState &) const = default;
+};
 
 /// Converts one engine configuration to its persisted JSON representation.
 nlohmann::json engine_json(const EngineConfig &config) {
@@ -916,6 +960,80 @@ public:
 		black_engine_.close();
 	}
 
+	/// Returns the minimal dynamic state required by the platform menu.
+	MenuState menu_state() const {
+		return {
+			.simulator = mode_ == Mode::Simulator,
+			.can_undo = simulator_.plies() > 0,
+			.analysis_running = analysis_open_,
+			.stadium_running = stadium_running_,
+			.stadium_paused = stadium_paused_,
+		};
+	}
+
+	/// Executes one menu command through the same application actions on every platform.
+	void handle_menu_command(MenuCommand command) {
+		switch(command) {
+		case MenuCommand::ImportPgn:
+			if(mode_ == Mode::Simulator) {
+				import_simulator_pgn();
+			}
+			break;
+		case MenuCommand::SavePgn:
+			if(mode_ == Mode::Simulator) {
+				save_pgn(simulator_, "White", "Black");
+			} else {
+				save_pgn(stadium_, stadium_white_name(), stadium_black_name());
+			}
+			break;
+		case MenuCommand::SetFen:
+			if(mode_ != Mode::Stadium || !stadium_running_) {
+				open_position_editor();
+			}
+			break;
+		case MenuCommand::Undo:
+			if(mode_ == Mode::Simulator) {
+				undo_simulator();
+			}
+			break;
+		case MenuCommand::Flip:
+			flipped_ = !flipped_;
+			break;
+		case MenuCommand::Start:
+			if(mode_ == Mode::Simulator) {
+				if(!analysis_open_) {
+					toggle_simulator_analysis();
+				}
+			} else if(!stadium_running_) {
+				start_stadium();
+			}
+			break;
+		case MenuCommand::Pause:
+			if(mode_ == Mode::Stadium) {
+				toggle_stadium_pause();
+			}
+			break;
+		case MenuCommand::Stop:
+			if(mode_ == Mode::Simulator) {
+				if(analysis_open_) {
+					toggle_simulator_analysis();
+				}
+			} else if(stadium_running_) {
+				stop_stadium();
+			}
+			break;
+		case MenuCommand::SimulatorMode:
+			set_mode(Mode::Simulator);
+			break;
+		case MenuCommand::StadiumMode:
+			set_mode(Mode::Stadium);
+			break;
+		case MenuCommand::Settings:
+			open_settings(mode_);
+			break;
+		}
+	}
+
 	/// Draws one frame and optionally advances engines and match state.
 	void frame(bool update_state = true) {
 		if(update_state) {
@@ -932,16 +1050,25 @@ public:
 			std::clamp(appearance_.font_size * viewport_scale / 32.0F, 0.44F, 1.25F);
 		ImGui::SetNextWindowPos({0.0F, 0.0F});
 		ImGui::SetNextWindowSize(io.DisplaySize);
-		ImGui::Begin("GadidaeRoot", nullptr,
-					 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
-						 ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings);
-		render_top_bar();
-		ImGui::Separator();
+		auto window_flags =
+			ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+			ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings;
+#ifndef _WIN32
+		window_flags |= ImGuiWindowFlags_MenuBar;
+#endif
+		const auto root_padding = ImGui::GetStyle().WindowPadding;
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {root_padding.x, 0.0F});
+		ImGui::Begin("GadidaeRoot", nullptr, window_flags);
+		ImGui::PopStyleVar();
+#ifndef _WIN32
+		render_menu_bar();
+#endif
 		if(mode_ == Mode::Simulator) {
 			render_simulator(update_state);
 		} else {
 			render_stadium();
 		}
+		render_position_editor();
 		render_settings();
 		render_error_popup();
 		ImGui::End();
@@ -1088,40 +1215,101 @@ private:
 		std::filesystem::rename(temporary, path);
 	}
 
-	/// Draws the stable mode selector without reconstructing either mode.
-	void render_top_bar() {
-		ImGui::AlignTextToFramePadding();
-		ImGui::TextUnformatted("GADIDAE");
-		ImGui::SameLine();
-		const auto mode_button = [&](const char *label, Mode mode) {
-			const bool active = mode_ == mode;
-			if(active) {
-				ImGui::PushStyleColor(ImGuiCol_Button, {0.20F, 0.47F, 0.38F, 1.0F});
-			}
-			if(ImGui::Button(label) && !active) {
-				if(mode_ == Mode::Stadium) {
-					stop_stadium();
-				}
-				simulator_engine_.stop_search();
-				mode_ = mode;
-				selected_square_.reset();
-				legal_targets_.clear();
-			}
-			if(active) {
-				ImGui::PopStyleColor();
-			}
-		};
-		mode_button("Simulator", Mode::Simulator);
-		ImGui::SameLine();
-		mode_button("Stadium", Mode::Stadium);
-		const float status_width = ImGui::CalcTextSize(status_.c_str()).x;
-		const float status_x =
-			ImGui::GetWindowContentRegionMax().x - status_width;
-		if(status_x >
-		   ImGui::GetCursorPosX() + ImGui::GetStyle().ItemSpacing.x) {
-			ImGui::SameLine(status_x);
-			ImGui::TextDisabled("%s", status_.c_str());
+	/// Draws conventional application menus while keeping the work area uncluttered.
+	void render_menu_bar() {
+		if(!ImGui::BeginMenuBar()) {
+			return;
 		}
+		if(ImGui::BeginMenu("File")) {
+			if(mode_ == Mode::Simulator && ImGui::MenuItem("Import PGN...")) {
+				handle_menu_command(MenuCommand::ImportPgn);
+			}
+			if(ImGui::MenuItem("Save PGN...")) {
+				handle_menu_command(MenuCommand::SavePgn);
+			}
+			ImGui::EndMenu();
+		}
+		if(ImGui::BeginMenu("Board")) {
+			const bool position_locked = mode_ == Mode::Stadium && stadium_running_;
+			ImGui::BeginDisabled(position_locked);
+			if(ImGui::MenuItem("Set FEN...")) {
+				handle_menu_command(MenuCommand::SetFen);
+			}
+			ImGui::EndDisabled();
+			if(mode_ == Mode::Simulator) {
+				ImGui::BeginDisabled(simulator_.plies() == 0);
+				if(ImGui::MenuItem("Undo")) {
+					handle_menu_command(MenuCommand::Undo);
+				}
+				ImGui::EndDisabled();
+			}
+			if(ImGui::MenuItem("Flip")) {
+				handle_menu_command(MenuCommand::Flip);
+			}
+			ImGui::EndMenu();
+		}
+		if(ImGui::BeginMenu("Mode")) {
+			if(ImGui::MenuItem("Simulator", nullptr, mode_ == Mode::Simulator)) {
+				handle_menu_command(MenuCommand::SimulatorMode);
+			}
+			if(ImGui::MenuItem("Stadium", nullptr, mode_ == Mode::Stadium)) {
+				handle_menu_command(MenuCommand::StadiumMode);
+			}
+			ImGui::EndMenu();
+		}
+		if(ImGui::BeginMenu("Run")) {
+			if(mode_ == Mode::Simulator) {
+				ImGui::BeginDisabled(analysis_open_);
+				if(ImGui::MenuItem("Start")) {
+					handle_menu_command(MenuCommand::Start);
+				}
+				ImGui::EndDisabled();
+				ImGui::BeginDisabled();
+				ImGui::MenuItem("Pause");
+				ImGui::EndDisabled();
+				ImGui::BeginDisabled(!analysis_open_);
+				if(ImGui::MenuItem("Stop")) {
+					handle_menu_command(MenuCommand::Stop);
+				}
+				ImGui::EndDisabled();
+			} else {
+				ImGui::BeginDisabled(stadium_running_);
+				if(ImGui::MenuItem("Start")) {
+					handle_menu_command(MenuCommand::Start);
+				}
+				ImGui::EndDisabled();
+				ImGui::BeginDisabled(!stadium_running_);
+				if(ImGui::MenuItem(stadium_paused_ ? "Resume" : "Pause")) {
+					handle_menu_command(MenuCommand::Pause);
+				}
+				if(ImGui::MenuItem("Stop")) {
+					handle_menu_command(MenuCommand::Stop);
+				}
+				ImGui::EndDisabled();
+			}
+			ImGui::EndMenu();
+		}
+		if(ImGui::BeginMenu("Tools")) {
+			if(ImGui::MenuItem("Settings...")) {
+				handle_menu_command(MenuCommand::Settings);
+			}
+			ImGui::EndMenu();
+		}
+		ImGui::EndMenuBar();
+	}
+
+	/// Switches the visible workspace and stops work owned by the previous mode.
+	void set_mode(Mode mode) {
+		if(mode_ == mode) {
+			return;
+		}
+		if(mode_ == Mode::Stadium) {
+			stop_stadium();
+		}
+		simulator_engine_.stop_search();
+		mode_ = mode;
+		selected_square_.reset();
+		legal_targets_.clear();
 	}
 
 	/// Renders the interactive position analyser.
@@ -1129,29 +1317,39 @@ private:
 		if(update_state) {
 			ensure_simulator_analysis();
 		}
+		const auto &visible = visible_simulator();
 		const float available_height = ImGui::GetContentRegionAvail().y;
 		const float available_width = ImGui::GetContentRegionAvail().x;
 		const auto layout = board_layout(available_width, available_height);
 
 		ImGui::BeginChild("simulator-left", {layout.board_size, 0.0F});
-		if(const auto square = draw_board(simulator_, layout.board_size, flipped_, appearance_,
-										 selected_square_, legal_targets_, "simulator")) {
+		const bool viewing_history = simulator_view_ply_.has_value();
+		if(const auto square =
+			   draw_board(visible, layout.board_size, flipped_, appearance_,
+						  viewing_history ? std::nullopt : selected_square_,
+						  viewing_history ? std::vector<chess::Move>{} : legal_targets_,
+						  "simulator");
+		   square && !viewing_history) {
 			handle_simulator_square(*square);
 		}
-		render_simulator_bottom();
+		if(render_history_slider("simulator-history", simulator_, simulator_view_ply_,
+								 simulator_preview_)) {
+			selected_square_.reset();
+			legal_targets_.clear();
+			invalidate_simulator_analysis();
+		}
 		ImGui::EndChild();
 		ImGui::SameLine();
 		ImGui::BeginChild("simulator-right", {0.0F, 0.0F});
-		render_simulator_toolbar();
 		ImGui::TextUnformatted("Suggested moves");
-		analysis_table(simulator_display_, simulator_.board().getFen(),
+		analysis_table(simulator_display_, visible_simulator().board().getFen(),
 					   available_height * 0.32F);
 		ImGui::Spacing();
 		ImGui::TextUnformatted("Engine analysis");
 		render_engine_summary(simulator_display_, available_height * 0.18F);
 		ImGui::Spacing();
 		ImGui::TextUnformatted("Board state");
-		render_board_state(simulator_, available_height * 0.32F);
+		render_board_state(visible_simulator(), available_height * 0.32F);
 		ImGui::EndChild();
 	}
 
@@ -1160,7 +1358,7 @@ private:
 		if(!analysis_open_ || simulator_config_.path.empty()) {
 			return;
 		}
-		const std::string fen = simulator_.board().getFen();
+		const std::string fen = visible_simulator().board().getFen();
 		try {
 			if(!simulator_engine_.ready()) {
 				const auto startup = simulator_engine_.snapshot();
@@ -1226,6 +1424,7 @@ private:
 					}
 				}
 				simulator_.make_move(selected);
+				simulator_view_ply_.reset();
 				selected_square_.reset();
 				legal_targets_.clear();
 				invalidate_simulator_analysis();
@@ -1239,86 +1438,6 @@ private:
 		} else {
 			selected_square_.reset();
 			legal_targets_.clear();
-		}
-	}
-
-	/// Draws compact board manipulation controls below Simulator.
-	void render_simulator_bottom() {
-		ImGui::Spacing();
-		const auto button_width = [](const char *label) {
-			return ImGui::CalcTextSize(label).x +
-				   ImGui::GetStyle().FramePadding.x * 2.0F;
-		};
-		const float reserved =
-			button_width("Reset") + button_width("Undo") + button_width("Flip") +
-			ImGui::GetStyle().ItemSpacing.x * 3.0F;
-		ImGui::SetNextItemWidth(
-			std::max(80.0F, ImGui::GetContentRegionAvail().x - reserved));
-		ImGui::InputTextWithHint("##fen", "FEN or startpos", &simulator_fen_input_);
-		ImGui::SameLine();
-		if(ImGui::Button("Reset")) {
-			try {
-				simulator_.reset(simulator_fen_input_.empty() ? "startpos"
-															 : simulator_fen_input_);
-				selected_square_.reset();
-				legal_targets_.clear();
-				invalidate_simulator_analysis();
-			} catch(const std::exception &error) {
-				show_error(error.what());
-			}
-		}
-		ImGui::SameLine();
-		if(ImGui::Button("Undo")) {
-			simulator_.undo();
-			selected_square_.reset();
-			legal_targets_.clear();
-			invalidate_simulator_analysis();
-		}
-		ImGui::SameLine();
-		if(ImGui::Button("Flip")) {
-			flipped_ = !flipped_;
-		}
-	}
-
-	/// Draws Simulator import/export, analysis, and settings commands.
-	void render_simulator_toolbar() {
-		if(ImGui::Button("Import PGN")) {
-			if(const auto path =
-				   file_dialog(false, L"PGN files\0*.pgn\0All files\0*.*\0", L"pgn")) {
-				try {
-					std::ifstream input(*path);
-					std::ostringstream document;
-					document << input.rdbuf();
-					simulator_.import_pgn(document.str());
-					selected_square_.reset();
-					legal_targets_.clear();
-					invalidate_simulator_analysis();
-				} catch(const std::exception &error) {
-					show_error(error.what());
-				}
-			}
-		}
-		ImGui::SameLine();
-		if(ImGui::Button("Save PGN")) {
-			save_pgn(simulator_, "White", "Black");
-		}
-		ImGui::SameLine();
-		if(ImGui::Button(analysis_open_ ? "Close" : "Open")) {
-			analysis_open_ = !analysis_open_;
-			if(!analysis_open_) {
-				simulator_engine_.stop_search();
-				simulator_display_ = {};
-			} else {
-				invalidate_simulator_analysis();
-			}
-		}
-		ImGui::SameLine();
-		if(ImGui::Button("Settings")) {
-			settings_mode_ = Mode::Simulator;
-			simulator_edit_ = simulator_config_;
-			appearance_edit_ = appearance_;
-			theme_edit_ = theme_;
-			settings_open_ = true;
 		}
 	}
 
@@ -1357,37 +1476,18 @@ private:
 
 	/// Renders one visible UCI match with live analysis for the side to move.
 	void render_stadium() {
+		const auto &visible = visible_stadium();
 		const float available_height = ImGui::GetContentRegionAvail().y;
 		const float available_width = ImGui::GetContentRegionAvail().x;
 		const auto layout = board_layout(available_width, available_height);
 		ImGui::BeginChild("stadium-left", {layout.board_size, 0.0F});
-		draw_board(stadium_, layout.board_size, flipped_, appearance_, std::nullopt, {},
+		draw_board(visible, layout.board_size, flipped_, appearance_, std::nullopt, {},
 				   "stadium");
-		ImGui::Spacing();
-		const auto button_width = [](const char *label) {
-			return ImGui::CalcTextSize(label).x +
-				   ImGui::GetStyle().FramePadding.x * 2.0F;
-		};
-		const float reserved =
-			button_width("Start") + button_width("Flip") +
-			ImGui::GetStyle().ItemSpacing.x * 2.0F;
-		ImGui::SetNextItemWidth(
-			std::max(80.0F, ImGui::GetContentRegionAvail().x - reserved));
-		const bool submitted = ImGui::InputTextWithHint(
-			"##stadium-fen", "Start FEN or startpos", &stadium_fen_input_,
-			ImGuiInputTextFlags_EnterReturnsTrue);
-		ImGui::SameLine();
-		if(ImGui::Button("Start##stadium") || submitted) {
-			start_stadium();
-		}
-		ImGui::SameLine();
-		if(ImGui::Button("Flip##stadium")) {
-			flipped_ = !flipped_;
-		}
+		render_history_slider("stadium-history", stadium_, stadium_view_ply_,
+							  stadium_preview_);
 		ImGui::EndChild();
 		ImGui::SameLine();
 		ImGui::BeginChild("stadium-right", {0.0F, 0.0F});
-		render_stadium_toolbar();
 		const bool white_turn = stadium_.board().sideToMove() == chess::Color::WHITE;
 		ImGui::Text("%s to move",
 					white_turn ? stadium_white_name().c_str()
@@ -1410,46 +1510,8 @@ private:
 		ImGui::EndChild();
 		ImGui::Spacing();
 		ImGui::TextUnformatted("Moves");
-		render_board_state(stadium_, available_height * 0.26F);
+		render_board_state(visible_stadium(), available_height * 0.26F);
 		ImGui::EndChild();
-	}
-
-	/// Draws Stadium lifecycle and settings commands.
-	void render_stadium_toolbar() {
-		if(stadium_running_) {
-			if(ImGui::Button(stadium_paused_ ? "Resume" : "Pause")) {
-				stadium_paused_ = !stadium_paused_;
-				if(stadium_paused_) {
-					active_stadium_engine().stop_search();
-					stadium_turn_started_ = false;
-					stadium_status_ = "Paused";
-				} else {
-					next_stadium_turn_ = Clock::now();
-					stadium_status_ = "Running";
-				}
-			}
-			ImGui::SameLine();
-			if(ImGui::Button("Stop")) {
-				stop_stadium();
-			}
-		}
-		if(stadium_running_) {
-			ImGui::SameLine();
-		}
-		if(ImGui::Button("Save PGN##stadium")) {
-			save_pgn(stadium_, stadium_white_name(), stadium_black_name());
-		}
-		ImGui::SameLine();
-		if(ImGui::Button("Settings##stadium")) {
-			settings_mode_ = Mode::Stadium;
-			white_edit_ = white_config_;
-			black_edit_ = black_config_;
-			appearance_edit_ = appearance_;
-			theme_edit_ = theme_;
-			delay_edit_ = delay_ms_;
-			max_plies_edit_ = max_plies_;
-			settings_open_ = true;
-		}
 	}
 
 	/// Launches both UCI engines and initializes a fresh visible match.
@@ -1460,6 +1522,7 @@ private:
 			}
 			stop_stadium();
 			stadium_.reset(stadium_fen_input_.empty() ? "startpos" : stadium_fen_input_);
+			stadium_view_ply_.reset();
 			white_engine_.start_async(white_config_);
 			black_engine_.start_async(black_config_);
 			stadium_running_ = true;
@@ -1586,6 +1649,178 @@ private:
 		}
 		const auto reported = black_engine_.display_name();
 		return reported.empty() ? "Black" : reported;
+	}
+
+	/// Returns the selected Simulator history position or the current live board.
+	const GameState &visible_simulator() const {
+		return simulator_view_ply_ ? simulator_preview_ : simulator_;
+	}
+
+	/// Returns the selected Stadium history position or the current live board.
+	const GameState &visible_stadium() const {
+		return stadium_view_ply_ ? stadium_preview_ : stadium_;
+	}
+
+	/// Moves a read-only history pointer while preserving the complete live game.
+	bool render_history_slider(const char *identifier, const GameState &live,
+							   std::optional<std::size_t> &view_ply,
+							   GameState &preview) {
+		ImGui::Spacing();
+		const int maximum = static_cast<int>(live.plies());
+		int position =
+			view_ply ? std::min(static_cast<int>(*view_ply), maximum) : maximum;
+		const bool at_live = !view_ply || position == maximum;
+		ImGui::AlignTextToFramePadding();
+		ImGui::Text("%s  %d / %d", at_live ? "Live" : "Position", position, maximum);
+		ImGui::SameLine();
+		ImGui::PushID(identifier);
+		ImGui::SetNextItemWidth(-1.0F);
+		ImGui::BeginDisabled(maximum == 0);
+		const bool changed = ImGui::SliderInt(
+			"##position", &position, 0, std::max(1, maximum), "",
+			ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_NoInput);
+		ImGui::EndDisabled();
+		ImGui::PopID();
+		if(!changed) {
+			return false;
+		}
+		if(position >= maximum) {
+			view_ply.reset();
+		} else {
+			view_ply = static_cast<std::size_t>(position);
+			preview = live.position_at(*view_ply);
+		}
+		return true;
+	}
+
+	/// Opens the settings editor with mode-specific engine and match values.
+	void open_settings(Mode mode) {
+		settings_mode_ = mode;
+		appearance_edit_ = appearance_;
+		theme_edit_ = theme_;
+		if(mode == Mode::Simulator) {
+			simulator_edit_ = simulator_config_;
+		} else {
+			white_edit_ = white_config_;
+			black_edit_ = black_config_;
+			delay_edit_ = delay_ms_;
+			max_plies_edit_ = max_plies_;
+		}
+		settings_open_ = true;
+	}
+
+	/// Imports one PGN main line into Simulator and returns the view to live.
+	void import_simulator_pgn() {
+		if(const auto path =
+			   file_dialog(false, L"PGN files\0*.pgn\0All files\0*.*\0", L"pgn")) {
+			try {
+				std::ifstream input(*path);
+				std::ostringstream document;
+				document << input.rdbuf();
+				simulator_.import_pgn(document.str());
+				simulator_fen_input_ = simulator_.start_fen();
+				simulator_view_ply_.reset();
+				selected_square_.reset();
+				legal_targets_.clear();
+				invalidate_simulator_analysis();
+			} catch(const std::exception &error) {
+				show_error(error.what());
+			}
+		}
+	}
+
+	/// Removes one Simulator move and resets its non-destructive history pointer.
+	void undo_simulator() {
+		if(simulator_.undo()) {
+			simulator_view_ply_.reset();
+			selected_square_.reset();
+			legal_targets_.clear();
+			invalidate_simulator_analysis();
+		}
+	}
+
+	/// Starts or stops live Simulator analysis.
+	void toggle_simulator_analysis() {
+		analysis_open_ = !analysis_open_;
+		if(!analysis_open_) {
+			simulator_engine_.stop_search();
+			simulator_display_ = {};
+		} else {
+			invalidate_simulator_analysis();
+		}
+	}
+
+	/// Pauses or resumes Stadium without destroying either engine process.
+	void toggle_stadium_pause() {
+		if(!stadium_running_) {
+			return;
+		}
+		stadium_paused_ = !stadium_paused_;
+		if(stadium_paused_) {
+			active_stadium_engine().stop_search();
+			stadium_turn_started_ = false;
+			stadium_status_ = "Paused";
+		} else {
+			next_stadium_turn_ = Clock::now();
+			stadium_status_ = "Running";
+		}
+	}
+
+	/// Opens a focused FEN editor for the active mode.
+	void open_position_editor() {
+		position_mode_ = mode_;
+		position_edit_ = mode_ == Mode::Simulator
+							 ? simulator_.board().getFen()
+							 : stadium_fen_input_;
+		position_editor_open_ = true;
+	}
+
+	/// Applies a FEN to Simulator or the next Stadium match.
+	void render_position_editor() {
+		if(position_editor_open_) {
+			ImGui::OpenPopup("Set FEN");
+			position_editor_open_ = false;
+		}
+		ImGui::SetNextWindowSize({680.0F, 0.0F}, ImGuiCond_Appearing);
+		if(!ImGui::BeginPopupModal("Set FEN", nullptr,
+								   ImGuiWindowFlags_AlwaysAutoResize |
+									   ImGuiWindowFlags_NoSavedSettings)) {
+			return;
+		}
+		ImGui::TextUnformatted(position_mode_ == Mode::Simulator
+								  ? "Simulator position"
+								  : "Stadium start position");
+		ImGui::SetNextItemWidth(-1.0F);
+		const bool submitted = ImGui::InputTextWithHint(
+			"##position-fen", "FEN or startpos", &position_edit_,
+			ImGuiInputTextFlags_EnterReturnsTrue);
+		if(ImGui::Button("Apply", {100.0F, 0.0F}) || submitted) {
+			try {
+				const std::string fen = position_edit_.empty() ? "startpos" : position_edit_;
+				if(position_mode_ == Mode::Simulator) {
+					simulator_.reset(fen);
+					simulator_fen_input_ = fen;
+					simulator_view_ply_.reset();
+					selected_square_.reset();
+					legal_targets_.clear();
+					invalidate_simulator_analysis();
+				} else {
+					stadium_.reset(fen);
+					stadium_fen_input_ = fen;
+					stadium_view_ply_.reset();
+					stadium_display_ = {};
+					stadium_status_ = "Ready";
+				}
+				ImGui::CloseCurrentPopup();
+			} catch(const std::exception &error) {
+				show_error(error.what());
+			}
+		}
+		ImGui::SameLine();
+		if(ImGui::Button("Cancel", {100.0F, 0.0F})) {
+			ImGui::CloseCurrentPopup();
+		}
+		ImGui::EndPopup();
 	}
 
 	/// Presents one engine's generic process and UCI controls.
@@ -1828,8 +2063,11 @@ private:
 
 	Mode mode_ = Mode::Simulator;
 	Mode settings_mode_ = Mode::Simulator;
+	Mode position_mode_ = Mode::Simulator;
 	GameState simulator_;
 	GameState stadium_;
+	GameState simulator_preview_;
+	GameState stadium_preview_;
 	UciEngine simulator_engine_;
 	UciEngine white_engine_;
 	UciEngine black_engine_;
@@ -1846,10 +2084,14 @@ private:
 	bool flipped_ = false;
 	bool analysis_open_ = true;
 	bool settings_open_ = false;
+	bool position_editor_open_ = false;
 	bool error_open_ = false;
+	std::optional<std::size_t> simulator_view_ply_;
+	std::optional<std::size_t> stadium_view_ply_;
 	std::optional<int> selected_square_;
 	std::vector<chess::Move> legal_targets_;
 	std::string simulator_fen_input_ = "startpos";
+	std::string position_edit_ = "startpos";
 	std::string simulator_analysis_fen_;
 	AnalysisSnapshot simulator_display_;
 	Clock::time_point simulator_last_display_{};
@@ -1870,6 +2112,222 @@ private:
 	std::string status_ = "Ready";
 	std::string error_message_;
 };
+
+#ifdef _WIN32
+/// Owns the Win32 menu bar and forwards WM_COMMAND events to the render loop.
+class NativeMenu {
+public:
+	/// Creates the conventional File, Board, Run, and Tools menus on a GLFW window.
+	explicit NativeMenu(GLFWwindow *window)
+		: window_(glfwGetWin32Window(window)) {
+		if(window_ == nullptr) {
+			throw std::runtime_error("could not obtain the native window handle");
+		}
+		menu_ = CreateMenu();
+		file_menu_ = CreatePopupMenu();
+		board_menu_ = CreatePopupMenu();
+		mode_menu_ = CreatePopupMenu();
+		run_menu_ = CreatePopupMenu();
+		tools_menu_ = CreatePopupMenu();
+		if(menu_ == nullptr || file_menu_ == nullptr || board_menu_ == nullptr ||
+		   mode_menu_ == nullptr || run_menu_ == nullptr || tools_menu_ == nullptr) {
+			destroy_menus();
+			throw std::runtime_error("could not create the native menu");
+		}
+
+		append_item(file_menu_, MenuCommand::ImportPgn, L"Import PGN...");
+		append_item(file_menu_, MenuCommand::SavePgn, L"Save PGN...");
+		append_popup(menu_, file_menu_, L"File");
+
+		append_item(board_menu_, MenuCommand::SetFen, L"Set FEN...");
+		append_item(board_menu_, MenuCommand::Undo, L"Undo");
+		AppendMenuW(board_menu_, MF_SEPARATOR, 0, nullptr);
+		append_item(board_menu_, MenuCommand::Flip, L"Flip");
+		append_popup(menu_, board_menu_, L"Board");
+
+		append_item(mode_menu_, MenuCommand::SimulatorMode, L"Simulator");
+		append_item(mode_menu_, MenuCommand::StadiumMode, L"Stadium");
+		append_popup(menu_, mode_menu_, L"Mode");
+
+		append_item(run_menu_, MenuCommand::Start, L"Start");
+		append_item(run_menu_, MenuCommand::Pause, L"Pause");
+		append_item(run_menu_, MenuCommand::Stop, L"Stop");
+		append_popup(menu_, run_menu_, L"Run");
+
+		append_item(tools_menu_, MenuCommand::Settings, L"Settings...");
+		append_popup(menu_, tools_menu_, L"Tools");
+
+		if(!SetMenu(window_, menu_)) {
+			destroy_menus();
+			throw std::runtime_error("could not attach the native menu");
+		}
+		active_ = this;
+		SetLastError(0);
+		previous_proc_ = reinterpret_cast<WNDPROC>(
+			SetWindowLongPtrW(window_, GWLP_WNDPROC,
+							  reinterpret_cast<LONG_PTR>(&NativeMenu::window_proc)));
+		if(previous_proc_ == nullptr && GetLastError() != 0) {
+			active_ = nullptr;
+			SetMenu(window_, nullptr);
+			destroy_menus();
+			throw std::runtime_error("could not install the native menu handler");
+		}
+		DrawMenuBar(window_);
+	}
+
+	NativeMenu(const NativeMenu &) = delete;
+	NativeMenu &operator=(const NativeMenu &) = delete;
+
+	/// Restores GLFW's original window procedure before destroying menu resources.
+	~NativeMenu() {
+		if(previous_proc_ != nullptr) {
+			SetWindowLongPtrW(window_, GWLP_WNDPROC,
+							  reinterpret_cast<LONG_PTR>(previous_proc_));
+		}
+		active_ = nullptr;
+		SetMenu(window_, nullptr);
+		destroy_menus();
+	}
+
+	/// Returns and clears the latest command received from Windows.
+	std::optional<MenuCommand> take_command() {
+		const auto command = pending_command_;
+		pending_command_.reset();
+		return command;
+	}
+
+	/// Updates command availability and the Pause/Resume label only when state changes.
+	void update(const MenuState &state) {
+		if(last_state_ && *last_state_ == state) {
+			return;
+		}
+		enable(MenuCommand::ImportPgn, state.simulator);
+		enable(MenuCommand::SetFen, state.simulator || !state.stadium_running);
+		enable(MenuCommand::Undo, state.simulator && state.can_undo);
+		enable(MenuCommand::Start,
+			   state.simulator ? !state.analysis_running : !state.stadium_running);
+		enable(MenuCommand::Pause, !state.simulator && state.stadium_running);
+		enable(MenuCommand::Stop,
+			   state.simulator ? state.analysis_running : state.stadium_running);
+		CheckMenuItem(mode_menu_, command_id(MenuCommand::SimulatorMode),
+					  MF_BYCOMMAND |
+						  (state.simulator ? MF_CHECKED : MF_UNCHECKED));
+		CheckMenuItem(mode_menu_, command_id(MenuCommand::StadiumMode),
+					  MF_BYCOMMAND |
+						  (state.simulator ? MF_UNCHECKED : MF_CHECKED));
+		const UINT flags = MF_BYCOMMAND | MF_STRING |
+			((!state.simulator && state.stadium_running) ? MF_ENABLED : MF_GRAYED);
+		ModifyMenuW(run_menu_, command_id(MenuCommand::Pause), flags,
+					command_id(MenuCommand::Pause),
+					state.stadium_paused ? L"Resume" : L"Pause");
+		DrawMenuBar(window_);
+		last_state_ = state;
+	}
+
+private:
+	/// Converts the shared command enum to the identifier carried by WM_COMMAND.
+	static UINT command_id(MenuCommand command) {
+		return static_cast<UINT>(command);
+	}
+
+	/// Appends one command to a native popup menu.
+	static void append_item(HMENU menu, MenuCommand command, const wchar_t *label) {
+		if(!AppendMenuW(menu, MF_STRING, command_id(command), label)) {
+			throw std::runtime_error("could not append a native menu item");
+		}
+	}
+
+	/// Appends one owned popup to the top-level menu bar.
+	static void append_popup(HMENU menu, HMENU popup, const wchar_t *label) {
+		if(!AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(popup), label)) {
+			throw std::runtime_error("could not append a native popup menu");
+		}
+	}
+
+	/// Enables or greys one command without changing the menu structure.
+	void enable(MenuCommand command, bool enabled) {
+		EnableMenuItem(menu_for(command), command_id(command),
+					   MF_BYCOMMAND | (enabled ? MF_ENABLED : MF_GRAYED));
+	}
+
+	/// Returns the popup that directly owns a command identifier.
+	HMENU menu_for(MenuCommand command) const {
+		switch(command) {
+		case MenuCommand::ImportPgn:
+		case MenuCommand::SavePgn:
+			return file_menu_;
+		case MenuCommand::SetFen:
+		case MenuCommand::Undo:
+		case MenuCommand::Flip:
+			return board_menu_;
+		case MenuCommand::Start:
+		case MenuCommand::Pause:
+		case MenuCommand::Stop:
+			return run_menu_;
+		case MenuCommand::SimulatorMode:
+		case MenuCommand::StadiumMode:
+			return mode_menu_;
+		case MenuCommand::Settings:
+			return tools_menu_;
+		}
+		return menu_;
+	}
+
+	/// Routes native menu selections into a small queue consumed after glfwPollEvents.
+	static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam,
+									   LPARAM lparam) {
+		if(active_ != nullptr && active_->window_ == window && message == WM_COMMAND &&
+		   HIWORD(wparam) == 0) {
+			const auto identifier = LOWORD(wparam);
+			if(identifier >= command_id(MenuCommand::ImportPgn) &&
+			   identifier <= command_id(MenuCommand::Settings)) {
+				active_->pending_command_ = static_cast<MenuCommand>(identifier);
+				return 0;
+			}
+		}
+		return active_ != nullptr && active_->previous_proc_ != nullptr
+			? CallWindowProcW(active_->previous_proc_, window, message, wparam, lparam)
+			: DefWindowProcW(window, message, wparam, lparam);
+	}
+
+	/// Releases the top-level menu and all popups owned by it.
+	void destroy_menus() {
+		if(menu_ != nullptr) {
+			DestroyMenu(menu_);
+			menu_ = nullptr;
+			file_menu_ = nullptr;
+			board_menu_ = nullptr;
+			mode_menu_ = nullptr;
+			run_menu_ = nullptr;
+			tools_menu_ = nullptr;
+			return;
+		}
+		const auto destroy_popup = [](HMENU &popup) {
+			if(popup != nullptr) {
+				DestroyMenu(popup);
+				popup = nullptr;
+			}
+		};
+		destroy_popup(file_menu_);
+		destroy_popup(board_menu_);
+		destroy_popup(mode_menu_);
+		destroy_popup(run_menu_);
+		destroy_popup(tools_menu_);
+	}
+
+	inline static NativeMenu *active_ = nullptr;
+	HWND window_ = nullptr;
+	HMENU menu_ = nullptr;
+	HMENU file_menu_ = nullptr;
+	HMENU board_menu_ = nullptr;
+	HMENU mode_menu_ = nullptr;
+	HMENU run_menu_ = nullptr;
+	HMENU tools_menu_ = nullptr;
+	WNDPROC previous_proc_ = nullptr;
+	std::optional<MenuCommand> pending_command_;
+	std::optional<MenuState> last_state_;
+};
+#endif
 
 std::string latest_glfw_error;
 
@@ -1994,6 +2452,9 @@ int run_application(int argc, char **argv) {
 	int result = 0;
 	try {
 		Application application(argc, argv);
+#ifdef _WIN32
+		NativeMenu native_menu(window);
+#endif
 		RefreshContext refresh;
 		refresh.render = [&](bool update_state) {
 			ImGui_ImplOpenGL3_NewFrame();
@@ -2017,7 +2478,15 @@ int run_application(int argc, char **argv) {
 		glfwSetWindowPosCallback(window, window_moved);
 		auto next_frame = Clock::now();
 		while(!glfwWindowShouldClose(window)) {
+#ifdef _WIN32
+			native_menu.update(application.menu_state());
+#endif
 			glfwPollEvents();
+#ifdef _WIN32
+			if(const auto command = native_menu.take_command()) {
+				application.handle_menu_command(*command);
+			}
+#endif
 			if(Clock::now() >= refresh.defer_drawing_until) {
 				refresh_window(window, true);
 			}
