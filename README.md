@@ -23,7 +23,6 @@ api/
 	glm/
 	imgui/
 	freetype/
-	stb/
 include/
 	gadus/
 	melano/
@@ -83,10 +82,10 @@ arch
 Python 公共脚本：
 
 ```bash
-python -m pip install -r requirements.txt
+python -m pip install -r scripts/requirements.txt
 ```
 
-C++ 依赖安装到 `api/`：LibTorch、HDF5、zlib、nlohmann-json、chess-library 与 Ninja。图形构建同时安装 GLFW、GLM、Dear ImGui、FreeType、STB 与 GLAD。`api/versions.env` 是 Windows 与 Linux 共用的依赖版本锁。安装脚本在 `nvidia-smi` 能查询 GPU compute capability 时选择 LibTorch CUDA `cu126`，其余环境选择 CPU 包，也可通过 `GADIDAE_TORCH_VARIANT=cpu|cu126` 指定。已有 LibTorch 安装可通过 `GADIDAE_TORCH_DIR` 指向其根目录。`setup.bat/.sh` 在安装结束时验证实际依赖，`build.bat/.sh` 在配置前再次验证，CMake 对 LibTorch、HDF5 与 zlib 使用精确版本约束。版本、variant 或 chess-library 校验和不匹配时立即停止。下载过程显示进度、速度和 ETA，成功后清理压缩包、源码和依赖构建目录。
+C++ 依赖安装到 `api/`：LibTorch、HDF5、zlib、nlohmann-json、chess-library 与 Ninja。图形构建同时安装 GLFW、GLM、Dear ImGui、FreeType 与 GLAD。`api/versions.env` 是 Windows 与 Linux 共用的依赖版本锁。安装脚本在 `nvidia-smi` 能查询 GPU compute capability 时选择 LibTorch CUDA `cu126`，其余环境选择 CPU 包，也可通过 `GADIDAE_TORCH_VARIANT=cpu|cu126` 指定。已有 LibTorch 安装可通过 `GADIDAE_TORCH_DIR` 指向其根目录。`setup.bat/.sh` 在安装结束时验证实际依赖，`build.bat/.sh` 在配置前再次验证，CMake 对 LibTorch、HDF5 与 zlib 使用精确版本约束。版本、variant 或 chess-library 校验和不匹配时立即停止。下载过程显示进度、速度和 ETA，成功后清理压缩包、源码和依赖构建目录。
 
 Windows：
 
@@ -113,7 +112,7 @@ sudo apt install xorg-dev
 GADIDAE_TORCH_VARIANT=cu126 bash api/setup.sh
 ```
 
-`setup.sh` 与 `build.sh` 默认根据 `DISPLAY` 或 `WAYLAND_DISPLAY` 判断当前 Linux 是否具有图形会话。纯命令行服务器会跳过 GLFW、OpenGL 图形依赖和 `Gadidae` GUI，同时保留 Gadus、Melano 的完整命令行训练、搜索、竞技场、FCPI 与 UCI 链路。可使用 `GADIDAE_BUILD_GRAPHICS=0` 明确选择命令行构建，或使用 `GADIDAE_BUILD_GRAPHICS=1` 在无图形会话的构建机上强制编译 GUI。
+`setup.sh` 与 `build.sh` 默认根据 `DISPLAY` 或 `WAYLAND_DISPLAY` 判断当前 Linux 是否具有图形会话。Windows 的 `setup.bat` 与 `build.bat` 在 `auto` 模式下构建 Graphics。纯命令行服务器会跳过 GLFW、OpenGL 图形依赖和 `Gadidae` GUI，同时保留 Gadus、Melano 的完整命令行训练、搜索、竞技场、FCPI 与 UCI 链路。可使用 `GADIDAE_BUILD_GRAPHICS=0` 明确选择命令行构建，或使用 `GADIDAE_BUILD_GRAPHICS=1` 强制编译 GUI。
 
 ## 3. 构建
 
@@ -1145,7 +1144,7 @@ GADIDAE_BUILD_GRAPHICS=1 bash scripts/build.sh
 
 Windows 双击 `build/graphics/Gadidae.exe`，具有 X11 或 Wayland 图形会话的 Linux 运行 `build/graphics/Gadidae`。程序默认进入 Simulator，顶部模式控件可切换到 Stadium。GUI 的 FreeType 压缩支持静态编译进可执行文件。SSH 服务器需要 X11 forwarding、远程桌面或其他可见显示服务才能实际操作 GUI；`xvfb-run` 适合自动化启动测试，无法提供可交互画面。
 
-Simulator 用于局面分析。Settings 的 `Engine` 区域填写 UCI 可执行文件、显示名称和设备，`Launch` 区域填写启动进程时附加的命令行参数，`Search` 区域填写时间或节点预算、MultiPV 行数与显示刷新间隔。`Additional UCI options` 在握手完成后发送额外的 `setoption` 命令。也可以从命令行指定常用参数：
+Simulator 用于局面分析。Settings 的 `Engine` 区域填写 UCI 可执行文件、显示名称和设备，`Launch` 区域填写启动进程时附加的命令行参数，`Search` 区域填写时间或节点预算、MultiPV 行数与显示刷新间隔。`Additional UCI options` 在握手完成后发送额外的 `setoption` 命令。`Run > Open/Close` 控制实时分析。也可以从命令行指定常用参数：
 
 ```powershell
 build\graphics\Gadidae.exe `
@@ -1159,16 +1158,29 @@ build\graphics\Gadidae.exe `
 	--theme dark
 ```
 
-Stadium 用于观看两个任意 UCI 引擎进行一盘对局。双方在 Settings 中拥有独立的可执行文件、设备、启动参数、额外 UCI options、计算预算和 MultiPV，`Match` 区域设置显示延迟与最大 ply。棋盘底部的 Start FEN 支持 `startpos` 或完整 FEN，按回车或点击 `Start` 后从该局面启动对局。可从命令行预填双方引擎：
+Stadium 用于同时组织多盘独立对局。`Tools > Matches` 可新建、进入和关闭对局，切换到 Simulator 或进入另一盘棋时，其余对局继续在后台运行。默认名称为 `#<id> <white> vs. <black>`，名称留空时自动采用该格式。每个席位都必须填写参赛者名称。Human toggle 打开时 UCI 设置整体置灰，走棋由用户直接在棋盘上完成；关闭时还必须填写 UCI 可执行文件，并可分别设置 UCI options、启动参数、计算预算与 MultiPV。`Match` 区域设置双方共用的初始时间、每步加秒、显示延迟与最大 ply，初始时间设为 0 时关闭棋钟。`Run > Start/Pause/Stop` 只控制当前进入的对局，关闭程序会终止全部对局拥有的 UCI 子进程。可从命令行预填首盘对局的双方引擎：
 
 ```powershell
 build\graphics\Gadidae.exe `
 	--mode stadium `
 	--white-uci "models\gadidae\gadus\gadus.exe" `
-	--black-uci "models\stockfish\stockfish.exe"
+	--white-name "Gadus" `
+	--black-uci "models\stockfish\stockfish.exe" `
+	--black-name "Stockfish"
 ```
 
-Appearance 提供 `Dark` 与 `Light` 应用主题、基础字号、受限范围内随窗口缩放的字号调整、棋盘配色预设、颜色编辑、坐标开关以及 `Vector`、`RhosGFX`、`Chessnut`、`Spatial` 棋子样式。四组棋子均由编译进程序的矢量几何绘制，运行时无需加载 SVG、PNG 或矢量解析库。点击 Apply 后设置写入用户配置目录，后续启动会自动恢复。Windows 配置位于 `%APPDATA%\Gadidae\gui.json`，Linux 配置位于 `$XDG_CONFIG_HOME/Gadidae/gui.json` 或 `~/.config/Gadidae/gui.json`。只修改外观时会保留已经加载的 UCI 进程与正在进行的 Stadium 对局。`--font-size <px>`、`--theme dark`、`--theme light` 与 `--piece-style vector|rhosgfx|chessnut|spatial` 可覆盖本次启动的外观。第三方棋子样式的来源与许可记录在 `src/graphics/THIRD_PARTY.md`。
+Appearance 提供 `Dark` 与 `Light` 应用主题、基础字号、受限范围内随窗口缩放的字号调整、棋盘配色预设、颜色编辑、坐标开关以及 `Vector`、`RhosGFX`、`Chessnut`、`Spatial`、`Cburnett` 棋子样式。棋子均由编译进程序的预计算几何绘制，Cburnett 的填充与描边全部预三角化，发布目录只包含可执行文件。点击 Apply 后设置写入用户配置目录，后续启动会自动恢复。Windows 配置位于 `%APPDATA%\Gadidae\gui.json`，Linux 配置位于 `$XDG_CONFIG_HOME/Gadidae/gui.json` 或 `~/.config/Gadidae/gui.json`。只修改外观时会保留已经加载的 UCI 进程与正在进行的 Stadium 对局。`--font-size <px>`、`--theme dark`、`--theme light` 与 `--piece-style vector|rhosgfx|chessnut|spatial|cburnett` 可覆盖本次启动的外观。第三方棋子样式的来源与许可记录在根目录 `THIRD_PARTY.md`。
+
+`scripts/import_pieces.py` 把一套 SVG 的填充与描边在构建前转换为 `piece.inc` 中的三角形。输入目录使用 `wK.svg`、`wQ.svg`、`wR.svg`、`wB.svg`、`wN.svg`、`wP.svg` 以及对应的 `bK.svg` 到 `bP.svg`。导入会替换当前的可导入样式槽，随后重新构建 Graphics：
+
+```powershell
+python scripts\import_pieces.py `
+	--input data\pieces\my-style `
+	--name my-style
+scripts\build.bat
+```
+
+新样式的作者、来源与许可证应同步记录到根目录 `THIRD_PARTY.md`。
 
 `Additional UCI options` 使用 JSON object。图形程序按引擎公开的 option 名称进行匹配，未知名称会报告错误。`Device` 与 `MultiPV` 由专用控件管理，额外 options 用于 `Hash`、`Threads` 等引擎自有设置。`Device` 在目标引擎公开该 option 时生效，因此同一界面可直接运行 Stockfish 等通用 UCI 引擎。
 

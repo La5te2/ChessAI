@@ -296,6 +296,7 @@ add_executable(gadidaegraphics
 	src/graphics/application.cpp
 	src/graphics/game.cpp
 	src/graphics/pieces.cpp
+	src/graphics/registry.cpp
 	src/graphics/simulator.cpp
 	src/graphics/stadium.cpp
 	src/graphics/uci.cpp

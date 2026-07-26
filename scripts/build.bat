@@ -7,8 +7,19 @@ set "NINJA=%NINJA_DIR%\ninja.exe"
 set "TORCH_DIR=%ROOT_DIR%\api\libtorch"
 set "PUBLISH_DIR=%ROOT_DIR%\build"
 set "WORK_DIR=%PUBLISH_DIR%\.build-work"
+set "BUILD_GRAPHICS=ON"
 
 if not "%GADIDAE_TORCH_DIR%"=="" set "TORCH_DIR=%GADIDAE_TORCH_DIR%"
+if /I "%GADIDAE_BUILD_GRAPHICS%"=="0" set "BUILD_GRAPHICS=OFF"
+if /I "%GADIDAE_BUILD_GRAPHICS%"=="OFF" set "BUILD_GRAPHICS=OFF"
+if /I "%GADIDAE_BUILD_GRAPHICS%"=="FALSE" set "BUILD_GRAPHICS=OFF"
+if /I "%GADIDAE_BUILD_GRAPHICS%"=="1" set "BUILD_GRAPHICS=ON"
+if /I "%GADIDAE_BUILD_GRAPHICS%"=="ON" set "BUILD_GRAPHICS=ON"
+if /I "%GADIDAE_BUILD_GRAPHICS%"=="TRUE" set "BUILD_GRAPHICS=ON"
+if not "%GADIDAE_BUILD_GRAPHICS%"=="" if /I not "%GADIDAE_BUILD_GRAPHICS%"=="AUTO" if /I not "%GADIDAE_BUILD_GRAPHICS%"=="0" if /I not "%GADIDAE_BUILD_GRAPHICS%"=="OFF" if /I not "%GADIDAE_BUILD_GRAPHICS%"=="FALSE" if /I not "%GADIDAE_BUILD_GRAPHICS%"=="1" if /I not "%GADIDAE_BUILD_GRAPHICS%"=="ON" if /I not "%GADIDAE_BUILD_GRAPHICS%"=="TRUE" (
+	echo GADIDAE_BUILD_GRAPHICS must be auto, 0, or 1.
+	exit /b 1
+)
 if not exist "%NINJA%" (
 	echo Ninja is missing. Run api\setup.bat first.
 	exit /b 1
@@ -17,7 +28,7 @@ if not exist "%TORCH_DIR%\share\cmake\Torch\TorchConfig.cmake" (
 	echo LibTorch is missing or GADIDAE_TORCH_DIR is invalid.
 	exit /b 1
 )
-cmake -DAPI_DIR="%ROOT_DIR%\api" -DTORCH_DIR="%TORCH_DIR%" -P "%ROOT_DIR%\api\verify.cmake" || exit /b 1
+cmake -DAPI_DIR="%ROOT_DIR%\api" -DTORCH_DIR="%TORCH_DIR%" -DVERIFY_GUI="%BUILD_GRAPHICS%" -P "%ROOT_DIR%\api\verify.cmake" || exit /b 1
 
 where cl >nul 2>nul
 if errorlevel 1 (
@@ -43,7 +54,7 @@ if not exist "%PUBLISH_DIR%" mkdir "%PUBLISH_DIR%" || exit /b 1
 set "PATH=%NINJA_DIR%;%PATH%"
 set "VSLANG=1033"
 
-cmake -S "%ROOT_DIR%" -B "%WORK_DIR%" -G Ninja -DCMAKE_BUILD_TYPE=Release -DGADIDAE_TORCH_DIR="%TORCH_DIR%" || goto :failed
+cmake -S "%ROOT_DIR%" -B "%WORK_DIR%" -G Ninja -DCMAKE_BUILD_TYPE=Release -DGADIDAE_BUILD_GRAPHICS="%BUILD_GRAPHICS%" -DGADIDAE_TORCH_DIR="%TORCH_DIR%" || goto :failed
 cmake --build "%WORK_DIR%" --parallel || goto :failed
 ctest --test-dir "%WORK_DIR%" --output-on-failure || goto :failed
 
@@ -52,7 +63,7 @@ if exist "%PUBLISH_DIR%\melano" rmdir /s /q "%PUBLISH_DIR%\melano"
 if exist "%PUBLISH_DIR%\graphics" rmdir /s /q "%PUBLISH_DIR%\graphics"
 mkdir "%PUBLISH_DIR%\gadus" || goto :failed
 mkdir "%PUBLISH_DIR%\melano" || goto :failed
-mkdir "%PUBLISH_DIR%\graphics" || goto :failed
+if "%BUILD_GRAPHICS%"=="ON" mkdir "%PUBLISH_DIR%\graphics" || goto :failed
 
 for %%A in (gadus melano) do (
 	for %%F in (preprocess train search arena fcpi uci) do (
@@ -64,12 +75,18 @@ for %%A in (gadus melano) do (
 	)
 )
 
-if not exist "%WORK_DIR%\graphics\Gadidae.exe" goto :failed
-copy /y "%WORK_DIR%\graphics\Gadidae.exe" "%PUBLISH_DIR%\graphics\Gadidae.exe" >nul || goto :failed
+if "%BUILD_GRAPHICS%"=="ON" (
+	if not exist "%WORK_DIR%\graphics\Gadidae.exe" goto :failed
+	copy /y "%WORK_DIR%\graphics\Gadidae.exe" "%PUBLISH_DIR%\graphics\Gadidae.exe" >nul || goto :failed
+)
 
 echo Gadus build finished: %PUBLISH_DIR%\gadus
 echo Melano build finished: %PUBLISH_DIR%\melano
-echo Gadidae graphics finished: %PUBLISH_DIR%\graphics
+if "%BUILD_GRAPHICS%"=="ON" (
+	echo Gadidae graphics finished: %PUBLISH_DIR%\graphics
+) else (
+	echo Gadidae graphics skipped for this build.
+)
 echo Incremental build cache: %WORK_DIR%
 exit /b 0
 

@@ -1,10 +1,13 @@
-// Implements one background-capable Stadium match with two owned UCI child processes.
+// Implements independently running Stadium matches with optional Human seats and clocks.
 #include "graphics/stadium.hpp"
 #include <algorithm>
+#include <filesystem>
 #include <stdexcept>
 #include <utility>
 
 namespace gadidae::graphics {
+
+StadiumSession::StadiumSession(std::size_t id) : id_(id) {}
 
 StadiumSession::~StadiumSession() {
 	stop();
@@ -16,6 +19,26 @@ const GameState &StadiumSession::game() const {
 
 const GameState &StadiumSession::visible_game() const {
 	return viewed_ply_ ? preview_ : game_;
+}
+
+std::size_t StadiumSession::id() const {
+	return id_;
+}
+
+const std::string &StadiumSession::name() const {
+	return name_;
+}
+
+void StadiumSession::set_name(std::string name) {
+	name_ = std::move(name);
+}
+
+std::string StadiumSession::display_name() const {
+	if(!name_.empty()) {
+		return name_;
+	}
+	return "#" + std::to_string(id_) + " " + white_name() + " vs. " +
+		   black_name();
 }
 
 const EngineConfig &StadiumSession::white_config() const {
@@ -57,6 +80,52 @@ void StadiumSession::set_match_limits(int display_delay_ms, int max_plies) {
 	max_plies_ = std::max(1, max_plies);
 }
 
+std::int64_t StadiumSession::clock_initial_ms() const {
+	return clock_initial_ms_;
+}
+
+std::int64_t StadiumSession::clock_increment_ms() const {
+	return clock_increment_ms_;
+}
+
+void StadiumSession::set_clock(std::int64_t initial_ms,
+							   std::int64_t increment_ms) {
+	if(running_) {
+		throw std::logic_error("stop the match before changing its clock");
+	}
+	clock_initial_ms_ = std::max<std::int64_t>(0, initial_ms);
+	clock_increment_ms_ = std::max<std::int64_t>(0, increment_ms);
+	white_remaining_ms_ = clock_initial_ms_;
+	black_remaining_ms_ = clock_initial_ms_;
+}
+
+std::int64_t StadiumSession::remaining_ms(chess::Color color,
+										 Clock::time_point now) const {
+	const auto stored =
+		color == chess::Color::WHITE ? white_remaining_ms_ : black_remaining_ms_;
+	if(!clock_enabled() || !running_ || paused_ || !turn_started_ ||
+	   game_.board().sideToMove() != color) {
+		return stored;
+	}
+	const auto elapsed =
+		std::chrono::duration_cast<std::chrono::milliseconds>(
+			now - turn_clock_started_)
+			.count();
+	return std::max<std::int64_t>(0, stored - elapsed);
+}
+
+std::int64_t StadiumSession::white_remaining_ms() const {
+	return remaining_ms(chess::Color::WHITE, Clock::now());
+}
+
+std::int64_t StadiumSession::black_remaining_ms() const {
+	return remaining_ms(chess::Color::BLACK, Clock::now());
+}
+
+bool StadiumSession::clock_enabled() const {
+	return clock_initial_ms_ > 0;
+}
+
 const std::string &StadiumSession::start_fen() const {
 	return start_fen_;
 }
@@ -73,25 +142,69 @@ void StadiumSession::reset() {
 	game_.reset(start_fen_);
 	follow_live();
 	display_ = {};
+	result_override_.clear();
+	termination_override_.clear();
+	white_remaining_ms_ = clock_initial_ms_;
+	black_remaining_ms_ = clock_initial_ms_;
 	status_ = "Ready";
 }
 
+bool StadiumSession::engine_configured(chess::Color color) const {
+	const auto &config =
+		color == chess::Color::WHITE ? white_config_ : black_config_;
+	return !config.path.empty();
+}
+
+bool StadiumSession::engines_ready() {
+	const auto check = [](const char *side, const UciEngine &engine,
+						  bool configured) {
+		if(!configured) {
+			return true;
+		}
+		if(engine.starting()) {
+			return false;
+		}
+		if(engine.ready()) {
+			return true;
+		}
+		const auto snapshot = engine.snapshot();
+		if(!snapshot.error.empty()) {
+			throw std::runtime_error(std::string(side) + " engine: " +
+									 snapshot.error);
+		}
+		throw std::runtime_error(std::string(side) +
+								 " engine initialization failed");
+	};
+	return check("White", white_engine_,
+				 engine_configured(chess::Color::WHITE)) &&
+		   check("Black", black_engine_,
+				 engine_configured(chess::Color::BLACK));
+}
+
 void StadiumSession::start() {
-	if(white_config_.path.empty() || black_config_.path.empty()) {
-		throw std::invalid_argument("Stadium requires two UCI engine paths");
-	}
 	stop();
 	game_.reset(start_fen_);
 	follow_live();
 	error_.reset();
 	display_ = {};
-	white_engine_.start_async(white_config_);
-	black_engine_.start_async(black_config_);
+	result_override_.clear();
+	termination_override_.clear();
+	white_remaining_ms_ = clock_initial_ms_;
+	black_remaining_ms_ = clock_initial_ms_;
+	if(engine_configured(chess::Color::WHITE)) {
+		white_engine_.start_async(white_config_);
+	}
+	if(engine_configured(chess::Color::BLACK)) {
+		black_engine_.start_async(black_config_);
+	}
 	running_ = true;
 	paused_ = false;
 	turn_started_ = false;
 	next_turn_ = Clock::now();
-	status_ = "Loading engines";
+	status_ = engine_configured(chess::Color::WHITE) ||
+					  engine_configured(chess::Color::BLACK)
+				  ? "Loading engines"
+				  : "Running";
 }
 
 void StadiumSession::stop() {
@@ -101,22 +214,64 @@ void StadiumSession::stop() {
 	paused_ = false;
 	turn_started_ = false;
 	if(status_ == "Running" || status_ == "Paused" ||
-	   status_ == "Loading engines") {
+	   status_ == "Loading engines" || status_ == "Waiting for Human") {
 		status_ = "Stopped";
 	}
+}
+
+bool StadiumSession::finish_turn_clock(Clock::time_point now,
+									   bool add_increment) {
+	if(!clock_enabled() || !turn_started_) {
+		return true;
+	}
+	const auto side = game_.board().sideToMove();
+	auto &stored = side == chess::Color::WHITE ? white_remaining_ms_
+											   : black_remaining_ms_;
+	const auto elapsed =
+		std::chrono::duration_cast<std::chrono::milliseconds>(
+			now - turn_clock_started_)
+			.count();
+	stored = std::max<std::int64_t>(0, stored - elapsed);
+	if(stored == 0) {
+		finish_on_time(side);
+		return false;
+	}
+	if(add_increment) {
+		stored += clock_increment_ms_;
+	}
+	return true;
+}
+
+void StadiumSession::finish_on_time(chess::Color loser) {
+	const bool white_lost = loser == chess::Color::WHITE;
+	result_override_ = white_lost ? "0-1" : "1-0";
+	termination_override_ = "time forfeit";
+	status_ = white_lost ? "White lost on time" : "Black lost on time";
+	white_engine_.close();
+	black_engine_.close();
+	running_ = false;
+	paused_ = false;
+	turn_started_ = false;
 }
 
 void StadiumSession::toggle_pause() {
 	if(!running_) {
 		return;
 	}
-	paused_ = !paused_;
-	if(paused_) {
-		active_engine().stop_search();
+	if(!paused_) {
+		if(turn_started_ && !finish_turn_clock(Clock::now(), false)) {
+			return;
+		}
+		if(engine_configured(game_.board().sideToMove())) {
+			active_engine().stop_search();
+		}
+		paused_ = true;
 		turn_started_ = false;
 		status_ = "Paused";
 		return;
 	}
+	paused_ = false;
+	turn_started_ = false;
 	next_turn_ = Clock::now();
 	status_ = "Running";
 }
@@ -126,20 +281,9 @@ void StadiumSession::update() {
 		return;
 	}
 	try {
-		if(white_engine_.starting() || black_engine_.starting()) {
+		if(!engines_ready()) {
 			status_ = "Loading engines";
 			return;
-		}
-		if(!white_engine_.ready() || !black_engine_.ready()) {
-			const auto white = white_engine_.snapshot();
-			const auto black = black_engine_.snapshot();
-			if(!white.error.empty()) {
-				throw std::runtime_error("White engine: " + white.error);
-			}
-			if(!black.error.empty()) {
-				throw std::runtime_error("Black engine: " + black.error);
-			}
-			throw std::runtime_error("UCI engine initialization failed");
 		}
 		if(status_ == "Loading engines") {
 			status_ = "Running";
@@ -156,18 +300,34 @@ void StadiumSession::update() {
 		}
 
 		const auto now = Clock::now();
+		if(turn_started_ && clock_enabled() &&
+		   remaining_ms(game_.board().sideToMove(), now) == 0) {
+			finish_on_time(game_.board().sideToMove());
+			return;
+		}
 		if(!turn_started_) {
 			if(now < next_turn_) {
 				return;
 			}
+			turn_started_ = true;
+			turn_clock_started_ = now;
+			last_display_ = Clock::time_point{};
+			if(!engine_configured(game_.board().sideToMove())) {
+				display_ = {};
+				status_ = "Waiting for Human";
+				return;
+			}
 			root_fen_ = game_.board().getFen();
 			generation_ = active_engine().analyse(root_fen_, false);
-			turn_started_ = true;
 			display_ = active_engine().snapshot();
-			last_display_ = Clock::time_point{};
+			status_ = "Running";
 			return;
 		}
 
+		if(!engine_configured(game_.board().sideToMove())) {
+			status_ = "Waiting for Human";
+			return;
+		}
 		const auto snapshot = active_engine().snapshot();
 		const auto interval =
 			std::max(50, active_config().progress_interval_ms);
@@ -183,16 +343,39 @@ void StadiumSession::update() {
 		if(snapshot.bestmove.empty()) {
 			throw std::runtime_error("UCI engine returned no legal bestmove");
 		}
+		if(!finish_turn_clock(now, true)) {
+			return;
+		}
 		game_.make_uci(snapshot.bestmove);
 		follow_live();
 		turn_started_ = false;
-		next_turn_ =
-			now + std::chrono::milliseconds(display_delay_ms_);
+		next_turn_ = now + std::chrono::milliseconds(display_delay_ms_);
 	} catch(const std::exception &exception) {
 		error_ = exception.what();
 		status_ = "Error";
 		stop();
 	}
+}
+
+void StadiumSession::make_human_move(const chess::Move &move) {
+	if(!human_to_move()) {
+		throw std::logic_error("the current seat is not ready for a Human move");
+	}
+	const auto now = Clock::now();
+	if(!finish_turn_clock(now, true)) {
+		return;
+	}
+	game_.make_move(move);
+	follow_live();
+	display_ = {};
+	turn_started_ = false;
+	next_turn_ = now + std::chrono::milliseconds(display_delay_ms_);
+	status_ = "Running";
+}
+
+bool StadiumSession::human_to_move() const {
+	return running_ && !paused_ && turn_started_ &&
+		   !engine_configured(game_.board().sideToMove()) && !game_.over();
 }
 
 bool StadiumSession::running() const {
@@ -212,19 +395,42 @@ const AnalysisSnapshot &StadiumSession::display() const {
 }
 
 std::string StadiumSession::white_name() const {
+	if(!engine_configured(chess::Color::WHITE)) {
+		return white_config_.name.empty() ? "Human" : white_config_.name;
+	}
 	if(!white_config_.name.empty()) {
 		return white_config_.name;
 	}
 	const auto reported = white_engine_.display_name();
-	return reported.empty() ? "White" : reported;
+	if(!reported.empty()) {
+		return reported;
+	}
+	const auto stem = white_config_.path.stem().string();
+	return stem.empty() ? "White" : stem;
 }
 
 std::string StadiumSession::black_name() const {
+	if(!engine_configured(chess::Color::BLACK)) {
+		return black_config_.name.empty() ? "Human" : black_config_.name;
+	}
 	if(!black_config_.name.empty()) {
 		return black_config_.name;
 	}
 	const auto reported = black_engine_.display_name();
-	return reported.empty() ? "Black" : reported;
+	if(!reported.empty()) {
+		return reported;
+	}
+	const auto stem = black_config_.path.stem().string();
+	return stem.empty() ? "Black" : stem;
+}
+
+std::string StadiumSession::result() const {
+	return result_override_.empty() ? game_.result() : result_override_;
+}
+
+std::string StadiumSession::termination() const {
+	return termination_override_.empty() ? game_.termination()
+										 : termination_override_;
 }
 
 std::optional<std::size_t> StadiumSession::viewed_ply() const {
@@ -276,8 +482,16 @@ const StadiumSession &StadiumWorkspace::active() const {
 	return *sessions_.at(active_index_);
 }
 
+StadiumSession &StadiumWorkspace::at(std::size_t index) {
+	return *sessions_.at(index);
+}
+
+const StadiumSession &StadiumWorkspace::at(std::size_t index) const {
+	return *sessions_.at(index);
+}
+
 std::size_t StadiumWorkspace::create_session() {
-	sessions_.push_back(std::make_unique<StadiumSession>());
+	sessions_.push_back(std::make_unique<StadiumSession>(next_id_++));
 	active_index_ = sessions_.size() - 1;
 	return active_index_;
 }
@@ -314,6 +528,10 @@ std::size_t StadiumWorkspace::size() const {
 	return sessions_.size();
 }
 
+std::size_t StadiumWorkspace::next_id() const {
+	return next_id_;
+}
+
 void StadiumWorkspace::update_all() {
 	for(auto &session : sessions_) {
 		session->update();
@@ -328,10 +546,9 @@ void StadiumWorkspace::stop_all() {
 
 std::vector<std::string> StadiumWorkspace::take_errors() {
 	std::vector<std::string> errors;
-	for(std::size_t index = 0; index < sessions_.size(); ++index) {
-		if(auto error = sessions_[index]->take_error()) {
-			errors.push_back("Stadium session " + std::to_string(index + 1) +
-							 ": " + *error);
+	for(const auto &session : sessions_) {
+		if(auto error = session->take_error()) {
+			errors.push_back(session->display_name() + ": " + *error);
 		}
 	}
 	return errors;

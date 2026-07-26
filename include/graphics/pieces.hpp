@@ -13,6 +13,7 @@ enum class PieceStyle {
 	Rhosgfx,
 	Chessnut,
 	Spatial,
+	Imported,
 };
 
 /// Returns the stable lowercase name stored in settings and accepted by the CLI.
@@ -21,7 +22,10 @@ std::string_view piece_style_name(PieceStyle style);
 /// Parses one stable style name without silently selecting an unrelated style.
 std::optional<PieceStyle> parse_piece_style(std::string_view name);
 
-/// Draws compiled vector geometry and returns false for the procedural Vector style.
+/// Reports whether piece.inc currently contains one imported 12-piece style.
+bool imported_piece_available();
+
+/// Draws compiled vector geometry and returns false for the procedural style.
 bool draw_compiled_piece(ImDrawList *draw, PieceStyle style,
 						 const chess::Piece &piece, ImVec2 center, float size);
 

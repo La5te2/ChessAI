@@ -164,7 +164,7 @@ GameState GameState::position_at(std::size_t ply) const {
 	return position;
 }
 
-std::string GameState::movetext() const {
+std::string GameState::movetext(const std::string &result_override) const {
 	std::ostringstream text;
 	for(std::size_t index = 0; index < san_.size(); ++index) {
 		if(index % 2 == 0) {
@@ -180,12 +180,18 @@ std::string GameState::movetext() const {
 	if(!san_.empty()) {
 		text << ' ';
 	}
-	text << result();
+	text << (result_override.empty() ? result() : result_override);
 	return wrap_movetext(text.str());
 }
 
 std::string GameState::pgn(const std::string &white,
-						   const std::string &black) const {
+						   const std::string &black,
+						   const std::string &result_override,
+						   const std::string &termination_override) const {
+	const auto effective_result =
+		result_override.empty() ? result() : result_override;
+	const auto effective_termination =
+		termination_override.empty() ? termination() : termination_override;
 	std::ostringstream output;
 	output << "[Event \"Gadidae\"]\n"
 		   << "[Site \"?\"]\n"
@@ -193,14 +199,15 @@ std::string GameState::pgn(const std::string &white,
 		   << "[Round \"?\"]\n"
 		   << "[White \"" << escape_pgn(white) << "\"]\n"
 		   << "[Black \"" << escape_pgn(black) << "\"]\n"
-		   << "[Result \"" << result() << "\"]\n";
+		   << "[Result \"" << effective_result << "\"]\n";
 	if(start_fen_ != chess::constants::STARTPOS) {
 		output << "[SetUp \"1\"]\n[FEN \"" << escape_pgn(start_fen_) << "\"]\n";
 	}
-	if(over()) {
-		output << "[Termination \"" << escape_pgn(termination()) << "\"]\n";
+	if(!effective_termination.empty()) {
+		output << "[Termination \"" << escape_pgn(effective_termination)
+			   << "\"]\n";
 	}
-	output << '\n' << movetext() << '\n';
+	output << '\n' << movetext(effective_result) << '\n';
 	return output.str();
 }
 

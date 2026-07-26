@@ -18,7 +18,6 @@ cleanup() {
 		"${API_DIR}/glm-unpack" \
 		"${API_DIR}/imgui-unpack" \
 		"${API_DIR}/freetype-unpack" \
-		"${API_DIR}/stb-unpack" \
 		"${API_DIR}/glad-generator-unpack" \
 		"${API_DIR}/glad-generator" \
 		"${API_DIR}/glad-python"
@@ -234,9 +233,6 @@ if [[ "${BUILD_GRAPHICS}" == "ON" ]]; then
 	download_source freetype "${FREETYPE_VERSION}" \
 		"https://github.com/freetype/freetype/archive/refs/tags/VER-${FREETYPE_VERSION}.tar.gz" \
 		"freetype-VER-${FREETYPE_VERSION}"
-	download_source stb "${STB_REF}" \
-		"https://github.com/nothings/stb/archive/${STB_REF}.tar.gz" \
-		"stb-${STB_REF}" "stb_image.h"
 	sed -i \
 		's/cmake_minimum_required(VERSION 3\.0\.\.\.3\.5)/cmake_minimum_required(VERSION 3.10...3.31)/' \
 		"${API_DIR}/freetype/CMakeLists.txt"

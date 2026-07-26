@@ -170,7 +170,6 @@ if(VERIFY_GUI)
 			glm/CMakeLists.txt
 			imgui/imgui.h
 			freetype/CMakeLists.txt
-			stb/stb_image.h
 			glad/include/glad/gl.h
 			glad/src/gl.c)
 		if(NOT EXISTS "${API_DIR}/${gui_dependency}")

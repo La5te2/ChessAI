@@ -1,1 +1,3 @@
 python-chess
+svgelements
+Shapely>=2.1
