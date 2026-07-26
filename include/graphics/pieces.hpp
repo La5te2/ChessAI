@@ -2,31 +2,20 @@
 #pragma once
 #include <chess.hpp>
 #include <imgui.h>
-#include <optional>
+#include <cstddef>
 #include <string_view>
 
 namespace gadidae::graphics {
 
-/// Identifies one user-selectable chess-piece presentation.
-enum class PieceStyle {
-	Vector,
-	Rhosgfx,
-	Chessnut,
-	Spatial,
-	Imported,
-};
+/// Returns the number and stable names of every style compiled into the executable.
+std::size_t piece_style_count();
+std::string_view piece_style_name(std::size_t index);
 
-/// Returns the stable lowercase name stored in settings and accepted by the CLI.
-std::string_view piece_style_name(PieceStyle style);
-
-/// Parses one stable style name without silently selecting an unrelated style.
-std::optional<PieceStyle> parse_piece_style(std::string_view name);
-
-/// Reports whether piece.inc currently contains one imported 12-piece style.
-bool imported_piece_available();
+/// Reports whether a stable style name is compiled into the executable.
+bool piece_style_available(std::string_view name);
 
 /// Draws compiled vector geometry and returns false for the procedural style.
-bool draw_compiled_piece(ImDrawList *draw, PieceStyle style,
+bool draw_compiled_piece(ImDrawList *draw, std::string_view style,
 						 const chess::Piece &piece, ImVec2 center, float size);
 
 } // namespace gadidae::graphics

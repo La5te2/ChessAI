@@ -1,10 +1,12 @@
-// Draws pre-tessellated SVG geometry without runtime assets or SVG libraries.
+// Draws procedural and pre-tessellated chess-piece styles compiled into the executable.
 #include "graphics/pieces.hpp"
 #include "piece.inc"
 #include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
+#include <string_view>
 #include <vector>
 
 namespace gadidae::graphics {
@@ -13,19 +15,19 @@ namespace {
 constexpr std::uint8_t fill_command = 0;
 constexpr std::uint8_t stroke_command = 1;
 constexpr std::size_t pieces_per_style = 12;
+constexpr std::array<std::string_view, 5> built_in_style_names = {
+	"vector", "rhosgfx", "chessnut", "spatial", "cburnett"};
 
-/// Maps one SVG-backed style to its first compiled piece index.
-std::optional<std::size_t> style_offset(PieceStyle style) {
-	switch(style) {
-	case PieceStyle::Rhosgfx:
+/// Maps one fixed SVG-backed style name to its first compiled piece index.
+std::optional<std::size_t> fixed_style_offset(std::string_view style) {
+	if(style == "rhosgfx") {
 		return 0;
-	case PieceStyle::Chessnut:
+	}
+	if(style == "chessnut") {
 		return pieces_per_style;
-	case PieceStyle::Spatial:
+	}
+	if(style == "spatial") {
 		return pieces_per_style * 2;
-	case PieceStyle::Vector:
-	case PieceStyle::Imported:
-		return std::nullopt;
 	}
 	return std::nullopt;
 }
@@ -102,76 +104,76 @@ void draw_stroke(ImDrawList *draw, const EmbeddedPieceCommand &command,
 					  std::max(1.0F, command.width * size));
 }
 
+/// Draws one piece from a standalone compiled geometry set.
+template<std::size_t VertexCount, std::size_t CommandCount>
+void draw_geometry(ImDrawList *draw,
+				   const std::array<EmbeddedPieceVertex, VertexCount> &vertices,
+				   const std::array<EmbeddedPieceCommand, CommandCount> &commands,
+				   const EmbeddedPieceGeometry &geometry, ImVec2 center,
+				   float size) {
+	const auto command_end = geometry.first + geometry.count;
+	for(std::uint32_t index = geometry.first; index < command_end; ++index) {
+		const auto &command = commands[index];
+		if(command.kind == fill_command) {
+			draw_fill(draw, command, vertices, center, size);
+		} else if(command.kind == stroke_command) {
+			draw_stroke(draw, command, vertices, center, size);
+		}
+	}
+}
+
 } // namespace
 
-std::string_view piece_style_name(PieceStyle style) {
-	switch(style) {
-	case PieceStyle::Vector:
-		return "vector";
-	case PieceStyle::Rhosgfx:
-		return "rhosgfx";
-	case PieceStyle::Chessnut:
-		return "chessnut";
-	case PieceStyle::Spatial:
-		return "spatial";
-	case PieceStyle::Imported:
-		return imported_piece_style_name;
-	}
-	return "vector";
+std::size_t piece_style_count() {
+	return built_in_style_names.size() + generated_piece_styles.size();
 }
 
-std::optional<PieceStyle> parse_piece_style(std::string_view name) {
-	for(const auto style : {PieceStyle::Vector, PieceStyle::Rhosgfx,
-						   PieceStyle::Chessnut, PieceStyle::Spatial,
-						   PieceStyle::Imported}) {
-		if(name == piece_style_name(style)) {
-			return style;
+std::string_view piece_style_name(std::size_t index) {
+	if(index < built_in_style_names.size()) {
+		return built_in_style_names[index];
+	}
+	const auto generated_index = index - built_in_style_names.size();
+	return generated_index < generated_piece_styles.size()
+		? std::string_view(generated_piece_styles[generated_index].name)
+		: std::string_view("vector");
+}
+
+bool piece_style_available(std::string_view name) {
+	for(std::size_t index = 0; index < piece_style_count(); ++index) {
+		if(piece_style_name(index) == name) {
+			return true;
 		}
 	}
-	return std::nullopt;
+	return false;
 }
 
-bool imported_piece_available() {
-	return imported_piece_geometries.size() == pieces_per_style;
-}
-
-bool draw_compiled_piece(ImDrawList *draw, PieceStyle style,
+bool draw_compiled_piece(ImDrawList *draw, std::string_view style,
 						 const chess::Piece &piece, ImVec2 center, float size) {
 	const auto local_piece = piece_offset(piece);
-	if(!local_piece) {
+	if(!local_piece || style == "vector") {
 		return false;
 	}
-	if(style == PieceStyle::Imported) {
-		if(!imported_piece_available()) {
-			return false;
-		}
-		const auto &geometry = imported_piece_geometries[*local_piece];
-		const auto command_end = geometry.first + geometry.count;
-		for(std::uint32_t index = geometry.first; index < command_end; ++index) {
-			const auto &command = imported_piece_commands[index];
-			if(command.kind == fill_command) {
-				draw_fill(draw, command, imported_piece_vertices, center, size);
-			} else if(command.kind == stroke_command) {
-				draw_stroke(draw, command, imported_piece_vertices, center, size);
-			}
-		}
+	if(style == "cburnett") {
+		draw_geometry(draw, cburnett_piece_vertices, cburnett_piece_commands,
+					  cburnett_piece_geometries[*local_piece], center, size);
 		return true;
 	}
-	const auto style_index = style_offset(style);
+	for(const auto &generated : generated_piece_styles) {
+		if(style == generated.name) {
+			const auto index =
+				static_cast<std::size_t>(generated.geometry_first) + *local_piece;
+			draw_geometry(draw, generated_piece_vertices, generated_piece_commands,
+						  generated_piece_geometries[index], center, size);
+			return true;
+		}
+	}
+	const auto style_index = fixed_style_offset(style);
 	if(!style_index) {
 		return false;
 	}
-	const auto &geometry =
-		embedded_piece_geometries[*style_index + *local_piece];
-	const auto command_end = geometry.first + geometry.count;
-	for(std::uint32_t index = geometry.first; index < command_end; ++index) {
-		const auto &command = embedded_piece_commands[index];
-		if(command.kind == fill_command) {
-			draw_fill(draw, command, embedded_piece_vertices, center, size);
-		} else if(command.kind == stroke_command) {
-			draw_stroke(draw, command, embedded_piece_vertices, center, size);
-		}
-	}
+	draw_geometry(draw, embedded_piece_vertices, embedded_piece_commands,
+				  embedded_piece_geometries[*style_index + *local_piece],
+				  center, size);
 	return true;
 }
 

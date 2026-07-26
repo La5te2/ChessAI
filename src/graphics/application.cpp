@@ -38,6 +38,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 #ifdef _WIN32
@@ -139,7 +140,7 @@ struct Appearance {
 	bool coordinates = true;
 	float font_size = 20.0F;
 	bool auto_font_scale = true;
-	PieceStyle piece_style = PieceStyle::Vector;
+	std::string piece_style = "vector";
 };
 
 struct BoardLayout {
@@ -498,9 +499,10 @@ void draw_vector_piece(ImDrawList *draw, const chess::Piece &piece,
 }
 
 /// Selects the embedded SVG atlas or falls back to the built-in Vector style.
-void draw_piece(ImDrawList *draw, PieceStyle style, const chess::Piece &piece,
+void draw_piece(ImDrawList *draw, std::string_view style,
+				const chess::Piece &piece,
 				ImVec2 center, float size) {
-	if(style != PieceStyle::Vector &&
+	if(style != "vector" &&
 	   draw_compiled_piece(draw, style, piece, center, size * 0.94F)) {
 		return;
 	}
@@ -869,13 +871,12 @@ private:
 			} else if(argument == "--font-size") {
 				appearance_.font_size = std::clamp(std::stof(value()), 14.0F, 36.0F);
 			} else if(argument == "--piece-style") {
-				const auto style = parse_piece_style(value());
-				if(!style) {
+				const auto style = value();
+				if(!piece_style_available(style)) {
 					throw std::invalid_argument(
-						"--piece-style must be vector, rhosgfx, chessnut, spatial, or " +
-						std::string(piece_style_name(PieceStyle::Imported)));
+						"--piece-style is not compiled into this executable");
 				}
-				appearance_.piece_style = *style;
+				appearance_.piece_style = style;
 			} else if(argument == "--uci") {
 				simulator_.config().path = value();
 			} else if(argument == "--arguments") {
@@ -962,11 +963,10 @@ private:
 						   14.0F, 36.0F);
 			appearance_.auto_font_scale =
 				appearance.value("auto_font_scale", appearance_.auto_font_scale);
-			if(const auto style =
-				   parse_piece_style(appearance.value(
-					   "piece_style",
-					   std::string(piece_style_name(appearance_.piece_style))))) {
-				appearance_.piece_style = *style;
+			const auto style =
+				appearance.value("piece_style", appearance_.piece_style);
+			if(piece_style_available(style)) {
+				appearance_.piece_style = style;
 			}
 			theme_ = json.value("theme", std::string("dark")) == "light"
 						 ? Theme::Light
@@ -1006,7 +1006,7 @@ private:
 			  {"coordinates", appearance_.coordinates},
 			  {"font_size", appearance_.font_size},
 			  {"auto_font_scale", appearance_.auto_font_scale},
-			  {"piece_style", std::string(piece_style_name(appearance_.piece_style))}}},
+			  {"piece_style", appearance_.piece_style}}},
 		};
 		const auto path = settings_path();
 		std::filesystem::create_directories(path.parent_path());
@@ -1072,8 +1072,11 @@ private:
 		if(ImGui::BeginMenu("Run")) {
 			if(mode_ == Mode::Simulator) {
 				const bool open = simulator_.analysis_open();
-				if(ImGui::MenuItem(open ? "Close" : "Open", nullptr, open)) {
+				if(ImGui::MenuItem("Open", nullptr, open) && !open) {
 					handle_menu_command(MenuCommand::Start);
+				}
+				if(ImGui::MenuItem("Close", nullptr, !open) && open) {
+					handle_menu_command(MenuCommand::Stop);
 				}
 			} else {
 				ImGui::BeginDisabled(stadium().running());
@@ -1996,19 +1999,19 @@ private:
 		}
 		ImGui::SliderFloat("Font size", &appearance.font_size, 14.0F, 36.0F, "%.0f px");
 		ImGui::Checkbox("Scale font with window", &appearance.auto_font_scale);
-		const char *piece_styles[] = {
-			"Vector", "RhosGFX", "Chessnut", "Spatial",
-			piece_style_name(PieceStyle::Imported).data()};
-		int selected_piece_style = static_cast<int>(appearance.piece_style);
-		const int piece_style_count = imported_piece_available() ? 5 : 4;
-		if(selected_piece_style >= piece_style_count) {
-			selected_piece_style = 0;
-			appearance.piece_style = PieceStyle::Vector;
-		}
 		ImGui::TextUnformatted("Pieces");
-		if(ImGui::Combo("##pieces", &selected_piece_style, piece_styles,
-						piece_style_count)) {
-			appearance.piece_style = static_cast<PieceStyle>(selected_piece_style);
+		if(ImGui::BeginCombo("##pieces", appearance.piece_style.c_str())) {
+			for(std::size_t index = 0; index < piece_style_count(); ++index) {
+				const auto name = piece_style_name(index);
+				const bool selected = appearance.piece_style == name;
+				if(ImGui::Selectable(name.data(), selected)) {
+					appearance.piece_style = name;
+				}
+				if(selected) {
+					ImGui::SetItemDefaultFocus();
+				}
+			}
+			ImGui::EndCombo();
 		}
 		ImGui::SeparatorText("Board");
 		if(ImGui::Button("Forest")) {
@@ -2274,6 +2277,8 @@ public:
 		}
 		remove_check_column(file_menu_);
 		remove_check_column(board_menu_);
+		remove_check_column(mode_menu_);
+		remove_check_column(run_menu_);
 		remove_check_column(tools_menu_);
 
 		append_item(file_menu_, MenuCommand::ImportEngine, L"Import Engine");
@@ -2288,8 +2293,8 @@ public:
 		append_item(board_menu_, MenuCommand::Flip, L"Flip");
 		append_popup(menu_, board_menu_, L"Board");
 
-		append_item(mode_menu_, MenuCommand::SimulatorMode, L"Simulator");
-		append_item(mode_menu_, MenuCommand::StadiumMode, L"Stadium");
+		append_item(mode_menu_, MenuCommand::SimulatorMode, L"Simulator", true);
+		append_item(mode_menu_, MenuCommand::StadiumMode, L"Stadium", true);
 		append_popup(menu_, mode_menu_, L"Mode");
 
 		append_popup(menu_, run_menu_, L"Run");
@@ -2346,9 +2351,12 @@ public:
 		enable(MenuCommand::Reset, state.simulator || !state.stadium_running);
 		enable(MenuCommand::Undo, state.simulator && state.can_undo);
 		enable(MenuCommand::Start,
-			   state.simulator || !state.stadium_running);
+			   state.simulator ? !state.analysis_running
+							   : !state.stadium_running);
 		enable(MenuCommand::Pause, !state.simulator && state.stadium_running);
-		enable(MenuCommand::Stop, !state.simulator && state.stadium_running);
+		enable(MenuCommand::Stop,
+			   state.simulator ? state.analysis_running
+							   : state.stadium_running);
 		CheckMenuItem(mode_menu_, command_id(MenuCommand::SimulatorMode),
 					  MF_BYCOMMAND |
 						  (state.simulator ? MF_CHECKED : MF_UNCHECKED));
@@ -2360,6 +2368,11 @@ public:
 	}
 
 private:
+	struct MenuItemPresentation {
+		std::wstring label;
+		bool checkable = false;
+	};
+
 	/// Converts the shared command enum to the identifier carried by WM_COMMAND.
 	static UINT command_id(MenuCommand command) {
 		return static_cast<UINT>(command);
@@ -2379,9 +2392,19 @@ private:
 		}
 	}
 
-	/// Appends one command to a native popup menu.
-	static void append_item(HMENU menu, MenuCommand command, const wchar_t *label) {
-		if(!AppendMenuW(menu, MF_STRING, command_id(command), label)) {
+	/// Appends one compact owner-drawn command without the unused shortcut column.
+	void append_item(HMENU menu, MenuCommand command, const wchar_t *label,
+					 bool checkable = false) {
+		const auto identifier = command_id(command);
+		presentations_[identifier] = {label, checkable};
+		MENUITEMINFOW item{};
+		item.cbSize = sizeof(item);
+		item.fMask = MIIM_FTYPE | MIIM_ID | MIIM_DATA;
+		item.fType = MFT_OWNERDRAW;
+		item.wID = identifier;
+		item.dwItemData = identifier;
+		if(!InsertMenuItemW(menu, static_cast<UINT>(GetMenuItemCount(menu)), TRUE,
+							&item)) {
 			throw std::runtime_error("could not append a native menu item");
 		}
 	}
@@ -2403,12 +2426,16 @@ private:
 		clear(run_menu_);
 		clear(tools_menu_);
 		if(state.simulator) {
-			append_item(run_menu_, MenuCommand::Start,
-						state.analysis_running ? L"Close" : L"Open");
+			append_item(run_menu_, MenuCommand::Start, L"Open", true);
+			append_item(run_menu_, MenuCommand::Stop, L"Close", true);
 			CheckMenuItem(run_menu_, command_id(MenuCommand::Start),
 						  MF_BYCOMMAND |
 							  (state.analysis_running ? MF_CHECKED
 													  : MF_UNCHECKED));
+			CheckMenuItem(run_menu_, command_id(MenuCommand::Stop),
+						  MF_BYCOMMAND |
+							  (state.analysis_running ? MF_UNCHECKED
+													  : MF_CHECKED));
 		} else {
 			append_item(run_menu_, MenuCommand::Start, L"Start");
 			append_item(run_menu_, MenuCommand::Pause,
@@ -2417,6 +2444,108 @@ private:
 			append_item(tools_menu_, MenuCommand::Matches, L"Matches");
 		}
 		append_item(tools_menu_, MenuCommand::Settings, L"Settings");
+	}
+
+	/// Measures popup items from their actual label and optional checkmark only.
+	bool measure_item(MEASUREITEMSTRUCT &item) const {
+		const auto found = presentations_.find(item.itemID);
+		if(found == presentations_.end()) {
+			return false;
+		}
+		HDC context = GetDC(window_);
+		if(context == nullptr) {
+			return false;
+		}
+		NONCLIENTMETRICSW metrics{};
+		metrics.cbSize = sizeof(metrics);
+		HFONT font = nullptr;
+		HGDIOBJ previous = nullptr;
+		if(SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics,
+								 0)) {
+			font = CreateFontIndirectW(&metrics.lfMenuFont);
+			if(font != nullptr) {
+				previous = SelectObject(context, font);
+			}
+		}
+		SIZE text{};
+		GetTextExtentPoint32W(context, found->second.label.c_str(),
+							 static_cast<int>(found->second.label.size()), &text);
+		if(previous != nullptr) {
+			SelectObject(context, previous);
+		}
+		if(font != nullptr) {
+			DeleteObject(font);
+		}
+		ReleaseDC(window_, context);
+		const auto scale = static_cast<int>(GetDpiForWindow(window_));
+		const auto pixels = [scale](int value) {
+			return std::max(1, MulDiv(value, scale, 96));
+		};
+		const int check_width = found->second.checkable ? pixels(18) : 0;
+		item.itemWidth =
+			static_cast<UINT>(pixels(8) + check_width + text.cx + pixels(8));
+		item.itemHeight =
+			static_cast<UINT>(
+				std::max(static_cast<int>(text.cy) + pixels(6), pixels(22)));
+		return true;
+	}
+
+	/// Draws compact native-looking popup rows with disabled and checked states.
+	bool draw_item(const DRAWITEMSTRUCT &item) const {
+		const auto found = presentations_.find(item.itemID);
+		if(found == presentations_.end()) {
+			return false;
+		}
+		const bool selected = (item.itemState & ODS_SELECTED) != 0;
+		const bool disabled = (item.itemState & ODS_DISABLED) != 0;
+		const bool checked = (item.itemState & ODS_CHECKED) != 0;
+		const int background =
+			selected ? COLOR_HIGHLIGHT : COLOR_MENU;
+		HBRUSH brush = GetSysColorBrush(background);
+		FillRect(item.hDC, &item.rcItem, brush);
+
+		NONCLIENTMETRICSW metrics{};
+		metrics.cbSize = sizeof(metrics);
+		HFONT font = nullptr;
+		HGDIOBJ previous = nullptr;
+		if(SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics,
+								 0)) {
+			font = CreateFontIndirectW(&metrics.lfMenuFont);
+			if(font != nullptr) {
+				previous = SelectObject(item.hDC, font);
+			}
+		}
+		SetBkMode(item.hDC, TRANSPARENT);
+		SetTextColor(item.hDC,
+					 GetSysColor(disabled ? COLOR_GRAYTEXT
+										  : (selected ? COLOR_HIGHLIGHTTEXT
+													  : COLOR_MENUTEXT)));
+		const auto scale = static_cast<int>(GetDpiForWindow(window_));
+		const auto pixels = [scale](int value) {
+			return std::max(1, MulDiv(value, scale, 96));
+		};
+		RECT text = item.rcItem;
+		text.left += pixels(8) + (found->second.checkable ? pixels(18) : 0);
+		text.right -= pixels(8);
+		DrawTextW(item.hDC, found->second.label.c_str(),
+				  static_cast<int>(found->second.label.size()), &text,
+				  DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+		if(checked && found->second.checkable) {
+			RECT mark = item.rcItem;
+			mark.left += pixels(3);
+			mark.right = mark.left + pixels(14);
+			mark.top += (mark.bottom - mark.top - pixels(14)) / 2;
+			mark.bottom = mark.top + pixels(14);
+			DrawFrameControl(item.hDC, &mark, DFC_MENU, DFCS_MENUCHECK |
+								(disabled ? DFCS_INACTIVE : 0));
+		}
+		if(previous != nullptr) {
+			SelectObject(item.hDC, previous);
+		}
+		if(font != nullptr) {
+			DeleteObject(font);
+		}
+		return true;
 	}
 
 	/// Enables or greys one command without changing the menu structure.
@@ -2454,6 +2583,17 @@ private:
 	/// Routes native menu selections into a small queue consumed after glfwPollEvents.
 	static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam,
 									   LPARAM lparam) {
+		if(active_ != nullptr && active_->window_ == window &&
+		   message == WM_MEASUREITEM && wparam == 0 &&
+		   active_->measure_item(
+			   *reinterpret_cast<MEASUREITEMSTRUCT *>(lparam))) {
+			return TRUE;
+		}
+		if(active_ != nullptr && active_->window_ == window &&
+		   message == WM_DRAWITEM && wparam == 0 &&
+		   active_->draw_item(*reinterpret_cast<DRAWITEMSTRUCT *>(lparam))) {
+			return TRUE;
+		}
 		if(active_ != nullptr && active_->window_ == window && message == WM_COMMAND &&
 		   HIWORD(wparam) == 0) {
 			const auto identifier = LOWORD(wparam);
@@ -2502,6 +2642,7 @@ private:
 	HMENU run_menu_ = nullptr;
 	HMENU tools_menu_ = nullptr;
 	WNDPROC previous_proc_ = nullptr;
+	std::unordered_map<UINT, MenuItemPresentation> presentations_;
 	std::optional<MenuCommand> pending_command_;
 	std::optional<MenuState> last_state_;
 };

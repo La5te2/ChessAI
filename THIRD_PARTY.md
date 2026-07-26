@@ -25,6 +25,13 @@ Spatial use the Lichess repository at commit
 - License: MIT
 - License text: https://opensource.org/license/mit
 
+## Fantasy
+
+- Author: Maurizio Monge
+- Source: https://github.com/lichess-org/lila/tree/c54596c9e1569d378fe20f80d4c790c6fdee54c4/public/piece/fantasy
+- License: MIT
+- License text: https://opensource.org/license/mit
+
 ## Cburnett
 
 - Author: Colin M.L. Burnett
