@@ -441,6 +441,8 @@ $$
 \frac{\epsilon}{|\mathcal A(s)|}
 $$
 
+$T_b<1$ 使行为分布更集中于高 Policy 动作，$T_b=1$ 保持原 Policy 比例，$T_b>1$ 提高低 Policy 动作的采样概率。$\epsilon$ 对所有合法动作混入均匀概率，因此 `behavior-temperature` 控制真实自对弈的集中程度，不控制反事实树的 Gumbel 候选宽度。
+
 终局取真实 side-to-move 结果，截断局面取冻结模型 Value 作为 bootstrap。代码从后向前计算 TD($\lambda$)：
 
 $$
@@ -510,16 +512,55 @@ $$
 w_P(s)=\frac{n(s)}{\sum_{u\in\mathcal T_{root}}n(u)}
 $$
 
-每棵反事实树贡献的 Policy 总权重恒为 1。只有真实自对弈根节点使用 TD($\lambda$) 回报训练 Value，树中间节点的 bootstrap 不作为 Value 真值。FCPI 损失为：
+每棵反事实树贡献的 Policy 总权重恒为 1。反事实 Value 目标使用冻结树已经回传的 $\overline V(s)$。设 $E(s)$ 是该节点实际评价过的动作集合，其在改进 Policy 下的概率质量为：
 
 $$
-L=w_P L_{CE}(\pi_{new},\pi^+)+
-w_V\operatorname{SmoothL1}(V_{new},G_t)
+c_T(s)=\sum_{a\in E(s)}\pi^+(a\mid s)
 $$
 
-$\pi^+$ 已经乘入冻结模型 prior，因此无需额外 KL 项重复锚定。最大绝对 Advantage 归一化把单次树改进的 log-odds 扰动限制在 $[-1,1]$，避免低 prior 动作因极小方差被异常放大。
+树 Value 权重自动定义为：
 
-每轮依次执行 `current.pth` 自对战、局面采样、树一致反事实展开、TD($\lambda$) Value 目标构造、candidate 训练和 paired-game arena。每局先按完整编码状态去重，再按 `positions-per-game` 做均匀无放回采样。
+$$
+w_T(s)=w_P(s)c_T(s)
+$$
+
+未展开动作继续使用冻结节点 Value，因此不计入 $c_T$。由于 $0\leq c_T(s)\leq1$ 且一棵树满足 $\sum_s w_P(s)=1$，每棵树的反事实 Value 总权重满足：
+
+$$
+\sum_s w_T(s)\leq1
+$$
+
+真实自对弈根节点保留 TD($\lambda$) 权重 $w_{TD}=1$，树中间节点的 $w_{TD}=0$。根节点同时拥有真实轨迹目标 $G_t$ 和冻结树目标 $\overline V(s)$，二者作为独立 SmoothL1 项进入 Value 损失：
+
+$$
+L_V=
+\frac{
+\sum_s w_{TD}(s)\rho\left(V_{new}(s)-G_t(s)\right)+
+\sum_s w_T(s)\rho\left(V_{new}(s)-\overline V(s)\right)
+}{
+\sum_s\left(w_{TD}(s)+w_T(s)\right)
+}
+$$
+
+其中 $\rho$ 是 SmoothL1。冻结树目标在构造训练记录时已经与计算图分离，因此不会把 candidate 的梯度传回 target model。Policy 损失为：
+
+$$
+L_P=
+\frac{\sum_s w_P(s)L_{CE}\left(\pi_{new}(\cdot\mid s),\pi^+(\cdot\mid s)\right)}
+{\sum_s w_P(s)}
+$$
+
+完整 FCPI 损失为：
+
+$$
+L=\alpha_P L_P+\alpha_V L_V
+$$
+
+$\alpha_P$ 与 $\alpha_V$ 分别由 `--policy-weight` 和 `--value-weight` 指定。$\pi^+$ 已经乘入冻结模型 prior，因此无需额外 KL 项重复锚定。最大绝对 Advantage 归一化把单次树改进的 log-odds 扰动限制在 $[-1,1]$，避免低 prior 动作因极小方差被异常放大。
+
+FCPI HDF5 分别保存 `td_value_targets`、`tree_value_targets`、`td_value_weights` 与 `tree_value_weights`。训练日志分别输出 `value_td`、`value_tree` 和二者按有效权重合并后的 `value`。
+
+每轮依次执行 `current.pth` 自对战、局面采样、树一致反事实展开、TD($\lambda$) 与反事实 Value 目标构造、candidate 训练和 paired-game arena。每局先按完整编码状态去重，再按 `positions-per-game` 做均匀无放回采样。
 
 每次运行由程序生成 `fcpi_YYYYMMDD_HHMMSS_id`，并创建：
 
@@ -945,36 +986,67 @@ $$
 {\sum_bP_{old}(b\mid s)\exp((Q(s,b)-m(s))/\sigma(s))}
 $$
 
-Melano 的 $A(s,a)\leq0$ 表示动作相对局面能力上界的损失。树先计算改进 Policy 下的动作值期望，再以原 Value 作为上界：
+Melano 的 $A(s,a)\leq0$ 表示动作相对局面能力上界的损失。反事实树使用所有合法动作的动作值上界：
 
 $$
-\overline V(s)=\min\left(
-V_{old}(s),\sum_a\pi^+(a\mid s)Q(s,a)
-\right)
+\overline V_T(s)=\max_{a\in\mathcal A(s)}Q_T(s,a)
 $$
 
-这让反事实树能够传播合理应手集合的整体退化，同时避免冻结模型凭自身 bootstrap 把 Value 抬高。真实自对弈根仍按 TD($\lambda$) 训练 Value：
+对应的非正 Advantage target 为：
+
+$$
+A_T(s,a)=\operatorname{clip}
+\left(Q_T(s,a)-\overline V_T(s),-2,0\right)
+$$
+
+因此 $V$、$Q$ 与 $A$ 使用同一棵冻结反事实树的定义，并满足 $Q_T(s,a)\leq\overline V_T(s)$。动作无法提高真实局面价值，但冻结模型的原 Value 估计可能偏高或偏低，所以反事实证据允许修正方向为正或负。真实自对弈根仍按 TD($\lambda$) 生成独立 Value target：
 
 $$
 G_t=-\left[(1-\lambda_{TD})V(s_{t+1})+\lambda_{TD}G_{t+1}\right]
 $$
 
-树中间节点的 Value 权重为 0。每个已展开动作的 Advantage target 为：
+设 $E(s)$ 为实际展开并通过精确棋规评价的动作集合，其在改进 Policy 下的覆盖质量为：
 
 $$
-A^*(s,a)=\operatorname{clip}(Q(s,a)-V_{target}(s),-2,0)
+c_T(s)=\sum_{a\in E(s)}\pi^+(a\mid s)
 $$
 
-每个已展开节点及其精确子状态同时训练 Policy、Advantage 与 latent transition。每棵树的节点权重仍为 $n(s)/\sum_u n(u)$，只有根节点参与 Value loss。FCPI 损失为：
+每棵树的节点 Policy 权重仍为：
+
+$$
+w_P(s)=\frac{n(s)}{\sum_{u\in\mathcal T_{root}}n(u)}
+$$
+
+树 Value 权重为：
+
+$$
+w_T(s)=w_P(s)c_T(s)
+$$
+
+因此每棵树满足 $\sum_s w_T(s)\leq1$。所有展开节点都使用 $\overline V_T(s)$ 训练反事实 Value，真实自对弈根另外保留权重为 1 的 TD target。Value loss 为：
+
+$$
+L_V=
+\frac{
+\sum_s w_{TD}(s)\rho(V_{new}(s)-G_t(s))+
+\sum_s w_T(s)\rho(V_{new}(s)-\overline V_T(s))
+}{
+\sum_s(w_{TD}(s)+w_T(s))
+}
+$$
+
+每个已展开节点及其精确子状态同时训练 Policy、Value、Advantage 与 latent transition。Dueling-Q 和 imagined Value 直接拟合同一份 $Q_T$，避免通过另一组 Value target 重构动作值。FCPI 损失为：
 
 $$
 L=w_P L_{CE}(\pi_{new},\pi^+)+
-w_V\operatorname{SmoothL1}(V,G_t)+
+w_VL_V+
 w_Q\operatorname{SmoothL1}(\widehat Q,Q^*)+
 w_D L_D+w_I\operatorname{SmoothL1}(-V(\widehat z'),Q^*)
 $$
 
 其中每条树边都通过精确棋规生成 $s'$，并写入 `candidate_next_states`。$L_D$ 使用与监督训练相同的 latent cosine consistency。动作条件 dynamics 对树中每个已展开节点学习一步转移 $E(s)\rightarrow E(s')$，与 $K=2$ anchored latent MCTS 的运行时假设保持一致。
+
+Melano FCPI HDF5 分别保存 `td_value_targets`、`tree_value_targets`、`td_value_weights`、`tree_value_weights` 和 `candidate_q`。训练日志分别输出 `value_td`、`value_tree`、合并后的 `value`、`dueling_q`、`dynamics` 与 `imagined_value`。
 
 Melano 每轮依次执行自身 `current.pth` 自对战、局面采样、树一致反事实展开、PVA 与 latent-dynamics 目标构造、candidate 训练和 paired-game arena。每次运行由程序生成 `fcpi_YYYYMMDD_HHMMSS_id`，创建对应的 `data/runs/<run-id>/` 与 `models/runs/<run-id>/`。其中 HDF5 schema、candidate 和 current checkpoint 均属于 Melano，candidate 达到 arena gate 后原子写入该 run 的 `current.pth`。`summary.json` 记录预算、决策节点数、评价边数、最大深度和 arena 结果。
 
@@ -1054,7 +1126,7 @@ bash scripts/build.sh
 
 Windows 双击 `build/graphics/Gadidae.exe`，Linux 运行 `build/graphics/Gadidae`。程序默认进入 Simulator，顶部模式控件可切换到 Stadium。GUI 的 FreeType 压缩支持静态编译进可执行文件。
 
-Simulator 用于局面分析。Settings 的 `Engine` 区域填写 UCI 可执行文件、显示名称和设备，`Arguments` 区域填写进程参数、UCI options、时间或节点预算、MultiPV 行数与显示刷新间隔。也可以从命令行指定常用参数：
+Simulator 用于局面分析。Settings 的 `Engine` 区域填写 UCI 可执行文件、显示名称和设备，`Launch` 区域填写启动进程时附加的命令行参数，`Search` 区域填写时间或节点预算、MultiPV 行数与显示刷新间隔。`Additional UCI options` 在握手完成后发送额外的 `setoption` 命令。也可以从命令行指定常用参数：
 
 ```powershell
 build\graphics\Gadidae.exe `
@@ -1064,10 +1136,11 @@ build\graphics\Gadidae.exe `
 	--movetime-ms 3000 `
 	--node-limit 0 `
 	--multipv 8 `
+	--font-size 20 `
 	--theme dark
 ```
 
-Stadium 用于观看两个任意 UCI 引擎进行一盘对局。双方在 Settings 中拥有独立的可执行文件、设备、进程参数、UCI options、计算预算和 MultiPV，`Match` 区域设置显示延迟与最大 ply。可从命令行预填双方引擎：
+Stadium 用于观看两个任意 UCI 引擎进行一盘对局。双方在 Settings 中拥有独立的可执行文件、设备、启动参数、额外 UCI options、计算预算和 MultiPV，`Match` 区域设置显示延迟与最大 ply。棋盘底部的 Start FEN 支持 `startpos` 或完整 FEN，按回车或点击 `Start` 后从该局面启动对局。可从命令行预填双方引擎：
 
 ```powershell
 build\graphics\Gadidae.exe `
@@ -1076,9 +1149,11 @@ build\graphics\Gadidae.exe `
 	--black-uci "models\stockfish\stockfish.exe"
 ```
 
-Appearance 提供 `Dark` 与 `Light` 应用主题、棋盘配色预设、颜色编辑和坐标开关。点击 Apply 后设置写入用户配置目录，后续启动会自动恢复。`--theme dark` 与 `--theme light` 可覆盖本次启动的主题。
+Appearance 提供 `Dark` 与 `Light` 应用主题、基础字号、受限范围内随窗口缩放的字号调整、棋盘配色预设、颜色编辑、坐标开关以及 `Vector`、`RhosGFX`、`Chessnut`、`Spatial` 棋子样式。四组棋子均由编译进程序的矢量几何绘制，运行时无需加载 SVG、PNG 或矢量解析库。点击 Apply 后设置写入用户配置目录，后续启动会自动恢复。Windows 配置位于 `%APPDATA%\Gadidae\gui.json`，Linux 配置位于 `$XDG_CONFIG_HOME/Gadidae/gui.json` 或 `~/.config/Gadidae/gui.json`。只修改外观时会保留已经加载的 UCI 进程与正在进行的 Stadium 对局。`--font-size <px>`、`--theme dark`、`--theme light` 与 `--piece-style vector|rhosgfx|chessnut|spatial` 可覆盖本次启动的外观。第三方棋子样式的来源与许可记录在 `src/graphics/THIRD_PARTY.md`。
 
-`UCI options` 使用 JSON object。图形程序按引擎公开的 option 名称进行匹配，未知名称会报告错误。`Device` 仅在目标引擎公开该 option 时设置，因此同一界面可直接运行 Stockfish 等通用 UCI 引擎。
+`Additional UCI options` 使用 JSON object。图形程序按引擎公开的 option 名称进行匹配，未知名称会报告错误。`Device` 与 `MultiPV` 由专用控件管理，额外 options 用于 `Hash`、`Threads` 等引擎自有设置。`Device` 在目标引擎公开该 option 时生效，因此同一界面可直接运行 Stockfish 等通用 UCI 引擎。
+
+Simulator 首次打开分析时在后台启动并加载一次 UCI 引擎，后续局面复用同一子进程。切换局面时会异步停止上一轮计算、丢弃其后续输出，再把最新局面交给已经加载的引擎。Gadus 与 Melano 的 UCI 命令循环和搜索线程彼此分离，MCTS 搜索会在批次边界响应 `stop`。图形程序在窗口持续移动或缩放时暂停 OpenGL 提交，操作停止后清空 GPU 命令队列并按新尺寸交换完整帧。
 
 ## 8. UCI 分析
 

@@ -292,8 +292,39 @@ UciEngine::~UciEngine() {
 
 void UciEngine::start(const EngineConfig &config) {
 	close();
-	config_ = config;
 	closing_ = false;
+	starting_ = true;
+	try {
+		initialize(config);
+		starting_ = false;
+	} catch(...) {
+		starting_ = false;
+		throw;
+	}
+}
+
+void UciEngine::start_async(const EngineConfig &config) {
+	close();
+	closing_ = false;
+	starting_ = true;
+	startup_ = std::thread([this, config] {
+		try {
+			initialize(config);
+		} catch(const std::exception &error) {
+			process_ready_ = false;
+			if(!closing_) {
+				std::lock_guard lock(mutex_);
+				snapshot_.error = error.what();
+				snapshot_.searching = false;
+			}
+		}
+		starting_ = false;
+		condition_.notify_all();
+	});
+}
+
+void UciEngine::initialize(const EngineConfig &config) {
+	config_ = config;
 	uciok_ = false;
 	readyok_ = false;
 	process_ready_ = false;
@@ -302,6 +333,9 @@ void UciEngine::start(const EngineConfig &config) {
 	{
 		std::lock_guard lock(mutex_);
 		snapshot_ = {};
+		command_searching_ = false;
+		discard_output_ = false;
+		pending_analysis_.reset();
 	}
 	process_ = std::make_unique<Process>(command_text(config_));
 	reader_ = std::thread(&UciEngine::reader_loop, this);
@@ -321,10 +355,21 @@ void UciEngine::start(const EngineConfig &config) {
 void UciEngine::close() {
 	closing_ = true;
 	process_ready_ = false;
+	condition_.notify_all();
+	if(startup_.joinable() &&
+	   startup_.get_id() != std::this_thread::get_id()) {
+		startup_.join();
+	}
+	{
+		std::lock_guard lock(mutex_);
+		pending_analysis_.reset();
+		discard_output_ = true;
+		snapshot_.searching = false;
+	}
 	if(process_) {
 		try {
-			process_->write_line("stop");
-			process_->write_line("quit");
+			send("stop");
+			send("quit");
 		} catch(...) {
 		}
 		process_->terminate();
@@ -333,9 +378,13 @@ void UciEngine::close() {
 		reader_.join();
 	}
 	process_.reset();
+	starting_ = false;
 	{
 		std::lock_guard lock(mutex_);
 		snapshot_.searching = false;
+		command_searching_ = false;
+		discard_output_ = false;
+		pending_analysis_.reset();
 	}
 }
 
@@ -343,30 +392,43 @@ std::uint64_t UciEngine::analyse(const std::string &fen, bool infinite) {
 	if(!ready()) {
 		throw std::runtime_error("UCI engine is not ready");
 	}
-	bool searching = false;
+	AnalysisRequest request;
+	bool stop_previous = false;
+	bool start_now = false;
 	{
 		std::lock_guard lock(mutex_);
-		searching = snapshot_.searching;
-	}
-	if(searching) {
-		send("stop");
-		std::unique_lock lock(mutex_);
-		if(!condition_.wait_for(lock, std::chrono::seconds(3),
-								[&] { return !snapshot_.searching || closing_; })) {
-			throw std::runtime_error("UCI engine did not stop the previous search");
-		}
-	}
-	{
-		std::lock_guard lock(mutex_);
-		++generation_;
+		request = {++generation_, fen, infinite};
 		snapshot_ = {};
-		snapshot_.generation = generation_;
+		snapshot_.generation = request.generation;
 		snapshot_.searching = true;
 		snapshot_.engine_name = display_name();
+		if(command_searching_) {
+			pending_analysis_ = request;
+			discard_output_ = true;
+			stop_previous = true;
+		} else {
+			command_searching_ = true;
+			discard_output_ = false;
+			start_now = true;
+		}
 	}
-	send("position fen " + fen);
-	if(infinite) {
-		send("go infinite");
+	if(stop_previous) {
+		send("stop");
+	}
+	if(start_now) {
+		send_analysis(request);
+	}
+	return request.generation;
+}
+
+void UciEngine::send_analysis(const AnalysisRequest &request) {
+	std::lock_guard send_lock(send_mutex_);
+	if(!process_) {
+		throw std::runtime_error("UCI process is not running");
+	}
+	process_->write_line("position fen " + request.fen);
+	if(request.infinite) {
+		process_->write_line("go infinite");
 	} else {
 		std::ostringstream go;
 		go << "go";
@@ -376,18 +438,21 @@ std::uint64_t UciEngine::analyse(const std::string &fen, bool infinite) {
 		if(config_.movetime_ms > 0 || config_.node_limit == 0) {
 			go << " movetime " << std::max(0, config_.movetime_ms);
 		}
-		send(go.str());
+		process_->write_line(go.str());
 	}
-	return generation_;
 }
 
 void UciEngine::stop_search() {
-	bool searching = false;
+	bool stop = false;
 	{
 		std::lock_guard lock(mutex_);
-		searching = snapshot_.searching;
+		pending_analysis_.reset();
+		discard_output_ = true;
+		snapshot_.searching = false;
+		snapshot_.finished = false;
+		stop = command_searching_;
 	}
-	if(searching && process_) {
+	if(stop && process_) {
 		try {
 			send("stop");
 		} catch(...) {
@@ -401,7 +466,11 @@ AnalysisSnapshot UciEngine::snapshot() const {
 }
 
 bool UciEngine::ready() const {
-	return process_ready_ && process_ != nullptr && !closing_;
+	return process_ready_ && !closing_;
+}
+
+bool UciEngine::starting() const {
+	return starting_ && !closing_;
 }
 
 std::string UciEngine::display_name() const {
@@ -415,6 +484,7 @@ std::string UciEngine::display_name() const {
 }
 
 void UciEngine::send(const std::string &line) {
+	std::lock_guard send_lock(send_mutex_);
 	if(!process_) {
 		throw std::runtime_error("UCI process is not running");
 	}
@@ -529,6 +599,9 @@ void UciEngine::parse_info_line(const std::string &line) {
 		return;
 	}
 	std::lock_guard lock(mutex_);
+	if(discard_output_) {
+		return;
+	}
 	auto &rows = snapshot_.lines;
 	const auto existing = std::find_if(rows.begin(), rows.end(), [&](const auto &row) {
 		return row.multipv == parsed.multipv;
@@ -545,13 +618,27 @@ void UciEngine::parse_info_line(const std::string &line) {
 
 void UciEngine::parse_bestmove_line(const std::string &line) {
 	const auto tokens = tokens_of(line);
-	std::lock_guard lock(mutex_);
-	snapshot_.searching = false;
-	snapshot_.finished = true;
-	if(tokens.size() >= 2 && tokens[1] != "(none)") {
-		snapshot_.bestmove = tokens[1];
+	std::optional<AnalysisRequest> next;
+	{
+		std::lock_guard lock(mutex_);
+		command_searching_ = false;
+		if(pending_analysis_) {
+			next = std::move(pending_analysis_);
+			pending_analysis_.reset();
+			command_searching_ = true;
+			discard_output_ = false;
+		} else if(!discard_output_) {
+			snapshot_.searching = false;
+			snapshot_.finished = true;
+			if(tokens.size() >= 2 && tokens[1] != "(none)") {
+				snapshot_.bestmove = tokens[1];
+			}
+		}
+		condition_.notify_all();
 	}
-	condition_.notify_all();
+	if(next) {
+		send_analysis(*next);
+	}
 }
 
 void UciEngine::configure() {
@@ -587,9 +674,15 @@ void UciEngine::configure() {
 		send("setoption name " + found->second + " value " + text);
 	};
 	for(auto iterator = requested.begin(); iterator != requested.end(); ++iterator) {
+		const auto key = lowercase(iterator.key());
+		if(key == "device" || key == "multipv") {
+			throw std::invalid_argument(
+				iterator.key() +
+				" is managed by its dedicated GUI field and must be removed from additional UCI options");
+		}
 		apply_option(iterator.key(), iterator.value());
 	}
-	if(lowercase(config_.device) != "auto" && requested.find("Device") == requested.end()) {
+	if(lowercase(config_.device) != "auto") {
 		const auto device = option_names_.find("device");
 		if(device != option_names_.end()) {
 			send("setoption name " + device->second + " value " + config_.device);

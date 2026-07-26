@@ -9,6 +9,7 @@ endif()
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+
 # LibTorch enables CUDA only to validate its imported runtime. No project target compiles .cu
 # sources, so keep that probe on the broadly supported CUDA C++17 dialect.
 set(CMAKE_CUDA_STANDARD 17)
@@ -290,6 +291,7 @@ target_link_libraries(gadidaeimgui PUBLIC glfw freetype)
 add_executable(gadidaegraphics
 	src/graphics/main.cpp
 	src/graphics/application.cpp
+	src/graphics/pieces.cpp
 	src/graphics/uci.cpp
 )
 set_target_properties(gadidaegraphics PROPERTIES
@@ -309,7 +311,6 @@ target_include_directories(gadidaegraphics SYSTEM PRIVATE
 		"${GADIDAE_API_DIR}/chess"
 		"${GADIDAE_API_DIR}/nlohmann/include"
 		"${GADIDAE_API_DIR}/glm"
-		"${GADIDAE_API_DIR}/stb"
 )
 target_link_libraries(gadidaegraphics PRIVATE
 	gadidaeimgui

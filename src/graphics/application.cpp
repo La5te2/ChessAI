@@ -1,6 +1,7 @@
 // Implements the native OpenGL Gadidae interface. Simulator and Stadium share
 // one renderer and chess state while communicating with engines only through UCI.
 #include "graphics/application.hpp"
+#include "graphics/pieces.hpp"
 #include "graphics/uci.hpp"
 #include <glad/gl.h>
 #define GLFW_INCLUDE_NONE
@@ -82,8 +83,8 @@ ImU32 packed_color(const ImVec4 &color) {
 std::optional<std::filesystem::path> system_font_path() {
 #ifdef _WIN32
 	const std::array candidates = {
-		std::filesystem::path("C:/Windows/Fonts/seguisb.ttf"),
 		std::filesystem::path("C:/Windows/Fonts/segoeui.ttf"),
+		std::filesystem::path("C:/Windows/Fonts/seguisb.ttf"),
 	};
 #else
 	const std::array candidates = {
@@ -406,7 +407,31 @@ struct Appearance {
 	ImVec4 last_move = color_vector(color32(0.66F, 0.75F, 0.36F));
 	ImVec4 legal = color_vector(color32(0.20F, 0.24F, 0.23F, 0.34F));
 	bool coordinates = true;
+	float font_size = 20.0F;
+	bool auto_font_scale = true;
+	PieceStyle piece_style = PieceStyle::Vector;
 };
+
+struct BoardLayout {
+	float board_size = 0.0F;
+	float right_width = 0.0F;
+};
+
+/// Fits the board and right panel inside the current content region at every font size.
+BoardLayout board_layout(float available_width, float available_height) {
+	const float right_minimum = std::min(410.0F, available_width * 0.46F);
+	const float right_maximum = std::min(610.0F, available_width * 0.52F);
+	const float right_width =
+		std::clamp(available_width * 0.39F, right_minimum,
+				   std::max(right_minimum, right_maximum));
+	const float bottom_controls =
+		ImGui::GetFrameHeight() + ImGui::GetStyle().ItemSpacing.y * 2.0F +
+		ImGui::GetStyle().WindowPadding.y * 2.0F + 4.0F;
+	const float board_size =
+		std::max(1.0F, std::min(available_height - bottom_controls,
+							   available_width - right_width - 16.0F));
+	return {board_size, right_width};
+}
 
 /// Selects application chrome independently from chessboard colors.
 enum class Theme { Dark, Light };
@@ -440,6 +465,35 @@ void read_engine_json(const nlohmann::json &json, EngineConfig &config) {
 	config.multipv = json.value("multipv", config.multipv);
 	config.progress_interval_ms =
 		json.value("progress_interval_ms", config.progress_interval_ms);
+}
+
+/// Compares every launch, protocol, and search field that affects a live UCI engine.
+bool same_engine_config(const EngineConfig &left, const EngineConfig &right) {
+	return left.path == right.path && left.name == right.name &&
+		   left.device == right.device && left.arguments == right.arguments &&
+		   left.options == right.options && left.movetime_ms == right.movetime_ms &&
+		   left.node_limit == right.node_limit && left.multipv == right.multipv &&
+		   left.progress_interval_ms == right.progress_interval_ms;
+}
+
+/// Validates additional setoption values while reserving fields managed by the GUI.
+nlohmann::json additional_uci_options(const std::string &text) {
+	const auto options = nlohmann::json::parse(text.empty() ? "{}" : text);
+	if(!options.is_object()) {
+		throw std::invalid_argument("Additional UCI options must be a JSON object");
+	}
+	for(auto iterator = options.begin(); iterator != options.end(); ++iterator) {
+		std::string key = iterator.key();
+		std::transform(key.begin(), key.end(), key.begin(), [](unsigned char character) {
+			return static_cast<char>(std::tolower(character));
+		});
+		if(key == "device" || key == "multipv") {
+			throw std::invalid_argument(
+				iterator.key() +
+				" is managed by its dedicated field and must be removed from additional UCI options");
+		}
+	}
+	return options;
 }
 
 /// Produces a side-to-move UCI score string for one analysis row.
@@ -520,9 +574,9 @@ void polygon(ImDrawList *draw, const std::vector<ImVec2> &points,
 					  ImDrawFlags_Closed, thickness);
 }
 
-/// Draws one crisp vector chess piece from simple geometry at any board scale.
-void draw_piece(ImDrawList *draw, const chess::Piece &piece,
-				ImVec2 center, float size) {
+/// Draws one built-in procedural chess piece at any board scale.
+void draw_vector_piece(ImDrawList *draw, const chess::Piece &piece,
+					   ImVec2 center, float size) {
 	const bool white = piece.color() == chess::Color::WHITE;
 	const ImU32 fill = white ? color32(0.96F, 0.97F, 0.96F)
 							 : color32(0.12F, 0.15F, 0.16F);
@@ -636,6 +690,16 @@ void draw_piece(ImDrawList *draw, const chess::Piece &piece,
 	}
 }
 
+/// Selects the embedded SVG atlas or falls back to the built-in Vector style.
+void draw_piece(ImDrawList *draw, PieceStyle style, const chess::Piece &piece,
+				ImVec2 center, float size) {
+	if(style != PieceStyle::Vector &&
+	   draw_compiled_piece(draw, style, piece, center, size * 0.94F)) {
+		return;
+	}
+	draw_vector_piece(draw, piece, center, size);
+}
+
 /// Draws a labeled board and returns the clicked square when one was pressed.
 std::optional<int> draw_board(const GameState &game, float size, bool flipped,
 							  const Appearance &appearance,
@@ -695,6 +759,7 @@ std::optional<int> draw_board(const GameState &game, float size, bool flipped,
 			const auto piece = game.board().at(chess::Square(square));
 			if(piece != chess::Piece::NONE) {
 				draw_piece(draw,
+						   appearance.piece_style,
 						   piece,
 						   {minimum.x + square_size * 0.5F,
 							minimum.y + square_size * 0.49F},
@@ -752,13 +817,24 @@ void analysis_table(const AnalysisSnapshot &snapshot, const std::string &fen,
 													  : "Analysis is idle");
 		} else if(ImGui::BeginTable(
 					  "multipv", 5,
-					  ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp |
+					  ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable |
+						  ImGuiTableFlags_BordersInnerV |
+						  ImGuiTableFlags_SizingStretchProp |
 						  ImGuiTableFlags_ScrollY)) {
-			ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 28.0F);
-			ImGui::TableSetupColumn("Move", ImGuiTableColumnFlags_WidthFixed, 72.0F);
-			ImGui::TableSetupColumn("Score", ImGuiTableColumnFlags_WidthFixed, 58.0F);
-			ImGui::TableSetupColumn("Depth", ImGuiTableColumnFlags_WidthFixed, 48.0F);
-			ImGui::TableSetupColumn("PV");
+			const auto column_width = [](const char *sample, float minimum) {
+				const float content = ImGui::CalcTextSize(sample).x;
+				const float padding = ImGui::GetStyle().CellPadding.x * 2.0F;
+				return std::max(minimum, content + padding + 8.0F);
+			};
+			ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed,
+									column_width("##", 32.0F));
+			ImGui::TableSetupColumn("Move", ImGuiTableColumnFlags_WidthFixed,
+									column_width("O-O-O+", 80.0F));
+			ImGui::TableSetupColumn("Score", ImGuiTableColumnFlags_WidthFixed,
+									column_width("-M123", 72.0F));
+			ImGui::TableSetupColumn("Depth", ImGuiTableColumnFlags_WidthFixed,
+									column_width("Depth", 64.0F));
+			ImGui::TableSetupColumn("PV", ImGuiTableColumnFlags_WidthStretch);
 			ImGui::TableHeadersRow();
 			for(const auto &line : snapshot.lines) {
 				ImGui::TableNextRow();
@@ -845,7 +921,15 @@ public:
 		if(update_state) {
 			update_stadium();
 		}
-		const auto &io = ImGui::GetIO();
+		auto &io = ImGui::GetIO();
+		const float window_ratio =
+			std::max(0.25F, std::min(io.DisplaySize.x / 1280.0F,
+									 io.DisplaySize.y / 820.0F));
+		const float viewport_scale = appearance_.auto_font_scale
+			? std::clamp(std::sqrt(window_ratio), 0.95F, 1.10F)
+			: 1.0F;
+		io.FontGlobalScale =
+			std::clamp(appearance_.font_size * viewport_scale / 32.0F, 0.44F, 1.25F);
 		ImGui::SetNextWindowPos({0.0F, 0.0F});
 		ImGui::SetNextWindowSize(io.DisplaySize);
 		ImGui::Begin("GadidaeRoot", nullptr,
@@ -880,6 +964,15 @@ private:
 				mode_ = value() == "stadium" ? Mode::Stadium : Mode::Simulator;
 			} else if(argument == "--theme") {
 				theme_ = value() == "light" ? Theme::Light : Theme::Dark;
+			} else if(argument == "--font-size") {
+				appearance_.font_size = std::clamp(std::stof(value()), 14.0F, 36.0F);
+			} else if(argument == "--piece-style") {
+				const auto style = parse_piece_style(value());
+				if(!style) {
+					throw std::invalid_argument(
+						"--piece-style must be vector, rhosgfx, chessnut, or spatial");
+				}
+				appearance_.piece_style = *style;
 			} else if(argument == "--uci") {
 				simulator_config_.path = value();
 			} else if(argument == "--arguments") {
@@ -937,8 +1030,20 @@ private:
 			read_color("dark", appearance_.dark);
 			read_color("selected", appearance_.selected);
 			read_color("last_move", appearance_.last_move);
+			read_color("legal", appearance_.legal);
 			appearance_.coordinates =
 				appearance.value("coordinates", appearance_.coordinates);
+			appearance_.font_size =
+				std::clamp(appearance.value("font_size", appearance_.font_size),
+						   14.0F, 36.0F);
+			appearance_.auto_font_scale =
+				appearance.value("auto_font_scale", appearance_.auto_font_scale);
+			if(const auto style =
+				   parse_piece_style(appearance.value(
+					   "piece_style",
+					   std::string(piece_style_name(appearance_.piece_style))))) {
+				appearance_.piece_style = *style;
+			}
 			theme_ = json.value("theme", std::string("dark")) == "light"
 						 ? Theme::Light
 						 : Theme::Dark;
@@ -965,7 +1070,11 @@ private:
 			  {"dark", color_json(appearance_.dark)},
 			  {"selected", color_json(appearance_.selected)},
 			  {"last_move", color_json(appearance_.last_move)},
-			  {"coordinates", appearance_.coordinates}}},
+			  {"legal", color_json(appearance_.legal)},
+			  {"coordinates", appearance_.coordinates},
+			  {"font_size", appearance_.font_size},
+			  {"auto_font_scale", appearance_.auto_font_scale},
+			  {"piece_style", std::string(piece_style_name(appearance_.piece_style))}}},
 		};
 		const auto path = settings_path();
 		std::filesystem::create_directories(path.parent_path());
@@ -983,13 +1092,13 @@ private:
 	void render_top_bar() {
 		ImGui::AlignTextToFramePadding();
 		ImGui::TextUnformatted("GADIDAE");
-		ImGui::SameLine(116.0F);
+		ImGui::SameLine();
 		const auto mode_button = [&](const char *label, Mode mode) {
 			const bool active = mode_ == mode;
 			if(active) {
 				ImGui::PushStyleColor(ImGuiCol_Button, {0.20F, 0.47F, 0.38F, 1.0F});
 			}
-			if(ImGui::Button(label, {104.0F, 0.0F}) && !active) {
+			if(ImGui::Button(label) && !active) {
 				if(mode_ == Mode::Stadium) {
 					stop_stadium();
 				}
@@ -1005,10 +1114,14 @@ private:
 		mode_button("Simulator", Mode::Simulator);
 		ImGui::SameLine();
 		mode_button("Stadium", Mode::Stadium);
-		ImGui::SameLine();
-		ImGui::SetCursorPosX(ImGui::GetWindowWidth() -
-							 ImGui::CalcTextSize(status_.c_str()).x - 18.0F);
-		ImGui::TextDisabled("%s", status_.c_str());
+		const float status_width = ImGui::CalcTextSize(status_.c_str()).x;
+		const float status_x =
+			ImGui::GetWindowContentRegionMax().x - status_width;
+		if(status_x >
+		   ImGui::GetCursorPosX() + ImGui::GetStyle().ItemSpacing.x) {
+			ImGui::SameLine(status_x);
+			ImGui::TextDisabled("%s", status_.c_str());
+		}
 	}
 
 	/// Renders the interactive position analyser.
@@ -1018,13 +1131,10 @@ private:
 		}
 		const float available_height = ImGui::GetContentRegionAvail().y;
 		const float available_width = ImGui::GetContentRegionAvail().x;
-		const float right_width = std::clamp(available_width * 0.39F, 410.0F, 610.0F);
-		const float board_size =
-			std::max(320.0F, std::min(available_height - 55.0F,
-									 available_width - right_width - 16.0F));
+		const auto layout = board_layout(available_width, available_height);
 
-		ImGui::BeginChild("simulator-left", {board_size, 0.0F});
-		if(const auto square = draw_board(simulator_, board_size, flipped_, appearance_,
+		ImGui::BeginChild("simulator-left", {layout.board_size, 0.0F});
+		if(const auto square = draw_board(simulator_, layout.board_size, flipped_, appearance_,
 										 selected_square_, legal_targets_, "simulator")) {
 			handle_simulator_square(*square);
 		}
@@ -1053,9 +1163,19 @@ private:
 		const std::string fen = simulator_.board().getFen();
 		try {
 			if(!simulator_engine_.ready()) {
-				simulator_engine_.start(simulator_config_);
-				invalidate_simulator_analysis();
+				const auto startup = simulator_engine_.snapshot();
+				if(!startup.error.empty()) {
+					throw std::runtime_error(startup.error);
+				}
+				if(!simulator_engine_.starting()) {
+					simulator_engine_.start_async(simulator_config_);
+					simulator_display_ = {};
+					simulator_display_.engine_name = "Loading engine";
+					status_ = "Loading UCI engine";
+				}
+				return;
 			}
+			status_ = "Ready";
 			if(simulator_analysis_fen_ != fen) {
 				simulator_engine_.analyse(
 					fen, simulator_config_.movetime_ms == 0 &&
@@ -1125,7 +1245,15 @@ private:
 	/// Draws compact board manipulation controls below Simulator.
 	void render_simulator_bottom() {
 		ImGui::Spacing();
-		ImGui::SetNextItemWidth(-230.0F);
+		const auto button_width = [](const char *label) {
+			return ImGui::CalcTextSize(label).x +
+				   ImGui::GetStyle().FramePadding.x * 2.0F;
+		};
+		const float reserved =
+			button_width("Reset") + button_width("Undo") + button_width("Flip") +
+			ImGui::GetStyle().ItemSpacing.x * 3.0F;
+		ImGui::SetNextItemWidth(
+			std::max(80.0F, ImGui::GetContentRegionAvail().x - reserved));
 		ImGui::InputTextWithHint("##fen", "FEN or startpos", &simulator_fen_input_);
 		ImGui::SameLine();
 		if(ImGui::Button("Reset")) {
@@ -1231,17 +1359,27 @@ private:
 	void render_stadium() {
 		const float available_height = ImGui::GetContentRegionAvail().y;
 		const float available_width = ImGui::GetContentRegionAvail().x;
-		const float right_width = std::clamp(available_width * 0.39F, 410.0F, 610.0F);
-		const float board_size =
-			std::max(320.0F, std::min(available_height - 55.0F,
-									 available_width - right_width - 16.0F));
-		ImGui::BeginChild("stadium-left", {board_size, 0.0F});
-		draw_board(stadium_, board_size, flipped_, appearance_, std::nullopt, {},
+		const auto layout = board_layout(available_width, available_height);
+		ImGui::BeginChild("stadium-left", {layout.board_size, 0.0F});
+		draw_board(stadium_, layout.board_size, flipped_, appearance_, std::nullopt, {},
 				   "stadium");
 		ImGui::Spacing();
-		ImGui::SetNextItemWidth(-80.0F);
-		ImGui::InputTextWithHint("##stadium-fen", "Start FEN or startpos",
-								 &stadium_fen_input_);
+		const auto button_width = [](const char *label) {
+			return ImGui::CalcTextSize(label).x +
+				   ImGui::GetStyle().FramePadding.x * 2.0F;
+		};
+		const float reserved =
+			button_width("Start") + button_width("Flip") +
+			ImGui::GetStyle().ItemSpacing.x * 2.0F;
+		ImGui::SetNextItemWidth(
+			std::max(80.0F, ImGui::GetContentRegionAvail().x - reserved));
+		const bool submitted = ImGui::InputTextWithHint(
+			"##stadium-fen", "Start FEN or startpos", &stadium_fen_input_,
+			ImGuiInputTextFlags_EnterReturnsTrue);
+		ImGui::SameLine();
+		if(ImGui::Button("Start##stadium") || submitted) {
+			start_stadium();
+		}
 		ImGui::SameLine();
 		if(ImGui::Button("Flip##stadium")) {
 			flipped_ = !flipped_;
@@ -1278,11 +1416,7 @@ private:
 
 	/// Draws Stadium lifecycle and settings commands.
 	void render_stadium_toolbar() {
-		if(!stadium_running_) {
-			if(ImGui::Button("Start")) {
-				start_stadium();
-			}
-		} else {
+		if(stadium_running_) {
 			if(ImGui::Button(stadium_paused_ ? "Resume" : "Pause")) {
 				stadium_paused_ = !stadium_paused_;
 				if(stadium_paused_) {
@@ -1299,7 +1433,9 @@ private:
 				stop_stadium();
 			}
 		}
-		ImGui::SameLine();
+		if(stadium_running_) {
+			ImGui::SameLine();
+		}
 		if(ImGui::Button("Save PGN##stadium")) {
 			save_pgn(stadium_, stadium_white_name(), stadium_black_name());
 		}
@@ -1324,14 +1460,14 @@ private:
 			}
 			stop_stadium();
 			stadium_.reset(stadium_fen_input_.empty() ? "startpos" : stadium_fen_input_);
-			white_engine_.start(white_config_);
-			black_engine_.start(black_config_);
+			white_engine_.start_async(white_config_);
+			black_engine_.start_async(black_config_);
 			stadium_running_ = true;
 			stadium_paused_ = false;
 			stadium_turn_started_ = false;
 			stadium_display_ = {};
 			next_stadium_turn_ = Clock::now();
-			stadium_status_ = "Running";
+			stadium_status_ = "Loading engines";
 		} catch(const std::exception &error) {
 			stop_stadium();
 			show_error(error.what());
@@ -1356,6 +1492,24 @@ private:
 			return;
 		}
 		try {
+			if(white_engine_.starting() || black_engine_.starting()) {
+				stadium_status_ = "Loading engines";
+				return;
+			}
+			if(!white_engine_.ready() || !black_engine_.ready()) {
+				const auto white = white_engine_.snapshot();
+				const auto black = black_engine_.snapshot();
+				if(!white.error.empty()) {
+					throw std::runtime_error("White engine: " + white.error);
+				}
+				if(!black.error.empty()) {
+					throw std::runtime_error("Black engine: " + black.error);
+				}
+				throw std::runtime_error("UCI engine initialization failed");
+			}
+			if(stadium_status_ == "Loading engines") {
+				stadium_status_ = "Running";
+			}
 			if(stadium_.over()) {
 				stadium_status_ = stadium_.termination();
 				stop_stadium();
@@ -1375,6 +1529,7 @@ private:
 				stadium_generation_ =
 					active_stadium_engine().analyse(stadium_root_fen_, false);
 				stadium_turn_started_ = true;
+				stadium_display_ = active_stadium_engine().snapshot();
 				stadium_last_display_ = Clock::time_point{};
 				return;
 			}
@@ -1436,8 +1591,9 @@ private:
 	/// Presents one engine's generic process and UCI controls.
 	void engine_editor(const char *identifier, EngineConfig &config) {
 		ImGui::PushID(identifier);
+		ImGui::SeparatorText("Engine");
 		std::string path = config.path.string();
-		ImGui::TextUnformatted("Path");
+		ImGui::TextUnformatted("Executable");
 		ImGui::SetNextItemWidth(-82.0F);
 		if(ImGui::InputText("##path", &path)) {
 			config.path = path;
@@ -1449,29 +1605,36 @@ private:
 				config.path = *selected;
 			}
 		}
-		ImGui::TextUnformatted("Name");
+		ImGui::TextUnformatted("Display name");
 		ImGui::SetNextItemWidth(-1.0F);
 		ImGui::InputText("##name", &config.name);
-		ImGui::TextUnformatted("Device");
+		ImGui::TextUnformatted("Device (managed UCI option)");
 		const char *devices[] = {"auto", "cpu", "cuda"};
 		int device = config.device == "cpu" ? 1 : config.device == "cuda" ? 2 : 0;
 		if(ImGui::Combo("##device", &device, devices, 3)) {
 			config.device = devices[device];
 		}
 		ImGui::Spacing();
-		ImGui::SeparatorText("Arguments");
-		ImGui::TextUnformatted("Process arguments");
-		ImGui::SetNextItemWidth(-1.0F);
-		ImGui::InputText("##arguments", &config.arguments);
+		ImGui::SeparatorText("Search");
 		ImGui::InputInt("Move time (ms)", &config.movetime_ms);
 		ImGui::InputScalar("Node limit", ImGuiDataType_U64, &config.node_limit);
-		ImGui::InputInt("Analysis lines", &config.multipv);
+		ImGui::InputInt("Analysis lines (MultiPV)", &config.multipv);
 		ImGui::InputInt("Display update (ms)", &config.progress_interval_ms);
 		config.movetime_ms = std::max(0, config.movetime_ms);
 		config.multipv = std::max(1, config.multipv);
 		config.progress_interval_ms = std::max(50, config.progress_interval_ms);
-		ImGui::TextUnformatted("UCI options (JSON)");
+		ImGui::Spacing();
+		ImGui::SeparatorText("UCI options");
+		ImGui::TextDisabled(
+			"JSON values become setoption commands after launch. Device and MultiPV are managed above.");
 		ImGui::InputTextMultiline("##options", &config.options, {-1.0F, 90.0F});
+		ImGui::Spacing();
+		if(ImGui::CollapsingHeader("Launch arguments")) {
+			ImGui::TextDisabled(
+				"Optional process arguments passed before the UCI handshake.");
+			ImGui::SetNextItemWidth(-1.0F);
+			ImGui::InputText("##arguments", &config.arguments);
+		}
 		ImGui::PopID();
 	}
 
@@ -1482,6 +1645,15 @@ private:
 		ImGui::TextUnformatted("Theme");
 		if(ImGui::Combo("##theme", &selected_theme, themes, 2)) {
 			theme = selected_theme == 1 ? Theme::Light : Theme::Dark;
+		}
+		ImGui::SliderFloat("Font size", &appearance.font_size, 14.0F, 36.0F, "%.0f px");
+		ImGui::Checkbox("Scale font with window", &appearance.auto_font_scale);
+		const char *piece_styles[] = {"Vector", "RhosGFX", "Chessnut", "Spatial"};
+		int selected_piece_style = static_cast<int>(appearance.piece_style);
+		ImGui::TextUnformatted("Pieces");
+		if(ImGui::Combo("##pieces", &selected_piece_style, piece_styles,
+						static_cast<int>(std::size(piece_styles)))) {
+			appearance.piece_style = static_cast<PieceStyle>(selected_piece_style);
 		}
 		ImGui::SeparatorText("Board");
 		if(ImGui::Button("Forest")) {
@@ -1497,6 +1669,16 @@ private:
 		if(ImGui::Button("Ocean")) {
 			appearance.light = color_vector(color32(0.79F, 0.86F, 0.86F));
 			appearance.dark = color_vector(color32(0.22F, 0.43F, 0.50F));
+		}
+		ImGui::SameLine();
+		if(ImGui::Button("Tournament")) {
+			appearance.light = color_vector(color32(0.94F, 0.85F, 0.68F));
+			appearance.dark = color_vector(color32(0.64F, 0.43F, 0.25F));
+		}
+		ImGui::SameLine();
+		if(ImGui::Button("Walnut")) {
+			appearance.light = color_vector(color32(0.78F, 0.69F, 0.56F));
+			appearance.dark = color_vector(color32(0.37F, 0.25F, 0.20F));
 		}
 		ImGui::ColorEdit4("Light squares", &appearance.light.x,
 						  ImGuiColorEditFlags_NoInputs);
@@ -1520,6 +1702,8 @@ private:
 								   ImGuiWindowFlags_NoSavedSettings)) {
 			return;
 		}
+		ImGui::BeginChild("settings-content", {0.0F, -48.0F}, ImGuiChildFlags_None,
+						  ImGuiWindowFlags_AlwaysVerticalScrollbar);
 		if(settings_mode_ == Mode::Simulator) {
 			if(ImGui::BeginTabBar("sim-settings")) {
 				if(ImGui::BeginTabItem("Engine")) {
@@ -1554,34 +1738,42 @@ private:
 			}
 			ImGui::EndTabBar();
 		}
-		ImGui::SetCursorPosY(ImGui::GetWindowHeight() - 48.0F);
+		ImGui::EndChild();
 		ImGui::Separator();
 		if(ImGui::Button("Apply", {100.0F, 0.0F})) {
 			try {
-				const auto primary_options = nlohmann::json::parse(
+				const auto primary_options = additional_uci_options(
 					settings_mode_ == Mode::Simulator ? simulator_edit_.options
 													 : white_edit_.options);
 				if(settings_mode_ == Mode::Stadium) {
-					const auto secondary_options =
-						nlohmann::json::parse(black_edit_.options);
+					const auto secondary_options = additional_uci_options(black_edit_.options);
 					static_cast<void>(secondary_options);
 				}
 				static_cast<void>(primary_options);
 				if(settings_mode_ == Mode::Simulator) {
-					simulator_engine_.close();
+					const bool engine_changed =
+						!same_engine_config(simulator_config_, simulator_edit_);
 					simulator_config_ = simulator_edit_;
-					invalidate_simulator_analysis();
+					if(engine_changed) {
+						simulator_engine_.close();
+						invalidate_simulator_analysis();
+					}
 				} else {
-					stop_stadium();
+					const bool engines_changed =
+						!same_engine_config(white_config_, white_edit_) ||
+						!same_engine_config(black_config_, black_edit_);
+					if(engines_changed) {
+						stop_stadium();
+					}
 					white_config_ = white_edit_;
 					black_config_ = black_edit_;
 					delay_ms_ = delay_edit_;
 					max_plies_ = max_plies_edit_;
-			}
-			appearance_ = appearance_edit_;
-			theme_ = theme_edit_;
-			apply_style(theme_);
-			save_settings();
+				}
+				appearance_ = appearance_edit_;
+				theme_ = theme_edit_;
+				apply_style(theme_);
+				save_settings();
 				ImGui::CloseCurrentPopup();
 			} catch(const std::exception &error) {
 				show_error(error.what());
@@ -1691,32 +1883,61 @@ struct RefreshContext {
 	std::function<void(bool)> render;
 	bool rendering = false;
 	Clock::time_point last_render{};
+	Clock::time_point defer_drawing_until{};
 };
 
-/// Draws at most one frame per interval and prevents recursive callbacks.
+constexpr auto frame_interval = std::chrono::microseconds(8333);
+
+/// Draws main content and overlays through the same bounded 120 Hz cadence.
 void refresh_window(GLFWwindow *window, bool update_state) {
 	auto *context =
 		static_cast<RefreshContext *>(glfwGetWindowUserPointer(window));
 	if(context == nullptr || context->rendering) {
 		return;
 	}
+	int width = 0;
+	int height = 0;
+	int window_width = 0;
+	int window_height = 0;
+	glfwGetFramebufferSize(window, &width, &height);
+	glfwGetWindowSize(window, &window_width, &window_height);
+	if(width <= 0 || height <= 0 || window_width <= 0 || window_height <= 0) {
+		return;
+	}
 	const auto now = Clock::now();
-	const auto minimum_interval = update_state
-		? std::chrono::milliseconds(8)
-		: std::chrono::milliseconds(33);
 	if(context->last_render != Clock::time_point{} &&
-	   now - context->last_render < minimum_interval) {
+	   now - context->last_render < frame_interval) {
 		return;
 	}
 	context->rendering = true;
-	context->render(update_state);
-	context->last_render = Clock::now();
-	context->rendering = false;
+	try {
+		context->render(update_state);
+		context->last_render = Clock::now();
+		context->rendering = false;
+	} catch(...) {
+		context->rendering = false;
+		throw;
+	}
 }
 
-/// Redraws cached UI state while Windows owns its modal move or resize loop.
-void refresh_window_modal(GLFWwindow *window) {
-	refresh_window(window, false);
+/// Defers OpenGL submissions while Windows continuously moves or resizes the window.
+void defer_window_drawing(GLFWwindow *window) {
+	auto *context =
+		static_cast<RefreshContext *>(glfwGetWindowUserPointer(window));
+	if(context != nullptr) {
+		context->defer_drawing_until =
+			Clock::now() + std::chrono::milliseconds(100);
+	}
+}
+
+/// Marks logical size changes without drawing inside the native callback.
+void window_resized(GLFWwindow *window, int, int) {
+	defer_window_drawing(window);
+}
+
+/// Marks window moves without drawing inside the native callback.
+void window_moved(GLFWwindow *window, int, int) {
+	defer_window_drawing(window);
 }
 
 } // namespace
@@ -1731,6 +1952,7 @@ int run_application(int argc, char **argv) {
 	glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
 	glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
 	glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+	glfwWindowHint(GLFW_SAMPLES, 4);
 #ifdef __APPLE__
 	glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
 #endif
@@ -1751,6 +1973,7 @@ int run_application(int argc, char **argv) {
 		glfwTerminate();
 		throw std::runtime_error("could not load OpenGL 3.3");
 	}
+	glEnable(GL_MULTISAMPLE);
 
 	IMGUI_CHECKVERSION();
 	ImGui::CreateContext();
@@ -1758,7 +1981,11 @@ int run_application(int argc, char **argv) {
 	io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 	io.IniFilename = nullptr;
 	if(const auto font = system_font_path()) {
-		io.Fonts->AddFontFromFileTTF(font->string().c_str(), 17.0F);
+		io.Fonts->AddFontFromFileTTF(font->string().c_str(), 32.0F);
+	} else {
+		ImFontConfig font_config;
+		font_config.SizePixels = 32.0F;
+		io.Fonts->AddFontDefault(&font_config);
 	}
 	apply_style(Theme::Dark);
 	ImGui_ImplGlfw_InitForOpenGL(window, true);
@@ -1767,7 +1994,8 @@ int run_application(int argc, char **argv) {
 	int result = 0;
 	try {
 		Application application(argc, argv);
-		const auto render_frame = [&](bool update_state) {
+		RefreshContext refresh;
+		refresh.render = [&](bool update_state) {
 			ImGui_ImplOpenGL3_NewFrame();
 			ImGui_ImplGlfw_NewFrame();
 			ImGui::NewFrame();
@@ -1781,16 +2009,19 @@ int run_application(int argc, char **argv) {
 			glClearColor(clear.x, clear.y, clear.z, clear.w);
 			glClear(GL_COLOR_BUFFER_BIT);
 			ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+			glFinish();
 			glfwSwapBuffers(window);
 		};
-		RefreshContext refresh{render_frame};
 		glfwSetWindowUserPointer(window, &refresh);
-		glfwSetWindowRefreshCallback(window, refresh_window_modal);
+		glfwSetWindowSizeCallback(window, window_resized);
+		glfwSetWindowPosCallback(window, window_moved);
 		auto next_frame = Clock::now();
 		while(!glfwWindowShouldClose(window)) {
 			glfwPollEvents();
-			refresh_window(window, true);
-			next_frame += std::chrono::milliseconds(8);
+			if(Clock::now() >= refresh.defer_drawing_until) {
+				refresh_window(window, true);
+			}
+			next_frame += frame_interval;
 			const auto now = Clock::now();
 			if(next_frame > now) {
 				std::this_thread::sleep_until(next_frame);
@@ -1798,7 +2029,8 @@ int run_application(int argc, char **argv) {
 				next_frame = now;
 			}
 		}
-		glfwSetWindowRefreshCallback(window, nullptr);
+		glfwSetWindowPosCallback(window, nullptr);
+		glfwSetWindowSizeCallback(window, nullptr);
 		glfwSetWindowUserPointer(window, nullptr);
 	} catch(const std::exception &error) {
 		std::cerr << "GUI runtime error: " << error.what() << '\n';

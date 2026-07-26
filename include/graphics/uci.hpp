@@ -64,6 +64,9 @@ public:
 	/// Launches and initializes the configured UCI process.
 	void start(const EngineConfig &config);
 
+	/// Launches and initializes the UCI process without blocking the GUI thread.
+	void start_async(const EngineConfig &config);
+
 	/// Stops the current search and terminates the child process.
 	void close();
 
@@ -79,14 +82,26 @@ public:
 	/// Reports whether initialization completed and the process is still usable.
 	bool ready() const;
 
+	/// Reports whether a background handshake or model load is in progress.
+	bool starting() const;
+
 	/// Returns the effective engine name from the UCI handshake or user override.
 	std::string display_name() const;
 
 private:
 	class Process;
+	struct AnalysisRequest {
+		std::uint64_t generation = 0;
+		std::string fen;
+		bool infinite = false;
+	};
 
 	/// Sends one complete line to the child process.
 	void send(const std::string &line);
+	/// Performs process creation, UCI handshake, and option configuration.
+	void initialize(const EngineConfig &config);
+	/// Sends position and go commands for a request that owns the output stream.
+	void send_analysis(const AnalysisRequest &request);
 
 	/// Waits for a handshake marker while checking process and parser errors.
 	void wait_for_flag(const std::atomic_bool &flag,
@@ -111,13 +126,19 @@ private:
 	std::unique_ptr<Process> process_;
 	EngineConfig config_;
 	mutable std::mutex mutex_;
+	std::mutex send_mutex_;
 	std::condition_variable condition_;
+	std::thread startup_;
 	std::thread reader_;
 	std::atomic_bool closing_{false};
+	std::atomic_bool starting_{false};
 	std::atomic_bool uciok_{false};
 	std::atomic_bool readyok_{false};
 	std::atomic_bool process_ready_{false};
 	std::uint64_t generation_ = 0;
+	bool command_searching_ = false;
+	bool discard_output_ = false;
+	std::optional<AnalysisRequest> pending_analysis_;
 	AnalysisSnapshot snapshot_;
 	std::string reported_name_;
 	std::unordered_map<std::string, std::string> option_names_;

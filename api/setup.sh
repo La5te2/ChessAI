@@ -19,7 +19,9 @@ cleanup() {
 		"${API_DIR}/imgui-unpack" \
 		"${API_DIR}/freetype-unpack" \
 		"${API_DIR}/stb-unpack" \
-		"${API_DIR}/glad-generator-unpack"
+		"${API_DIR}/glad-generator-unpack" \
+		"${API_DIR}/glad-generator" \
+		"${API_DIR}/glad-python"
 }
 trap cleanup EXIT
 
@@ -210,15 +212,15 @@ download_source freetype "${FREETYPE_VERSION}" \
 download_source stb "${STB_REF}" \
 	"https://github.com/nothings/stb/archive/${STB_REF}.tar.gz" \
 	"stb-${STB_REF}" "stb_image.h"
-download_source glad-generator "${GLAD_VERSION}" \
-	"https://github.com/Dav1dde/glad/archive/refs/tags/v${GLAD_VERSION}.tar.gz" \
-	"glad-${GLAD_VERSION}"
 sed -i \
 	's/cmake_minimum_required(VERSION 3\.0\.\.\.3\.5)/cmake_minimum_required(VERSION 3.10...3.31)/' \
 	"${API_DIR}/freetype/CMakeLists.txt"
 
 if [[ ! -f "${API_DIR}/glad/include/glad/gl.h" ]]; then
 	echo "Generating GLAD ${GLAD_VERSION} for OpenGL 3.3 Core..."
+	download_source glad-generator "${GLAD_VERSION}" \
+		"https://github.com/Dav1dde/glad/archive/refs/tags/v${GLAD_VERSION}.tar.gz" \
+		"glad-${GLAD_VERSION}"
 	if [[ ! -d "${API_DIR}/glad-python/jinja2" ]]; then
 		python3 -m pip install --disable-pip-version-check --no-cache-dir \
 			--target "${API_DIR}/glad-python" \

@@ -548,7 +548,8 @@ struct Searcher::Impl {
 	// Search many independent roots while sharing neural leaf batches across games.
 	std::vector<SearchResult> search_many(const std::vector<chess::Board> &boards,
 									   const SearchProgressCallback &progress = {},
-									   int progress_interval_ms = 0) {
+									   int progress_interval_ms = 0,
+									   const SearchCancelCallback &cancel = {}) {
 		if (boards.empty()) {
 			return {};
 		}
@@ -594,7 +595,7 @@ struct Searcher::Impl {
 
 		if (options.type == SearchType::OnlyMcts && options.mcts_sims > 0) {
 			const int batch_size = std::max(1, options.mcts_batch_size);
-			while (!deadline_reached(deadline)) {
+			while (!deadline_reached(deadline) && !(cancel && cancel())) {
 				bool active = false;
 				bool progressed = false;
 				std::vector<SelectedLeaf> selected;
@@ -612,7 +613,7 @@ struct Searcher::Impl {
 					for (int attempt = 0, accepted = 0;
 						 accepted < wanted && attempt < std::max(wanted * 5, wanted + 8);
 						 ++attempt) {
-						if (deadline_reached(deadline)) {
+						if (deadline_reached(deadline) || (cancel && cancel())) {
 							break;
 						}
 						auto leaf = select_leaf(state_index, state);
@@ -756,8 +757,9 @@ Searcher::Searcher(Model model, torch::Device device, SearchOptions options)
 
 // Search one position and expose timed snapshots to interactive front ends.
 SearchResult Searcher::search(const chess::Board &board,
-							  const SearchProgressCallback &progress, int progress_interval_ms) {
-	return impl_->search_many({board}, progress, progress_interval_ms)[0];
+							  const SearchProgressCallback &progress, int progress_interval_ms,
+							  const SearchCancelCallback &cancel) {
+	return impl_->search_many({board}, progress, progress_interval_ms, cancel)[0];
 }
 
 // Search a batch without progress callbacks, as used by arena and FCPI.

@@ -78,11 +78,11 @@ call :download_source glm "%GLM_VERSION%" "https://github.com/g-truc/glm/archive
 call :download_source imgui "%IMGUI_VERSION%" "https://github.com/ocornut/imgui/archive/refs/tags/v%IMGUI_VERSION%.zip" "imgui-%IMGUI_VERSION%" || exit /b 1
 call :download_source freetype "%FREETYPE_VERSION%" "https://github.com/freetype/freetype/archive/refs/tags/VER-%FREETYPE_VERSION%.zip" "freetype-VER-%FREETYPE_VERSION%" || exit /b 1
 call :download_source stb "%STB_REF%" "https://github.com/nothings/stb/archive/%STB_REF%.zip" "stb-%STB_REF%" || exit /b 1
-call :download_source glad-generator "%GLAD_VERSION%" "https://github.com/Dav1dde/glad/archive/refs/tags/v%GLAD_VERSION%.zip" "glad-%GLAD_VERSION%" || exit /b 1
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$path='%API_DIR%freetype\CMakeLists.txt'; $text=[IO.File]::ReadAllText($path); $text=$text.Replace('cmake_minimum_required(VERSION 3.0...3.5)','cmake_minimum_required(VERSION 3.10...3.31)'); [IO.File]::WriteAllText($path,$text,[Text.UTF8Encoding]::new($false))" || exit /b 1
 
 if not exist "%API_DIR%glad\include\glad\gl.h" (
 	echo Generating GLAD %GLAD_VERSION% for OpenGL 3.3 Core...
+	call :download_source glad-generator "%GLAD_VERSION%" "https://github.com/Dav1dde/glad/archive/refs/tags/v%GLAD_VERSION%.zip" "glad-%GLAD_VERSION%" || exit /b 1
 	if not exist "%API_DIR%glad-python\jinja2" (
 		python -m pip install --disable-pip-version-check --no-cache-dir --target "%API_DIR%glad-python" "Jinja2==%JINJA2_VERSION%" "MarkupSafe==%MARKUPSAFE_VERSION%" || exit /b 1
 	)
@@ -142,7 +142,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -Force '!
 exit /b 0
 
 :cleanup
-for %%D in (zlib-src zlib-build zlib-unpack hdf5-src hdf5-build hdf5-unpack glfw-unpack glm-unpack imgui-unpack freetype-unpack stb-unpack glad-generator-unpack downloads) do (
+for %%D in (zlib-src zlib-build zlib-unpack hdf5-src hdf5-build hdf5-unpack glfw-unpack glm-unpack imgui-unpack freetype-unpack stb-unpack glad-generator-unpack glad-generator glad-python downloads) do (
 	if exist "%API_DIR%%%D" rmdir /s /q "%API_DIR%%%D"
 )
 exit /b 0

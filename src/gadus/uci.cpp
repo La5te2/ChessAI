@@ -1,14 +1,17 @@
 // Exposes Gadus checkpoints as a standards-oriented UCI process for GUI and bot clients.
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <filesystem>
 #include <iostream>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 #include "gadus/args.hpp"
@@ -108,6 +111,9 @@ class UciEngine {
 	public:
 	// Store initial options; model loading remains lazy until readiness or search.
 	explicit UciEngine(EngineOptions options) : options_(std::move(options)) {}
+	~UciEngine() {
+		stop_and_join();
+	}
 
 	// Dispatch UCI commands until quit or end-of-input, reporting command errors as info strings.
 	void loop() {
@@ -125,15 +131,18 @@ class UciEngine {
 					ensure_model();
 					print("readyok");
 				} else if (command == "setoption") {
+					stop_and_join();
 					set_option(line);
 				} else if (command == "ucinewgame") {
+					stop_and_join();
 					board_ = chess::Board();
 				} else if (command == "position") {
+					stop_and_join();
 					set_position(line);
 				} else if (command == "go") {
 					go(line);
 				} else if (command == "stop") {
-					continue;
+					stop_requested_ = true;
 				} else if (command == "quit") {
 					break;
 				} else if (command == "debug" || command == "ponderhit" ||
@@ -151,12 +160,24 @@ class UciEngine {
 				}
 			}
 		}
+		stop_and_join();
 	}
 
 	private:
 	// Emit and flush one complete protocol line.
 	static void print(const std::string &text) {
+		static std::mutex output_mutex;
+		std::lock_guard lock(output_mutex);
 		std::cout << text << std::endl;
+	}
+
+	// Request cooperative cancellation and join the search before mutable UCI state changes.
+	void stop_and_join() {
+		stop_requested_ = true;
+		if (search_thread_.joinable()) {
+			search_thread_.join();
+		}
+		stop_requested_ = false;
 	}
 
 	// Advertise engine identity and every configurable UCI option before uciok.
@@ -384,8 +405,9 @@ class UciEngine {
 		}
 	}
 
-	// Run one search under go overrides, emit progress, then publish exactly one bestmove.
+	// Start search on a worker so the protocol loop can process stop while MCTS is running.
 	void go(const std::string &line) {
+		stop_and_join();
 		if (gadus::game_is_over(board_)) {
 			print("bestmove 0000");
 			return;
@@ -398,12 +420,27 @@ class UciEngine {
 			search_options.mcts_sims = std::max(0, parse_int(nodes->second, search_options.mcts_sims));
 		}
 		search_options.root_topn = std::max(options_.multipv, search_options.root_topn);
-		gadus::Searcher searcher(model_, device_, search_options);
-		const auto result = searcher.search(
-			board_, [this](const gadus::SearchResult &partial) { emit_info(partial); },
-			options_.progress_interval_ms);
-		emit_info(result);
-		print("bestmove " + gadus::move_uci(result.move));
+		const auto board = board_;
+		const auto model = model_;
+		const auto device = device_;
+		const int progress_interval_ms = options_.progress_interval_ms;
+		stop_requested_ = false;
+		search_thread_ = std::thread([this, board, model, device, search_options,
+									  progress_interval_ms] {
+			try {
+				gadus::Searcher searcher(model, device, search_options);
+				const auto result = searcher.search(
+					board, [this](const gadus::SearchResult &partial) { emit_info(partial); },
+					progress_interval_ms, [this] { return stop_requested_.load(); });
+				emit_info(result);
+				print("bestmove " + gadus::move_uci(result.move));
+			} catch (const std::exception &error) {
+				print("info string go error: " + std::string(error.what()));
+				const auto moves = gadus::legal_moves(board);
+				print("bestmove " +
+					  (moves.empty() ? std::string("0000") : gadus::move_uci(moves.front())));
+			}
+		});
 	}
 
 	// Supply a deterministic legal move only when command recovery needs a protocol response.
@@ -418,6 +455,8 @@ class UciEngine {
 	gadus::Model model_{nullptr};
 	std::filesystem::path loaded_model_path_;
 	std::string loaded_device_;
+	std::thread search_thread_;
+	std::atomic_bool stop_requested_{false};
 };
 
 // Convert process arguments to initial UCI options before entering the protocol loop.

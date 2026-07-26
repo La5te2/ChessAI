@@ -27,7 +27,7 @@ namespace melano {
 
 namespace {
 
-inline constexpr const char *kFcpiFormula = "melano_tree_consistent_latent_fcpi";
+inline constexpr const char *kFcpiFormula = "melano_dueling_tree_value_fcpi";
 
 // Format iteration numbers for stable, lexically sortable artifact names.
 std::string zero_pad(int value, int width) {
@@ -46,13 +46,15 @@ struct Position {
 	std::vector<float> legal_advantage;
 	int played_index = 0;
 	std::vector<int> candidate_indices;
-	float value_target = 0.0F;
+	float td_value_target = 0.0F;
+	float tree_value_target = 0.0F;
 	std::vector<float> policy_target;
 	std::vector<float> candidate_q;
 	std::vector<float> advantage_target;
 	std::vector<PackedState> candidate_next_states;
 	float policy_weight = 1.0F;
-	float value_weight = 1.0F;
+	float td_value_weight = 1.0F;
+	float tree_value_weight = 0.0F;
 	int aggregate_count = 1;
 };
 
@@ -98,6 +100,9 @@ struct TargetSummary {
 	int max_depth = 0;
 	double residual_sum = 0.0;
 	std::int64_t residual_count = 0;
+	double tree_value_weight_sum = 0.0;
+	double tree_value_correction_sum = 0.0;
+	std::int64_t tree_value_count = 0;
 };
 
 struct SamplingSpec {
@@ -439,7 +444,8 @@ std::vector<Position> collect_selfplay(Model model, const torch::Device &device,
 										 : trajectory.positions[index + 1].root_value;
 			const float current_return =
 				-static_cast<float>((1.0 - lambda) * next_value + lambda * next_return);
-			trajectory.positions[index].value_target = std::clamp(current_return, -1.0F, 1.0F);
+			trajectory.positions[index].td_value_target =
+				std::clamp(current_return, -1.0F, 1.0F);
 			next_return = current_return;
 		}
 	}
@@ -575,8 +581,24 @@ std::vector<float> improve_policy(const std::vector<float> &prior,
 	return stable_softmax(logits);
 }
 
-// Expand exact-board counterfactual trees. Every expanded node trains P/A and
-// latent dynamics, while only real self-play roots carry a Value target.
+// Measure how much of the improved Policy is supported by explicitly evaluated
+// edges. Unexpanded PVA estimates remain useful baselines but add no tree evidence.
+float evaluated_policy_mass(const TreeNode &node) {
+	float mass = 0.0F;
+	for (const int action : node.candidate_indices) {
+		const auto legal =
+			std::find(node.legal_indices.begin(), node.legal_indices.end(), action);
+		if (legal == node.legal_indices.end()) {
+			throw std::runtime_error("tree candidate is absent from legal actions");
+		}
+		const auto index = static_cast<std::size_t>(legal - node.legal_indices.begin());
+		mass += node.policy_target[index];
+	}
+	return std::clamp(mass, 0.0F, 1.0F);
+}
+
+// Expand exact-board counterfactual trees. Every expanded node trains P/V/A and
+// latent dynamics; real self-play roots additionally retain an independent TD target.
 void construct_targets(std::vector<Position> &records, Model model, const torch::Device &device,
 					   const FcpiOptions &options, TargetSummary &summary) {
 	if (options.counterfactual_budget < 2) {
@@ -748,12 +770,12 @@ void construct_targets(std::vector<Position> &records, Model model, const torch:
 					node.candidate_q[slot] = q;
 				}
 				node.policy_target = improve_policy(node.legal_prior, action_values);
-				float policy_value = 0.0F;
-				for (std::size_t index = 0; index < action_values.size(); ++index) {
-					policy_value += node.policy_target[index] * action_values[index];
-				}
+				// Melano defines V(s) as the best available action value and
+				// A(s,a)=Q(s,a)-V(s)<=0. The frozen estimate may be wrong in either
+				// direction, so tree evidence must be allowed to raise or lower V.
 				node.backed_value =
-					std::min(node.value, std::clamp(policy_value, -1.0F, 1.0F));
+					std::clamp(*std::max_element(action_values.begin(), action_values.end()),
+							   -1.0F, 1.0F);
 			}
 
 			const float edge_total =
@@ -774,17 +796,26 @@ void construct_targets(std::vector<Position> &records, Model model, const torch:
 				record.legal_advantage = node.advantages;
 				record.played_index = node_index == 0 ? root.played_index : -1;
 				record.candidate_indices = node.candidate_indices;
-				record.value_target = node_index == 0 ? root.value_target : node.value;
 				record.policy_target = node.policy_target;
 				record.candidate_q = node.candidate_q;
 				record.policy_weight =
 					static_cast<float>(node.candidate_indices.size()) / edge_total;
-				record.value_weight = node_index == 0 ? 1.0F : 0.0F;
+				record.td_value_target =
+					node_index == 0 ? root.td_value_target : 0.0F;
+				record.td_value_weight = node_index == 0 ? 1.0F : 0.0F;
+				record.tree_value_target = node.backed_value;
+				const float coverage = evaluated_policy_mass(node);
+				record.tree_value_weight = record.policy_weight * coverage;
+				summary.tree_value_weight_sum += record.tree_value_weight;
+				summary.tree_value_correction_sum +=
+					record.tree_value_weight *
+					std::abs(static_cast<double>(node.backed_value - node.value));
+				++summary.tree_value_count;
 				for (std::size_t slot = 0; slot < node.children.size(); ++slot) {
 					record.candidate_next_states.push_back(
 						tree.nodes[static_cast<std::size_t>(node.children[slot])].state);
 					record.advantage_target.push_back(std::clamp(
-						node.candidate_q[slot] - record.value_target, -2.0F, 0.0F));
+						node.candidate_q[slot] - record.tree_value_target, -2.0F, 0.0F));
 				}
 				tree_records.push_back(std::move(record));
 				++summary.decision_nodes;
@@ -799,12 +830,25 @@ void construct_targets(std::vector<Position> &records, Model model, const torch:
 		}
 	}
 	records = std::move(tree_records);
+	const double maximum_tree_value_weight =
+		static_cast<double>(summary.trees) +
+		1e-5 * static_cast<double>(std::max<std::int64_t>(1, summary.trees));
+	if (summary.tree_value_weight_sum > maximum_tree_value_weight) {
+		throw std::runtime_error(
+			"counterfactual Value weight exceeded one unit per tree");
+	}
 	std::cout << "fcpi counterfactual summary: trees=" << summary.trees
 			  << " decision_nodes=" << summary.decision_nodes
 			  << " evaluated_edges=" << summary.evaluated_edges
 			  << " terminal_edges=" << summary.terminal_edges
 			  << " max_depth=" << summary.max_depth << " mean_residual="
 			  << (summary.residual_count > 0 ? summary.residual_sum / summary.residual_count : 0.0)
+			  << " tree_value_nodes=" << summary.tree_value_count
+			  << " tree_value_weight=" << summary.tree_value_weight_sum
+			  << " mean_tree_value_correction="
+			  << (summary.tree_value_weight_sum > 0.0
+					  ? summary.tree_value_correction_sum / summary.tree_value_weight_sum
+					  : 0.0)
 			  << std::endl;
 }
 
@@ -829,8 +873,12 @@ std::vector<Position> aggregate_records(std::vector<Position> records, nlohmann:
 		const float new_count = old_count + 1.0F;
 		const float old_policy_weight = merged.policy_weight;
 		const float new_policy_weight = old_policy_weight + record.policy_weight;
-		const float old_value_weight = merged.value_weight;
-		const float new_value_weight = old_value_weight + record.value_weight;
+		const float old_td_value_weight = merged.td_value_weight;
+		const float new_td_value_weight =
+			old_td_value_weight + record.td_value_weight;
+		const float old_tree_value_weight = merged.tree_value_weight;
+		const float new_tree_value_weight =
+			old_tree_value_weight + record.tree_value_weight;
 		for (std::size_t index = 0; index < merged.legal_prior.size(); ++index) {
 			merged.legal_prior[index] =
 				(merged.legal_prior[index] * old_count + record.legal_prior[index]) / new_count;
@@ -846,11 +894,17 @@ std::vector<Position> aggregate_records(std::vector<Position> records, nlohmann:
 				(merged.legal_advantage[index] * old_count + record.legal_advantage[index]) /
 				new_count;
 		}
-		if (new_value_weight > 0.0F) {
-			merged.value_target =
-				(merged.value_target * old_value_weight +
-				 record.value_target * record.value_weight) /
-				new_value_weight;
+		if (new_td_value_weight > 0.0F) {
+			merged.td_value_target =
+				(merged.td_value_target * old_td_value_weight +
+				 record.td_value_target * record.td_value_weight) /
+				new_td_value_weight;
+		}
+		if (new_tree_value_weight > 0.0F) {
+			merged.tree_value_target =
+				(merged.tree_value_target * old_tree_value_weight +
+				 record.tree_value_target * record.tree_value_weight) /
+				new_tree_value_weight;
 		}
 		for (std::size_t candidate = 0; candidate < record.candidate_indices.size(); ++candidate) {
 			const int action = record.candidate_indices[candidate];
@@ -872,16 +926,24 @@ std::vector<Position> aggregate_records(std::vector<Position> records, nlohmann:
 			}
 		}
 		merged.policy_weight = new_policy_weight;
-		merged.value_weight = new_value_weight;
+		merged.td_value_weight = new_td_value_weight;
+		merged.tree_value_weight = new_tree_value_weight;
 		merged.aggregate_count += 1;
 	}
 	for (auto &record : output) {
 		record.legal_prior = normalize(std::move(record.legal_prior));
 		record.policy_target = normalize(std::move(record.policy_target));
+		if (!record.candidate_q.empty()) {
+			record.tree_value_target =
+				std::max(record.tree_value_target,
+						 *std::max_element(record.candidate_q.begin(),
+										   record.candidate_q.end()));
+		}
 		record.advantage_target.resize(record.candidate_q.size());
 		for (std::size_t index = 0; index < record.candidate_q.size(); ++index) {
 			record.advantage_target[index] =
-				std::clamp(record.candidate_q[index] - record.value_target, -2.0F, 0.0F);
+				std::clamp(record.candidate_q[index] - record.tree_value_target,
+						   -2.0F, 0.0F);
 		}
 	}
 	summary = {
@@ -914,9 +976,11 @@ nlohmann::json write_fcpi_h5(const std::filesystem::path &path, std::vector<Posi
 	std::vector<float> priors(count * legal_width, 0.0F);
 	std::vector<float> policy(count * legal_width, 0.0F);
 	std::vector<std::uint8_t> legal_counts(count);
-	std::vector<float> values(count);
+	std::vector<float> td_values(count);
+	std::vector<float> tree_values(count);
 	std::vector<float> policy_weights(count);
-	std::vector<float> value_weights(count);
+	std::vector<float> td_value_weights(count);
+	std::vector<float> tree_value_weights(count);
 	std::vector<std::int32_t> candidates(count * candidate_width, 0);
 	std::vector<float> candidate_q(count * candidate_width, 0.0F);
 	std::vector<float> advantage_targets(count * candidate_width, 0.0F);
@@ -928,9 +992,11 @@ nlohmann::json write_fcpi_h5(const std::filesystem::path &path, std::vector<Posi
 				  states.begin() + row * kStateFeatures);
 		legal_counts[row] = static_cast<std::uint8_t>(records[row].legal_indices.size());
 		candidate_counts[row] = static_cast<std::uint8_t>(records[row].candidate_indices.size());
-		values[row] = records[row].value_target;
+		td_values[row] = records[row].td_value_target;
+		tree_values[row] = records[row].tree_value_target;
 		policy_weights[row] = records[row].policy_weight;
-		value_weights[row] = records[row].value_weight;
+		td_value_weights[row] = records[row].td_value_weight;
+		tree_value_weights[row] = records[row].tree_value_weight;
 		for (std::size_t column = 0; column < records[row].legal_indices.size(); ++column) {
 			legal[row * legal_width + column] = records[row].legal_indices[column];
 			priors[row * legal_width + column] = records[row].legal_prior[column];
@@ -964,11 +1030,16 @@ nlohmann::json write_fcpi_h5(const std::filesystem::path &path, std::vector<Posi
 				  policy.data());
 	write_dataset(file, "legal_counts", H5T_STD_U8LE, H5T_NATIVE_UINT8, {count},
 				  legal_counts.data());
-	write_dataset(file, "value_targets", H5T_IEEE_F32LE, H5T_NATIVE_FLOAT, {count}, values.data());
+	write_dataset(file, "td_value_targets", H5T_IEEE_F32LE, H5T_NATIVE_FLOAT, {count},
+				  td_values.data());
+	write_dataset(file, "tree_value_targets", H5T_IEEE_F32LE, H5T_NATIVE_FLOAT, {count},
+				  tree_values.data());
 	write_dataset(file, "policy_weights", H5T_IEEE_F32LE, H5T_NATIVE_FLOAT, {count},
 				  policy_weights.data());
-	write_dataset(file, "value_weights", H5T_IEEE_F32LE, H5T_NATIVE_FLOAT, {count},
-				  value_weights.data());
+	write_dataset(file, "td_value_weights", H5T_IEEE_F32LE, H5T_NATIVE_FLOAT, {count},
+				  td_value_weights.data());
+	write_dataset(file, "tree_value_weights", H5T_IEEE_F32LE, H5T_NATIVE_FLOAT, {count},
+				  tree_value_weights.data());
 	write_dataset(file, "candidate_indices", H5T_STD_I32LE, H5T_NATIVE_INT32,
 				  {count, candidate_width}, candidates.data());
 	write_dataset(file, "candidate_q", H5T_IEEE_F32LE, H5T_NATIVE_FLOAT, {count, candidate_width},
@@ -987,7 +1058,8 @@ nlohmann::json write_fcpi_h5(const std::filesystem::path &path, std::vector<Posi
 	};
 }
 
-// Train P/A/dynamics on expanded tree nodes and V only on real self-play roots.
+// Train P/V/A/dynamics on expanded tree nodes while preserving independent TD
+// and counterfactual-tree evidence for the shared Value head.
 nlohmann::json train_candidate(const std::filesystem::path &source,
 							   const std::filesystem::path &candidate, Model model,
 							   const torch::Device &device, std::vector<Position> &records,
@@ -1002,7 +1074,7 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 	std::mt19937_64 rng(options.seed);
 	std::int64_t steps = 0;
 	auto metric_totals =
-		torch::zeros({6}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+		torch::zeros({8}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
 	for (int epoch = 0; epoch < std::max(0, options.epochs); ++epoch) {
 		std::shuffle(order.begin(), order.end(), rng);
 		for (std::size_t begin = 0; begin < order.size();
@@ -1035,30 +1107,36 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 			auto targets =
 				torch::zeros({batch, static_cast<std::int64_t>(width)}, float_options);
 			auto counts = torch::zeros({batch}, int_options);
-			auto values = torch::zeros({batch}, float_options);
+			auto td_values = torch::zeros({batch}, float_options);
+			auto tree_values = torch::zeros({batch}, float_options);
 			auto policy_weights = torch::zeros({batch}, float_options);
-			auto value_weights = torch::zeros({batch}, float_options);
+			auto td_value_weights = torch::zeros({batch}, float_options);
+			auto tree_value_weights = torch::zeros({batch}, float_options);
 			auto candidate_indices =
 				torch::zeros({batch, static_cast<std::int64_t>(candidate_width)}, int_options);
-			auto advantage_targets =
+			auto candidate_q_targets =
 				torch::zeros({batch, static_cast<std::int64_t>(candidate_width)}, float_options);
 			auto candidate_counts = torch::zeros({batch}, int_options);
 			auto legal_access = legal.accessor<std::int64_t, 2>();
 			auto target_access = targets.accessor<float, 2>();
 			auto count_access = counts.accessor<std::int64_t, 1>();
-			auto value_access = values.accessor<float, 1>();
+			auto td_value_access = td_values.accessor<float, 1>();
+			auto tree_value_access = tree_values.accessor<float, 1>();
 			auto policy_weight_access = policy_weights.accessor<float, 1>();
-			auto value_weight_access = value_weights.accessor<float, 1>();
+			auto td_value_weight_access = td_value_weights.accessor<float, 1>();
+			auto tree_value_weight_access = tree_value_weights.accessor<float, 1>();
 			auto candidate_access = candidate_indices.accessor<std::int64_t, 2>();
-			auto advantage_access = advantage_targets.accessor<float, 2>();
+			auto candidate_q_access = candidate_q_targets.accessor<float, 2>();
 			auto candidate_count_access = candidate_counts.accessor<std::int64_t, 1>();
 			for (std::size_t index = begin; index < end; ++index) {
 				const auto &record = records[order[index]];
 				const auto row = static_cast<std::int64_t>(index - begin);
 				count_access[row] = record.legal_indices.size();
-				value_access[row] = record.value_target;
+				td_value_access[row] = record.td_value_target;
+				tree_value_access[row] = record.tree_value_target;
 				policy_weight_access[row] = record.policy_weight;
-				value_weight_access[row] = record.value_weight;
+				td_value_weight_access[row] = record.td_value_weight;
+				tree_value_weight_access[row] = record.tree_value_weight;
 				candidate_count_access[row] = record.candidate_indices.size();
 				for (std::size_t column = 0; column < record.legal_indices.size(); ++column) {
 					legal_access[row][column] = record.legal_indices[column];
@@ -1066,7 +1144,7 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 				}
 				for (std::size_t column = 0; column < record.candidate_indices.size(); ++column) {
 					candidate_access[row][column] = record.candidate_indices[column];
-					advantage_access[row][column] = record.advantage_target[column];
+					candidate_q_access[row][column] = record.candidate_q[column];
 					std::copy(record.candidate_next_states[column].begin(),
 							  record.candidate_next_states[column].end(),
 							  packed_next.begin() +
@@ -1080,11 +1158,13 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 			legal = legal.to(device, true);
 			targets = targets.to(device, true);
 			counts = counts.to(device, true);
-			values = values.to(device, true);
+			td_values = td_values.to(device, true);
+			tree_values = tree_values.to(device, true);
 			policy_weights = policy_weights.to(device, true);
-			value_weights = value_weights.to(device, true);
+			td_value_weights = td_value_weights.to(device, true);
+			tree_value_weights = tree_value_weights.to(device, true);
 			candidate_indices = candidate_indices.to(device, true);
-			advantage_targets = advantage_targets.to(device, true);
+			candidate_q_targets = candidate_q_targets.to(device, true);
 			candidate_counts = candidate_counts.to(device, true);
 
 			optimizer.zero_grad();
@@ -1122,16 +1202,31 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 			auto policy_loss =
 				(policy_errors * policy_weights).sum() / policy_weights.sum().clamp_min(1e-8);
 			auto predicted_values = output.value.squeeze(1).to(torch::kFloat32);
-			auto value_errors = torch::nn::functional::smooth_l1_loss(
-				predicted_values, values,
+			auto td_value_errors = torch::nn::functional::smooth_l1_loss(
+				predicted_values, td_values,
 				torch::nn::functional::SmoothL1LossFuncOptions().reduction(torch::kNone));
+			auto tree_value_errors = torch::nn::functional::smooth_l1_loss(
+				predicted_values, tree_values,
+				torch::nn::functional::SmoothL1LossFuncOptions().reduction(torch::kNone));
+			const auto td_weight_sum = td_value_weights.sum();
+			const auto tree_weight_sum = tree_value_weights.sum();
+			auto td_value_loss =
+				(td_value_errors * td_value_weights).sum() /
+				td_weight_sum.clamp_min(1.0);
+			auto tree_value_loss =
+				(tree_value_errors * tree_value_weights).sum() /
+				tree_weight_sum.clamp_min(1.0);
+			const auto combined_value_weight =
+				(td_weight_sum + tree_weight_sum).clamp_min(1.0);
 			auto value_loss =
-				(value_errors * value_weights).sum() / value_weights.sum().clamp_min(1.0);
+				((td_value_errors * td_value_weights).sum() +
+				 (tree_value_errors * tree_value_weights).sum()) /
+				combined_value_weight;
 			auto selected_advantages =
 				output.advantages.to(torch::kFloat32).gather(1, candidate_indices);
 			auto predicted_q = torch::clamp(predicted_values.unsqueeze(1) + selected_advantages,
 										 -1.0, 1.0);
-			auto target_q = torch::clamp(values.unsqueeze(1) + advantage_targets, -1.0, 1.0);
+			auto target_q = torch::clamp(candidate_q_targets, -1.0, 1.0);
 			auto candidate_columns = torch::arange(
 				static_cast<std::int64_t>(candidate_width), candidate_counts.options());
 			auto candidate_mask = candidate_columns.unsqueeze(0) < candidate_counts.unsqueeze(1);
@@ -1176,11 +1271,14 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 			optimizer.step();
 			++steps;
 			metric_totals.add_(torch::stack(
-				{loss.detach(), policy_loss.detach(), value_loss.detach(), dueling_q_loss.detach(),
-				 dynamics_loss.detach(), imagined_value_loss.detach()}));
+				{loss.detach(), policy_loss.detach(), value_loss.detach(),
+				 td_value_loss.detach(), tree_value_loss.detach(),
+				 dueling_q_loss.detach(), dynamics_loss.detach(),
+				 imagined_value_loss.detach()}));
 			if (options.log_every > 0 && (steps == 1 || steps % options.log_every == 0)) {
 				auto metrics =
-					torch::stack({policy_loss.detach(), value_loss.detach(),
+					torch::stack({policy_loss.detach(), td_value_loss.detach(),
+								  tree_value_loss.detach(), value_loss.detach(),
 								  dueling_q_loss.detach(), dynamics_loss.detach(),
 								  imagined_value_loss.detach(), loss.detach()})
 						.to(torch::kCPU)
@@ -1188,11 +1286,13 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 				auto metric_values = metrics.accessor<float, 1>();
 				std::cout << "fcpi train: step=" << steps
 						  << " policy=" << metric_values[0]
-						  << " value=" << metric_values[1]
-						  << " dueling_q=" << metric_values[2]
-						  << " dynamics=" << metric_values[3]
-						  << " imagined_value=" << metric_values[4]
-						  << " loss=" << metric_values[5] << std::endl;
+						  << " value_td=" << metric_values[1]
+						  << " value_tree=" << metric_values[2]
+						  << " value=" << metric_values[3]
+						  << " dueling_q=" << metric_values[4]
+						  << " dynamics=" << metric_values[5]
+						  << " imagined_value=" << metric_values[6]
+						  << " loss=" << metric_values[7] << std::endl;
 			}
 			if (options.train_max_steps > 0 && steps >= options.train_max_steps) {
 				break;
@@ -1218,9 +1318,11 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 			 {"loss", metric_values[0] / divisor},
 			 {"policy", metric_values[1] / divisor},
 			 {"value", metric_values[2] / divisor},
-			 {"dueling_q", metric_values[3] / divisor},
-			 {"dynamics", metric_values[4] / divisor},
-			 {"imagined_value", metric_values[5] / divisor},
+			 {"value_td", metric_values[3] / divisor},
+			 {"value_tree", metric_values[4] / divisor},
+			 {"dueling_q", metric_values[5] / divisor},
+			 {"dynamics", metric_values[6] / divisor},
+			 {"imagined_value", metric_values[7] / divisor},
 		 }},
 	};
 }
@@ -1273,6 +1375,13 @@ void run_fcpi(const FcpiOptions &options) {
 			{"evaluated_edges", target_summary.evaluated_edges},
 			{"terminal_edges", target_summary.terminal_edges},
 			{"max_depth", target_summary.max_depth},
+			{"tree_value_nodes", target_summary.tree_value_count},
+			{"tree_value_weight", target_summary.tree_value_weight_sum},
+			{"mean_tree_value_correction",
+			 target_summary.tree_value_weight_sum > 0.0
+				 ? target_summary.tree_value_correction_sum /
+					   target_summary.tree_value_weight_sum
+				 : 0.0},
 		};
 		const auto candidate = model_dir / ("candidate_iter_" + zero_pad(iteration, 3) + ".pth");
 		auto train_summary = train_candidate(current, candidate, model, device, records, options);
