@@ -1,8 +1,10 @@
 # Chess Piece Geometry
 
-`piece.inc` contains normalized triangle, gradient-color, and stroke-path
-data generated from the SVG sources listed below. RhosGFX, Chessnut, and
-Spatial use the Lichess repository at commit
+`piece.inc` contains the fixed built-in geometry, while `pieces.gpack` contains
+deduplicated and compressed indexed geometry for imported styles. Both are
+generated from the SVG sources listed below. Imported SVG files are one-time
+inputs and are not retained by the project. RhosGFX, Chessnut, and Spatial use
+the Lichess repository at commit
 `c54596c9e1569d378fe20f80d4c790c6fdee54c4`.
 
 ## RhosGFX
@@ -39,5 +41,5 @@ Spatial use the Lichess repository at commit
 - License: Creative Commons Attribution-ShareAlike 3.0 Unported
 - License text: https://creativecommons.org/licenses/by-sa/3.0/legalcode
 
-The generated geometry is compiled into `Gadidae`. The application does not
-load the original SVG files at runtime.
+The generated geometry is embedded in `Gadidae`. The application does not load
+the original SVG files at runtime.

@@ -242,6 +242,30 @@ add_test(NAME melanotests COMMAND melanotests)
 if(GADIDAE_BUILD_GRAPHICS)
 # The native GUI owns no model implementation. It talks to Gadus, Melano, and
 # third-party engines through UCI and therefore links only graphics dependencies.
+set(GADIDAE_PIECE_ARCHIVE "${CMAKE_SOURCE_DIR}/src/graphics/pieces.gpack")
+if(NOT EXISTS "${GADIDAE_PIECE_ARCHIVE}")
+	message(FATAL_ERROR "Missing compressed piece archive: ${GADIDAE_PIECE_ARCHIVE}")
+endif()
+file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/generated")
+if(WIN32)
+	enable_language(RC)
+	file(TO_NATIVE_PATH "${GADIDAE_PIECE_ARCHIVE}" GADIDAE_PIECE_ARCHIVE_NATIVE)
+	string(REPLACE "\\" "\\\\" GADIDAE_PIECE_ARCHIVE_NATIVE "${GADIDAE_PIECE_ARCHIVE_NATIVE}")
+	configure_file(
+		"${CMAKE_SOURCE_DIR}/src/graphics/pieces.rc.in"
+		"${CMAKE_BINARY_DIR}/generated/pieces.rc"
+		@ONLY
+	)
+	set(GADIDAE_PIECE_ARCHIVE_SOURCE "${CMAKE_BINARY_DIR}/generated/pieces.rc")
+else()
+	enable_language(ASM)
+	configure_file(
+		"${CMAKE_SOURCE_DIR}/src/graphics/pieces.S.in"
+		"${CMAKE_BINARY_DIR}/generated/pieces.S"
+		@ONLY
+	)
+	set(GADIDAE_PIECE_ARCHIVE_SOURCE "${CMAKE_BINARY_DIR}/generated/pieces.S")
+endif()
 set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -295,11 +319,13 @@ add_executable(gadidaegraphics
 	src/graphics/main.cpp
 	src/graphics/application.cpp
 	src/graphics/game.cpp
+	src/graphics/archive.cpp
 	src/graphics/pieces.cpp
 	src/graphics/registry.cpp
 	src/graphics/simulator.cpp
 	src/graphics/stadium.cpp
 	src/graphics/uci.cpp
+	"${GADIDAE_PIECE_ARCHIVE_SOURCE}"
 )
 set_target_properties(gadidaegraphics PROPERTIES
 	OUTPUT_NAME "Gadidae"
@@ -318,6 +344,7 @@ target_include_directories(gadidaegraphics SYSTEM PRIVATE
 		"${GADIDAE_API_DIR}/chess"
 		"${GADIDAE_API_DIR}/nlohmann/include"
 		"${GADIDAE_API_DIR}/glm"
+		"${GADIDAE_ZLIB_DIR}/include"
 )
 target_link_libraries(gadidaegraphics PRIVATE
 	gadidaeimgui
@@ -326,8 +353,10 @@ target_link_libraries(gadidaegraphics PRIVATE
 )
 if(MSVC)
 	target_compile_options(gadidaegraphics PRIVATE /MP /W4 /permissive- /utf-8)
-	target_link_libraries(gadidaegraphics PRIVATE Comdlg32 Shell32 User32)
+	target_link_libraries(gadidaegraphics PRIVATE
+		"${GADIDAE_ZLIB_STATIC}" Comdlg32 Shell32 User32)
 else()
 	target_compile_options(gadidaegraphics PRIVATE -Wall -Wextra -Wpedantic)
+	target_link_libraries(gadidaegraphics PRIVATE ZLIB::ZLIB)
 endif()
 endif()

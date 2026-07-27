@@ -2477,13 +2477,20 @@ private:
 			DeleteObject(font);
 		}
 		ReleaseDC(window_, context);
-		const auto scale = static_cast<int>(GetDpiForWindow(window_));
-		const auto pixels = [scale](int value) {
-			return std::max(1, MulDiv(value, scale, 96));
+		const auto dpi = GetDpiForWindow(window_);
+		const auto pixels = [dpi](int value) {
+			return std::max(1, MulDiv(value, static_cast<int>(dpi), 96));
 		};
 		const int check_width = found->second.checkable ? pixels(18) : 0;
-		item.itemWidth =
-			static_cast<UINT>(pixels(8) + check_width + text.cx + pixels(8));
+		// Windows adds a native checkmark column after measuring owner-drawn
+		// rows. Remove that duplicate reservation because this menu draws its
+		// own optional mark inside the requested symmetric padding.
+		const int system_trailing =
+			GetSystemMetricsForDpi(SM_CXMENUCHECK, dpi);
+		const int requested_width =
+			pixels(4) + check_width + text.cx + pixels(4);
+		item.itemWidth = static_cast<UINT>(
+			std::max(1, requested_width - system_trailing));
 		item.itemHeight =
 			static_cast<UINT>(
 				std::max(static_cast<int>(text.cy) + pixels(6), pixels(22)));
@@ -2525,19 +2532,27 @@ private:
 			return std::max(1, MulDiv(value, scale, 96));
 		};
 		RECT text = item.rcItem;
-		text.left += pixels(8) + (found->second.checkable ? pixels(18) : 0);
-		text.right -= pixels(8);
+		text.left += pixels(4) + (found->second.checkable ? pixels(18) : 0);
+		text.right -= pixels(4);
 		DrawTextW(item.hDC, found->second.label.c_str(),
 				  static_cast<int>(found->second.label.size()), &text,
 				  DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 		if(checked && found->second.checkable) {
-			RECT mark = item.rcItem;
-			mark.left += pixels(3);
-			mark.right = mark.left + pixels(14);
-			mark.top += (mark.bottom - mark.top - pixels(14)) / 2;
-			mark.bottom = mark.top + pixels(14);
-			DrawFrameControl(item.hDC, &mark, DFC_MENU, DFCS_MENUCHECK |
-								(disabled ? DFCS_INACTIVE : 0));
+			const COLORREF mark_color = GetSysColor(
+				disabled ? COLOR_GRAYTEXT
+						 : (selected ? COLOR_HIGHLIGHTTEXT : COLOR_MENUTEXT));
+			HPEN pen = CreatePen(PS_SOLID, pixels(1), mark_color);
+			if(pen != nullptr) {
+				HGDIOBJ old_pen = SelectObject(item.hDC, pen);
+				const int left = item.rcItem.left + pixels(6);
+				const int middle =
+					(item.rcItem.top + item.rcItem.bottom) / 2;
+				MoveToEx(item.hDC, left, middle, nullptr);
+				LineTo(item.hDC, left + pixels(4), middle + pixels(4));
+				LineTo(item.hDC, left + pixels(11), middle - pixels(5));
+				SelectObject(item.hDC, old_pen);
+				DeleteObject(pen);
+			}
 		}
 		if(previous != nullptr) {
 			SelectObject(item.hDC, previous);

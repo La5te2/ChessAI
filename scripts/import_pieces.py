@@ -1,12 +1,14 @@
-"""Add or update compiled SVG piece styles in src/graphics/piece.inc."""
+"""Convert one SVG piece set into Gadidae's compressed geometry archive."""
 
 from __future__ import annotations
 
 import argparse
 import math
+import os
 import re
-import shutil
+import struct
 import xml.etree.ElementTree as et
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -18,11 +20,12 @@ from svgelements import SVG, Shape
 
 
 PIECES = ("wK", "wQ", "wR", "wB", "wN", "wP", "bK", "bQ", "bR", "bB", "bN", "bP")
-BEGIN = "// GADIDAE_GENERATED_PIECES_BEGIN"
-END = "// GADIDAE_GENERATED_PIECES_END"
 RESERVED_STYLES = {"vector", "rhosgfx", "chessnut", "spatial", "cburnett"}
 HEX_COLOR = re.compile(r"^#([0-9a-fA-F]{3,8})$")
 URL_PAINT = re.compile(r"^url\(\s*#([^)]+)\s*\)$")
+COMPRESSED_MAGIC = b"GPCZ"
+ARCHIVE_MAGIC = b"GPS1"
+MAX_ARCHIVE_SIZE = 256 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -115,6 +118,18 @@ class LinearPaint:
 		return (alpha << 24) | (blue << 16) | (green << 8) | red
 
 
+@dataclass
+class PackedMesh:
+	vertices: list[tuple[float, float, int]]
+	indices: list[int]
+
+
+@dataclass
+class PackedStyle:
+	name: str
+	pieces: list[PackedMesh]
+
+
 def parser() -> argparse.ArgumentParser:
 	result = argparse.ArgumentParser(
 		description="Add one 12-piece SVG set to Gadidae compiled geometry."
@@ -128,13 +143,7 @@ def parser() -> argparse.ArgumentParser:
 	result.add_argument(
 		"--output",
 		type=Path,
-		default=Path("src/graphics/piece.inc"),
-	)
-	result.add_argument(
-		"--catalog",
-		type=Path,
-		default=Path("src/graphics/pieces"),
-		help="Source catalog retained for regenerating every added style.",
+		default=Path("src/graphics/pieces.gpack"),
 	)
 	result.add_argument(
 		"--curve-step",
@@ -419,15 +428,11 @@ def stroke_geometry(
 	)
 
 
-def append_piece(
-	path: Path,
-	curve_step: float,
-	vertices: list[tuple[float, float, int]],
-	commands: list[tuple[int, int, int, float, int, bool]],
-) -> tuple[int, int]:
+def append_piece(path: Path, curve_step: float) -> PackedMesh:
+	"""Triangulate one SVG and deduplicate its exact normalized vertices."""
 	frame = svg_frame(path)
 	gradients = gradient_definitions(path)
-	first_command = len(commands)
+	triangle_vertices: list[tuple[float, float, int]] = []
 	white_piece = path.stem.startswith("w")
 	default_fill = 0xFFF2F2F2 if white_piece else 0xFF202020
 	default_stroke = 0xFF202020 if white_piece else 0xFFF2F2F2
@@ -444,13 +449,8 @@ def append_piece(
 			# original open/closed state, which matters for the Cburnett knights.
 			rings = [points for points, _closed in subpaths if len(points) >= 3]
 			geometry = fill_geometry(rings)
-			first_vertex = len(vertices)
 			# Constrained triangulation preserves concave boundaries and holes.
-			count = append_triangles(geometry, fill, frame, vertices)
-			if count:
-				commands.append(
-					(first_vertex, count, 0, 0.0, 0, False)
-				)
+			append_triangles(geometry, fill, frame, triangle_vertices)
 		stroke = resolved_paint(element, "stroke", gradients, None)
 		if stroke is not None:
 			try:
@@ -461,7 +461,6 @@ def append_piece(
 			linecap = str(values.get("stroke-linecap", "round")).lower()
 			linejoin = str(values.get("stroke-linejoin", "round")).lower()
 			for points, closed in subpaths:
-				first_vertex = len(vertices)
 				geometry = stroke_geometry(
 					points,
 					closed,
@@ -469,65 +468,122 @@ def append_piece(
 					linecap,
 					linejoin,
 				)
-				count = append_triangles(
+				append_triangles(
 					geometry,
 					stroke or default_stroke,
 					frame,
-					vertices,
+					triangle_vertices,
 				)
-				if count:
-					commands.append((first_vertex, count, 0, 0.0, 0, False))
-	return first_command, len(commands) - first_command
+
+	vertices: list[tuple[float, float, int]] = []
+	indices: list[int] = []
+	seen: dict[bytes, int] = {}
+	for x, y, color in triangle_vertices:
+		# Keep the old generator's seven-decimal normalization before storing
+		# float32 coordinates, so migration does not change visible geometry.
+		key = struct.pack("<ffI", round(x, 7), round(y, 7), color)
+		index = seen.get(key)
+		if index is None:
+			index = len(vertices)
+			if index >= 65536:
+				raise ValueError(f"{path} exceeds the uint16 vertex limit")
+			px, py, packed = struct.unpack("<ffI", key)
+			vertices.append((px, py, packed))
+			seen[key] = index
+		indices.append(index)
+	return PackedMesh(vertices, indices)
 
 
-def array_block(
-	styles: list[tuple[str, int]],
-	vertices: list[tuple[float, float, int]],
-	commands: list[tuple[int, int, int, float, int, bool]],
-	geometries: list[tuple[int, int]],
-) -> str:
-	vertex_lines = [
-		f"\t{{{x:.7f}F, {y:.7f}F, 0x{color:08x}U}},"
-		for x, y, color in vertices
-	]
-	command_lines = [
-		f"\t{{{first}U, {count}U, 0x{color:08x}U, {width:.7f}F, {kind}U, "
-		f"{str(closed).lower()}}},"
-		for first, count, color, width, kind, closed in commands
-	]
-	geometry_lines = [
-		f"\t{{{first}U, {count}U}}," for first, count in geometries
-	]
-	style_lines = [
-		f'\t{{"{name}", {geometry_first}U}},'
-		for name, geometry_first in styles
-	]
-	return "\n".join(
-		(
-			BEGIN,
-			f"inline constexpr std::array<EmbeddedPieceVertex, {len(vertices)}> generated_piece_vertices = {{{{",
-			*vertex_lines,
-			"}};",
-			f"inline constexpr std::array<EmbeddedPieceCommand, {len(commands)}> generated_piece_commands = {{{{",
-			*command_lines,
-			"}};",
-			f"inline constexpr std::array<EmbeddedPieceGeometry, {len(geometries)}> generated_piece_geometries = {{{{",
-			*geometry_lines,
-			"}};",
-			f"inline constexpr std::array<EmbeddedPieceStyle, {len(styles)}> generated_piece_styles = {{{{",
-			*style_lines,
-			"}};",
-			END,
-		)
-	)
+def read_exact(view: memoryview, offset: int, size: int) -> tuple[memoryview, int]:
+	"""Read one bounded archive slice."""
+	end = offset + size
+	if size < 0 or end > len(view):
+		raise ValueError("truncated piece archive")
+	return view[offset:end], end
 
 
-def replace_block(document: str, block: str) -> str:
-	pattern = re.compile(re.escape(BEGIN) + r".*?" + re.escape(END), re.DOTALL)
-	updated, count = pattern.subn(block, document)
-	if count != 1:
-		raise RuntimeError("piece.inc does not contain exactly one imported-piece block")
-	return updated
+def decode_archive(path: Path) -> list[PackedStyle]:
+	"""Load the existing compressed archive for replace-or-append imports."""
+	if not path.exists():
+		return []
+	data = path.read_bytes()
+	if len(data) < 12 or data[:4] != COMPRESSED_MAGIC:
+		raise ValueError(f"{path} is not a Gadidae piece archive")
+	raw_size = struct.unpack_from("<Q", data, 4)[0]
+	if raw_size > MAX_ARCHIVE_SIZE:
+		raise ValueError(f"{path} expands beyond {MAX_ARCHIVE_SIZE} bytes")
+	raw = zlib.decompress(data[12:])
+	if len(raw) != raw_size or raw[:4] != ARCHIVE_MAGIC:
+		raise ValueError(f"{path} has an invalid payload")
+	view = memoryview(raw)
+	offset = 4
+	if offset + 4 > len(view):
+		raise ValueError("truncated piece archive")
+	style_count = struct.unpack_from("<I", view, offset)[0]
+	offset += 4
+	styles: list[PackedStyle] = []
+	for _ in range(style_count):
+		if offset + 2 > len(view):
+			raise ValueError("truncated piece archive")
+		name_size = struct.unpack_from("<H", view, offset)[0]
+		offset += 2
+		name_data, offset = read_exact(view, offset, name_size)
+		name = bytes(name_data).decode("utf-8")
+		pieces: list[PackedMesh] = []
+		for _piece in PIECES:
+			if offset + 8 > len(view):
+				raise ValueError("truncated piece archive")
+			vertex_count, index_count = struct.unpack_from("<II", view, offset)
+			offset += 8
+			if vertex_count > 65535 or index_count % 3:
+				raise ValueError("invalid piece mesh dimensions")
+			vertex_data, offset = read_exact(view, offset, vertex_count * 12)
+			index_data, offset = read_exact(view, offset, index_count * 2)
+			vertices = [
+				struct.unpack_from("<ffI", vertex_data, index * 12)
+				for index in range(vertex_count)
+			]
+			indices = list(struct.unpack(f"<{index_count}H", index_data))
+			if indices and max(indices) >= vertex_count:
+				raise ValueError("piece mesh index is out of range")
+			pieces.append(PackedMesh(vertices, indices))
+		styles.append(PackedStyle(name, pieces))
+	if offset != len(view):
+		raise ValueError("piece archive contains trailing data")
+	return styles
+
+
+def encode_archive(styles: list[PackedStyle]) -> bytes:
+	"""Serialize styles deterministically, then compress the complete payload."""
+	raw = bytearray(ARCHIVE_MAGIC)
+	raw.extend(struct.pack("<I", len(styles)))
+	for style in styles:
+		name = style.name.encode("utf-8")
+		if len(name) > 65535 or len(style.pieces) != len(PIECES):
+			raise ValueError(f"invalid style record: {style.name}")
+		raw.extend(struct.pack("<H", len(name)))
+		raw.extend(name)
+		for mesh in style.pieces:
+			if len(mesh.vertices) > 65535 or len(mesh.indices) % 3:
+				raise ValueError(f"invalid mesh in style: {style.name}")
+			raw.extend(struct.pack("<II", len(mesh.vertices), len(mesh.indices)))
+			for vertex in mesh.vertices:
+				raw.extend(struct.pack("<ffI", *vertex))
+			raw.extend(struct.pack(f"<{len(mesh.indices)}H", *mesh.indices))
+	if len(raw) > MAX_ARCHIVE_SIZE:
+		raise ValueError(f"piece archive exceeds {MAX_ARCHIVE_SIZE} bytes")
+	return COMPRESSED_MAGIC + struct.pack("<Q", len(raw)) + zlib.compress(raw, 9)
+
+
+def atomic_write(path: Path, data: bytes) -> None:
+	"""Replace the archive only after the complete new payload is durable."""
+	path.parent.mkdir(parents=True, exist_ok=True)
+	temporary = path.with_name(f"{path.name}.tmp_{os.getpid()}")
+	try:
+		temporary.write_bytes(data)
+		os.replace(temporary, path)
+	finally:
+		temporary.unlink(missing_ok=True)
 
 
 def main() -> None:
@@ -540,48 +596,28 @@ def main() -> None:
 	if style_name in RESERVED_STYLES:
 		raise ValueError(f"{style_name} is already a built-in style")
 
-	# Retain normalized SVG sources so later imports can regenerate every
-	# previously added style into one compact compiled geometry catalog.
 	for piece in PIECES:
 		source_path(args.input, piece)
-	target = args.catalog / style_name
-	target.mkdir(parents=True, exist_ok=True)
-	for piece in PIECES:
-		shutil.copy2(source_path(args.input, piece), target / f"{piece}.svg")
-
-	styles: list[tuple[str, int]] = []
-	vertices: list[tuple[float, float, int]] = []
-	commands: list[tuple[int, int, int, float, int, bool]] = []
-	geometries: list[tuple[int, int]] = []
-	for directory in sorted(path for path in args.catalog.iterdir() if path.is_dir()):
-		name = directory.name.lower()
-		if not re.fullmatch(r"[a-z][a-z0-9-]*", name):
-			raise ValueError(f"invalid style directory name: {directory.name}")
-		if name in RESERVED_STYLES:
-			raise ValueError(f"generated style conflicts with built-in style: {name}")
-		styles.append((name, len(geometries)))
-		for piece in PIECES:
-			geometries.append(
-				append_piece(
-					source_path(directory, piece),
-					args.curve_step,
-					vertices,
-					commands,
-				)
-			)
-	document = args.output.read_text(encoding="utf-8")
-	args.output.write_text(
-		replace_block(
-			document,
-			array_block(styles, vertices, commands, geometries),
-		),
-		encoding="utf-8",
-		newline="\n",
+	style = PackedStyle(
+		style_name,
+		[append_piece(source_path(args.input, piece), args.curve_step) for piece in PIECES],
 	)
+	styles = decode_archive(args.output)
+	for index, current in enumerate(styles):
+		if current.name == style_name:
+			styles[index] = style
+			break
+	else:
+		styles.append(style)
+	archive = encode_archive(styles)
+	atomic_write(args.output, archive)
+	vertex_count = sum(len(mesh.vertices) for mesh in style.pieces)
+	index_count = sum(len(mesh.indices) for mesh in style.pieces)
 	print(
-		"piece style embedded: "
+		"piece style archived: "
 		f"input={args.input} output={args.output} "
-		f"styles={len(styles)} vertices={len(vertices)} commands={len(commands)}"
+		f"styles={len(styles)} vertices={vertex_count} indices={index_count} "
+		f"archive_bytes={len(archive)}"
 	)
 
 

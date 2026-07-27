@@ -1,5 +1,6 @@
 // Draws procedural and pre-tessellated chess-piece styles compiled into the executable.
 #include "graphics/pieces.hpp"
+#include "graphics/archive.hpp"
 #include "piece.inc"
 #include <algorithm>
 #include <array>
@@ -122,10 +123,30 @@ void draw_geometry(ImDrawList *draw,
 	}
 }
 
+/// Emits one imported mesh through ImGui's indexed primitive path.
+void draw_archived_mesh(ImDrawList *draw, const ArchivedPieceMesh &mesh,
+						ImVec2 center, float size) {
+	if(mesh.vertices.empty() || mesh.indices.empty()) {
+		return;
+	}
+	draw->PrimReserve(static_cast<int>(mesh.indices.size()),
+					  static_cast<int>(mesh.vertices.size()));
+	const ImDrawIdx base = static_cast<ImDrawIdx>(draw->_VtxCurrentIdx);
+	for(const auto index : mesh.indices) {
+		draw->PrimWriteIdx(static_cast<ImDrawIdx>(base + index));
+	}
+	const ImVec2 white_pixel = ImGui::GetFontTexUvWhitePixel();
+	for(const auto &vertex : mesh.vertices) {
+		draw->PrimWriteVtx(
+			{center.x + vertex.x * size, center.y + vertex.y * size},
+			white_pixel, vertex.color);
+	}
+}
+
 } // namespace
 
 std::size_t piece_style_count() {
-	return built_in_style_names.size() + generated_piece_styles.size();
+	return built_in_style_names.size() + archived_piece_styles().size();
 }
 
 std::string_view piece_style_name(std::size_t index) {
@@ -133,8 +154,9 @@ std::string_view piece_style_name(std::size_t index) {
 		return built_in_style_names[index];
 	}
 	const auto generated_index = index - built_in_style_names.size();
-	return generated_index < generated_piece_styles.size()
-		? std::string_view(generated_piece_styles[generated_index].name)
+	const auto &archived = archived_piece_styles();
+	return generated_index < archived.size()
+		? std::string_view(archived[generated_index].name)
 		: std::string_view("vector");
 }
 
@@ -158,12 +180,9 @@ bool draw_compiled_piece(ImDrawList *draw, std::string_view style,
 					  cburnett_piece_geometries[*local_piece], center, size);
 		return true;
 	}
-	for(const auto &generated : generated_piece_styles) {
-		if(style == generated.name) {
-			const auto index =
-				static_cast<std::size_t>(generated.geometry_first) + *local_piece;
-			draw_geometry(draw, generated_piece_vertices, generated_piece_commands,
-						  generated_piece_geometries[index], center, size);
+	for(const auto &archived : archived_piece_styles()) {
+		if(style == archived.name) {
+			draw_archived_mesh(draw, archived.pieces[*local_piece], center, size);
 			return true;
 		}
 	}

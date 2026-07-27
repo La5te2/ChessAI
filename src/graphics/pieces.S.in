@@ -1,0 +1,8 @@
+.section .rodata
+.balign 1
+.global gadidae_piece_archive_start
+gadidae_piece_archive_start:
+.incbin "@GADIDAE_PIECE_ARCHIVE@"
+.global gadidae_piece_archive_end
+gadidae_piece_archive_end:
+.section .note.GNU-stack,"",@progbits

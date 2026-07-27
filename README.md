@@ -1169,11 +1169,11 @@ build\graphics\Gadidae.exe `
 	--black-name "Stockfish"
 ```
 
-Appearance 提供 `Dark` 与 `Light` 应用主题、基础字号、受限范围内随窗口缩放的字号调整、棋盘配色预设、颜色编辑、坐标开关以及 `Vector`、`RhosGFX`、`Chessnut`、`Spatial`、`Cburnett`、`Fantasy` 棋子样式。棋子均由编译进程序的预计算几何绘制，SVG 的填充、线性渐变与描边在导入阶段完成预三角化，发布目录只包含可执行文件。点击 Apply 后设置写入用户配置目录，后续启动会自动恢复。Windows 配置位于 `%APPDATA%\Gadidae\gui.json`，Linux 配置位于 `$XDG_CONFIG_HOME/Gadidae/gui.json` 或 `~/.config/Gadidae/gui.json`。只修改外观时会保留已经加载的 UCI 进程与正在进行的 Stadium 对局。`--font-size <px>`、`--theme dark`、`--theme light` 与 `--piece-style vector|rhosgfx|chessnut|spatial|cburnett|fantasy` 可覆盖本次启动的外观。第三方棋子样式的来源与许可记录在根目录 `THIRD_PARTY.md`。
+Appearance 提供 `Dark` 与 `Light` 应用主题、基础字号、受限范围内随窗口缩放的字号调整、棋盘配色预设、颜色编辑、坐标开关以及 `Vector`、`RhosGFX`、`Chessnut`、`Spatial`、`Cburnett`、`Fantasy` 棋子样式。棋子均由编译进程序的预计算几何绘制，SVG 的填充、线性渐变与描边在导入阶段完成预三角化，外部样式经过顶点去重和 zlib 压缩后嵌入可执行文件，发布目录只包含可执行文件。点击 Apply 后设置写入用户配置目录，后续启动会自动恢复。Windows 配置位于 `%APPDATA%\Gadidae\gui.json`，Linux 配置位于 `$XDG_CONFIG_HOME/Gadidae/gui.json` 或 `~/.config/Gadidae/gui.json`。只修改外观时会保留已经加载的 UCI 进程与正在进行的 Stadium 对局。`--font-size <px>`、`--theme dark`、`--theme light` 与 `--piece-style vector|rhosgfx|chessnut|spatial|cburnett|fantasy` 可覆盖本次启动的外观。第三方棋子样式的来源与许可记录在根目录 `THIRD_PARTY.md`。
 
 ### 7.1 导入棋子样式
 
-`scripts/import_pieces.py` 把一套 SVG 的填充、线性渐变与描边转换为 `piece.inc` 中的预三角化顶点。先安装脚本依赖：
+`scripts/import_pieces.py` 把一套 SVG 的填充、线性渐变与描边转换为 `src/graphics/pieces.gpack` 中的预三角化索引网格。先安装脚本依赖：
 
 ```powershell
 python -m pip install -r scripts\requirements.txt
@@ -1197,9 +1197,9 @@ python scripts/import_pieces.py \
 GADIDAE_BUILD_GRAPHICS=1 bash scripts/build.sh
 ```
 
-导入器把源 SVG 保存到 `src/graphics/pieces/<name>/`，随后扫描该目录并重新生成全部外部样式的编译几何。新名称追加一个内置样式，同名导入覆盖对应的 12 个 SVG 并更新该样式。`--curve-step` 控制曲线路径采样间距，默认值为 `1.5`。较小值产生更平滑且更大的几何数据，较大值减少源码体积与编译成本。程序运行时只使用编译进可执行文件的几何。
+导入器一次性读取 12 个 SVG，完成预三角化、逐棋子无损顶点去重与 zlib 压缩。导入结束后项目只保留 `pieces.gpack`，不复制或保留 SVG，输入目录也不会被脚本修改。新名称向几何包追加一个内置样式，同名导入原子覆盖该样式。`--curve-step` 控制曲线路径采样间距，默认值为 `1.5`。较小值产生更平滑且更大的几何数据，较大值减少几何包体积与导入成本。构建时，Windows 通过 `RCDATA`、Linux 通过只读数据段把几何包嵌入 `Gadidae`。
 
-每个新增的第三方样式都必须在根目录 `THIRD_PARTY.md` 中独立声明。来源应链接到固定 commit、固定版本或其他固定页面，并记录原作者、许可证名称和许可证全文链接。声明格式：
+每个新增的第三方样式都必须在根目录 `THIRD_PARTY.md` 中独立声明。SVG 不随项目保留，因此该声明是样式来源与授权信息的长期记录。来源应链接到固定 commit、固定版本或其他固定页面，并记录原作者、许可证名称和许可证全文链接。声明格式：
 
 ```markdown
 ## <Style Name>
