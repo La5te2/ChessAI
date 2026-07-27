@@ -11,12 +11,8 @@
 #define GLFW_INCLUDE_NONE
 #ifdef _WIN32
 #define NOMINMAX
-#define GLFW_EXPOSE_NATIVE_WIN32
 #endif
 #include <GLFW/glfw3.h>
-#ifdef _WIN32
-#include <GLFW/glfw3native.h>
-#endif
 #include <chess.hpp>
 #include <imgui.h>
 #include <imgui_impl_glfw.h>
@@ -38,7 +34,6 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 #ifdef _WIN32
@@ -224,9 +219,47 @@ bool toggle_switch(const char *label, bool &value) {
 	return pressed;
 }
 
-/// Stable commands shared by native and client-side menu implementations.
-enum class MenuCommand : unsigned int {
-	ImportPgn = 40001,
+/// Draws a compact clipboard command using two overlapping document outlines.
+bool copy_button(const char *identifier) {
+	ImGui::PushID(identifier);
+	const float side = ImGui::GetTextLineHeight();
+	const bool pressed = ImGui::InvisibleButton("##copy", {side, side});
+	const ImVec2 minimum = ImGui::GetItemRectMin();
+	const ImVec2 maximum = ImGui::GetItemRectMax();
+	const bool hovered = ImGui::IsItemHovered();
+	if(hovered) {
+		const ImVec4 background = ImGui::GetStyleColorVec4(ImGuiCol_WindowBg);
+		const ImVec4 foreground = ImGui::GetStyleColorVec4(ImGuiCol_Text);
+		constexpr float foreground_mix = 0.12F;
+		const ImVec4 neutral = {
+			background.x * (1.0F - foreground_mix) +
+				foreground.x * foreground_mix,
+			background.y * (1.0F - foreground_mix) +
+				foreground.y * foreground_mix,
+			background.z * (1.0F - foreground_mix) +
+				foreground.z * foreground_mix,
+			1.0F,
+		};
+		ImGui::GetWindowDrawList()->AddRectFilled(
+			minimum, maximum, ImGui::GetColorU32(neutral), 2.0F);
+	}
+	const auto color =
+		ImGui::GetColorU32(hovered ? ImGuiCol_Text : ImGuiCol_TextDisabled);
+	const float unit = side / 16.0F;
+	auto *draw = ImGui::GetWindowDrawList();
+	draw->AddRect({minimum.x + 6.0F * unit, minimum.y + 2.0F * unit},
+				  {minimum.x + 14.0F * unit, minimum.y + 10.0F * unit}, color,
+				  1.0F, 0, std::max(1.0F, unit));
+	draw->AddRect({minimum.x + 2.0F * unit, minimum.y + 6.0F * unit},
+				  {minimum.x + 10.0F * unit, minimum.y + 14.0F * unit}, color,
+				  1.0F, 0, std::max(1.0F, unit));
+	ImGui::PopID();
+	return pressed;
+}
+
+/// Commands issued by the shared ImGui application menu.
+enum class MenuCommand {
+	ImportPgn,
 	SavePgn,
 	SetFen,
 	Reset,
@@ -240,17 +273,6 @@ enum class MenuCommand : unsigned int {
 	Settings,
 	ImportEngine,
 	Matches,
-};
-
-/// Exposes only the state needed to enable and label application menus.
-struct MenuState {
-	bool simulator = true;
-	bool can_undo = false;
-	bool analysis_running = false;
-	bool stadium_running = false;
-	bool stadium_paused = false;
-
-	bool operator==(const MenuState &) const = default;
 };
 
 /// Converts one engine configuration to its persisted JSON representation.
@@ -723,17 +745,6 @@ public:
 		stadiums_.stop_all();
 	}
 
-	/// Returns the minimal dynamic state required by the platform menu.
-	MenuState menu_state() const {
-		return {
-			.simulator = mode_ == Mode::Simulator,
-			.can_undo = simulator_.game().plies() > 0,
-			.analysis_running = simulator_.analysis_open(),
-			.stadium_running = stadium().running(),
-			.stadium_paused = stadium().paused(),
-		};
-	}
-
 	/// Executes one menu command through the same application actions on every platform.
 	void handle_menu_command(MenuCommand command) {
 		switch(command) {
@@ -828,17 +839,13 @@ public:
 		ImGui::SetNextWindowSize(io.DisplaySize);
 		auto window_flags =
 			ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
-			ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings;
-#ifndef _WIN32
-		window_flags |= ImGuiWindowFlags_MenuBar;
-#endif
+			ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings |
+			ImGuiWindowFlags_MenuBar;
 		const auto root_padding = ImGui::GetStyle().WindowPadding;
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {root_padding.x, 1.0F});
 		ImGui::Begin("GadidaeRoot", nullptr, window_flags);
 		ImGui::PopStyleVar();
-#ifndef _WIN32
 		render_menu_bar();
-#endif
 		if(mode_ == Mode::Simulator) {
 			render_simulator(update_state);
 		} else {
@@ -972,7 +979,7 @@ private:
 						 ? Theme::Light
 						 : Theme::Dark;
 		} catch(...) {
-			status_ = "Settings file was ignored because it could not be parsed";
+			// Keep defaults when a stale or partial settings file cannot be read.
 		}
 	}
 
@@ -1025,14 +1032,22 @@ private:
 		if(!ImGui::BeginMenuBar()) {
 			return;
 		}
+		const auto command_item = [](const char *label) {
+			const ImVec2 size = ImGui::CalcTextSize(label);
+			return ImGui::Selectable(
+				label, false, ImGuiSelectableFlags_None, size);
+		};
+		const auto popup_padding = ImGui::GetStyle().WindowPadding;
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+							{8.0F, popup_padding.y});
 		if(ImGui::BeginMenu("File")) {
-			if(ImGui::MenuItem("Import Engine")) {
+			if(command_item("Import Engine")) {
 				handle_menu_command(MenuCommand::ImportEngine);
 			}
-			if(mode_ == Mode::Simulator && ImGui::MenuItem("Import PGN")) {
+			if(mode_ == Mode::Simulator && command_item("Import PGN")) {
 				handle_menu_command(MenuCommand::ImportPgn);
 			}
-			if(ImGui::MenuItem("Save PGN")) {
+			if(command_item("Save PGN")) {
 				handle_menu_command(MenuCommand::SavePgn);
 			}
 			ImGui::EndMenu();
@@ -1041,27 +1056,29 @@ private:
 			const bool position_locked =
 				mode_ == Mode::Stadium && stadium().running();
 			ImGui::BeginDisabled(position_locked);
-			if(ImGui::MenuItem("FEN")) {
+			if(command_item("FEN")) {
 				handle_menu_command(MenuCommand::SetFen);
 			}
-			if(ImGui::MenuItem("Reset")) {
+			if(command_item("Reset")) {
 				handle_menu_command(MenuCommand::Reset);
 			}
 			ImGui::EndDisabled();
 			if(mode_ == Mode::Simulator) {
 				ImGui::BeginDisabled(simulator_.game().plies() == 0);
-				if(ImGui::MenuItem("Undo")) {
+				if(command_item("Undo")) {
 					handle_menu_command(MenuCommand::Undo);
 				}
 				ImGui::EndDisabled();
 			}
-			if(ImGui::MenuItem("Flip")) {
+			ImGui::Separator();
+			if(command_item("Flip")) {
 				handle_menu_command(MenuCommand::Flip);
 			}
 			ImGui::EndMenu();
 		}
 		if(ImGui::BeginMenu("Mode")) {
-			if(ImGui::MenuItem("Simulator", nullptr, mode_ == Mode::Simulator)) {
+			if(ImGui::MenuItem("Simulator", nullptr,
+							   mode_ == Mode::Simulator)) {
 				handle_menu_command(MenuCommand::SimulatorMode);
 			}
 			if(ImGui::MenuItem("Stadium", nullptr, mode_ == Mode::Stadium)) {
@@ -1080,15 +1097,15 @@ private:
 				}
 			} else {
 				ImGui::BeginDisabled(stadium().running());
-				if(ImGui::MenuItem("Start")) {
+				if(command_item("Start")) {
 					handle_menu_command(MenuCommand::Start);
 				}
 				ImGui::EndDisabled();
 				ImGui::BeginDisabled(!stadium().running());
-				if(ImGui::MenuItem(stadium().paused() ? "Resume" : "Pause")) {
+				if(command_item(stadium().paused() ? "Resume" : "Pause")) {
 					handle_menu_command(MenuCommand::Pause);
 				}
-				if(ImGui::MenuItem("Stop")) {
+				if(command_item("Stop")) {
 					handle_menu_command(MenuCommand::Stop);
 				}
 				ImGui::EndDisabled();
@@ -1096,14 +1113,15 @@ private:
 			ImGui::EndMenu();
 		}
 		if(ImGui::BeginMenu("Tools")) {
-			if(mode_ == Mode::Stadium && ImGui::MenuItem("Matches")) {
+			if(mode_ == Mode::Stadium && command_item("Matches")) {
 				handle_menu_command(MenuCommand::Matches);
 			}
-			if(ImGui::MenuItem("Settings")) {
+			if(command_item("Settings")) {
 				handle_menu_command(MenuCommand::Settings);
 			}
 			ImGui::EndMenu();
 		}
+		ImGui::PopStyleVar();
 		ImGui::EndMenuBar();
 	}
 
@@ -1128,7 +1146,10 @@ private:
 		const auto layout =
 			board_layout(available_width, available_height, simulator_board_fraction_);
 
+		ImGui::PushStyleColor(ImGuiCol_ChildBg,
+							  ImGui::GetStyleColorVec4(ImGuiCol_WindowBg));
 		ImGui::BeginChild("simulator-left", {layout.board_size, 0.0F});
+		ImGui::PopStyleColor();
 		const bool viewing_history = simulator_.viewing_history();
 		if(const auto square =
 			   draw_board(visible, layout.board_size, flipped_, appearance_,
@@ -1238,11 +1259,21 @@ private:
 	void render_board_state(const GameState &game, float height) {
 		if(ImGui::BeginChild("board-state", {0.0F, height},
 							 ImGuiChildFlags_Borders)) {
+			const std::string fen = game.board().getFen();
+			const std::string pgn = game.movetext();
 			ImGui::TextDisabled("FEN");
-			ImGui::TextWrapped("%s", game.board().getFen().c_str());
+			ImGui::SameLine(0.0F, 4.0F);
+			if(copy_button("fen")) {
+				ImGui::SetClipboardText(fen.c_str());
+			}
+			ImGui::TextWrapped("%s", fen.c_str());
 			ImGui::Separator();
 			ImGui::TextDisabled("PGN");
-			ImGui::TextWrapped("%s", game.movetext().c_str());
+			ImGui::SameLine(0.0F, 4.0F);
+			if(copy_button("pgn")) {
+				ImGui::SetClipboardText(pgn.c_str());
+			}
+			ImGui::TextWrapped("%s", pgn.c_str());
 		}
 		ImGui::EndChild();
 	}
@@ -1256,7 +1287,10 @@ private:
 		const float available_width = ImGui::GetContentRegionAvail().x;
 		const auto layout =
 			board_layout(available_width, available_height, stadium_board_fraction_);
+		ImGui::PushStyleColor(ImGuiCol_ChildBg,
+							  ImGui::GetStyleColorVec4(ImGuiCol_WindowBg));
 		ImGui::BeginChild("stadium-left", {layout.board_size, 0.0F});
+		ImGui::PopStyleColor();
 		if(const auto square = draw_board(
 			   visible, layout.board_size, flipped_, appearance_,
 			   human_input ? selected_square_ : std::nullopt,
@@ -1583,10 +1617,8 @@ private:
 				EngineConfig engine;
 				engine.path = *path;
 				engine.name = path->stem().string();
-				const auto index = registry_.add(std::move(engine));
+				registry_.add(std::move(engine));
 				save_settings();
-				status_ = "Imported engine: " +
-					registry_.engines()[index].name;
 			} catch(const std::exception &error) {
 				show_error(error.what());
 			}
@@ -1688,7 +1720,6 @@ private:
 				} else {
 					stadium().set_start_fen(fen);
 				}
-				status_ = "Start FEN updated";
 				ImGui::CloseCurrentPopup();
 			} catch(const std::exception &error) {
 				show_error(error.what());
@@ -2179,7 +2210,6 @@ private:
 				}
 				output << game.pgn(white, black, result_override,
 								   termination_override);
-				status_ = "PGN saved";
 			} catch(const std::exception &error) {
 				show_error(error.what());
 			}
@@ -2250,418 +2280,8 @@ private:
 	int new_max_plies_ = 240;
 	int delay_edit_ = 250;
 	int max_plies_edit_ = 240;
-	std::string status_ = "Ready";
 	std::string error_message_;
 };
-
-#ifdef _WIN32
-/// Owns the Win32 menu bar and forwards WM_COMMAND events to the render loop.
-class NativeMenu {
-public:
-	/// Creates the conventional File, Board, Run, and Tools menus on a GLFW window.
-	explicit NativeMenu(GLFWwindow *window)
-		: window_(glfwGetWin32Window(window)) {
-		if(window_ == nullptr) {
-			throw std::runtime_error("could not obtain the native window handle");
-		}
-		menu_ = CreateMenu();
-		file_menu_ = CreatePopupMenu();
-		board_menu_ = CreatePopupMenu();
-		mode_menu_ = CreatePopupMenu();
-		run_menu_ = CreatePopupMenu();
-		tools_menu_ = CreatePopupMenu();
-		if(menu_ == nullptr || file_menu_ == nullptr || board_menu_ == nullptr ||
-		   mode_menu_ == nullptr || run_menu_ == nullptr || tools_menu_ == nullptr) {
-			destroy_menus();
-			throw std::runtime_error("could not create the native menu");
-		}
-		remove_check_column(file_menu_);
-		remove_check_column(board_menu_);
-		remove_check_column(mode_menu_);
-		remove_check_column(run_menu_);
-		remove_check_column(tools_menu_);
-
-		append_item(file_menu_, MenuCommand::ImportEngine, L"Import Engine");
-		append_item(file_menu_, MenuCommand::ImportPgn, L"Import PGN");
-		append_item(file_menu_, MenuCommand::SavePgn, L"Save PGN");
-		append_popup(menu_, file_menu_, L"File");
-
-		append_item(board_menu_, MenuCommand::SetFen, L"FEN");
-		append_item(board_menu_, MenuCommand::Reset, L"Reset");
-		append_item(board_menu_, MenuCommand::Undo, L"Undo");
-		AppendMenuW(board_menu_, MF_SEPARATOR, 0, nullptr);
-		append_item(board_menu_, MenuCommand::Flip, L"Flip");
-		append_popup(menu_, board_menu_, L"Board");
-
-		append_item(mode_menu_, MenuCommand::SimulatorMode, L"Simulator", true);
-		append_item(mode_menu_, MenuCommand::StadiumMode, L"Stadium", true);
-		append_popup(menu_, mode_menu_, L"Mode");
-
-		append_popup(menu_, run_menu_, L"Run");
-
-		append_popup(menu_, tools_menu_, L"Tools");
-
-		if(!SetMenu(window_, menu_)) {
-			destroy_menus();
-			throw std::runtime_error("could not attach the native menu");
-		}
-		active_ = this;
-		SetLastError(0);
-		previous_proc_ = reinterpret_cast<WNDPROC>(
-			SetWindowLongPtrW(window_, GWLP_WNDPROC,
-							  reinterpret_cast<LONG_PTR>(&NativeMenu::window_proc)));
-		if(previous_proc_ == nullptr && GetLastError() != 0) {
-			active_ = nullptr;
-			SetMenu(window_, nullptr);
-			destroy_menus();
-			throw std::runtime_error("could not install the native menu handler");
-		}
-		DrawMenuBar(window_);
-	}
-
-	NativeMenu(const NativeMenu &) = delete;
-	NativeMenu &operator=(const NativeMenu &) = delete;
-
-	/// Restores GLFW's original window procedure before destroying menu resources.
-	~NativeMenu() {
-		if(previous_proc_ != nullptr) {
-			SetWindowLongPtrW(window_, GWLP_WNDPROC,
-							  reinterpret_cast<LONG_PTR>(previous_proc_));
-		}
-		active_ = nullptr;
-		SetMenu(window_, nullptr);
-		destroy_menus();
-	}
-
-	/// Returns and clears the latest command received from Windows.
-	std::optional<MenuCommand> take_command() {
-		const auto command = pending_command_;
-		pending_command_.reset();
-		return command;
-	}
-
-	/// Updates command availability and the Pause/Resume label only when state changes.
-	void update(const MenuState &state) {
-		if(last_state_ && *last_state_ == state) {
-			return;
-		}
-		rebuild_context_menus(state);
-		enable(MenuCommand::ImportPgn, state.simulator);
-		enable(MenuCommand::SetFen, state.simulator || !state.stadium_running);
-		enable(MenuCommand::Reset, state.simulator || !state.stadium_running);
-		enable(MenuCommand::Undo, state.simulator && state.can_undo);
-		enable(MenuCommand::Start,
-			   state.simulator ? !state.analysis_running
-							   : !state.stadium_running);
-		enable(MenuCommand::Pause, !state.simulator && state.stadium_running);
-		enable(MenuCommand::Stop,
-			   state.simulator ? state.analysis_running
-							   : state.stadium_running);
-		CheckMenuItem(mode_menu_, command_id(MenuCommand::SimulatorMode),
-					  MF_BYCOMMAND |
-						  (state.simulator ? MF_CHECKED : MF_UNCHECKED));
-		CheckMenuItem(mode_menu_, command_id(MenuCommand::StadiumMode),
-					  MF_BYCOMMAND |
-						  (state.simulator ? MF_UNCHECKED : MF_CHECKED));
-		DrawMenuBar(window_);
-		last_state_ = state;
-	}
-
-private:
-	struct MenuItemPresentation {
-		std::wstring label;
-		bool checkable = false;
-	};
-
-	/// Converts the shared command enum to the identifier carried by WM_COMMAND.
-	static UINT command_id(MenuCommand command) {
-		return static_cast<UINT>(command);
-	}
-
-	/// Removes the unused checkmark gutter from menus that contain only commands.
-	static void remove_check_column(HMENU menu) {
-		MENUINFO information{};
-		information.cbSize = sizeof(information);
-		information.fMask = MIM_STYLE;
-		if(!GetMenuInfo(menu, &information)) {
-			throw std::runtime_error("could not read native menu style");
-		}
-		information.dwStyle |= MNS_NOCHECK;
-		if(!SetMenuInfo(menu, &information)) {
-			throw std::runtime_error("could not update native menu style");
-		}
-	}
-
-	/// Appends one compact owner-drawn command without the unused shortcut column.
-	void append_item(HMENU menu, MenuCommand command, const wchar_t *label,
-					 bool checkable = false) {
-		const auto identifier = command_id(command);
-		presentations_[identifier] = {label, checkable};
-		MENUITEMINFOW item{};
-		item.cbSize = sizeof(item);
-		item.fMask = MIIM_FTYPE | MIIM_ID | MIIM_DATA;
-		item.fType = MFT_OWNERDRAW;
-		item.wID = identifier;
-		item.dwItemData = identifier;
-		if(!InsertMenuItemW(menu, static_cast<UINT>(GetMenuItemCount(menu)), TRUE,
-							&item)) {
-			throw std::runtime_error("could not append a native menu item");
-		}
-	}
-
-	/// Appends one owned popup to the top-level menu bar.
-	static void append_popup(HMENU menu, HMENU popup, const wchar_t *label) {
-		if(!AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(popup), label)) {
-			throw std::runtime_error("could not append a native popup menu");
-		}
-	}
-
-	/// Rebuilds mode-specific Run and Tools commands without affecting active matches.
-	void rebuild_context_menus(const MenuState &state) {
-		const auto clear = [](HMENU menu) {
-			while(GetMenuItemCount(menu) > 0) {
-				DeleteMenu(menu, 0, MF_BYPOSITION);
-			}
-		};
-		clear(run_menu_);
-		clear(tools_menu_);
-		if(state.simulator) {
-			append_item(run_menu_, MenuCommand::Start, L"Open", true);
-			append_item(run_menu_, MenuCommand::Stop, L"Close", true);
-			CheckMenuItem(run_menu_, command_id(MenuCommand::Start),
-						  MF_BYCOMMAND |
-							  (state.analysis_running ? MF_CHECKED
-													  : MF_UNCHECKED));
-			CheckMenuItem(run_menu_, command_id(MenuCommand::Stop),
-						  MF_BYCOMMAND |
-							  (state.analysis_running ? MF_UNCHECKED
-													  : MF_CHECKED));
-		} else {
-			append_item(run_menu_, MenuCommand::Start, L"Start");
-			append_item(run_menu_, MenuCommand::Pause,
-						state.stadium_paused ? L"Resume" : L"Pause");
-			append_item(run_menu_, MenuCommand::Stop, L"Stop");
-			append_item(tools_menu_, MenuCommand::Matches, L"Matches");
-		}
-		append_item(tools_menu_, MenuCommand::Settings, L"Settings");
-	}
-
-	/// Measures popup items from their actual label and optional checkmark only.
-	bool measure_item(MEASUREITEMSTRUCT &item) const {
-		const auto found = presentations_.find(item.itemID);
-		if(found == presentations_.end()) {
-			return false;
-		}
-		HDC context = GetDC(window_);
-		if(context == nullptr) {
-			return false;
-		}
-		NONCLIENTMETRICSW metrics{};
-		metrics.cbSize = sizeof(metrics);
-		HFONT font = nullptr;
-		HGDIOBJ previous = nullptr;
-		if(SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics,
-								 0)) {
-			font = CreateFontIndirectW(&metrics.lfMenuFont);
-			if(font != nullptr) {
-				previous = SelectObject(context, font);
-			}
-		}
-		SIZE text{};
-		GetTextExtentPoint32W(context, found->second.label.c_str(),
-							 static_cast<int>(found->second.label.size()), &text);
-		if(previous != nullptr) {
-			SelectObject(context, previous);
-		}
-		if(font != nullptr) {
-			DeleteObject(font);
-		}
-		ReleaseDC(window_, context);
-		const auto dpi = GetDpiForWindow(window_);
-		const auto pixels = [dpi](int value) {
-			return std::max(1, MulDiv(value, static_cast<int>(dpi), 96));
-		};
-		const int check_width = found->second.checkable ? pixels(18) : 0;
-		// Windows adds a native checkmark column after measuring owner-drawn
-		// rows. Remove that duplicate reservation because this menu draws its
-		// own optional mark inside the requested symmetric padding.
-		const int system_trailing =
-			GetSystemMetricsForDpi(SM_CXMENUCHECK, dpi);
-		const int requested_width =
-			pixels(4) + check_width + text.cx + pixels(4);
-		item.itemWidth = static_cast<UINT>(
-			std::max(1, requested_width - system_trailing));
-		item.itemHeight =
-			static_cast<UINT>(
-				std::max(static_cast<int>(text.cy) + pixels(6), pixels(22)));
-		return true;
-	}
-
-	/// Draws compact native-looking popup rows with disabled and checked states.
-	bool draw_item(const DRAWITEMSTRUCT &item) const {
-		const auto found = presentations_.find(item.itemID);
-		if(found == presentations_.end()) {
-			return false;
-		}
-		const bool selected = (item.itemState & ODS_SELECTED) != 0;
-		const bool disabled = (item.itemState & ODS_DISABLED) != 0;
-		const bool checked = (item.itemState & ODS_CHECKED) != 0;
-		const int background =
-			selected ? COLOR_HIGHLIGHT : COLOR_MENU;
-		HBRUSH brush = GetSysColorBrush(background);
-		FillRect(item.hDC, &item.rcItem, brush);
-
-		NONCLIENTMETRICSW metrics{};
-		metrics.cbSize = sizeof(metrics);
-		HFONT font = nullptr;
-		HGDIOBJ previous = nullptr;
-		if(SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics,
-								 0)) {
-			font = CreateFontIndirectW(&metrics.lfMenuFont);
-			if(font != nullptr) {
-				previous = SelectObject(item.hDC, font);
-			}
-		}
-		SetBkMode(item.hDC, TRANSPARENT);
-		SetTextColor(item.hDC,
-					 GetSysColor(disabled ? COLOR_GRAYTEXT
-										  : (selected ? COLOR_HIGHLIGHTTEXT
-													  : COLOR_MENUTEXT)));
-		const auto scale = static_cast<int>(GetDpiForWindow(window_));
-		const auto pixels = [scale](int value) {
-			return std::max(1, MulDiv(value, scale, 96));
-		};
-		RECT text = item.rcItem;
-		text.left += pixels(4) + (found->second.checkable ? pixels(18) : 0);
-		text.right -= pixels(4);
-		DrawTextW(item.hDC, found->second.label.c_str(),
-				  static_cast<int>(found->second.label.size()), &text,
-				  DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-		if(checked && found->second.checkable) {
-			const COLORREF mark_color = GetSysColor(
-				disabled ? COLOR_GRAYTEXT
-						 : (selected ? COLOR_HIGHLIGHTTEXT : COLOR_MENUTEXT));
-			HPEN pen = CreatePen(PS_SOLID, pixels(1), mark_color);
-			if(pen != nullptr) {
-				HGDIOBJ old_pen = SelectObject(item.hDC, pen);
-				const int left = item.rcItem.left + pixels(6);
-				const int middle =
-					(item.rcItem.top + item.rcItem.bottom) / 2;
-				MoveToEx(item.hDC, left, middle, nullptr);
-				LineTo(item.hDC, left + pixels(4), middle + pixels(4));
-				LineTo(item.hDC, left + pixels(11), middle - pixels(5));
-				SelectObject(item.hDC, old_pen);
-				DeleteObject(pen);
-			}
-		}
-		if(previous != nullptr) {
-			SelectObject(item.hDC, previous);
-		}
-		if(font != nullptr) {
-			DeleteObject(font);
-		}
-		return true;
-	}
-
-	/// Enables or greys one command without changing the menu structure.
-	void enable(MenuCommand command, bool enabled) {
-		EnableMenuItem(menu_for(command), command_id(command),
-					   MF_BYCOMMAND | (enabled ? MF_ENABLED : MF_GRAYED));
-	}
-
-	/// Returns the popup that directly owns a command identifier.
-	HMENU menu_for(MenuCommand command) const {
-		switch(command) {
-		case MenuCommand::ImportEngine:
-		case MenuCommand::ImportPgn:
-		case MenuCommand::SavePgn:
-			return file_menu_;
-		case MenuCommand::SetFen:
-		case MenuCommand::Reset:
-		case MenuCommand::Undo:
-		case MenuCommand::Flip:
-			return board_menu_;
-		case MenuCommand::Start:
-		case MenuCommand::Pause:
-		case MenuCommand::Stop:
-			return run_menu_;
-		case MenuCommand::SimulatorMode:
-		case MenuCommand::StadiumMode:
-			return mode_menu_;
-		case MenuCommand::Settings:
-		case MenuCommand::Matches:
-			return tools_menu_;
-		}
-		return menu_;
-	}
-
-	/// Routes native menu selections into a small queue consumed after glfwPollEvents.
-	static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam,
-									   LPARAM lparam) {
-		if(active_ != nullptr && active_->window_ == window &&
-		   message == WM_MEASUREITEM && wparam == 0 &&
-		   active_->measure_item(
-			   *reinterpret_cast<MEASUREITEMSTRUCT *>(lparam))) {
-			return TRUE;
-		}
-		if(active_ != nullptr && active_->window_ == window &&
-		   message == WM_DRAWITEM && wparam == 0 &&
-		   active_->draw_item(*reinterpret_cast<DRAWITEMSTRUCT *>(lparam))) {
-			return TRUE;
-		}
-		if(active_ != nullptr && active_->window_ == window && message == WM_COMMAND &&
-		   HIWORD(wparam) == 0) {
-			const auto identifier = LOWORD(wparam);
-			if(identifier >= command_id(MenuCommand::ImportPgn) &&
-			   identifier <= command_id(MenuCommand::Matches)) {
-				active_->pending_command_ = static_cast<MenuCommand>(identifier);
-				return 0;
-			}
-		}
-		return active_ != nullptr && active_->previous_proc_ != nullptr
-			? CallWindowProcW(active_->previous_proc_, window, message, wparam, lparam)
-			: DefWindowProcW(window, message, wparam, lparam);
-	}
-
-	/// Releases the top-level menu and all popups owned by it.
-	void destroy_menus() {
-		if(menu_ != nullptr) {
-			DestroyMenu(menu_);
-			menu_ = nullptr;
-			file_menu_ = nullptr;
-			board_menu_ = nullptr;
-			mode_menu_ = nullptr;
-			run_menu_ = nullptr;
-			tools_menu_ = nullptr;
-			return;
-		}
-		const auto destroy_popup = [](HMENU &popup) {
-			if(popup != nullptr) {
-				DestroyMenu(popup);
-				popup = nullptr;
-			}
-		};
-		destroy_popup(file_menu_);
-		destroy_popup(board_menu_);
-		destroy_popup(mode_menu_);
-		destroy_popup(run_menu_);
-		destroy_popup(tools_menu_);
-	}
-
-	inline static NativeMenu *active_ = nullptr;
-	HWND window_ = nullptr;
-	HMENU menu_ = nullptr;
-	HMENU file_menu_ = nullptr;
-	HMENU board_menu_ = nullptr;
-	HMENU mode_menu_ = nullptr;
-	HMENU run_menu_ = nullptr;
-	HMENU tools_menu_ = nullptr;
-	WNDPROC previous_proc_ = nullptr;
-	std::unordered_map<UINT, MenuItemPresentation> presentations_;
-	std::optional<MenuCommand> pending_command_;
-	std::optional<MenuState> last_state_;
-};
-#endif
 
 std::string latest_glfw_error;
 
@@ -2786,9 +2406,6 @@ int run_application(int argc, char **argv) {
 	int result = 0;
 	try {
 		Application application(argc, argv);
-#ifdef _WIN32
-		NativeMenu native_menu(window);
-#endif
 		RefreshContext refresh;
 		refresh.render = [&](bool update_state) {
 			ImGui_ImplOpenGL3_NewFrame();
@@ -2812,15 +2429,7 @@ int run_application(int argc, char **argv) {
 		glfwSetWindowPosCallback(window, window_moved);
 		auto next_frame = Clock::now();
 		while(!glfwWindowShouldClose(window)) {
-#ifdef _WIN32
-			native_menu.update(application.menu_state());
-#endif
 			glfwPollEvents();
-#ifdef _WIN32
-			if(const auto command = native_menu.take_command()) {
-				application.handle_menu_command(*command);
-			}
-#endif
 			if(Clock::now() >= refresh.defer_drawing_until) {
 				refresh_window(window, true);
 			}
