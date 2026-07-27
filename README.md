@@ -409,7 +409,7 @@ build/gadus/fcpi \
 	--max-plies 240 \
 	--positions-per-game 200 \
 	--opening-book data/openings.gen.bin \
-	--startpos-fraction 0.5 \
+	--startpos-fraction 0.2 \
 	--book-plies 8 \
 	--max-book-positions 50000 \
 	--inference-batch-size 64 \
@@ -493,23 +493,21 @@ $$
 Q(s,a)=V_{old}(s)
 $$
 
-设冻结 Policy 下的局部均值与尺度为：
+设冻结 Policy 下的局部均值为：
 
 $$
 m(s)=\sum_aP_{old}(a\mid s)Q(s,a)
 $$
 
-$$
-\sigma(s)=\max_a|Q(s,a)-m(s)|
-$$
-
-当 $\sigma(s)<10^{-4}$ 时保持原 Policy。其余情况使用：
+Policy target 直接使用 Value 原生范围内的反事实 Advantage：
 
 $$
 \pi^+(a\mid s)=
-\frac{P_{old}(a\mid s)\exp\left((Q(s,a)-m(s))/\sigma(s)\right)}
-{\sum_bP_{old}(b\mid s)\exp\left((Q(s,b)-m(s))/\sigma(s)\right)}
+\frac{P_{old}(a\mid s)\exp\left(Q(s,a)-m(s)\right)}
+{\sum_bP_{old}(b\mid s)\exp\left(Q(s,b)-m(s)\right)}
 $$
+
+由于 $Q\in[-1,1]$，该更新不需要额外尺度参数。较小的 Value 差异只产生较小的 Policy 调整，明确的反事实差异才会显著改变动作排序。旧 Policy 已经作为乘性先验进入 $\pi^+$，KL 只作为 summary 诊断量，不进入训练损失。
 
 Gadus 节点回传值为：
 
@@ -574,9 +572,9 @@ $$
 L=\alpha_P L_P+\alpha_V L_V
 $$
 
-$\alpha_P$ 与 $\alpha_V$ 分别由 `--policy-weight` 和 `--value-weight` 指定。$\pi^+$ 已经乘入冻结模型 prior，因此无需额外 KL 项重复锚定。最大绝对 Advantage 归一化把单次树改进的 log-odds 扰动限制在 $[-1,1]$，避免低 prior 动作因极小方差被异常放大。
+$\alpha_P$ 与 $\alpha_V$ 分别由 `--policy-weight` 和 `--value-weight` 指定。$\pi^+$ 已经乘入冻结模型 prior，因此无需额外 KL 项重复锚定。
 
-FCPI HDF5 分别保存 `td_value_targets`、`tree_value_targets`、`td_value_weights` 与 `tree_value_weights`。训练日志分别输出 `value_td`、`value_tree` 和二者按有效权重合并后的 `value`。
+FCPI HDF5 分别保存 `td_value_targets`、`tree_value_targets`、`td_value_weights` 与 `tree_value_weights`。训练日志分别输出 `value_td`、`value_tree` 和二者按有效权重合并后的 `value`。summary 还记录 `mean_abs_advantage`、`max_abs_advantage`、`mean_policy_kl`、`mean_policy_total_variation` 与 `policy_top1_change_rate`，用于区分学习信号强度、策略移动幅度和 arena 结果。
 
 每轮依次执行 `current.pth` 自对战、局面采样、树一致反事实展开、TD($\lambda$) 与反事实 Value 目标构造、candidate 训练和 paired-game arena。每局先按完整编码状态去重，再按 `positions-per-game` 做均匀无放回采样。
 
@@ -988,21 +986,19 @@ $$
 Q(s,a)=-\overline V(T(s,a))
 $$
 
-Policy target 使用与 Gadus 相同的节点内均值、最大绝对 Advantage 尺度和 prior 乘性更新：
+Melano 在自己的 FCPI backend 中根据 PVA 动作值计算节点内均值：
 
 $$
 m(s)=\sum_aP_{old}(a\mid s)Q(s,a)
 $$
 
 $$
-\sigma(s)=\max_a|Q(s,a)-m(s)|
+\pi^+(a\mid s)=
+\frac{P_{old}(a\mid s)\exp(Q(s,a)-m(s))}
+{\sum_bP_{old}(b\mid s)\exp(Q(s,b)-m(s))}
 $$
 
-$$
-\pi^+(a\mid s)=
-\frac{P_{old}(a\mid s)\exp((Q(s,a)-m(s))/\sigma(s))}
-{\sum_bP_{old}(b\mid s)\exp((Q(s,b)-m(s))/\sigma(s))}
-$$
+该更新保留 Melano 动作值的原生尺度。summary 中的 KL、总变差距离、Advantage 幅度和 top-1 改变率只用于诊断，不进入训练损失。
 
 Melano 的 $A(s,a)\leq0$ 表示动作相对局面能力上界的损失。反事实树使用所有合法动作的动作值上界：
 
@@ -1064,7 +1060,7 @@ $$
 
 其中每条树边都通过精确棋规生成 $s'$，并写入 `candidate_next_states`。$L_D$ 使用与监督训练相同的 latent cosine consistency。动作条件 dynamics 对树中每个已展开节点学习一步转移 $E(s)\rightarrow E(s')$，与 $K=2$ anchored latent MCTS 的运行时假设保持一致。
 
-Melano FCPI HDF5 分别保存 `td_value_targets`、`tree_value_targets`、`td_value_weights`、`tree_value_weights` 和 `candidate_q`。训练日志分别输出 `value_td`、`value_tree`、合并后的 `value`、`dueling_q`、`dynamics` 与 `imagined_value`。
+Melano FCPI HDF5 分别保存 `td_value_targets`、`tree_value_targets`、`td_value_weights`、`tree_value_weights` 和 `candidate_q`。训练日志分别输出 `value_td`、`value_tree`、合并后的 `value`、`dueling_q`、`dynamics` 与 `imagined_value`。summary 使用与 Melano backend 对应的 `mean_abs_advantage`、`max_abs_advantage`、`mean_policy_kl`、`mean_policy_total_variation` 与 `policy_top1_change_rate` 描述策略更新。
 
 Melano 每轮依次执行自身 `current.pth` 自对战、局面采样、树一致反事实展开、PVA 与 latent-dynamics 目标构造、candidate 训练和 paired-game arena。每次运行由程序生成 `fcpi_YYYYMMDD_HHMMSS_id`，创建对应的 `data/runs/<run-id>/` 与 `models/runs/<run-id>/`。其中 HDF5 schema、candidate 和 current checkpoint 均属于 Melano，candidate 达到 arena gate 后原子写入该 run 的 `current.pth`。`summary.json` 记录预算、决策节点数、评价边数、最大深度和 arena 结果。
 

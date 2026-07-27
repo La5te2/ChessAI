@@ -27,7 +27,8 @@ namespace melano {
 
 namespace {
 
-inline constexpr const char *kFcpiFormula = "melano_dueling_tree_value_fcpi";
+inline constexpr const char *kFcpiFormula =
+	"melano_dueling_tree_value_raw_advantage_fcpi";
 
 // Format iteration numbers for stable, lexically sortable artifact names.
 std::string zero_pad(int value, int width) {
@@ -103,6 +104,12 @@ struct TargetSummary {
 	double tree_value_weight_sum = 0.0;
 	double tree_value_correction_sum = 0.0;
 	std::int64_t tree_value_count = 0;
+	double policy_kl_sum = 0.0;
+	double policy_total_variation_sum = 0.0;
+	double mean_abs_advantage_sum = 0.0;
+	double max_abs_advantage = 0.0;
+	std::int64_t policy_top1_changes = 0;
+	std::int64_t policy_diagnostic_nodes = 0;
 };
 
 struct SamplingSpec {
@@ -558,27 +565,55 @@ int expansion_width(const CounterfactualTree &tree) {
 	return std::min(tree.remaining_budget, progressive);
 }
 
-// Build one tree-consistent improved policy using exact child values where available
-// and Melano V+A estimates for actions outside the expanded set.
+// Build one tree-consistent improved Policy using exact child values where available
+// and Melano V+A estimates elsewhere. Native-scale backed Advantage preserves the
+// confidence represented by each counterfactual difference.
 std::vector<float> improve_policy(const std::vector<float> &prior,
 								  const std::vector<float> &action_values) {
 	double mean = 0.0;
 	for (std::size_t index = 0; index < prior.size(); ++index) {
 		mean += prior[index] * action_values[index];
 	}
-	double scale = 0.0;
-	for (std::size_t index = 0; index < prior.size(); ++index) {
-		scale = std::max(scale, std::abs(static_cast<double>(action_values[index]) - mean));
-	}
-	if (scale < 1e-4) {
-		return prior;
-	}
 	std::vector<double> logits(prior.size());
 	for (std::size_t index = 0; index < prior.size(); ++index) {
 		logits[index] = std::log(std::clamp(static_cast<double>(prior[index]), 1e-12, 1.0)) +
-						(action_values[index] - mean) / scale;
+						(action_values[index] - mean);
 	}
 	return stable_softmax(logits);
+}
+
+// Summarize Policy movement independently from the FCPI training loss.
+void record_policy_diagnostics(TargetSummary &summary, const std::vector<float> &prior,
+							   const std::vector<float> &action_values,
+							   const std::vector<float> &target) {
+	double mean = 0.0;
+	for (std::size_t index = 0; index < prior.size(); ++index) {
+		mean += prior[index] * action_values[index];
+	}
+	double mean_abs_advantage = 0.0;
+	double maximum_abs_advantage = 0.0;
+	double kl = 0.0;
+	double l1 = 0.0;
+	for (std::size_t index = 0; index < prior.size(); ++index) {
+		const double advantage = static_cast<double>(action_values[index]) - mean;
+		mean_abs_advantage += prior[index] * std::abs(advantage);
+		maximum_abs_advantage = std::max(maximum_abs_advantage, std::abs(advantage));
+		const double target_probability =
+			std::clamp(static_cast<double>(target[index]), 1e-12, 1.0);
+		const double prior_probability =
+			std::clamp(static_cast<double>(prior[index]), 1e-12, 1.0);
+		kl += target_probability * std::log(target_probability / prior_probability);
+		l1 += std::abs(target_probability - prior_probability);
+	}
+	const auto prior_top1 = std::max_element(prior.begin(), prior.end()) - prior.begin();
+	const auto target_top1 = std::max_element(target.begin(), target.end()) - target.begin();
+	summary.mean_abs_advantage_sum += mean_abs_advantage;
+	summary.max_abs_advantage =
+		std::max(summary.max_abs_advantage, maximum_abs_advantage);
+	summary.policy_kl_sum += std::max(0.0, kl);
+	summary.policy_total_variation_sum += 0.5 * l1;
+	summary.policy_top1_changes += prior_top1 != target_top1 ? 1 : 0;
+	++summary.policy_diagnostic_nodes;
 }
 
 // Measure how much of the improved Policy is supported by explicitly evaluated
@@ -770,6 +805,8 @@ void construct_targets(std::vector<Position> &records, Model model, const torch:
 					node.candidate_q[slot] = q;
 				}
 				node.policy_target = improve_policy(node.legal_prior, action_values);
+				record_policy_diagnostics(
+					summary, node.legal_prior, action_values, node.policy_target);
 				// Melano defines V(s) as the best available action value and
 				// A(s,a)=Q(s,a)-V(s)<=0. The frozen estimate may be wrong in either
 				// direction, so tree evidence must be allowed to raise or lower V.
@@ -848,6 +885,25 @@ void construct_targets(std::vector<Position> &records, Model model, const torch:
 			  << " mean_tree_value_correction="
 			  << (summary.tree_value_weight_sum > 0.0
 					  ? summary.tree_value_correction_sum / summary.tree_value_weight_sum
+					  : 0.0)
+			  << " mean_abs_advantage="
+			  << (summary.policy_diagnostic_nodes > 0
+					  ? summary.mean_abs_advantage_sum / summary.policy_diagnostic_nodes
+					  : 0.0)
+			  << " max_abs_advantage=" << summary.max_abs_advantage
+			  << " mean_policy_kl="
+			  << (summary.policy_diagnostic_nodes > 0
+					  ? summary.policy_kl_sum / summary.policy_diagnostic_nodes
+					  : 0.0)
+			  << " mean_policy_total_variation="
+			  << (summary.policy_diagnostic_nodes > 0
+					  ? summary.policy_total_variation_sum /
+							summary.policy_diagnostic_nodes
+					  : 0.0)
+			  << " policy_top1_change_rate="
+			  << (summary.policy_diagnostic_nodes > 0
+					  ? static_cast<double>(summary.policy_top1_changes) /
+							summary.policy_diagnostic_nodes
 					  : 0.0)
 			  << std::endl;
 }
@@ -1381,6 +1437,27 @@ void run_fcpi(const FcpiOptions &options) {
 			 target_summary.tree_value_weight_sum > 0.0
 				 ? target_summary.tree_value_correction_sum /
 					   target_summary.tree_value_weight_sum
+				 : 0.0},
+			{"mean_abs_advantage",
+			 target_summary.policy_diagnostic_nodes > 0
+				 ? target_summary.mean_abs_advantage_sum /
+					   target_summary.policy_diagnostic_nodes
+				 : 0.0},
+			{"max_abs_advantage", target_summary.max_abs_advantage},
+			{"mean_policy_kl",
+			 target_summary.policy_diagnostic_nodes > 0
+				 ? target_summary.policy_kl_sum /
+					   target_summary.policy_diagnostic_nodes
+				 : 0.0},
+			{"mean_policy_total_variation",
+			 target_summary.policy_diagnostic_nodes > 0
+				 ? target_summary.policy_total_variation_sum /
+					   target_summary.policy_diagnostic_nodes
+				 : 0.0},
+			{"policy_top1_change_rate",
+			 target_summary.policy_diagnostic_nodes > 0
+				 ? static_cast<double>(target_summary.policy_top1_changes) /
+					   target_summary.policy_diagnostic_nodes
 				 : 0.0},
 		};
 		const auto candidate = model_dir / ("candidate_iter_" + zero_pad(iteration, 3) + ".pth");
