@@ -574,7 +574,9 @@ $$
 
 $\alpha_P$ 与 $\alpha_V$ 分别由 `--policy-weight` 和 `--value-weight` 指定。$\pi^+$ 已经乘入冻结模型 prior，因此无需额外 KL 项重复锚定。
 
-FCPI HDF5 分别保存 `td_value_targets`、`tree_value_targets`、`td_value_weights` 与 `tree_value_weights`。训练日志分别输出 `value_td`、`value_tree` 和二者按有效权重合并后的 `value`。summary 还记录 `mean_abs_advantage`、`max_abs_advantage`、`mean_policy_kl`、`mean_policy_total_variation` 与 `policy_top1_change_rate`，用于区分学习信号强度、策略移动幅度和 arena 结果。
+FCPI HDF5 分别保存 `td_value_targets`、`tree_value_targets`、`td_value_weights` 与 `tree_value_weights`。Gadus 的反事实 target 由冻结模型在推理模式下生成，candidate 训练也保持 BatchNorm running mean/variance 不变，使训练前向与 arena 前向使用相同的归一化统计。`eval()` 只固定归一化行为，不会关闭 autograd 或参数更新。
+
+训练日志分别输出 `value_td`、`value_tree`、二者按有效权重合并后的 `value`，以及 candidate 对 $\pi^+$ 的 `policy_fit_kl`。summary 还记录 `mean_abs_advantage`、`max_abs_advantage`、`mean_policy_kl`、`mean_policy_total_variation` 与 `policy_top1_change_rate`，用于区分学习信号强度、策略移动幅度和 arena 结果。其中 `mean_policy_kl` 描述 target 相对冻结 prior 的移动，`policy_fit_kl` 描述 candidate 对该 target 的拟合误差。
 
 每轮依次执行 `current.pth` 自对战、局面采样、树一致反事实展开、TD($\lambda$) 与反事实 Value 目标构造、candidate 训练和 paired-game arena。每局先按完整编码状态去重，再按 `positions-per-game` 做均匀无放回采样。
 

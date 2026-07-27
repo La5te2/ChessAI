@@ -27,8 +27,7 @@ namespace gadus {
 
 namespace {
 
-inline constexpr const char *kFcpiFormula =
-	"gadus_tree_consistent_raw_advantage_fcpi";
+inline constexpr const char *kFcpiFormula = "tree_consistent";
 
 // Format iteration numbers for stable, lexically sortable artifact names.
 std::string zero_pad(int value, int width) {
@@ -1047,7 +1046,10 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 							   const torch::Device &device, std::vector<Position> &records,
 							   const FcpiOptions &options) {
 	model->to(device);
-	model->train();
+	// FCPI targets are generated from the frozen model in inference mode. Keep
+	// BatchNorm on those same running statistics while autograd updates parameters;
+	// eval() changes normalization behavior but does not disable gradients.
+	model->eval();
 	torch::optim::AdamW optimizer(
 		model->parameters(),
 		torch::optim::AdamWOptions(options.learning_rate).weight_decay(options.weight_decay));
@@ -1056,7 +1058,7 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 	std::mt19937_64 rng(options.seed);
 	std::int64_t steps = 0;
 	auto metric_totals =
-		torch::zeros({5}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+		torch::zeros({6}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
 	for (int epoch = 0; epoch < std::max(0, options.epochs); ++epoch) {
 		std::shuffle(order.begin(), order.end(), rng);
 		for (std::size_t begin = 0; begin < order.size(); begin += std::max(1, options.batch_size)) {
@@ -1139,6 +1141,13 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 			auto policy_errors = -(masked_targets * log_probability).sum(1);
 			auto policy_loss =
 				(policy_errors * policy_weights).sum() / policy_weights.sum().clamp_min(1e-8);
+			auto target_entropy_errors =
+				-(masked_targets * masked_targets.clamp_min(1e-12).log()).sum(1);
+			auto policy_fit_kl_errors =
+				(policy_errors - target_entropy_errors).clamp_min(0.0);
+			auto policy_fit_kl =
+				(policy_fit_kl_errors * policy_weights).sum() /
+				policy_weights.sum().clamp_min(1e-8);
 			auto td_value_errors = torch::nn::functional::smooth_l1_loss(
 				predicted.squeeze(1), td_values,
 				torch::nn::functional::SmoothL1LossFuncOptions().reduction(torch::kNone));
@@ -1167,21 +1176,24 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 			optimizer.step();
 			++steps;
 			metric_totals.add_(
-				torch::stack({loss.detach(), policy_loss.detach(), value_loss.detach(),
-							  td_value_loss.detach(), tree_value_loss.detach()}));
+				torch::stack({loss.detach(), policy_loss.detach(), policy_fit_kl.detach(),
+							  value_loss.detach(), td_value_loss.detach(),
+							  tree_value_loss.detach()}));
 			if (options.log_every > 0 && (steps == 1 || steps % options.log_every == 0)) {
 				auto metrics =
-					torch::stack({policy_loss.detach(), td_value_loss.detach(),
-								  tree_value_loss.detach(), value_loss.detach(), loss.detach()})
+					torch::stack({policy_loss.detach(), policy_fit_kl.detach(),
+								  td_value_loss.detach(), tree_value_loss.detach(),
+								  value_loss.detach(), loss.detach()})
 						.to(torch::kCPU)
 						.contiguous();
 				auto metric_values = metrics.accessor<float, 1>();
 				std::cout << "fcpi train: step=" << steps
 						  << " policy=" << metric_values[0]
-						  << " value_td=" << metric_values[1]
-						  << " value_tree=" << metric_values[2]
-						  << " value=" << metric_values[3]
-						  << " loss=" << metric_values[4] << std::endl;
+						  << " policy_fit_kl=" << metric_values[1]
+						  << " value_td=" << metric_values[2]
+						  << " value_tree=" << metric_values[3]
+						  << " value=" << metric_values[4]
+						  << " loss=" << metric_values[5] << std::endl;
 			}
 			if (options.train_max_steps > 0 && steps >= options.train_max_steps) {
 				break;
@@ -1201,13 +1213,15 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 		{"steps", steps},
 		{"epochs_requested", options.epochs},
 		{"candidate", candidate.string()},
+		{"batch_norm_running_stats", "frozen"},
 		{"metrics",
 		 {
 			 {"loss", metric_values[0] / divisor},
 			 {"policy", metric_values[1] / divisor},
-			 {"value", metric_values[2] / divisor},
-			 {"value_td", metric_values[3] / divisor},
-			 {"value_tree", metric_values[4] / divisor},
+			 {"policy_fit_kl", metric_values[2] / divisor},
+			 {"value", metric_values[3] / divisor},
+			 {"value_td", metric_values[4] / divisor},
+			 {"value_tree", metric_values[5] / divisor},
 		 }},
 	};
 }

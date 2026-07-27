@@ -27,8 +27,7 @@ namespace melano {
 
 namespace {
 
-inline constexpr const char *kFcpiFormula =
-	"melano_dueling_tree_value_raw_advantage_fcpi";
+inline constexpr const char *kFcpiFormula = "dueling_tree_consistent";
 
 // Format iteration numbers for stable, lexically sortable artifact names.
 std::string zero_pad(int value, int width) {
