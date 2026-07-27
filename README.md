@@ -968,7 +968,7 @@ $$
 \frac{\epsilon}{|\mathcal A(s)|}
 $$
 
-Melano 与 Gadus 分别实现树一致 FCPI。`--counterfactual-budget` 同样是每个真实根最多评价的动作边数，局部宽度、Gumbel 无放回候选和前沿优先级由剩余预算自动产生。Melano 的候选 proposal 使用：
+Melano `--counterfactual-budget` 同样是每个真实根最多评价的动作边数。局部宽度、Gumbel 无放回候选和前沿优先级由剩余预算自动产生。Melano 的候选 proposal 使用：
 
 $$
 \nu(a\mid s)=\operatorname{softmax}_a\left(
