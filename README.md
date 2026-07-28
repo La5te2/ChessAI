@@ -364,7 +364,7 @@ FCPI 完成后，可让最终 `current.pth` 与同一 run 开始时写入的 `in
 python scripts/test.py
 ```
 
-脚本默认读取 `data/runs/` 中最新的 FCPI `summary.json`，使用其中的 `current_model` 作为 candidate、`initial_model` 作为 baseline。第一阶段采用与 Gadus FCPI 验收一致的 2000 局 `closed` paired Arena；完成后从标准初始局面运行 2 局换边 `only-mcts` 对战，默认每步上限为 10000 simulations。`--summary <path>` 可选择指定 run，`--candidate` 与 `--baseline` 可覆盖模型路径，`--mcts-sims` 可调整第二阶段预算。每次测试在 `data/tests/gadus_vs_initial_<timestamp>/` 中写入 `summary.json`、`closed.pgn`、`startpos-mcts.pgn` 和 `info.log`。
+脚本默认读取 `data/runs/` 中最新的 FCPI `summary.json`，使用其中的 `current_model` 作为 candidate、`initial_model` 作为 baseline。测试采用与 Gadus FCPI 验收一致的 2000 局 `closed` paired Arena，默认最多 240 plies。`--summary <path>` 可选择指定 run，`--candidate` 与 `--baseline` 可覆盖模型路径。每次测试在 `data/tests/gadus_vs_initial_<timestamp>/` 中写入 `summary.json`、`closed.pgn` 和 `info.log`。
 
 从标准初始局面开始时，将开局书设为空：
 
@@ -958,7 +958,6 @@ build/melano/fcpi \
 	--games-per-iter 1000 \
 	--games-in-flight 64 \
 	--max-plies 240 \
-	--positions-per-game 200 \
 	--opening-book data/openings.gen.bin \
 	--startpos-fraction 0.5 \
 	--book-plies 8 \
@@ -966,7 +965,6 @@ build/melano/fcpi \
 	--inference-batch-size 64 \
 	--target-records-per-batch 256 \
 	--counterfactual-budget 24 \
-	--td-lambda 0.85 \
 	--behavior-temperature 0.85 \
 	--uniform-mix 0.02 \
 	--policy-weight 1.0 \
@@ -1020,7 +1018,15 @@ $$
 \frac{\epsilon}{|\mathcal A(s)|}
 $$
 
-Melano `--counterfactual-budget` 同样是每个真实根最多评价的动作边数。局部宽度、Gumbel 无放回候选和前沿优先级由剩余预算自动产生。Melano 的候选 proposal 使用：
+完整结束的自对弈使用终局事实生成 Monte Carlo 回报。设终局 side-to-move 回报为 $z_T$：
+
+$$
+G_T=z_T,\qquad G_t=-G_{t+1}
+$$
+
+这些回报只作为实际 state-action 的事实 $Q$ 样本，不直接作为 Melano Value 标签。Melano 的 $V(s)$ 表示合法动作价值的上界，而随机行为动作的 $G(s,a)$ 只说明该动作的结果；直接令 $V(s)=G(s,a)$ 会让一个坏动作错误地下拉整个局面。达到 `max-plies` 的截断对局不使用冻结 Value 冒充事实回报，但局面仍可建立反事实树。每局先按 Melano state encoding 去重，再使用全部不同局面，不做人为的每局数量截断。
+
+Melano 的反事实树在根节点评价全部合法动作。`--counterfactual-budget` 只表示根节点之后可额外评价的动作边数。非根节点的局部宽度、Gumbel 无放回候选和前沿优先级由剩余预算自动产生。Melano 的候选 proposal 使用：
 
 $$
 \nu(a\mid s)=\operatorname{softmax}_a\left(
@@ -1028,19 +1034,28 @@ $$
 \right)
 $$
 
-对未展开动作，反事实树保留 Melano 自身的 dueling 动作值：
+设由完整自对弈得到的同一 state-action 平均回报为：
+
+$$
+\widehat G(s,a)=
+\frac{1}{N(s,a)}
+\sum_{i:(s_i,a_i)=(s,a)}G_i
+$$
+
+Melano 对每条动作边按以下优先级构造动作值：
+
+1. 动作立即结束对局时，使用精确棋规给出的终局值。
+2. 完整自对弈实际走过该 state-action 时，使用 $\widehat G(s,a)$。
+3. 该动作已进入反事实子树时，使用递归回传值 $-\overline V(T(s,a))$。
+4. 该动作未展开时，使用冻结 Melano 的 dueling 动作值。
+
+最后一种情况为：
 
 $$
 Q(s,a)=\operatorname{clip}(V_{old}(s)+A_{old}(s,a),-1,1)
 $$
 
-已展开动作由精确棋规生成子局面并覆盖为：
-
-$$
-Q(s,a)=-\overline V(T(s,a))
-$$
-
-Melano 在自己的 FCPI backend 中根据 PVA 动作值计算节点内均值：
+Melano 在自己的 FCPI backend 中根据 Policy/Value/Advantage 动作值计算节点内均值：
 
 $$
 m(s)=\sum_aP_{old}(a\mid s)Q(s,a)
@@ -1067,11 +1082,7 @@ A_T(s,a)=\operatorname{clip}
 \left(Q_T(s,a)-\overline V_T(s),-2,0\right)
 $$
 
-因此 $V$、$Q$ 与 $A$ 使用同一棵冻结反事实树的定义，并满足 $Q_T(s,a)\leq\overline V_T(s)$。动作无法提高真实局面价值，但冻结模型的原 Value 估计可能偏高或偏低，所以反事实证据允许修正方向为正或负。真实自对弈根仍按 TD($\lambda$) 生成独立 Value target：
-
-$$
-G_t=-\left[(1-\lambda_{TD})V(s_{t+1})+\lambda_{TD}G_{t+1}\right]
-$$
+因此 $V$、$Q$ 与 $A$ 使用同一棵事实锚定的反事实树，并满足 $Q_T(s,a)\leq\overline V_T(s)$。冻结模型的原 Value 估计可能偏高或偏低，所以终局、实际动作回报和反事实证据都允许修正方向为正或负。
 
 设 $E(s)$ 为实际展开并通过精确棋规评价的动作集合，其在改进 Policy 下的覆盖质量为：
 
@@ -1085,22 +1096,18 @@ $$
 w_P(s)=\frac{n(s)}{\sum_{u\in\mathcal T_{root}}n(u)}
 $$
 
-树 Value 权重为：
+树 Value 权重使用同一预算份额：
 
 $$
-w_T(s)=w_P(s)c_T(s)
+w_T(s)=w_P(s)
 $$
 
-因此每棵树满足 $\sum_s w_T(s)\leq1$。所有展开节点都使用 $\overline V_T(s)$ 训练反事实 Value，真实自对弈根另外保留权重为 1 的 TD target。Value loss 为：
+因此每棵树满足 $\sum_s w_T(s)=1$。覆盖率 $c_T(s)$ 只用于诊断；未展开动作已经通过冻结 $V+A$ 留在 $\overline V_T(s)$ 中，有限树预算会自然缩小修正。所有展开节点使用 $\overline V_T(s)$ 训练 Value：
 
 $$
 L_V=
-\frac{
-\sum_s w_{TD}(s)\rho(V_{new}(s)-G_t(s))+
-\sum_s w_T(s)\rho(V_{new}(s)-\overline V_T(s))
-}{
-\sum_s(w_{TD}(s)+w_T(s))
-}
+\frac{\sum_s w_T(s)\rho(V_{new}(s)-\overline V_T(s))}
+{\sum_s w_T(s)}
 $$
 
 每个已展开节点及其精确子状态同时训练 Policy、Value、Advantage 与 latent transition。Dueling-Q 和 imagined Value 直接拟合同一份 $Q_T$，避免通过另一组 Value target 重构动作值。FCPI 损失为：
@@ -1114,9 +1121,17 @@ $$
 
 其中每条树边都通过精确棋规生成 $s'$，并写入 `candidate_next_states`。$L_D$ 使用与监督训练相同的 latent cosine consistency。动作条件 dynamics 对树中每个已展开节点学习一步转移 $E(s)\rightarrow E(s')$，与 $K=2$ anchored latent MCTS 的运行时假设保持一致。
 
-Melano FCPI HDF5 分别保存 `td_value_targets`、`tree_value_targets`、`td_value_weights`、`tree_value_weights` 和 `candidate_q`。训练日志分别输出 `value_td`、`value_tree`、合并后的 `value`、`dueling_q`、`dynamics` 与 `imagined_value`。summary 使用与 Melano backend 对应的 `mean_abs_advantage`、`max_abs_advantage`、`mean_policy_kl`、`mean_policy_total_variation` 与 `policy_top1_change_rate` 描述策略更新。
+Melano FCPI HDF5 保存 `tree_value_targets`、`tree_value_weights`、`candidate_q` 和逐动作的 `candidate_weights`。完整对局事实已经写入对应动作的 `candidate_q`，不建立一份与 Melano Value 定义冲突的独立 Monte Carlo Value 数据集。训练日志输出 `policy`、`value`、`dueling_q`、`dynamics`、`imagined_value` 与总损失。summary 另外记录终局边、真实动作边、反事实覆盖率、Advantage 幅度、Policy 总变差距离与 top-1 改变率。
 
-Melano 每轮依次执行自身 `current.pth` 自对战、局面采样、树一致反事实展开、PVA 与 latent-dynamics 目标构造、candidate 训练和 paired-game arena。每次运行由程序生成 `fcpi_YYYYMMDD_HHMMSS_id`，创建对应的 `data/runs/<run-id>/` 与 `models/runs/<run-id>/`。其中 HDF5 schema、candidate 和 current checkpoint 均属于 Melano，candidate 达到 arena gate 后原子写入该 run 的 `current.pth`。`summary.json` 记录预算、决策节点数、评价边数、最大深度和 arena 结果。
+Melano 每轮依次执行自身 `current.pth` 自对战、完整轨迹事实回传、局面去重、事实锚定反事实展开、Policy/Value/Advantage 与 latent-dynamics 目标构造、candidate 训练和 paired-game arena。每次运行由程序生成 `fcpi_YYYYMMDD_HHMMSS_id`，创建对应的 `data/runs/<run-id>/` 与 `models/runs/<run-id>/`。其中 HDF5 schema、candidate 和 current checkpoint 均属于 Melano，candidate 达到 arena gate 后原子写入该 run 的 `current.pth`。`summary.json` 记录预算、决策节点数、终局/事实边数、评价边数、最大深度和 arena 结果。
+
+云端可用同一组默认参数后台启动：
+
+```bash
+bash scripts/melano_fcpi.sh
+```
+
+参数通过环境变量覆盖，例如 `GAMES_PER_ITER=2000 BATCH_SIZE=512 bash scripts/melano_fcpi.sh`。脚本会打印 run id、PID、日志路径、`tail` 命令和停止命令。
 
 ## 6. UCI
 

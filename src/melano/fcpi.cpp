@@ -12,9 +12,8 @@ int main(int argc, char **argv) {
 			std::cout
 				<< "Usage: fcpi --model <melano.pth> [options]\n"
 				<< "  --iterations <n> --games-per-iter <n> --games-in-flight <n> --max-plies <n>\n"
-				<< "  --positions-per-game <n> --opening-book <path|empty> --startpos-fraction "
-				   "<x>\n"
-				<< "  --counterfactual-budget <n> --td-lambda <x> --behavior-temperature <x>\n"
+				<< "  --opening-book <path|empty> --startpos-fraction <x>\n"
+				<< "  --counterfactual-budget <n> --behavior-temperature <x>\n"
 				<< "  --uniform-mix <x> --policy-weight <x> --value-weight <x>\n"
 				<< "  --dueling-q-weight <x> --dynamics-weight <x> "
 					 "--imagined-value-weight <x>\n"
@@ -37,7 +36,6 @@ int main(int argc, char **argv) {
 		options.games_per_iter = args.get_int("games-per-iter", options.games_per_iter);
 		options.games_in_flight = args.get_int("games-in-flight", options.games_in_flight);
 		options.max_plies = args.get_int("max-plies", options.max_plies);
-		options.positions_per_game = args.get_int("positions-per-game", options.positions_per_game);
 		options.opening_book = args.get("opening-book", options.opening_book);
 		options.startpos_fraction = args.get_double("startpos-fraction", options.startpos_fraction);
 		options.book_plies = args.get_int("book-plies", options.book_plies);
@@ -48,7 +46,6 @@ int main(int argc, char **argv) {
 			args.get_int("target-records-per-batch", options.target_records_per_batch);
 		options.counterfactual_budget =
 			args.get_int("counterfactual-budget", options.counterfactual_budget);
-		options.td_lambda = args.get_double("td-lambda", options.td_lambda);
 		options.behavior_temperature =
 			args.get_double("behavior-temperature", options.behavior_temperature);
 		options.uniform_mix = args.get_double("uniform-mix", options.uniform_mix);

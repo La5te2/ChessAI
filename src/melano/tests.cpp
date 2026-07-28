@@ -123,6 +123,15 @@ int main() {
 		chess::Board insufficient("7k/8/8/8/8/8/8/K7 w - - 0 1");
 		require(melano::game_termination(insufficient) == "insufficient material",
 				"insufficient-material termination mismatch");
+		chess::Board bishop_only("7k/8/8/8/8/8/8/KB6 w - - 0 1");
+		require(melano::game_termination(bishop_only) == "insufficient material",
+				"king-and-bishop termination mismatch");
+		chess::Board knight_only("7k/8/8/8/8/8/8/KN6 w - - 0 1");
+		require(melano::game_termination(knight_only) == "insufficient material",
+				"king-and-knight termination mismatch");
+		chess::Board bishop_vs_knight("6nk/8/8/8/8/8/8/KB6 w - - 0 1");
+		require(!melano::game_is_over(bishop_vs_knight),
+				"king-and-bishop versus king-and-knight was incorrectly adjudicated");
 
 		chess::Board fifty_move("7k/8/8/8/8/8/6R1/K7 b - - 100 1");
 		require(melano::game_termination(fifty_move) == "fifty move rule",

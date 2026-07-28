@@ -70,15 +70,6 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--opening-book", default="data/openings.gen.bin")
     result.add_argument("--book-plies", type=int, default=8)
     result.add_argument("--max-book-positions", type=int, default=50000)
-    result.add_argument(
-        "--search-type", default="closed", choices=("closed", "only-mcts")
-    )
-    result.add_argument("--sims", type=int, default=0)
-    result.add_argument("--mcts-batch-size", type=int, default=512)
-    result.add_argument("--movetime-ms", type=float, default=0.0)
-    result.add_argument("--mcts-games", type=int, default=2)
-    result.add_argument("--mcts-sims", type=int, default=10000)
-    result.add_argument("--mcts-movetime-ms", type=float, default=0.0)
     result.add_argument("--repetition-policy-penalty", type=float, default=1.0)
     result.add_argument("--instant-mate-first", type=int, default=1, choices=(0, 1))
     result.add_argument("--seed", type=int, default=2026)
@@ -140,7 +131,7 @@ def run_arena(command: list[str], log, phase: str) -> dict:
 
 
 def main() -> int:
-    """Run the closed benchmark followed by a two-game startpos MCTS match."""
+    """Run the paired Arena benchmark recorded by an FCPI run."""
     args = parser().parse_args()
     summary_path = (
         repository_path(args.summary) if args.summary else latest_fcpi_summary()
@@ -177,7 +168,6 @@ def main() -> int:
     output.mkdir(parents=True, exist_ok=False)
     log_path = output / "info.log"
     closed_pgn_path = output / "closed.pgn"
-    mcts_pgn_path = output / "startpos-mcts.pgn"
     result_path = output / "summary.json"
 
     common_command = [
@@ -190,10 +180,6 @@ def main() -> int:
         args.device,
         "--precision",
         precision,
-        "--max-plies",
-        str(args.max_plies),
-        "--mcts-batch-size",
-        str(args.mcts_batch_size),
         "--repetition-policy-penalty",
         str(args.repetition_policy_penalty),
         "--instant-mate-first",
@@ -206,6 +192,8 @@ def main() -> int:
     closed_command = common_command + [
         "--games",
         str(args.games),
+        "--max-plies",
+        str(args.max_plies),
         "--games-in-flight",
         str(args.games_in_flight),
         "--opening-book",
@@ -215,56 +203,28 @@ def main() -> int:
         "--max-book-positions",
         str(args.max_book_positions),
         "--search-type",
-        args.search_type,
+        "closed",
         "--sims",
-        str(args.sims),
+        "0",
         "--movetime-ms",
-        str(args.movetime_ms),
+        "0",
         "--pgn-output",
         str(closed_pgn_path),
         "--log-every",
         str(args.log_every),
     ]
-    mcts_command = common_command + [
-        "--games",
-        str(args.mcts_games),
-        "--games-in-flight",
-        str(args.mcts_games),
-        "--opening-book",
-        "",
-        "--book-plies",
-        str(args.book_plies),
-        "--max-book-positions",
-        str(args.max_book_positions),
-        "--search-type",
-        "only-mcts",
-        "--sims",
-        str(args.mcts_sims),
-        "--movetime-ms",
-        str(args.mcts_movetime_ms),
-        "--pgn-output",
-        str(mcts_pgn_path),
-        "--log-every",
-        "1",
-    ]
-
     print("Gadus cumulative Arena test")
     print(f"summary={display_path(summary_path)}")
     print(f"candidate={display_path(candidate)}")
     print(f"baseline={display_path(baseline)}")
     print(
-        f"games={args.games} search_type={args.search_type} "
+        f"games={args.games} search_type=closed "
         f"device={args.device} precision={precision}"
-    )
-    print(
-        f"startpos_mcts_games={args.mcts_games} "
-        f"startpos_mcts_sims={args.mcts_sims}"
     )
     print(f"output={display_path(output)}")
 
     with log_path.open("w", encoding="utf-8", newline="") as log:
         closed_summary = run_arena(closed_command, log, "closed")
-        mcts_summary = run_arena(mcts_command, log, "startpos MCTS")
 
     result = {
         "source_summary": display_path(summary_path),
@@ -272,7 +232,6 @@ def main() -> int:
         "candidate": display_path(candidate),
         "baseline": display_path(baseline),
         "closed": closed_summary,
-        "startpos_mcts": mcts_summary,
     }
     result_path.write_text(
         json.dumps(result, indent=2, ensure_ascii=False) + "\n",
@@ -280,7 +239,6 @@ def main() -> int:
     )
     print(f"result={display_path(result_path)}")
     print(f"closed_pgn={display_path(closed_pgn_path)}")
-    print(f"startpos_mcts_pgn={display_path(mcts_pgn_path)}")
     return 0
 
 
