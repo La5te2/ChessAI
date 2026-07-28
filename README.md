@@ -358,6 +358,14 @@ build/gadus/arena \
 
 `--games` 使用正偶数，使每个开局都能交换双方颜色完成配对。`--games-in-flight` 控制同时推进的对局数，candidate 与 baseline 各加载一次，轮到同一模型行棋的局面组成 inference batch。
 
+FCPI 完成后，可让最终 `current.pth` 与同一 run 开始时写入的 `initial.pth` 进行累计棋力测试：
+
+```bash
+python scripts/test.py
+```
+
+脚本默认读取 `data/runs/` 中最新的 FCPI `summary.json`，使用其中的 `current_model` 作为 candidate、`initial_model` 作为 baseline，并采用与 Gadus FCPI 验收一致的 `closed` paired Arena 参数。`--summary <path>` 可选择指定 run，`--candidate` 与 `--baseline` 可覆盖模型路径。每次测试在 `data/tests/gadus_vs_initial_<timestamp>/` 中写入 `summary.json`、`games.pgn` 和 `info.log`。
+
 从标准初始局面开始时，将开局书设为空：
 
 ```bash
