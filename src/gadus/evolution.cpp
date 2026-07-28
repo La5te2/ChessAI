@@ -793,11 +793,13 @@ void construct_targets(std::vector<Position> &records, Model model, const torch:
 					if (!child.terminal) {
 						const auto state = factual_returns.find(packed_key(node.state));
 						if (state != factual_returns.end()) {
-							const auto action = state->second.find(node.candidate_indices[slot]);
-							if (action != state->second.end() && action->second.count > 0) {
+							const auto return_entry =
+								state->second.find(node.candidate_indices[slot]);
+							if (return_entry != state->second.end() &&
+								return_entry->second.count > 0) {
 								q = static_cast<float>(
-									action->second.sum /
-									static_cast<double>(action->second.count));
+									return_entry->second.sum /
+									static_cast<double>(return_entry->second.count));
 								++summary.factual_edges;
 							}
 						}

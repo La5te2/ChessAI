@@ -7,6 +7,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 
 FCPI="${FCPI:-build/gadus/fcpi}"
+ARENA="${ARENA:-build/gadus/arena}"
 MODEL="${MODEL:-models/gadus/gadus.pth}"
 DEVICE="${DEVICE:-cuda}"
 PRECISION="${PRECISION:-bf16}"
@@ -67,6 +68,11 @@ if [[ ! -x "${FCPI}" ]]; then
 	echo "Run: bash scripts/build.sh" >&2
 	exit 1
 fi
+if [[ ! -x "${ARENA}" ]]; then
+	echo "Gadus Arena executable is missing: ${ARENA}" >&2
+	echo "Run: bash scripts/build.sh" >&2
+	exit 1
+fi
 if [[ ! -f "${MODEL}" ]]; then
 	echo "Gadus model is missing: ${MODEL}" >&2
 	exit 1
@@ -81,6 +87,10 @@ if [[ -n "${EVAL_OPENING_BOOK}" && ! -f "${EVAL_OPENING_BOOK}" ]]; then
 fi
 if [[ "${DEVICE}" == "cuda" ]] && ! command -v nvidia-smi >/dev/null 2>&1; then
 	echo "CUDA was requested but nvidia-smi is unavailable." >&2
+	exit 1
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+	echo "python3 is required to merge the final Arena report into summary.json." >&2
 	exit 1
 fi
 
@@ -122,6 +132,101 @@ COMMAND=(
 	--seed "${SEED}"
 )
 
+run_pipeline() {
+	local fcpi_capture
+	local arena_capture
+	local run_id
+	local run_dir
+	local summary
+	local pgn
+	local -a children
+	mkdir -p data/runs
+	fcpi_capture="$(mktemp "data/runs/.gadus_fcpi_capture_XXXXXX.log")"
+	arena_capture=""
+	cleanup_pipeline() {
+		mapfile -t children < <(jobs -pr)
+		if (( ${#children[@]} > 0 )); then
+			kill "${children[@]}" 2>/dev/null || true
+		fi
+		rm -f -- "${fcpi_capture}"
+		if [[ -n "${arena_capture}" ]]; then
+			rm -f -- "${arena_capture}"
+		fi
+	}
+	abort_pipeline() {
+		trap - EXIT TERM INT
+		cleanup_pipeline
+		exit 143
+	}
+	trap cleanup_pipeline EXIT
+	trap abort_pipeline TERM INT
+
+	"${COMMAND[@]}" 2>&1 | tee "${fcpi_capture}"
+	run_id="$(sed -n 's/^fcpi run id: //p' "${fcpi_capture}" | head -n 1)"
+	if [[ -z "${run_id}" ]]; then
+		echo "FCPI completed without reporting a run id." >&2
+		exit 1
+	fi
+	run_dir="data/runs/${run_id}"
+	summary="${run_dir}/summary.json"
+	pgn="${run_dir}/current_vs_initial.pgn"
+	arena_capture="$(mktemp "${run_dir}/.final_arena_XXXXXX.log")"
+
+	echo "fcpi final arena: current=models/runs/${run_id}/current.pth initial=models/runs/${run_id}/initial.pth games=${EVAL_GAMES}"
+	"${ARENA}" \
+		--candidate "models/runs/${run_id}/current.pth" \
+		--baseline "models/runs/${run_id}/initial.pth" \
+		--device "${DEVICE}" \
+		--precision "${PRECISION}" \
+		--games "${EVAL_GAMES}" \
+		--games-in-flight "${EVAL_GAMES_IN_FLIGHT}" \
+		--max-plies "${EVAL_MAX_PLIES}" \
+		--opening-book "${EVAL_OPENING_BOOK}" \
+		--book-plies "${EVAL_BOOK_PLIES}" \
+		--max-book-positions "${EVAL_MAX_BOOK_POSITIONS}" \
+		--search-type closed \
+		--sims 0 \
+		--mcts-batch-size "${EVAL_MCTS_BATCH_SIZE}" \
+		--movetime-ms 0 \
+		--repetition-policy-penalty "${EVAL_REPETITION_POLICY_PENALTY}" \
+		--instant-mate-first "${EVAL_INSTANT_MATE_FIRST}" \
+		--min-net-wins 0 \
+		--pgn-output "${pgn}" \
+		--seed "$((SEED + ITERATIONS + 1))" \
+		--log-every "${LOG_EVERY}" \
+		2>&1 | tee "${arena_capture}"
+
+	python3 - "${summary}" "${arena_capture}" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+summary_path = Path(sys.argv[1])
+arena_log = Path(sys.argv[2]).read_text(encoding="utf-8")
+marker = "arena summary:\n"
+if marker not in arena_log:
+	raise RuntimeError("final Arena output does not contain a JSON summary")
+arena = json.loads(arena_log.rsplit(marker, 1)[1])
+for key in ("accepted", "result_ok", "min_net_wins"):
+	arena.pop(key, None)
+arena["informational"] = True
+summary = json.loads(summary_path.read_text(encoding="utf-8"))
+summary["final_arena"] = arena
+temporary = summary_path.with_suffix(summary_path.suffix + ".tmp")
+temporary.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+os.replace(temporary, summary_path)
+PY
+	echo "fcpi final arena merged: ${summary}"
+	cleanup_pipeline
+	trap - EXIT TERM INT
+}
+
+if [[ "${1:-}" == "--pipeline" ]]; then
+	run_pipeline
+	exit 0
+fi
+
 mkdir -p data/runs
 LAUNCH_LOG="data/runs/.gadus_fcpi_$(date +%Y%m%d_%H%M%S)_$$.log"
 
@@ -131,8 +236,9 @@ echo "self-play: games=${GAMES_PER_ITER} games_in_flight=${GAMES_IN_FLIGHT} max_
 echo "counterfactual: deep_budget_per_root=${COUNTERFACTUAL_BUDGET}"
 echo "training: batch_size=${BATCH_SIZE} epochs=${EPOCHS} max_steps=${TRAIN_MAX_STEPS} lr=${LEARNING_RATE}"
 echo "arena: games=${EVAL_GAMES} search_type=${EVAL_SEARCH_TYPE} sims=${EVAL_SIMS} min_net_wins=${EVAL_MIN_NET_WINS}"
+echo "final arena: current vs initial games=${EVAL_GAMES} search_type=closed informational=true"
 
-nohup "${COMMAND[@]}" >"${LAUNCH_LOG}" 2>&1 < /dev/null &
+nohup bash "${BASH_SOURCE[0]}" --pipeline >"${LAUNCH_LOG}" 2>&1 < /dev/null &
 PID=$!
 
 RUN_ID=""

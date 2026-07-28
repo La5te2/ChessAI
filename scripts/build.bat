@@ -74,6 +74,8 @@ for %%A in (gadus melano) do (
 		copy /y "%%~fF" "%PUBLISH_DIR%\%%A\%%~nxF" >nul || goto :failed
 	)
 )
+if not exist "%WORK_DIR%\gadus\brci.exe" goto :failed
+copy /y "%WORK_DIR%\gadus\brci.exe" "%PUBLISH_DIR%\gadus\brci.exe" >nul || goto :failed
 
 if "%BUILD_GRAPHICS%"=="ON" (
 	if not exist "%WORK_DIR%\graphics\Gadidae.exe" goto :failed
