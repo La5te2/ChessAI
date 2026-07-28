@@ -12,12 +12,10 @@ int main(int argc, char **argv) {
 			std::cout
 				<< "Usage: fcpi --model <gadus.pth> [options]\n"
 				<< "  --iterations <n> --games-per-iter <n> --games-in-flight <n> --max-plies <n>\n"
-				<< "  --positions-per-game <n> --opening-book <path|empty> --startpos-fraction "
-				   "<x>\n"
-				<< "  --counterfactual-budget <n> --td-lambda <x> --behavior-temperature <x>\n"
-				<< "  --uniform-mix <x> --policy-weight <x> --value-weight <x>\n"
+				<< "  --opening-book <path|empty> --startpos-fraction <x>\n"
+				<< "  --counterfactual-budget <deep-edges> --behavior-temperature <x>\n"
 				<< "  --epochs <n> --train-max-steps <n>\n"
-				<< "  --batch-size <n> --lr <x> --weight-decay <x> --grad-clip <x>\n"
+				<< "  --batch-size <n> --lr <x>\n"
 				<< "  --eval-games <n> --eval-games-in-flight <n> --eval-max-plies <n>\n"
 				<< "  --eval-opening-book <path|empty> --eval-search-type <closed|only-mcts>\n"
 				<< "  --eval-sims <n> --eval-mcts-batch-size <n> --eval-movetime-ms <ms>\n"
@@ -35,7 +33,6 @@ int main(int argc, char **argv) {
 		options.games_per_iter = args.get_int("games-per-iter", options.games_per_iter);
 		options.games_in_flight = args.get_int("games-in-flight", options.games_in_flight);
 		options.max_plies = args.get_int("max-plies", options.max_plies);
-		options.positions_per_game = args.get_int("positions-per-game", options.positions_per_game);
 		options.opening_book = args.get("opening-book", options.opening_book);
 		options.startpos_fraction = args.get_double("startpos-fraction", options.startpos_fraction);
 		options.book_plies = args.get_int("book-plies", options.book_plies);
@@ -46,18 +43,12 @@ int main(int argc, char **argv) {
 			args.get_int("target-records-per-batch", options.target_records_per_batch);
 		options.counterfactual_budget =
 			args.get_int("counterfactual-budget", options.counterfactual_budget);
-		options.td_lambda = args.get_double("td-lambda", options.td_lambda);
 		options.behavior_temperature =
 			args.get_double("behavior-temperature", options.behavior_temperature);
-		options.uniform_mix = args.get_double("uniform-mix", options.uniform_mix);
-		options.policy_weight = args.get_double("policy-weight", options.policy_weight);
-		options.value_weight = args.get_double("value-weight", options.value_weight);
 		options.epochs = args.get_int("epochs", options.epochs);
 		options.train_max_steps = args.get_int64("train-max-steps", options.train_max_steps);
 		options.batch_size = args.get_int("batch-size", options.batch_size);
 		options.learning_rate = args.get_double("lr", options.learning_rate);
-		options.weight_decay = args.get_double("weight-decay", options.weight_decay);
-		options.grad_clip = args.get_double("grad-clip", options.grad_clip);
 		options.log_every = args.get_int("log-every", options.log_every);
 		options.seed = static_cast<std::uint64_t>(args.get_int64("seed", options.seed));
 

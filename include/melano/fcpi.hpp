@@ -12,7 +12,7 @@
 namespace melano {
 
 struct FcpiOptions {
-	std::filesystem::path model = "models/melano.pth";
+	std::filesystem::path model = "models/melano/melano.pth";
 	std::string device = "auto";
 	ComputePrecision precision = ComputePrecision::Fp32;
 	int iterations = 1;

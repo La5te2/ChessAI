@@ -72,7 +72,7 @@ void preprocess_pgn(const PreprocessOptions &options);
 
 struct TrainOptions {
 	std::filesystem::path data = "data/games.melano.h5";
-	std::filesystem::path output = "models/melano.pth";
+	std::filesystem::path output = "models/melano/melano.pth";
 	int channels = 128;
 	int blocks = 10;
 	int epochs = 10;

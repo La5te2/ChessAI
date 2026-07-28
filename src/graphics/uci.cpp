@@ -678,7 +678,7 @@ void UciEngine::configure() {
 		if(key == "device" || key == "multipv") {
 			throw std::invalid_argument(
 				iterator.key() +
-				" is managed by its dedicated GUI field and must be removed from additional UCI options");
+				" is managed by its dedicated GUI field and must be removed from UCI options");
 		}
 		apply_option(iterator.key(), iterator.value());
 	}

@@ -22,7 +22,7 @@ int main(int argc, char **argv) {
 				<< "  --instant-mate-first <0|1> --root-topn <n>\n";
 			return 0;
 		}
-		const auto model_path = args.get("model", "models/melano.pth");
+		const auto model_path = args.get("model", "models/melano/melano.pth");
 		const auto device = melano::resolve_device(args.get("device", "auto"));
 		melano::SearchOptions options;
 		options.precision =

@@ -29,6 +29,7 @@
 #include <fstream>
 #include <functional>
 #include <iomanip>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -108,8 +109,8 @@ std::optional<std::filesystem::path> system_font_path() {
 	return std::nullopt;
 }
 
-/// Returns a writable per-user settings path on Windows and Linux.
-std::filesystem::path settings_path() {
+/// Returns the former per-user path used only for one-time config migration.
+std::filesystem::path legacy_settings_path() {
 #ifdef _WIN32
 	if(const auto appdata = environment_value("APPDATA")) {
 		return std::filesystem::path(*appdata) / "Gadidae" / "gui.json";
@@ -123,6 +124,40 @@ std::filesystem::path settings_path() {
 	}
 #endif
 	return std::filesystem::current_path() / "gadidae-gui.json";
+}
+
+/// Places portable GUI settings beside the running executable.
+std::filesystem::path executable_settings_path(const char *argument_zero) {
+	std::error_code error;
+	if(argument_zero != nullptr && argument_zero[0] != '\0') {
+		auto executable =
+			std::filesystem::absolute(std::filesystem::path(argument_zero), error);
+		if(!error) {
+			return executable.parent_path() / "gui.json";
+		}
+	}
+	return std::filesystem::current_path() / "gui.json";
+}
+
+/// Moves the former per-user config into the portable executable directory.
+void migrate_legacy_settings(const std::filesystem::path &destination) {
+	if(std::filesystem::exists(destination)) {
+		return;
+	}
+	const auto source = legacy_settings_path();
+	if(source == destination || !std::filesystem::is_regular_file(source)) {
+		return;
+	}
+	std::error_code error;
+	std::filesystem::create_directories(destination.parent_path(), error);
+	if(error) {
+		return;
+	}
+	std::filesystem::copy_file(source, destination,
+							   std::filesystem::copy_options::none, error);
+	if(!error) {
+		std::filesystem::remove(source, error);
+	}
 }
 
 /// Mutable board colors and presentation preferences stored with the GUI config.
@@ -219,6 +254,86 @@ bool toggle_switch(const char *label, bool &value) {
 	return pressed;
 }
 
+/// Draws one step button whose symbol is centered by geometry instead of font metrics.
+bool centered_step_button(const char *identifier, bool increment) {
+	const float side = ImGui::GetFrameHeight();
+	const bool pressed = ImGui::Button(identifier, {side, side});
+	const ImVec2 minimum = ImGui::GetItemRectMin();
+	const ImVec2 maximum = ImGui::GetItemRectMax();
+	const ImVec2 center = {
+		(minimum.x + maximum.x) * 0.5F,
+		(minimum.y + maximum.y) * 0.5F,
+	};
+	const float half_extent = side * 0.12F;
+	const float thickness = std::max(1.5F, side * 0.045F);
+	const auto color = ImGui::GetColorU32(ImGuiCol_Text);
+	auto *draw = ImGui::GetWindowDrawList();
+	draw->AddLine({center.x - half_extent, center.y},
+				  {center.x + half_extent, center.y}, color, thickness);
+	if(increment) {
+		draw->AddLine({center.x, center.y - half_extent},
+					  {center.x, center.y + half_extent}, color, thickness);
+	}
+	return pressed;
+}
+
+/// Edits one signed integer with geometrically centered decrement and increment controls.
+bool step_input(const char *label, int &value) {
+	ImGui::PushID(label);
+	const auto &style = ImGui::GetStyle();
+	const float button_extent = ImGui::GetFrameHeight();
+	const float input_width =
+		std::max(1.0F, ImGui::CalcItemWidth() -
+						   2.0F * (button_extent + style.ItemInnerSpacing.x));
+	ImGui::SetNextItemWidth(input_width);
+	bool changed =
+		ImGui::InputScalar("##value", ImGuiDataType_S32, &value, nullptr, nullptr);
+	ImGui::SameLine(0.0F, style.ItemInnerSpacing.x);
+	if(centered_step_button("##decrement", false) &&
+	   value > std::numeric_limits<int>::min()) {
+		--value;
+		changed = true;
+	}
+	ImGui::SameLine(0.0F, style.ItemInnerSpacing.x);
+	if(centered_step_button("##increment", true) &&
+	   value < std::numeric_limits<int>::max()) {
+		++value;
+		changed = true;
+	}
+	ImGui::SameLine(0.0F, style.ItemInnerSpacing.x);
+	ImGui::TextUnformatted(label);
+	ImGui::PopID();
+	return changed;
+}
+
+/// Edits one unsigned integer with geometrically centered decrement and increment controls.
+bool step_input(const char *label, std::uint64_t &value) {
+	ImGui::PushID(label);
+	const auto &style = ImGui::GetStyle();
+	const float button_extent = ImGui::GetFrameHeight();
+	const float input_width =
+		std::max(1.0F, ImGui::CalcItemWidth() -
+						   2.0F * (button_extent + style.ItemInnerSpacing.x));
+	ImGui::SetNextItemWidth(input_width);
+	bool changed =
+		ImGui::InputScalar("##value", ImGuiDataType_U64, &value, nullptr, nullptr);
+	ImGui::SameLine(0.0F, style.ItemInnerSpacing.x);
+	if(centered_step_button("##decrement", false) && value > 0) {
+		--value;
+		changed = true;
+	}
+	ImGui::SameLine(0.0F, style.ItemInnerSpacing.x);
+	if(centered_step_button("##increment", true) &&
+	   value < std::numeric_limits<std::uint64_t>::max()) {
+		++value;
+		changed = true;
+	}
+	ImGui::SameLine(0.0F, style.ItemInnerSpacing.x);
+	ImGui::TextUnformatted(label);
+	ImGui::PopID();
+	return changed;
+}
+
 /// Draws a compact clipboard command using two overlapping document outlines.
 bool copy_button(const char *identifier) {
 	ImGui::PushID(identifier);
@@ -310,7 +425,7 @@ void read_engine_json(const nlohmann::json &json, EngineConfig &config) {
 nlohmann::json additional_uci_options(const std::string &text) {
 	const auto options = nlohmann::json::parse(text.empty() ? "{}" : text);
 	if(!options.is_object()) {
-		throw std::invalid_argument("Additional UCI options must be a JSON object");
+		throw std::invalid_argument("UCI options must be a JSON object");
 	}
 	for(auto iterator = options.begin(); iterator != options.end(); ++iterator) {
 		std::string key = iterator.key();
@@ -320,7 +435,7 @@ nlohmann::json additional_uci_options(const std::string &text) {
 		if(key == "device" || key == "multipv") {
 			throw std::invalid_argument(
 				iterator.key() +
-				" is managed by its dedicated field and must be removed from additional UCI options");
+				" is managed by its dedicated field and must be removed from UCI options");
 		}
 	}
 	return options;
@@ -733,8 +848,11 @@ void apply_style(Theme theme) {
 /// Main application state and frame renderer.
 class Application {
 public:
-	/// Loads persisted settings, then applies supported command-line overrides.
-	Application(int argc, char **argv) {
+	/// Loads portable settings, then applies supported command-line overrides.
+	Application(int argc, char **argv)
+		: settings_path_(
+			  executable_settings_path(argc > 0 ? argv[0] : nullptr)) {
+		migrate_legacy_settings(settings_path_);
 		load_settings();
 		parse_arguments(argc, argv);
 		apply_style(theme_);
@@ -913,12 +1031,11 @@ private:
 
 	/// Loads user settings while treating a malformed file as recoverable.
 	void load_settings() {
-		const auto path = settings_path();
-		if(!std::filesystem::exists(path)) {
+		if(!std::filesystem::exists(settings_path_)) {
 			return;
 		}
 		try {
-			std::ifstream input(path);
+			std::ifstream input(settings_path_);
 			const auto json = nlohmann::json::parse(input);
 			if(json.contains("simulator")) {
 				read_engine_json(json["simulator"], simulator_.config());
@@ -983,7 +1100,7 @@ private:
 		}
 	}
 
-	/// Atomically replaces the per-user JSON settings file.
+	/// Atomically replaces the portable JSON settings file.
 	void save_settings() {
 		const auto color_json = [](const ImVec4 &color) {
 			return nlohmann::json::array({color.x, color.y, color.z, color.w});
@@ -1015,16 +1132,15 @@ private:
 			  {"auto_font_scale", appearance_.auto_font_scale},
 			  {"piece_style", appearance_.piece_style}}},
 		};
-		const auto path = settings_path();
-		std::filesystem::create_directories(path.parent_path());
-		const auto temporary = path.string() + ".tmp";
+		std::filesystem::create_directories(settings_path_.parent_path());
+		const auto temporary = settings_path_.string() + ".tmp";
 		{
 			std::ofstream output(temporary, std::ios::trunc);
 			output << std::setw(2) << json << '\n';
 		}
 		std::error_code error;
-		std::filesystem::remove(path, error);
-		std::filesystem::rename(temporary, path);
+		std::filesystem::remove(settings_path_, error);
+		std::filesystem::rename(temporary, settings_path_);
 	}
 
 	/// Draws conventional application menus while keeping the work area uncluttered.
@@ -1790,10 +1906,10 @@ private:
 		}
 		ImGui::Spacing();
 		ImGui::SeparatorText("Search");
-		ImGui::InputInt("Move time (ms)", &config.movetime_ms);
-		ImGui::InputScalar("Node limit", ImGuiDataType_U64, &config.node_limit);
-		ImGui::InputInt("Analysis lines (MultiPV)", &config.multipv);
-		ImGui::InputInt("Display update (ms)", &config.progress_interval_ms);
+		step_input("Move time (ms)", config.movetime_ms);
+		step_input("Node / simulation limit", config.node_limit);
+		step_input("Analysis lines (MultiPV)", config.multipv);
+		step_input("Display update (ms)", config.progress_interval_ms);
 		config.movetime_ms = std::max(0, config.movetime_ms);
 		config.multipv = std::max(1, config.multipv);
 		config.progress_interval_ms = std::max(50, config.progress_interval_ms);
@@ -1801,7 +1917,10 @@ private:
 		ImGui::SeparatorText("UCI options");
 		ImGui::TextDisabled(
 			"JSON values become setoption commands after launch. Device and MultiPV are managed above.");
-		ImGui::InputTextMultiline("##options", &config.options, {-1.0F, 90.0F});
+		const float options_height =
+			std::max(180.0F, ImGui::GetTextLineHeightWithSpacing() * 10.0F);
+		ImGui::InputTextMultiline("##options", &config.options,
+								  {-1.0F, options_height});
 		ImGui::Spacing();
 		if(ImGui::CollapsingHeader("Launch arguments")) {
 			ImGui::TextDisabled(
@@ -1904,13 +2023,11 @@ private:
 					ImGui::EndTabItem();
 				}
 				if(ImGui::BeginTabItem("Match")) {
-					ImGui::InputInt("Initial time (minutes)",
-									&new_clock_minutes_);
-					ImGui::InputInt("Increment (seconds)",
-									&new_increment_seconds_);
+					step_input("Initial time (minutes)", new_clock_minutes_);
+					step_input("Increment (seconds)", new_increment_seconds_);
 					ImGui::TextDisabled("An initial time of 0 disables the clock.");
-					ImGui::InputInt("Display delay (ms)", &new_delay_);
-					ImGui::InputInt("Maximum plies", &new_max_plies_);
+					step_input("Display delay (ms)", new_delay_);
+					step_input("Maximum plies", new_max_plies_);
 					new_clock_minutes_ = std::max(0, new_clock_minutes_);
 					new_increment_seconds_ =
 						std::max(0, new_increment_seconds_);
@@ -2119,12 +2236,11 @@ private:
 			if(ImGui::BeginTabItem("Match")) {
 				ImGui::InputTextWithHint("Name", stadium().display_name().c_str(),
 									 &match_name_edit_);
-				ImGui::InputInt("Initial time (minutes)", &clock_minutes_edit_);
-				ImGui::InputInt("Increment (seconds)",
-								&clock_increment_seconds_edit_);
+				step_input("Initial time (minutes)", clock_minutes_edit_);
+				step_input("Increment (seconds)", clock_increment_seconds_edit_);
 				ImGui::TextDisabled("An initial time of 0 disables the clock.");
-				ImGui::InputInt("Display delay (ms)", &delay_edit_);
-				ImGui::InputInt("Maximum plies", &max_plies_edit_);
+				step_input("Display delay (ms)", delay_edit_);
+				step_input("Maximum plies", max_plies_edit_);
 				clock_minutes_edit_ = std::max(0, clock_minutes_edit_);
 				clock_increment_seconds_edit_ =
 					std::max(0, clock_increment_seconds_edit_);
@@ -2238,6 +2354,7 @@ private:
 		}
 	}
 
+	std::filesystem::path settings_path_;
 	Mode mode_ = Mode::Simulator;
 	Mode settings_mode_ = Mode::Simulator;
 	Mode position_mode_ = Mode::Simulator;

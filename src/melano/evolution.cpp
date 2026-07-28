@@ -890,10 +890,6 @@ void construct_targets(std::vector<Position> &records, Model model, const torch:
 					  ? summary.mean_abs_advantage_sum / summary.policy_diagnostic_nodes
 					  : 0.0)
 			  << " max_abs_advantage=" << summary.max_abs_advantage
-			  << " mean_policy_kl="
-			  << (summary.policy_diagnostic_nodes > 0
-					  ? summary.policy_kl_sum / summary.policy_diagnostic_nodes
-					  : 0.0)
 			  << " mean_policy_total_variation="
 			  << (summary.policy_diagnostic_nodes > 0
 					  ? summary.policy_total_variation_sum /

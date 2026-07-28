@@ -16,7 +16,7 @@ pushd "%ROOT%" || exit /b 1
 
 for %%I in ("%MODEL_ARG%") do set "MODEL=%%~fI"
 set "UCI=%ROOT%\build\%ARCH%\uci.exe"
-set "OUTPUT=%ROOT%\models\gadidae\%ARCH%"
+set "OUTPUT=%ROOT%\models\%ARCH%"
 
 if not exist "%MODEL%" (
 	echo Model not found: %MODEL%
@@ -32,7 +32,9 @@ if not exist "%UCI%" (
 
 if not exist "%OUTPUT%" mkdir "%OUTPUT%"
 copy /Y "%UCI%" "%OUTPUT%\%ARCH%.exe" >nul || goto :copy_error
-copy /Y "%MODEL%" "%OUTPUT%\%ARCH%.pth" >nul || goto :copy_error
+if /I not "%MODEL%"=="%OUTPUT%\%ARCH%.pth" (
+	copy /Y "%MODEL%" "%OUTPUT%\%ARCH%.pth" >nul || goto :copy_error
+)
 for %%F in ("%ROOT%\build\%ARCH%\*.dll") do (
 	copy /Y "%%~fF" "%OUTPUT%\%%~nxF" >nul || goto :copy_error
 )

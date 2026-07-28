@@ -26,7 +26,7 @@ if [[ ! -f "$MODEL_ARG" ]]; then
 fi
 MODEL="$(realpath "$MODEL_ARG")"
 UCI="$ROOT/build/$ARCH/uci"
-OUTPUT="$ROOT/models/gadidae/$ARCH"
+OUTPUT="$ROOT/models/$ARCH"
 LIB_OUTPUT="$OUTPUT/lib"
 BINARY="$OUTPUT/$ARCH.bin"
 LAUNCHER="$OUTPUT/$ARCH"
@@ -39,7 +39,9 @@ fi
 
 mkdir -p "$OUTPUT" "$LIB_OUTPUT"
 cp -f "$UCI" "$BINARY"
-cp -f "$MODEL" "$OUTPUT/$ARCH.pth"
+if [[ "$MODEL" != "$OUTPUT/$ARCH.pth" ]]; then
+	cp -f "$MODEL" "$OUTPUT/$ARCH.pth"
+fi
 
 for library_dir in \
 	"$ROOT/api/libtorch/lib" \

@@ -47,8 +47,8 @@ build/
 	graphics/
 data/
 models/
-	gadidae/
 	gadus/
+	melano/
 	stockfish/
 ```
 
@@ -62,9 +62,8 @@ models/
 - `build/gadus/`、`build/melano/`：可直接运行的架构程序与运行 DLL。
 - `build/graphics/`：原生 Gadidae 图形程序与图形运行库。
 - `data/`：PGN、HDF5、开局书、分析结果和运行数据。
-- `models/gadus/`：Gadus LibTorch checkpoint。
-- `models/gadidae/gadus/`、`models/gadidae/melano/`：可直接注册到 UCI 客户端的架构引擎、checkpoint 与运行库。
-- `models/stockfish/`：UCI 教师机。
+- `models/gadus/`、`models/melano/`：各架构的 LibTorch checkpoint，以及可直接注册到 UCI 客户端的引擎与运行库。
+- `models/stockfish/`：UCI 引擎示例。
 
 Gadus 与 Melano 的数据定义、数学公式和运行方法分别写在第 4、5 节。
 
@@ -407,7 +406,6 @@ build/gadus/fcpi \
 	--games-per-iter 1000 \
 	--games-in-flight 64 \
 	--max-plies 240 \
-	--positions-per-game 200 \
 	--opening-book data/openings.gen.bin \
 	--startpos-fraction 0.2 \
 	--book-plies 8 \
@@ -415,17 +413,11 @@ build/gadus/fcpi \
 	--inference-batch-size 64 \
 	--target-records-per-batch 256 \
 	--counterfactual-budget 24 \
-	--td-lambda 0.8 \
 	--behavior-temperature 1.0 \
-	--uniform-mix 0.03 \
-	--policy-weight 1.0 \
-	--value-weight 1.0 \
 	--epochs 15 \
 	--train-max-steps 2000 \
 	--batch-size 256 \
 	--lr 0.00002 \
-	--weight-decay 0.0001 \
-	--grad-clip 1.0 \
 	--eval-games 400 \
 	--eval-games-in-flight 32 \
 	--eval-max-plies 240 \
@@ -436,62 +428,81 @@ build/gadus/fcpi \
 	--eval-sims 0 \
 	--eval-mcts-batch-size 64 \
 	--eval-movetime-ms 0 \
-	--eval-c-puct 0.5 \
-	--eval-c-puct-base 19652 \
-	--eval-c-puct-factor 1.0 \
-	--eval-fpu-reduction 0.15 \
-	--eval-repetition-policy-penalty 0.0 \
-	--eval-instant-mate-first 0 \
+	--eval-repetition-policy-penalty 1.0 \
+	--eval-instant-mate-first 1 \
 	--eval-min-net-wins 4 \
 	--log-every 50 \
 	--seed 2026
 ```
 
-每轮 FCPI 使用 `current.pth` 进行模型自对战。Gadus 的行为分布先做温度变换，再混入均匀探索：
+每轮 FCPI 使用冻结的 `current.pth` 进行模型自对战。Gadus 的行为分布只做温度变换：
 
 $$
-\widetilde\mu(a\mid s)=
+\mu(a\mid s)=
 \frac{P(a\mid s)^{1/T_b}}{\sum_bP(b\mid s)^{1/T_b}}
 $$
 
-$$
-\mu(a\mid s)=(1-\epsilon)\widetilde\mu(a\mid s)+
-\frac{\epsilon}{|\mathcal A(s)|}
-$$
+$T_b<1$ 使行为分布更集中于高 Policy 动作，$T_b=1$ 使用原 Policy 比例，$T_b>1$ 提高低 Policy 动作的采样概率。`behavior-temperature` 只控制真实自对弈，不控制反事实树的候选宽度。
 
-$T_b<1$ 使行为分布更集中于高 Policy 动作，$T_b=1$ 保持原 Policy 比例，$T_b>1$ 提高低 Policy 动作的采样概率。$\epsilon$ 对所有合法动作混入均匀概率，因此 `behavior-temperature` 控制真实自对弈的集中程度，不控制反事实树的 Gumbel 候选宽度。
-
-终局取真实 side-to-move 结果，截断局面取冻结模型 Value 作为 bootstrap。代码从后向前计算 TD($\lambda$)：
+同一编码局面第 $n$ 次出现时，FCPI 使用概率欠额分配动作：
 
 $$
-G_t=-\left[(1-\lambda_{TD})V(s_{t+1})+\lambda_{TD}G_{t+1}\right]
+a_n=\arg\max_a\left[n\mu(a\mid s)-N_{n-1}(s,a)\right]
 $$
 
-负号对应行棋方在每个 ply 的切换。每个被采样的真实局面建立一棵独立反事实树。`--counterfactual-budget` 表示每棵树最多评价多少条动作边，也是反事实树唯一的规模参数。节点的局部展开宽度由剩余预算自动确定：
+$N_{n-1}(s,a)$ 是此前该局面选择动作 $a$ 的次数。该调度使实际动作频率跟随 $\mu$，同时避免独立随机抽样持续漏掉某个正概率动作。只要同一局面继续出现，任意满足 $\mu(a\mid s)>0$ 的动作都会在有限次访问内取得样本。
+
+真实终局是无教师机自学习中直接来自棋规环境的事实信号。设终局 side-to-move 结果为 $z_T\in\{-1,0,1\}$，完整结束的对局对整条轨迹执行无 bootstrap 的 Monte Carlo 回传：
+
+$$
+G_T=z_T,\qquad G_t=-G_{t+1}
+$$
+
+负号对应行棋方在每个 ply 的切换。完整终局轨迹中所有真实局面的 Monte Carlo 权重为 $w_{MC}=1$。被 `max-plies` 截断的对局没有结果标签，因此 $w_{MC}=0$；其中的局面仍可作为反事实树根。
+
+每局按完整 Gadus 编码对局面去重，每个局面建立一棵独立反事实树。根节点一次评价全部合法动作，使任何合法动作都不会被 top-k 排除。`--counterfactual-budget` 表示根节点之外可评价的动作边数，也是深层反事实树唯一的规模参数。非根节点的局部展开宽度由剩余预算自动确定：
 
 $$
 w(s)=\min\left(|\mathcal A(s)|,B_{remain},
 \max\left(2,\left\lceil\sqrt{B_{remain}}\right\rceil\right)\right)
 $$
 
-根节点候选始终包含实际走法与 Policy top-1，其他节点始终包含 Policy top-1，其余位置通过 Gumbel top-k 无放回采样得到：
+非根节点始终选择 Policy top-1，其余位置通过 Gumbel top-k 无放回采样得到：
 
 $$
 \operatorname{key}(a)=\log(P(a\mid s)+\varepsilon)+g_a,
 \qquad g_a\sim\operatorname{Gumbel}(0,1)
 $$
 
-树使用冻结的 `current.pth` 批量评价精确棋盘子局面。已展开动作的价值为：
+树使用冻结的 `current.pth` 批量评价精确棋盘子局面。完整对局还会形成按局面与动作聚合的事实回报：
+
+$$
+\widehat G(s,a)=
+\frac{1}{N(s,a)}
+\sum_{i=1}^{N(s,a)}G_i(s,a)
+$$
+
+动作价值按信息强度依次确定：
+
+$$
+Q(s,a)=
+\begin{cases}
+z, & T(s,a)\text{ 是终局}\\
+\widehat G(s,a), & N(s,a)>0\\
+-\overline V(T(s,a)), & a\text{ 已展开}\\
+V_{old}(s), & a\text{ 未展开}
+\end{cases}
+$$
+
+终局边使用棋规给出的精确结果。事实回报是当前行为策略从该动作继续行棋至终局的 Monte Carlo 样本均值，它会取代该边错误的浅层 Value bootstrap。没有事实样本的已展开动作使用子树回传值，未展开动作使用冻结模型基线。
+
+对只有模型回传信息的已展开动作：
 
 $$
 Q(s,a)=-\overline V(T(s,a))
 $$
 
-其中 $\overline V$ 是子树从叶到根回传后的值。未展开动作保持冻结模型基线：
-
-$$
-Q(s,a)=V_{old}(s)
-$$
+其中 $\overline V$ 是子树从叶到根回传后的值。
 
 设冻结 Policy 下的局部均值为：
 
@@ -499,7 +510,7 @@ $$
 m(s)=\sum_aP_{old}(a\mid s)Q(s,a)
 $$
 
-Policy target 直接使用 Value 原生范围内的反事实 Advantage：
+局部 Policy target 使用 KL 正则化 Policy improvement：
 
 $$
 \pi^+(a\mid s)=
@@ -507,13 +518,57 @@ $$
 {\sum_bP_{old}(b\mid s)\exp\left(Q(s,b)-m(s)\right)}
 $$
 
-由于 $Q\in[-1,1]$，该更新不需要额外尺度参数。较小的 Value 差异只产生较小的 Policy 调整，明确的反事实差异才会显著改变动作排序。旧 Policy 已经作为乘性先验进入 $\pi^+$，KL 只作为 summary 诊断量，不进入训练损失。
+它等价于：
+
+$$
+\pi^+=\arg\max_\pi
+\left[
+\sum_a\pi(a\mid s)Q(s,a)
+-D_{KL}\left(\pi(\cdot\mid s)\,\|\,P_{old}(\cdot\mid s)\right)
+\right]
+$$
+
+KL 项只出现在 Policy target 的闭式构造中，用于限制一次有限预算规划对原 Policy 的偏离；训练总损失没有额外 KL 项。由于 $Q\in[-1,1]$，Policy improvement 直接使用 Value 原生尺度。
 
 Gadus 节点回传值为：
 
 $$
 \overline V(s)=\sum_a\pi^+(a\mid s)Q(s,a)
 $$
+
+定义反事实残差：
+
+$$
+\delta_{CF}(s)=\overline V(s)-V_{old}(s)
+$$
+
+由于未展开动作满足 $Q(s,a)=V_{old}(s)$，只有实际展开的动作能够贡献非零残差：
+
+$$
+\delta_{CF}(s)=
+\sum_{a\in E(s)}
+\pi^+(a\mid s)\left(Q(s,a)-V_{old}(s)\right)
+$$
+
+因此树覆盖率已经进入残差本身。预算较小时，未展开概率质量把 $\overline V(s)$ 拉回冻结基线；预算增加后，更多反事实结论进入修正。完整对局结果同时训练局面 Value，并作为实际动作的事实 $Q$ 参与 Policy 比较。这一步把终局事实传入动作排序，避免冻结 Value 在各层形成自洽但错误的循环。
+
+对同一局面的两个动作 $a$ 与 $b$，一次精确拟合后的目标赔率满足：
+
+$$
+\log\frac{\pi^+(a\mid s)}{\pi^+(b\mid s)}
+=
+\log\frac{P_{old}(a\mid s)}{P_{old}(b\mid s)}
++Q(s,a)-Q(s,b)
+$$
+
+若后续迭代持续得到 $Q(s,a)-Q(s,b)=\Delta>0$，第 $k$ 次局部改进后的对数赔率累计增加 $k\Delta$。因此排序翻转所需的理想拟合迭代数满足：
+
+$$
+k>
+\frac{\log P_0(b\mid s)-\log P_0(a\mid s)}{\Delta}
+$$
+
+这证明了正回报差异能够在有限次局部改进中改变排序。它不等同于在固定浅层预算内证明某步棋的博弈论真值；真值仍来自终局样本或完整求解。根节点全动作评价与概率欠额采样消除了“动作从未进入训练”的结构性盲区。
 
 待展开前沿按到达概率与 Bellman residual 排序。对深度为 $d$ 的子节点 $s'$：
 
@@ -522,43 +577,34 @@ priority(s')=\rho(s)P(a\mid s)
 \left(|-V(s')-V(s)|+\frac{1}{\sqrt{2+d}}\right)
 $$
 
-因此预算会自然分配给较可能到达、局部判断不一致且仍靠近根部的节点。每个执行过局部展开的决策节点都成为 Policy 训练样本。设该节点展开边数为 $n(s)$，同一真实根树中的 Policy 权重为：
+因此预算会自然分配给较可能到达、局部判断不一致且仍靠近根部的节点。设该节点展开边数为 $n(s)$，同一根树中的训练权重为：
 
 $$
-w_P(s)=\frac{n(s)}{\sum_{u\in\mathcal T_{root}}n(u)}
+w_T(s)=w_P(s)=
+\frac{n(s)}{\sum_{u\in\mathcal T_{root}}n(u)}
 $$
 
-每棵反事实树贡献的 Policy 总权重恒为 1。反事实 Value 目标使用冻结树已经回传的 $\overline V(s)$。设 $E(s)$ 是该节点实际评价过的动作集合，其在改进 Policy 下的概率质量为：
+每棵树的 Policy 总权重和反事实 Value 总权重均为 1：
 
 $$
-c_T(s)=\sum_{a\in E(s)}\pi^+(a\mid s)
+\sum_s w_P(s)=\sum_s w_T(s)=1
 $$
 
-树 Value 权重自动定义为：
-
-$$
-w_T(s)=w_P(s)c_T(s)
-$$
-
-未展开动作继续使用冻结节点 Value，因此不计入 $c_T$。由于 $0\leq c_T(s)\leq1$ 且一棵树满足 $\sum_s w_P(s)=1$，每棵树的反事实 Value 总权重满足：
-
-$$
-\sum_s w_T(s)\leq1
-$$
-
-真实自对弈根节点保留 TD($\lambda$) 权重 $w_{TD}=1$，树中间节点的 $w_{TD}=0$。根节点同时拥有真实轨迹目标 $G_t$ 和冻结树目标 $\overline V(s)$，二者作为独立 SmoothL1 项进入 Value 损失：
+真实 Monte Carlo 目标 $G_t$ 与冻结树目标 $\overline V(s)$ 作为独立 SmoothL1 项进入 Value 损失：
 
 $$
 L_V=
 \frac{
-\sum_s w_{TD}(s)\rho\left(V_{new}(s)-G_t(s)\right)+
+\sum_s w_{MC}(s)\rho\left(V_{new}(s)-G_t(s)\right)+
 \sum_s w_T(s)\rho\left(V_{new}(s)-\overline V(s)\right)
 }{
-\sum_s\left(w_{TD}(s)+w_T(s)\right)
+\sum_s\left(w_{MC}(s)+w_T(s)\right)
 }
 $$
 
-其中 $\rho$ 是 SmoothL1。冻结树目标在构造训练记录时已经与计算图分离，因此不会把 candidate 的梯度传回 target model。Policy 损失为：
+其中 $\rho$ 是 SmoothL1。$\overline V(s)$ 是冻结模型经过有限反事实规划得到的 detached target。它不是把当前 Value 原样训练回自身：当多步回传与原判断矛盾时，$\delta_{CF}\neq0$；未展开动作的冻结基线和 SmoothL1 的有界梯度共同使修正保持渐进。
+
+Policy 损失为：
 
 $$
 L_P=
@@ -566,19 +612,17 @@ L_P=
 {\sum_s w_P(s)}
 $$
 
-完整 FCPI 损失为：
+完整 FCPI 损失固定为：
 
 $$
-L=\alpha_P L_P+\alpha_V L_V
+L=L_P+L_V
 $$
 
-$\alpha_P$ 与 $\alpha_V$ 分别由 `--policy-weight` 和 `--value-weight` 指定。$\pi^+$ 已经乘入冻结模型 prior，因此无需额外 KL 项重复锚定。
+Policy、Value 和共享 residual backbone 通过同一次反向传播联合更新。AdamW weight decay 与梯度裁剪使用固定训练常量，FCPI 命令行只提供学习率、batch、epoch 与 step 上限。
 
-FCPI HDF5 分别保存 `td_value_targets`、`tree_value_targets`、`td_value_weights` 与 `tree_value_weights`。Gadus 的反事实 target 由冻结模型在推理模式下生成，candidate 训练也保持 BatchNorm running mean/variance 不变，使训练前向与 arena 前向使用相同的归一化统计。`eval()` 只固定归一化行为，不会关闭 autograd 或参数更新。
+FCPI HDF5 保存 `policy_targets`、`policy_weights`、`mc_value_targets`、`mc_value_weights`、`tree_value_targets` 与 `tree_value_weights`。训练日志只输出 `policy`、`value_mc`、`value_tree`、合并后的 `value` 和 `loss`。反事实 summary 记录树数、决策节点数、评价边数、事实回报边数、终局边数、最大深度、平均 Bellman residual、平均覆盖率、平均 Value 修正和 Policy top-1 改变率。
 
-训练日志分别输出 `value_td`、`value_tree`、二者按有效权重合并后的 `value`，以及 candidate 对 $\pi^+$ 的 `policy_fit_kl`。summary 还记录 `mean_abs_advantage`、`max_abs_advantage`、`mean_policy_kl`、`mean_policy_total_variation` 与 `policy_top1_change_rate`，用于区分学习信号强度、策略移动幅度和 arena 结果。其中 `mean_policy_kl` 描述 target 相对冻结 prior 的移动，`policy_fit_kl` 描述 candidate 对该 target 的拟合误差。
-
-每轮依次执行 `current.pth` 自对战、局面采样、树一致反事实展开、TD($\lambda$) 与反事实 Value 目标构造、candidate 训练和 paired-game arena。每局先按完整编码状态去重，再按 `positions-per-game` 做均匀无放回采样。
+每轮依次执行 `current.pth` 自对战、全局面去重采集、冻结反事实树展开、Monte Carlo/反事实 Value 目标构造、candidate 训练和 paired-game arena。每局按完整 Gadus 编码对全部局面去重。
 
 每次运行由程序生成 `fcpi_YYYYMMDD_HHMMSS_id`，并创建：
 
@@ -724,7 +768,7 @@ build/melano/preprocess \
 
 build/melano/train \
 	--data data/games.melano.h5 \
-	--out models/melano.pth \
+	--out models/melano/melano.pth \
 	--channels 128 \
 	--blocks 10 \
 	--epochs 3 \
@@ -741,7 +785,7 @@ build/melano/train \
 	--log-every 50
 
 build/melano/search \
-	--model models/melano.pth \
+	--model models/melano/melano.pth \
 	--fen "startpos" \
 	--device cuda \
 	--precision bf16 \
@@ -843,7 +887,7 @@ $$
 ```bash
 build/melano/arena \
 	--candidate models/melano-candidate.pth \
-	--baseline models/melano.pth \
+	--baseline models/melano/melano.pth \
 	--device cuda \
 	--precision bf16 \
 	--games 400 \
@@ -899,7 +943,7 @@ $$
 
 ```bash
 build/melano/fcpi \
-	--model models/melano.pth \
+	--model models/melano/melano.pth \
 	--device cuda \
 	--precision bf16 \
 	--iterations 5 \
@@ -1080,7 +1124,7 @@ build\gadus\uci.exe `
 
 ```powershell
 build\melano\uci.exe `
-	--model models\melano.pth `
+	--model models\melano\melano.pth `
 	--device cuda `
 	--search-type only-mcts `
 	--mcts-sims 1000
@@ -1088,9 +1132,66 @@ build\melano\uci.exe `
 
 UCI 输出包含 MultiPV、side-to-move `score cp`、节点数、NPS、耗时和 PV。搜索开始时先发布模型直觉结果，MCTS 期间按 `ProgressIntervalMS` 发布中间结果。
 
-### 6.1 Gadidae 引擎目录
+### 6.1 Gadus UCI options
 
-Windows 可将指定 checkpoint 包装到对应的 `models/gadidae/<architecture>/` UCI 引擎目录：
+Gadus 在 `uci` 握手中公开以下 option：
+
+- `ModelPath`：checkpoint 路径。打包引擎默认读取可执行文件同目录的 `gadus.pth`。
+- `Device`：`auto`、`cpu` 或 `cuda`。
+- `SearchType`：`closed` 表示只使用模型 Policy，`only-mcts` 表示使用 Gadus MCTS。
+- `MCTSSims`：MCTS simulation 上限，默认 `100`。客户端发送 `go nodes <n>` 时以 `<n>` 为当前搜索上限。
+- `MCTSMinSims`：时间预算结束前至少完成的 simulation 数，默认 `0`。
+- `MCTSBatchSize`：一次神经网络叶子批量，默认 `32`。
+- `MoveTimeMS`：客户端未在 `go` 中给出时间时使用的固定思考时间，默认 `0`。
+- `MoveOverheadMS`：从棋钟预算中预留的通信与落子时间，默认 `50`。
+- `MinMoveTimeMS`、`MaxMoveTimeMS`：棋钟模式下的单步时间边界，默认 `50` 与 `10000`。
+- `TimeDivisor`：把剩余时间按该除数分配给当前步，默认 `30.0`。
+- `IncrementFraction`：当前步可使用的加秒比例，默认 `0.75`。
+- `CPuct`、`CPuctBase`、`CPuctFactor`：PUCT 探索系数及其访问数 schedule，默认 `0.5`、`19652`、`1.0`。
+- `FPUReduction`：未访问 child 的 first-play urgency 折减，默认 `0.15`。
+- `VirtualLoss`：同一批 MCTS selection 的重复路径惩罚，默认 `0.0`。
+- `RepetitionPolicyPenalty`：决策层对己方优势时重复和棋走法的排序惩罚，范围 $[0,1]$，默认 `0.0`。
+- `InstantMateFirst`：发现一步将杀时优先选择该走法，默认 `false`。
+- `ProgressIntervalMS`：UCI 中间 `info` 行的发布间隔，默认 `750`。
+- `MultiPV`：输出的分析行数，默认 `5`。
+- `ScoreScale`：把 $[-1,1]$ Value/Q 映射为 `score cp` 的显示比例，默认 `1000`。
+
+在 Gadidae GUI 中，`Device` 与 `MultiPV` 使用专用控件，思考时间和 simulation 上限使用 `Search` 区域。`UCI options` 可以直接填写 JSON object，例如：
+
+```json
+{
+  "SearchType": "only-mcts",
+  "MCTSSims": 1000,
+  "MCTSMinSims": 0,
+  "MCTSBatchSize": 64,
+  "CPuct": 0.5,
+  "CPuctBase": 19652,
+  "CPuctFactor": 1.0,
+  "FPUReduction": 0.15,
+  "VirtualLoss": 0.0,
+  "RepetitionPolicyPenalty": 1.0,
+  "InstantMateFirst": true,
+  "ProgressIntervalMS": 750,
+  "ScoreScale": 1000
+}
+```
+
+`MCTSSims` 设置 Gadus 在 UCI 客户端没有提供 `go nodes <n>` 时使用的默认 simulation 上限。GUI Search 区域的 `Node / simulation limit` 会为每次搜索发送 `go nodes <n>` 并覆盖该次搜索的 `MCTSSims`。设为 `0` 时不发送 nodes 限制。`Device` 与 `MultiPV` 使用 GUI 对应控件填写，`Launch arguments` 通常留空。
+
+其他 UCI 客户端使用标准命令设置同一组选项：
+
+```text
+setoption name SearchType value only-mcts
+setoption name MCTSSims value 1000
+setoption name MCTSBatchSize value 64
+setoption name CPuct value 0.5
+setoption name RepetitionPolicyPenalty value 1.0
+setoption name InstantMateFirst value true
+```
+
+### 6.2 Gadidae 引擎目录
+
+Windows 可将指定 checkpoint 包装到对应的 `models/<architecture>/` UCI 引擎目录：
 
 ```powershell
 scripts\package_engine.bat gadus models\gadus\candidate3.pth
@@ -1107,7 +1208,7 @@ bash scripts/package_engine.sh melano models/melano/candidate.pth
 Gadus UCI 在缺少 `--model` 时只读取自身目录中的 `gadus.pth`，Melano UCI 只读取 `melano.pth`。该规则不引用仓库默认模型，也不依赖 EXE 名称。Windows 目录结构为：
 
 ```text
-models/gadidae/
+models/
 	gadus/
 		gadus.exe
 		gadus.pth
@@ -1120,7 +1221,7 @@ models/gadidae/
 
 Linux 在各架构目录内使用 `gadus`、`melano` launcher，架构二进制分别为 `gadus.bin` 与 `melano.bin`，运行库位于各自的 `lib/`。重复打包同一架构会更新对应 checkpoint、UCI 程序和运行库。
 
-UCI 客户端可以直接注册 `models/gadidae/gadus/gadus.exe` 或 `models/gadidae/melano/melano.exe`，无需填写命令行参数。Linux 注册对应架构目录内的 `gadus` 或 `melano` launcher。
+UCI 客户端可以直接注册 `models/gadus/gadus.exe` 或 `models/melano/melano.exe`，无需填写命令行参数。Linux 注册对应架构目录内的 `gadus` 或 `melano` launcher。
 
 ## 7. GUI
 
@@ -1142,12 +1243,12 @@ GADIDAE_BUILD_GRAPHICS=1 bash scripts/build.sh
 
 Windows 双击 `build/graphics/Gadidae.exe`，具有 X11 或 Wayland 图形会话的 Linux 运行 `build/graphics/Gadidae`。程序默认进入 Simulator，顶部模式控件可切换到 Stadium。GUI 的 FreeType 压缩支持静态编译进可执行文件。SSH 服务器需要 X11 forwarding、远程桌面或其他可见显示服务才能实际操作 GUI；`xvfb-run` 适合自动化启动测试，无法提供可交互画面。
 
-Simulator 用于局面分析。Settings 的 `Engine` 区域填写 UCI 可执行文件、显示名称和设备，`Launch` 区域填写启动进程时附加的命令行参数，`Search` 区域填写时间或节点预算、MultiPV 行数与显示刷新间隔。`Additional UCI options` 在握手完成后发送额外的 `setoption` 命令。`Run` 同时显示 `Open` 与 `Close`，勾选项表示实时分析的当前状态。也可以从命令行指定常用参数：
+Simulator 用于局面分析。Settings 的 `Engine` 区域填写 UCI 可执行文件、显示名称和设备，`Launch` 区域填写启动进程时附加的命令行参数，`Search` 区域填写时间或节点预算、MultiPV 行数与显示刷新间隔。`UCI options` 在握手完成后发送对应的 `setoption` 命令。`Run` 同时显示 `Open` 与 `Close`，勾选项表示实时分析的当前状态。也可以从命令行指定常用参数：
 
 ```powershell
 build\graphics\Gadidae.exe `
 	--mode simulator `
-	--uci "models\gadidae\gadus\gadus.exe" `
+	--uci "models\gadus\gadus.exe" `
 	--device cpu `
 	--movetime-ms 3000 `
 	--node-limit 0 `
@@ -1161,13 +1262,13 @@ Stadium 用于同时组织多盘独立对局。`Tools > Matches` 可新建、进
 ```powershell
 build\graphics\Gadidae.exe `
 	--mode stadium `
-	--white-uci "models\gadidae\gadus\gadus.exe" `
+	--white-uci "models\gadus\gadus.exe" `
 	--white-name "Gadus" `
 	--black-uci "models\stockfish\stockfish.exe" `
 	--black-name "Stockfish"
 ```
 
-Appearance 提供 `Dark` 与 `Light` 应用主题、基础字号、受限范围内随窗口缩放的字号调整、棋盘配色预设、颜色编辑、坐标开关以及 `Vector`、`RhosGFX`、`Chessnut`、`Spatial`、`Cburnett`、`Fantasy` 棋子样式。棋子均由编译进程序的预计算几何绘制，SVG 的填充、线性渐变与描边在导入阶段完成预三角化，外部样式经过顶点去重和 zlib 压缩后嵌入可执行文件，发布目录只包含可执行文件。点击 Apply 后设置写入用户配置目录，后续启动会自动恢复。Windows 配置位于 `%APPDATA%\Gadidae\gui.json`，Linux 配置位于 `$XDG_CONFIG_HOME/Gadidae/gui.json` 或 `~/.config/Gadidae/gui.json`。只修改外观时会保留已经加载的 UCI 进程与正在进行的 Stadium 对局。`--font-size <px>`、`--theme dark`、`--theme light` 与 `--piece-style vector|rhosgfx|chessnut|spatial|cburnett|fantasy` 可覆盖本次启动的外观。第三方棋子样式的来源与许可记录在根目录 `THIRD_PARTY.md`。
+Appearance 提供 `Dark` 与 `Light` 应用主题、基础字号、受限范围内随窗口缩放的字号调整、棋盘配色预设、颜色编辑、坐标开关以及 `Vector`、`RhosGFX`、`Chessnut`、`Spatial`、`Cburnett`、`Fantasy` 棋子样式。棋子均由编译进程序的预计算几何绘制，SVG 的填充、线性渐变与描边在导入阶段完成预三角化，外部样式经过顶点去重和 zlib 压缩后嵌入可执行文件，发布目录只包含可执行文件。点击 Apply 后设置写入 `Gadidae` 可执行文件同目录的 `gui.json`，后续启动会自动恢复。已有的用户目录配置会在首次启动时迁移到该位置。只修改外观时会保留已经加载的 UCI 进程与正在进行的 Stadium 对局。`--font-size <px>`、`--theme dark`、`--theme light` 与 `--piece-style vector|rhosgfx|chessnut|spatial|cburnett|fantasy` 可覆盖本次启动的外观。第三方棋子样式的来源与许可记录在根目录 `THIRD_PARTY.md`。
 
 ### 7.1 导入棋子样式
 
@@ -1210,7 +1311,7 @@ GADIDAE_BUILD_GRAPHICS=1 bash scripts/build.sh
 
 导入前应确认许可证允许复制、修改和随项目分发，并遵守署名、相同方式共享、源代码提供或用途限制等条款。经过修改的素材应在对应声明中注明修改内容。由多个来源组合的样式应分别列出各来源及其许可证。
 
-`Additional UCI options` 使用 JSON object。图形程序按引擎公开的 option 名称进行匹配，未知名称会报告错误。`Device` 与 `MultiPV` 由专用控件管理，额外 options 用于 `Hash`、`Threads` 等引擎自有设置。`Device` 在目标引擎公开该 option 时生效，因此同一界面可直接运行 Stockfish 等通用 UCI 引擎。
+`UCI options` 使用 JSON object。图形程序按引擎公开的 option 名称进行匹配，未知名称会报告错误。`Device` 与 `MultiPV` 由专用控件管理，其余 options 用于 `Hash`、`Threads` 等引擎自有设置。`Device` 在目标引擎公开该 option 时生效，因此同一界面可直接运行 Stockfish 等通用 UCI 引擎。
 
 Simulator 首次打开分析时在后台启动并加载一次 UCI 引擎，后续局面复用同一子进程。切换局面时会异步停止上一轮计算、丢弃其后续输出，再把最新局面交给已经加载的引擎。Gadus 与 Melano 的 UCI 命令循环和搜索线程彼此分离，MCTS 搜索会在批次边界响应 `stop`。图形程序在窗口持续移动或缩放时暂停 OpenGL 提交，操作停止后清空 GPU 命令队列并按新尺寸交换完整帧。
 
@@ -1228,7 +1329,7 @@ python scripts/analyze.py \
 	--pgn-comments
 ```
 
-Windows 教师机路径使用 `models/stockfish/stockfish.exe`。
+Windows 路径示例： `models/stockfish/stockfish.exe`。
 
 ## 9. Opening Book
 
