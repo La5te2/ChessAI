@@ -364,7 +364,7 @@ FCPI 完成后，可让最终 `current.pth` 与同一 run 开始时写入的 `in
 python scripts/test.py
 ```
 
-脚本默认读取 `data/runs/` 中最新的 FCPI `summary.json`，使用其中的 `current_model` 作为 candidate、`initial_model` 作为 baseline，并采用与 Gadus FCPI 验收一致的 `closed` paired Arena 参数。`--summary <path>` 可选择指定 run，`--candidate` 与 `--baseline` 可覆盖模型路径。每次测试在 `data/tests/gadus_vs_initial_<timestamp>/` 中写入 `summary.json`、`games.pgn` 和 `info.log`。
+脚本默认读取 `data/runs/` 中最新的 FCPI `summary.json`，使用其中的 `current_model` 作为 candidate、`initial_model` 作为 baseline。第一阶段采用与 Gadus FCPI 验收一致的 2000 局 `closed` paired Arena；完成后从标准初始局面运行 2 局换边 `only-mcts` 对战，默认每步上限为 10000 simulations。`--summary <path>` 可选择指定 run，`--candidate` 与 `--baseline` 可覆盖模型路径，`--mcts-sims` 可调整第二阶段预算。每次测试在 `data/tests/gadus_vs_initial_<timestamp>/` 中写入 `summary.json`、`closed.pgn`、`startpos-mcts.pgn` 和 `info.log`。
 
 从标准初始局面开始时，将开局书设为空：
 

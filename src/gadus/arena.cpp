@@ -53,7 +53,8 @@ int main(int argc, char **argv) {
 			args.get_double("repetition-policy-penalty", search.repetition_policy_penalty);
 		search.instant_mate_first = args.get_bool("instant-mate-first", search.instant_mate_first);
 
-		std::cout << "arena summary:\n" << gadus::evaluate_models(options).dump(2) << std::endl;
+		const auto summary = gadus::evaluate_models(options);
+		std::cout << "arena summary:\n" << summary.dump(2) << std::endl;
 		return 0;
 	} catch (const std::exception &error) {
 		std::cerr << "arena error: " << error.what() << std::endl;

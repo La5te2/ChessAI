@@ -112,14 +112,19 @@ void play_turns(std::vector<ActiveGame> &games, Searcher &candidate, Searcher &b
 	}
 }
 
-// Format SAN movetext with PGN move numbers and conventional 80-column wrapping.
-std::string wrap_moves(const std::vector<std::string> &moves) {
+// Format SAN movetext from the FEN side and fullmove counter with 80-column wrapping.
+std::string wrap_moves(const std::vector<std::string> &moves, const std::string &start_fen) {
 	std::ostringstream output;
+	const chess::Board start(start_fen);
+	int move_number = static_cast<int>(start.fullMoveNumber());
+	bool white_to_move = start.sideToMove() == chess::Color::WHITE;
 	int column = 0;
 	for (std::size_t ply = 0; ply < moves.size(); ++ply) {
 		std::ostringstream token;
-		if (ply % 2 == 0) {
-			token << ply / 2 + 1 << ". ";
+		if (white_to_move) {
+			token << move_number << ". ";
+		} else if (ply == 0) {
+			token << move_number << "... ";
 		}
 		token << moves[ply] << ' ';
 		const auto text = token.str();
@@ -129,6 +134,10 @@ std::string wrap_moves(const std::vector<std::string> &moves) {
 		}
 		output << text;
 		column += static_cast<int>(text.size());
+		if (!white_to_move) {
+			++move_number;
+		}
+		white_to_move = !white_to_move;
 	}
 	return output.str();
 }
@@ -159,7 +168,8 @@ void write_pgn(const std::filesystem::path &path, const std::vector<GameRecord> 
 		if (record.start_fen != chess::constants::STARTPOS) {
 			output << "[SetUp \"1\"]\n[FEN \"" << record.start_fen << "\"]\n";
 		}
-		output << '\n' << wrap_moves(record.san_moves) << record.result << "\n\n";
+		output << '\n'
+			   << wrap_moves(record.san_moves, record.start_fen) << record.result << "\n\n";
 	}
 }
 

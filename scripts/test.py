@@ -76,6 +76,9 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--sims", type=int, default=0)
     result.add_argument("--mcts-batch-size", type=int, default=512)
     result.add_argument("--movetime-ms", type=float, default=0.0)
+    result.add_argument("--mcts-games", type=int, default=2)
+    result.add_argument("--mcts-sims", type=int, default=10000)
+    result.add_argument("--mcts-movetime-ms", type=float, default=0.0)
     result.add_argument("--repetition-policy-penalty", type=float, default=1.0)
     result.add_argument("--instant-mate-first", type=int, default=1, choices=(0, 1))
     result.add_argument("--seed", type=int, default=2026)
@@ -93,8 +96,51 @@ def require_file(path: Path, label: str) -> None:
         raise FileNotFoundError(f"{label} is missing: {path}")
 
 
+def run_arena(command: list[str], log, phase: str) -> dict:
+    """Stream one Arena phase and decode its final JSON summary."""
+    heading = f"\n=== {phase} ===\n"
+    print(heading, end="", flush=True)
+    log.write(heading)
+    log.flush()
+    transcript: list[str] = []
+    process = subprocess.Popen(
+        command,
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+    assert process.stdout is not None
+    for line in process.stdout:
+        print(line, end="", flush=True)
+        log.write(line)
+        log.flush()
+        transcript.append(line)
+    return_code = process.wait()
+    if return_code != 0:
+        raise RuntimeError(
+            f"Gadus Arena {phase} exited with code {return_code}; see {log.name}"
+        )
+
+    output_text = "".join(transcript)
+    finished = output_text.rfind("arena: finished")
+    json_start = output_text.find("{", finished if finished >= 0 else 0)
+    if json_start < 0:
+        raise RuntimeError(f"Arena {phase} summary was not found; see {log.name}")
+    try:
+        summary, _ = json.JSONDecoder().raw_decode(output_text[json_start:])
+        return summary
+    except json.JSONDecodeError as error:
+        raise RuntimeError(
+            f"Arena {phase} summary could not be parsed: {error}; see {log.name}"
+        ) from error
+
+
 def main() -> int:
-    """Resolve models, stream Arena output, and save PGN plus structured results."""
+    """Run the closed benchmark followed by a two-game startpos MCTS match."""
     args = parser().parse_args()
     summary_path = (
         repository_path(args.summary) if args.summary else latest_fcpi_summary()
@@ -130,10 +176,11 @@ def main() -> int:
     )
     output.mkdir(parents=True, exist_ok=False)
     log_path = output / "info.log"
-    pgn_path = output / "games.pgn"
+    closed_pgn_path = output / "closed.pgn"
+    mcts_pgn_path = output / "startpos-mcts.pgn"
     result_path = output / "summary.json"
 
-    command = [
+    common_command = [
         str(arena),
         "--candidate",
         str(candidate),
@@ -143,12 +190,24 @@ def main() -> int:
         args.device,
         "--precision",
         precision,
+        "--max-plies",
+        str(args.max_plies),
+        "--mcts-batch-size",
+        str(args.mcts_batch_size),
+        "--repetition-policy-penalty",
+        str(args.repetition_policy_penalty),
+        "--instant-mate-first",
+        str(args.instant_mate_first),
+        "--min-net-wins",
+        "0",
+        "--seed",
+        str(args.seed),
+    ]
+    closed_command = common_command + [
         "--games",
         str(args.games),
         "--games-in-flight",
         str(args.games_in_flight),
-        "--max-plies",
-        str(args.max_plies),
         "--opening-book",
         str(opening_book) if opening_book is not None else "",
         "--book-plies",
@@ -159,22 +218,34 @@ def main() -> int:
         args.search_type,
         "--sims",
         str(args.sims),
-        "--mcts-batch-size",
-        str(args.mcts_batch_size),
         "--movetime-ms",
         str(args.movetime_ms),
-        "--repetition-policy-penalty",
-        str(args.repetition_policy_penalty),
-        "--instant-mate-first",
-        str(args.instant_mate_first),
-        "--min-net-wins",
-        "0",
         "--pgn-output",
-        str(pgn_path),
-        "--seed",
-        str(args.seed),
+        str(closed_pgn_path),
         "--log-every",
         str(args.log_every),
+    ]
+    mcts_command = common_command + [
+        "--games",
+        str(args.mcts_games),
+        "--games-in-flight",
+        str(args.mcts_games),
+        "--opening-book",
+        "",
+        "--book-plies",
+        str(args.book_plies),
+        "--max-book-positions",
+        str(args.max_book_positions),
+        "--search-type",
+        "only-mcts",
+        "--sims",
+        str(args.mcts_sims),
+        "--movetime-ms",
+        str(args.mcts_movetime_ms),
+        "--pgn-output",
+        str(mcts_pgn_path),
+        "--log-every",
+        "1",
     ]
 
     print("Gadus cumulative Arena test")
@@ -185,51 +256,31 @@ def main() -> int:
         f"games={args.games} search_type={args.search_type} "
         f"device={args.device} precision={precision}"
     )
+    print(
+        f"startpos_mcts_games={args.mcts_games} "
+        f"startpos_mcts_sims={args.mcts_sims}"
+    )
     print(f"output={display_path(output)}")
 
-    transcript: list[str] = []
     with log_path.open("w", encoding="utf-8", newline="") as log:
-        process = subprocess.Popen(
-            command,
-            cwd=ROOT,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-        )
-        assert process.stdout is not None
-        for line in process.stdout:
-            print(line, end="", flush=True)
-            log.write(line)
-            log.flush()
-            transcript.append(line)
-        return_code = process.wait()
+        closed_summary = run_arena(closed_command, log, "closed")
+        mcts_summary = run_arena(mcts_command, log, "startpos MCTS")
 
-    if return_code != 0:
-        raise RuntimeError(
-            f"Gadus Arena exited with code {return_code}; see {log_path}"
-        )
-
-    output_text = "".join(transcript)
-    marker = "arena summary:\n"
-    if marker not in output_text:
-        raise RuntimeError(f"Arena summary was not found; see {log_path}")
-    arena_summary = json.loads(output_text.rsplit(marker, 1)[1].strip())
     result = {
         "source_summary": display_path(summary_path),
         "run_id": summary.get("run_id"),
         "candidate": display_path(candidate),
         "baseline": display_path(baseline),
-        "arena": arena_summary,
+        "closed": closed_summary,
+        "startpos_mcts": mcts_summary,
     }
     result_path.write_text(
         json.dumps(result, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
     print(f"result={display_path(result_path)}")
-    print(f"pgn={display_path(pgn_path)}")
+    print(f"closed_pgn={display_path(closed_pgn_path)}")
+    print(f"startpos_mcts_pgn={display_path(mcts_pgn_path)}")
     return 0
 
 
