@@ -164,13 +164,13 @@ bool StadiumSession::engines_ready() {
 		if(engine.starting()) {
 			return false;
 		}
-		if(engine.ready()) {
-			return true;
-		}
 		const auto snapshot = engine.snapshot();
 		if(!snapshot.error.empty()) {
 			throw std::runtime_error(std::string(side) + " engine: " +
 									 snapshot.error);
+		}
+		if(engine.ready()) {
+			return true;
 		}
 		throw std::runtime_error(std::string(side) +
 								 " engine initialization failed");
@@ -329,6 +329,9 @@ void StadiumSession::update() {
 			return;
 		}
 		const auto snapshot = active_engine().snapshot();
+		if(!snapshot.error.empty()) {
+			throw std::runtime_error(snapshot.error);
+		}
 		const auto interval =
 			std::max(50, active_config().progress_interval_ms);
 		if(last_display_ == Clock::time_point{} ||

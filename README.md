@@ -1610,7 +1610,7 @@ Gadus 与 Melano 当前公开相同的 UCI 控制项。选项作用于各自的�
 - `VirtualLoss`：同一批 MCTS selection 的重复路径惩罚，默认 `0.0`。
 - `RepetitionPolicyPenalty`：决策层对己方优势时重复和棋走法的排序惩罚，范围 $[0,1]$，默认 `0.0`。
 - `InstantMateFirst`：发现一步将杀时优先选择该走法，默认 `false`。
-- `ProgressIntervalMS`：UCI 中间 `info` 行的发布间隔，默认 `750`。
+- `ProgressIntervalMS`：UCI 中间 `info` 行的发布间隔，默认 `750`。它只改变可见更新频率，不改变搜索预算、搜索顺序或最终结果；设为 `0` 时不发布搜索过程中的周期更新。
 - `MultiPV`：输出的分析行数，默认 `5`。
 - `ScoreScale`：把 $[-1,1]$ Value/Q 映射为 `score cp` 的显示比例，默认 `1000`。
 
@@ -1629,12 +1629,11 @@ Gadus 与 Melano 当前公开相同的 UCI 控制项。选项作用于各自的�
   "VirtualLoss": 0.0,
   "RepetitionPolicyPenalty": 1.0,
   "InstantMateFirst": true,
-  "ProgressIntervalMS": 750,
   "ScoreScale": 1000
 }
 ```
 
-`MCTSSims` 设置引擎在 UCI 客户端没有提供 `go nodes <n>` 时使用的默认 simulation 上限。GUI Search 区域的 `Node / simulation limit` 会为每次搜索发送 `go nodes <n>` 并覆盖该次搜索的 `MCTSSims`。设为 `0` 时不发送 nodes 限制。`Device` 与 `MultiPV` 使用 GUI 对应控件填写，`Launch arguments` 通常留空。
+`MCTSSims` 设置引擎在 UCI 客户端没有提供 `go nodes <n>` 时使用的默认 simulation 上限。GUI Search 区域的 `Node / simulation limit` 会为每次搜索发送 `go nodes <n>` 并覆盖该次搜索的 `MCTSSims`。设为 `0` 时不发送 nodes 限制。`Device`、`MultiPV` 与 `ProgressIntervalMS` 分别由 GUI 的专用控件填写，其中 `Display update (ms)` 同时控制 GUI 刷新节奏，并在引擎公开 `ProgressIntervalMS` 时下发该选项。`Launch arguments` 通常留空。
 
 其他 UCI 客户端使用标准命令设置同一组选项：
 

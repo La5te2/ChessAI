@@ -372,6 +372,14 @@ void UciEngine::close() {
 			send("quit");
 		} catch(...) {
 		}
+#ifdef _WIN32
+		// A synchronous ReadFile on the engine pipe is not guaranteed to wake
+		// merely because another thread closes the handle. Cancel it explicitly
+		// so closing a Stadium match cannot strand the GUI thread in join().
+		if(reader_.joinable()) {
+			CancelSynchronousIo(reader_.native_handle());
+		}
+#endif
 		process_->terminate();
 	}
 	if(reader_.joinable()) {
@@ -527,12 +535,14 @@ void UciEngine::reader_loop() {
 			}
 		}
 		if(!closing_) {
+			process_ready_ = false;
 			std::lock_guard lock(mutex_);
 			snapshot_.searching = false;
 			snapshot_.error = "UCI engine closed its output stream";
 			condition_.notify_all();
 		}
 	} catch(const std::exception &error) {
+		process_ready_ = false;
 		std::lock_guard lock(mutex_);
 		snapshot_.searching = false;
 		snapshot_.error = error.what();
@@ -675,7 +685,8 @@ void UciEngine::configure() {
 	};
 	for(auto iterator = requested.begin(); iterator != requested.end(); ++iterator) {
 		const auto key = lowercase(iterator.key());
-		if(key == "device" || key == "multipv") {
+		if(key == "device" || key == "multipv" ||
+		   key == "progressintervalms") {
 			throw std::invalid_argument(
 				iterator.key() +
 				" is managed by its dedicated GUI field and must be removed from UCI options");
@@ -692,6 +703,11 @@ void UciEngine::configure() {
 	if(multipv != option_names_.end()) {
 		send("setoption name " + multipv->second + " value " +
 			 std::to_string(std::max(1, config_.multipv)));
+	}
+	const auto progress = option_names_.find("progressintervalms");
+	if(progress != option_names_.end()) {
+		send("setoption name " + progress->second + " value " +
+			 std::to_string(std::clamp(config_.progress_interval_ms, 0, 60000)));
 	}
 }
 
