@@ -5,10 +5,17 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <torch/types.h>
 #include "gadus/arena.hpp"
 #include "gadus/precision.hpp"
 
 namespace gadus {
+
+/// Computes BRCI cross-entropy over variable-width legal-action rows.
+torch::Tensor brci_masked_policy_loss(const torch::Tensor &selected_logits,
+									  const torch::Tensor &targets,
+									  const torch::Tensor &counts,
+									  const torch::Tensor &weights);
 
 struct BrciOptions {
 	std::filesystem::path model = "models/gadus/gadus.pth";

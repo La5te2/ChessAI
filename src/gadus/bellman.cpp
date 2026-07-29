@@ -25,6 +25,34 @@
 
 namespace gadus {
 
+// Compute cross-entropy only on each row's real graph edges. Padding log
+// probabilities are zeroed explicitly because IEEE arithmetic defines
+// 0 * -infinity as NaN.
+torch::Tensor brci_masked_policy_loss(const torch::Tensor &selected_logits,
+									  const torch::Tensor &targets,
+									  const torch::Tensor &counts,
+									  const torch::Tensor &weights) {
+	if (selected_logits.dim() != 2 || targets.sizes() != selected_logits.sizes() ||
+		counts.dim() != 1 || weights.dim() != 1 ||
+		counts.size(0) != selected_logits.size(0) ||
+		weights.size(0) != selected_logits.size(0)) {
+		throw std::invalid_argument("BRCI masked policy tensors are not aligned");
+	}
+	auto logits = selected_logits.to(torch::kFloat32);
+	auto normalized_targets = targets.to(torch::kFloat32);
+	auto normalized_weights = weights.to(torch::kFloat32);
+	auto columns = torch::arange(logits.size(1), counts.options());
+	auto mask = columns.unsqueeze(0) < counts.unsqueeze(1);
+	logits = logits.masked_fill(~mask, -std::numeric_limits<float>::infinity());
+	auto log_probability = torch::log_softmax(logits, 1).masked_fill(~mask, 0.0);
+	normalized_targets = normalized_targets.masked_fill(~mask, 0.0);
+	normalized_targets =
+		normalized_targets / normalized_targets.sum(1, true).clamp_min(1e-8);
+	auto policy_errors = -(normalized_targets * log_probability).sum(1);
+	return (policy_errors * normalized_weights).sum() /
+		   normalized_weights.sum().clamp_min(1.0);
+}
+
 namespace {
 
 inline constexpr const char *kBrciFormula = "bellman_restricted_counterfactual";
@@ -958,20 +986,22 @@ nlohmann::json train_proposal(const std::filesystem::path &source,
 			}
 			auto selected = logits.to(torch::kFloat32).gather(1, legal);
 			predicted = predicted.reshape({-1}).to(torch::kFloat32);
-			auto columns = torch::arange(static_cast<std::int64_t>(width), counts.options());
-			auto mask = columns.unsqueeze(0) < counts.unsqueeze(1);
-			selected = selected.masked_fill(
-				~mask, -std::numeric_limits<float>::infinity());
-			auto log_probability = torch::log_softmax(selected, 1);
-			auto masked_targets = targets * mask;
-			masked_targets = masked_targets / masked_targets.sum(1, true).clamp_min(1e-8);
-			auto policy_errors = -(masked_targets * log_probability).sum(1);
 			auto policy_loss =
-				(policy_errors * policy_weights).sum() / policy_weights.sum().clamp_min(1.0);
+				brci_masked_policy_loss(selected, targets, counts, policy_weights);
 			auto value_errors = torch::square(predicted - values);
 			auto value_loss =
 				(value_errors * value_weights).sum() / value_weights.sum().clamp_min(1.0);
 			auto loss = policy_loss + value_loss;
+			const auto next_step = steps + 1;
+			const bool inspect =
+				next_step == 1 ||
+				(options.log_every > 0 && next_step % options.log_every == 0);
+			if (inspect &&
+				(!torch::isfinite(policy_loss).item<bool>() ||
+				 !torch::isfinite(value_loss).item<bool>() ||
+				 !torch::isfinite(loss).item<bool>())) {
+				throw std::runtime_error("BRCI training produced a non-finite loss");
+			}
 			loss.backward();
 			torch::nn::utils::clip_grad_norm_(model->parameters(), kGradientClip);
 			optimizer.step();
