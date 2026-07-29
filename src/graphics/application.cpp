@@ -2127,7 +2127,7 @@ private:
 			selected_square_.reset();
 			legal_targets_.clear();
 		}
-		if(ImGui::Button("New Match", {120.0F, 0.0F})) {
+		if(ImGui::Button("New", {120.0F, 0.0F})) {
 			begin_new_match();
 		}
 		ImGui::SameLine();

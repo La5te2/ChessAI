@@ -36,7 +36,7 @@ EVAL_OPENING_BOOK="${EVAL_OPENING_BOOK:-data/openings.gen.bin}"
 EVAL_BOOK_PLIES="${EVAL_BOOK_PLIES:-8}"
 EVAL_MAX_BOOK_POSITIONS="${EVAL_MAX_BOOK_POSITIONS:-50000}"
 EVAL_SEARCH_TYPE="${EVAL_SEARCH_TYPE:-only-mcts}"
-EVAL_SIMS="${EVAL_SIMS:-100}"
+EVAL_SIMS="${EVAL_SIMS:-10}"
 EVAL_MCTS_BATCH_SIZE="${EVAL_MCTS_BATCH_SIZE:-512}"
 EVAL_MOVETIME_MS="${EVAL_MOVETIME_MS:-0}"
 EVAL_REPETITION_POLICY_PENALTY="${EVAL_REPETITION_POLICY_PENALTY:-1.0}"
@@ -53,7 +53,7 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 		"Environment overrides:" \
 		"  MODEL=models/gadus/gadus.pth ITERATIONS=5 GAMES_PER_ITER=2000" \
 		"  PRECISION=bf16 BATCH_SIZE=1024 INFERENCE_BATCH_SIZE=512 EVAL_GAMES=400" \
-		"  EVAL_SEARCH_TYPE=only-mcts EVAL_SIMS=100 EVAL_MCTS_BATCH_SIZE=512" \
+		"  EVAL_SEARCH_TYPE=only-mcts EVAL_SIMS=10 EVAL_MCTS_BATCH_SIZE=512" \
 		"" \
 		"The process runs in the background. The launcher prints its run id, pid," \
 		"log path, tail command, and stop command."
