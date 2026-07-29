@@ -27,7 +27,6 @@ struct FcpiOptions {
 	int target_records_per_batch = 256;
 	int counterfactual_budget = 24;
 	double behavior_temperature = 0.85;
-	double uniform_mix = 0.02;
 	double policy_weight = 1.0;
 	double value_weight = 1.0;
 	double dueling_q_weight = 0.5;

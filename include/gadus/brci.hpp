@@ -17,6 +17,11 @@ torch::Tensor brci_masked_policy_loss(const torch::Tensor &selected_logits,
 									  const torch::Tensor &counts,
 									  const torch::Tensor &weights);
 
+/// Returns the minimum-norm convex weight on the Policy backbone gradient.
+double brci_common_descent_lambda(double policy_norm_squared,
+								  double value_norm_squared,
+								  double policy_value_dot);
+
 struct BrciOptions {
 	std::filesystem::path model = "models/gadus/gadus.pth";
 	std::string device = "auto";

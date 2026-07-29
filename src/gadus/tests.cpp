@@ -146,6 +146,12 @@ int main() {
 		brci_loss.backward();
 		require(torch::isfinite(brci_logits.grad()).all().item<bool>(),
 				"BRCI masked policy gradient is non-finite");
+		require(std::abs(gadus::brci_common_descent_lambda(4.0, 1.0, 0.0) - 0.2) <
+					1e-12,
+				"BRCI common-descent weight mismatch");
+		require(std::abs(gadus::brci_common_descent_lambda(1.0, 1.0, 0.0) - 0.5) <
+					1e-12,
+				"BRCI symmetric common-descent weight mismatch");
 
 		const auto checkpoint = std::filesystem::temp_directory_path() / "gadustest.pth";
 		model->eval();

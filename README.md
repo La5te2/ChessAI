@@ -715,9 +715,11 @@ $$
 
 $N_n(s,a)$ 是前 $n$ 次出现中动作 $a$ 的实际选择次数。该确定性配额规则让正概率动作随重复采样获得覆盖，同时避免独立随机抽样造成的额外方差。
 
-只有由棋规判定结束的完整轨迹进入受限图。达到 `max-plies` 的轨迹计入诊断，但不生成图节点或训练目标。代码以“起始 FEN + 完整动作序列”为轨迹签名，并对签名执行由 `seed` 固定的哈希分区。同一条轨迹在整个 run 中始终属于训练图或测试图。测试签名的期望比例约为 $1/\sqrt{G}$，其中 $G$ 是每轮计划对局数，因此每轮测试轨迹的期望数量约为 $\sqrt G$。两个图分别跨迭代追加。
+只有由棋规判定结束的完整轨迹进入受限图。达到 `max-plies` 的轨迹计入诊断，但不生成图节点或训练目标。每条主轨迹完成后，代码在其前半段优先选择一个具有多个合法动作的分支点，排除主轨迹实际动作，并令冻结源模型从另一个高概率动作继续走完一条兄弟轨迹。兄弟轨迹同样必须到达规则终局才能进入受限图。由此产生的两条轨迹具有公共前缀、不同动作和终局锚点，能够主动形成可比较的反事实分支。
 
-受限图采用如下节点合并规则：两个轨迹前缀当且仅当起始 FEN 相同且动作序列逐项相同时表示同一个图节点。同一路径前缀可以合并，不同历史路径不会因棋盘摆放相同而合并。因此重复局面历史、半回合计数和其他棋规状态保留在图结构中。网络输入仍是 $\phi(x)$，所以状态编码省略的历史可能形成不可约拟合误差。
+代码以主轨迹的“起始 FEN + 完整动作序列”作为轨迹族签名。主轨迹及其兄弟轨迹使用同一族签名，并由 `seed` 固定地分配到训练图或测试图，公共前缀不会跨越数据划分。测试轨迹族的期望比例约为 $1/\sqrt{G}$，其中 $G$ 是每轮计划对局数。两个图分别跨迭代追加。
+
+受限图是未来规则状态 DAG。节点身份由起始局面分量和完整的未来规则状态共同确定。未来规则状态包括当前不带回合编号的 FEN、半回合计数，以及自最近一次不可逆动作以来各历史局面的重复次数。两个节点只有在这些信息全部相同时才会合并。因此，换序到达且未来棋规行为等价的节点共享 Bellman 子图，而可能改变三次重复或五十回合判定的历史保持分离。网络输入仍是 $\phi(x)$，所以多个规则节点可能对应同一个网络观测。
 
 记第 $k$ 轮累积后的有限训练图或测试图为 $\mathcal G_k$，节点 $x$ 的已观察动作集合为 $\mathcal A_k(x)$。每个叶节点都是规则终局。BRCI 中的 Bellman 计算指受限图上的 Bellman 最优算子：
 
@@ -742,7 +744,7 @@ $$
 Q_k^*(x,a)=-V_k^*(T(x,a))
 $$
 
-图按动作前缀建立，因此是有限无环图。终局节点提供边界值，`RestrictedGraph::solve()` 按节点深度逆序执行 Bellman 最优递推，唯一确定所有 $V_k^*$ 与 $Q_k^*$。`materialize_graph()` 再把这些解转换成 Policy 和 Value 训练目标。该计算只使用图结构与规则终局值，截断局面不会进入受限图。
+半回合计数和重复历史随可逆动作推进，不可逆动作会改变棋盘并重置相应历史，因此未来规则状态 DAG 不包含状态回路。终局节点提供边界值，`RestrictedGraph::solve()` 使用带环检测的记忆化 Bellman 递推，唯一确定所有 $V_k^*$ 与 $Q_k^*$。`materialize_graph()` 再把这些解转换成 Policy 和 Value 训练目标。该计算只使用图结构与规则终局值，截断局面不会进入受限图。
 
 #### 4.8.2 训练目标
 
@@ -768,36 +770,72 @@ $$
 }
 $$
 
-当节点只有一条已观察边，或所有已观察动作的 $Q_k^*$ 相等时，该节点不提供 Policy 梯度。每个内部节点都使用 $V_k^*(x)$ 监督 Value。记训练节点集合为 $\mathcal X_k^{\mathrm{train}}$，Policy 有效节点集合为 $\mathcal X_{P,k}^{\mathrm{train}}$，训练损失为：
+当节点只有一条已观察边，或所有已观察动作的 $Q_k^*$ 相等时，该节点不提供 Policy 梯度。每个内部节点都使用 $V_k^*(x)$ 监督 Value。
+
+网络无法区分具有相同 $\phi(x)$ 的规则节点。Value 样本按 $\phi(x)$ 分组，并以样本权重加权平均 $V_k^*(x)$。Policy 样本按“$\phi(x)$ + 已观察动作集合”分组，对齐动作索引后加权平均目标分布。动作集合不同的样本不会合并。该聚合分别保持加权均方误差与交叉熵目标，并将规则历史别名转化为网络可拟合的条件目标。
+
+记聚合后的 Value 样本集合为 $\overline{\mathcal X}_{V,k}^{\mathrm{train}}$，Policy 样本集合为 $\overline{\mathcal X}_{P,k}^{\mathrm{train}}$，聚合权重分别为 $\overline w_V$ 与 $\overline w_P$。两个目标为：
 
 $$
-L_{\mathrm{BRCI}}=
-\frac{1}{|\mathcal X_{P,k}^{\mathrm{train}}|}
-\sum_{x\in\mathcal X_{P,k}^{\mathrm{train}}}
+L_P=
+\frac{
+\sum_{\bar x\in\overline{\mathcal X}_{P,k}^{\mathrm{train}}}
+\overline w_P(\bar x)
 L_{\mathrm{CE}}\left(
-\pi_{\theta,k}(\cdot\mid\phi(x)),
-\pi_k^+(\cdot\mid\phi(x))
+\pi_{\theta,k}(\cdot\mid\phi(\bar x)),
+\overline\pi_k^+(\cdot\mid\phi(\bar x))
 \right)
-+
-\frac{1}{|\mathcal X_k^{\mathrm{train}}|}
-\sum_{x\in\mathcal X_k^{\mathrm{train}}}
-\left[V_\theta(\phi(x))-V_k^*(x)\right]^2
+}{
+\sum_{\bar x\in\overline{\mathcal X}_{P,k}^{\mathrm{train}}}
+\overline w_P(\bar x)
+}
 $$
 
-训练 HDF5 保存：
+$$
+L_V=
+\frac{
+\sum_{\bar x\in\overline{\mathcal X}_{V,k}^{\mathrm{train}}}
+\overline w_V(\bar x)
+\left[V_\theta(\phi(\bar x))-\overline V_k^*(\bar x)\right]^2
+}{
+\sum_{\bar x\in\overline{\mathcal X}_{V,k}^{\mathrm{train}}}
+\overline w_V(\bar x)
+}
+$$
+
+每个 optimizer step 分别从 Policy 池和 Value 池抽取分层批次，再合并成一次网络前向。两个 head 使用各自目标的梯度。记共享 residual backbone 上的梯度为 $g_P=\nabla_{\theta_B}L_P$ 与 $g_V=\nabla_{\theta_B}L_V$。共同下降权重定义为：
+
+$$
+\lambda^*=
+\operatorname{clip}_{[0,1]}
+\left(
+\frac{\|g_V\|^2-\langle g_P,g_V\rangle}
+{\|g_P-g_V\|^2}
+\right)
+$$
+
+当分母在数值上为零时取 $\lambda^*=1/2$。共享骨干使用：
+
+$$
+g_B=\lambda^*g_P+(1-\lambda^*)g_V
+$$
+
+$g_B$ 是 $g_P$ 与 $g_V$ 连线上的最小范数点。当两个目标存在共同下降方向时，$-g_B$ 同时降低两者的一阶近似。Policy head 使用 $\nabla_{\theta_P}L_P$，Value head 使用 $\nabla_{\theta_V}L_V$，两个 head 不进行梯度混合。
+
+训练 HDF5 分别保存：
 
 ```text
-states
-legal_indices
-legal_counts
-policy_targets
-policy_weights
+value_states
 value_targets
 value_weights
-components
+policy_states
+policy_legal_indices
+policy_legal_counts
+policy_targets
+policy_weights
 ```
 
-`components` 标识起始 FEN 对应的图分量。具有不同完整历史但相同网络编码的节点保留为独立样本。
+独立测试图保留未聚合的规则节点和起始 FEN 分量，用于计算受限图误差与分量改进率。
 
 #### 4.8.3 独立图误差
 
@@ -960,7 +998,7 @@ $$
 \lim_{k\to\infty}Q_k^*(x,a)=Q^*(x,a)
 $$
 
-**证明：** 按照第 4.8.1 节定义的节点合并规则，每个图节点由起始 FEN 与完整动作前缀唯一确定，重复局面历史和其他棋规状态不会在图合并过程中丢失。国际象棋的可达状态动作边集合有限。对每条边 $e$，记其首次进入受限图的阶段为 $k_e$。第四项保证每个 $k_e$ 都是有限整数。取：
+**证明：** 按照第 4.8.1 节定义的节点合并规则，每个图节点由起始局面分量与完整未来规则状态确定。重复历史与半回合计数不会在图合并过程中丢失，只有未来合法转移和终局判定一致的节点能够共享后继。国际象棋的可达规则状态动作边集合有限。对每条边 $e$，记其首次进入受限图的阶段为 $k_e$。第四项保证每个 $k_e$ 都是有限整数。取：
 
 $$
 K=\max_{e\in\mathcal E(\mathcal G)}k_e
@@ -1030,7 +1068,7 @@ $$
 
 当前实现对 12 个有限回溯步长计算独立图误差，并只把误差严格下降的步长交给 Arena。这保证每个通过受限图判别的 candidate 在该独立图上变好。当前实现尚未证明对任意非最优参数都存在能够通过判别的步长，也未证明 Arena 会接受每个满足受限图条件的 candidate。因此，上述结论给出 BRCI 从 Bellman 目标通向 Value 误差与 Policy 遗憾收敛的充分条件，实际运行仍可能因拟合停滞或 Arena 拒绝而保持原模型。
 
-`summary.json` 记录每轮新增终局轨迹、训练图和测试图规模、分支节点数、Policy 目标变化、训练损失、12 个回溯步长的 Value 均方误差与 Policy 平均遗憾、分量改进率、Arena 结果与最终晋升状态。
+`summary.json` 记录主轨迹与兄弟轨迹的终局/截断数量、训练图和测试图规模、DAG 转置复用次数、分支节点数、网络观测聚合数量、Value 别名方差、Policy 目标变化、分层批次规模、共享梯度权重与夹角、12 个回溯步长的 Value 均方误差与 Policy 平均遗憾、分量改进率、Arena 结果与最终晋升状态。
 
 复现实验使用：
 
@@ -1188,11 +1226,11 @@ build/melano/train \
 	--data data/games.melano.h5 \
 	--out models/melano/melano.pth \
 	--channels 128 \
-	--blocks 10 \
+	--blocks 12 \
 	--epochs 3 \
 	--batch-size 256 \
-	--max-steps 80000 \
-	--lr 0.0002 \
+	--max-steps 200000 \
+	--lr 0.0005 \
 	--weight-decay 0.0001 \
 	--value-weight 1.0 \
 	--dueling-q-weight 0.5 \
@@ -1378,20 +1416,21 @@ $$
 \sigma_A(s)=\max_a|A(s,a)|
 $$
 
-当 $\sigma_A(s)<10^{-4}$ 时，行为策略等于温度变换后的 Policy。其余情况先构造 Advantage 修正分布：
+当 $\sigma_A(s)<10^{-4}$ 时，行为策略等于温度变换后的 Policy。其余情况构造 Advantage 修正分布：
 
 $$
-\widetilde\mu(a\mid s)=\operatorname{softmax}_a\left(
+\mu(a\mid s)=\operatorname{softmax}_a\left(
 \frac{\log(P(a\mid s)+\varepsilon)+A(s,a)/\sigma_A(s)}{T_b}
 \right)
 $$
 
+同一编码局面第 $n$ 次出现时，记 $N_{n-1}^{\mu}(s,a)$ 为前 $n-1$ 次访问中实际选择动作 $a$ 的次数。Melano 对自己的 P+A 行为分布使用概率欠额分配：
+
 $$
-\mu(a\mid s)=(1-\epsilon_u)\widetilde\mu(a\mid s)+
-\frac{\epsilon_u}{|\mathcal A(s)|}
+a_n=\arg\max_a\left[n\mu(a\mid s)-N_{n-1}^{\mu}(s,a)\right]
 $$
 
-其中 $T_b>0$ 是行为温度，$\epsilon_u\in[0,1]$ 是 `uniform-mix`，$\varepsilon>0$ 只用于保证对数数值稳定。完整结束的自对弈使用终局事实生成 MC 回报。设终局时刻为 $\tau$，终局行棋方视角回报为 $z_\tau$：
+其中 $T_b>0$ 是行为温度，$\varepsilon>0$ 只用于保证对数数值稳定。该调度保持 Melano 的 P+A 动作偏好，同时避免独立随机抽样持续漏掉正概率动作。完整结束的自对弈使用终局事实生成 MC 回报。设终局时刻为 $\tau$，终局行棋方视角回报为 $z_\tau$：
 
 $$
 G_\tau=z_\tau,\qquad G_t=-G_{t+1}

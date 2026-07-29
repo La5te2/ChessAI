@@ -10,6 +10,7 @@
 #include <iostream>
 #include <limits>
 #include <numeric>
+#include <optional>
 #include <random>
 #include <sstream>
 #include <stdexcept>
@@ -53,6 +54,20 @@ torch::Tensor brci_masked_policy_loss(const torch::Tensor &selected_logits,
 		   normalized_weights.sum().clamp_min(1.0);
 }
 
+// Find the minimum-norm point on the segment between the two shared-backbone
+// gradients. Its negative is a simultaneous descent direction when one exists.
+double brci_common_descent_lambda(double policy_norm_squared,
+								  double value_norm_squared,
+								  double policy_value_dot) {
+	const double denominator =
+		policy_norm_squared + value_norm_squared - 2.0 * policy_value_dot;
+	if (!std::isfinite(denominator) || denominator <= 1e-20) {
+		return 0.5;
+	}
+	return std::clamp(
+		(value_norm_squared - policy_value_dot) / denominator, 0.0, 1.0);
+}
+
 namespace {
 
 inline constexpr const char *kBrciFormula = "bellman_restricted_counterfactual";
@@ -74,20 +89,56 @@ std::string zero_pad(int value, int width) {
 struct EpisodeStep {
 	PackedState state{};
 	int action = 0;
+	std::string rule_key;
 };
 
 struct Episode {
 	int game_id = 0;
 	std::string start_fen;
+	std::string family_key;
+	std::string final_rule_key;
 	std::vector<EpisodeStep> steps;
 	chess::Board final_board;
+};
+
+// Tracks the rule history that can change future terminal outcomes. FEN omits
+// previous repetitions, so the restricted graph carries their counts explicitly.
+struct RuleHistory {
+	std::unordered_map<std::string, int> repetitions;
+
+	void initialize(const chess::Board &board) {
+		repetitions.clear();
+		repetitions.emplace(board.getFen(false), 1);
+	}
+
+	void observe_after_move(const chess::Board &board) {
+		if (board.halfMoveClock() == 0) {
+			repetitions.clear();
+		}
+		++repetitions[board.getFen(false)];
+	}
+
+	std::string key(const chess::Board &board) const {
+		std::vector<std::pair<std::string, int>> ordered(
+			repetitions.begin(), repetitions.end());
+		std::sort(ordered.begin(), ordered.end());
+		std::ostringstream output;
+		output << board.getFen(false) << "|hm=" << board.halfMoveClock() << "|rep=";
+		for (const auto &[fen, count] : ordered) {
+			output << count << ':' << fen.size() << ':' << fen << ';';
+		}
+		return output.str();
+	}
 };
 
 struct WorkingGame {
 	int game_id = 0;
 	std::string start_fen;
+	std::string family_key;
 	chess::Board board;
+	RuleHistory history;
 	std::vector<EpisodeStep> steps;
+	std::optional<int> excluded_first_action;
 };
 
 struct SelfplayBatch {
@@ -115,13 +166,14 @@ struct GraphNode {
 	bool terminal = false;
 };
 
-// Store exact action-prefix histories. Different histories are never merged, so
-// repetition rights remain part of the environment state even though the network
-// observes only PackedState.
+// Merge nodes only when their complete future-relevant rule state agrees inside
+// one opening component. The resulting DAG shares move-order transpositions
+// without erasing repetition or fifty-move information.
 class RestrictedGraph {
 	public:
 	void append(const Episode &episode) {
-		if (episode.steps.empty() || !game_is_over(episode.final_board)) {
+		if (episode.steps.empty() || episode.steps.front().rule_key.empty() ||
+			episode.final_rule_key.empty() || !game_is_over(episode.final_board)) {
 			throw std::invalid_argument("restricted graph accepts only non-empty terminal episodes");
 		}
 		std::size_t node_index = 0;
@@ -133,9 +185,15 @@ class RestrictedGraph {
 			node.state = episode.steps.front().state;
 			node.component = next_component_++;
 			nodes_.push_back(std::move(node));
+			node_lookup_.emplace(
+				graph_key(nodes_[node_index].component, episode.steps.front().rule_key),
+				node_index);
 		} else {
 			node_index = root->second;
-			if (nodes_[node_index].state != episode.steps.front().state) {
+			const auto lookup = node_lookup_.find(
+				graph_key(nodes_[node_index].component, episode.steps.front().rule_key));
+			if (lookup == node_lookup_.end() || lookup->second != node_index ||
+				nodes_[node_index].state != episode.steps.front().state) {
 				throw std::runtime_error("restricted graph root state mismatch");
 			}
 		}
@@ -148,28 +206,57 @@ class RestrictedGraph {
 			const bool terminal_child = step + 1 == episode.steps.size();
 			const PackedState child_state =
 				terminal_child ? encode_state(episode.final_board) : episode.steps[step + 1].state;
+			const auto &child_rule_key =
+				terminal_child ? episode.final_rule_key : episode.steps[step + 1].rule_key;
 			auto edge = std::find_if(parent.edges.begin(), parent.edges.end(),
 									 [&](const GraphEdge &candidate) {
 										 return candidate.action == episode.steps[step].action;
 									 });
 			if (edge == parent.edges.end()) {
-				GraphNode child;
-				child.state = child_state;
-				child.component = parent.component;
-				child.depth = parent.depth + 1;
-				child.terminal = terminal_child;
-				if (terminal_child) {
-					child.terminal_value =
-						std::clamp(terminal_value_side_to_move(episode.final_board), -1.0F, 1.0F);
+				const auto key = graph_key(parent.component, child_rule_key);
+				auto existing = node_lookup_.find(key);
+				std::size_t child_index = 0;
+				if (existing == node_lookup_.end()) {
+					GraphNode child;
+					child.state = child_state;
+					child.component = parent.component;
+					child.depth = parent.depth + 1;
+					child.terminal = terminal_child;
+					if (terminal_child) {
+						child.terminal_value = std::clamp(
+							terminal_value_side_to_move(episode.final_board), -1.0F, 1.0F);
+					}
+					child_index = nodes_.size();
+					nodes_.push_back(std::move(child));
+					node_lookup_.emplace(key, child_index);
+				} else {
+					child_index = existing->second;
+					auto &child = nodes_[child_index];
+					if (child.component != parent.component || child.state != child_state ||
+						child.terminal != terminal_child) {
+						throw std::runtime_error(
+							"restricted graph future-equivalent node mismatch");
+					}
+					if (terminal_child) {
+						const float terminal_value = std::clamp(
+							terminal_value_side_to_move(episode.final_board), -1.0F, 1.0F);
+						if (std::abs(child.terminal_value - terminal_value) > 1e-6F) {
+							throw std::runtime_error(
+								"restricted graph merged terminal value mismatch");
+						}
+					}
+					child.depth = std::min(child.depth, parent.depth + 1);
+					++transposition_reuses_;
 				}
-				const auto child_index = nodes_.size();
-				nodes_.push_back(std::move(child));
 				nodes_[node_index].edges.push_back({episode.steps[step].action, child_index});
 				node_index = child_index;
 			} else {
 				node_index = edge->child;
 				const auto &child = nodes_[node_index];
-				if (child.state != child_state || child.terminal != terminal_child) {
+				const auto lookup = node_lookup_.find(
+					graph_key(child.component, child_rule_key));
+				if (lookup == node_lookup_.end() || lookup->second != node_index ||
+					child.state != child_state || child.terminal != terminal_child) {
 					throw std::runtime_error("restricted graph deterministic edge mismatch");
 				}
 				if (terminal_child) {
@@ -180,30 +267,18 @@ class RestrictedGraph {
 					}
 				}
 			}
+			max_observed_depth_ =
+				std::max(max_observed_depth_, static_cast<int>(step + 1));
 		}
 		++episodes_;
 	}
 
-	// Solve the finite graph exactly. Every non-terminal leaf is forbidden because
-	// it would reintroduce a model bootstrap into the Bellman target.
+	// Solve the finite terminal-anchored DAG by memoized Bellman recursion.
 	void solve() {
-		for (std::size_t reverse = nodes_.size(); reverse-- > 0;) {
-			auto &node = nodes_[reverse];
-			if (node.terminal) {
-				node.optimal_value = node.terminal_value;
-				continue;
-			}
-			if (node.edges.empty()) {
-				throw std::runtime_error("restricted graph contains an unanchored leaf");
-			}
-			float best = -std::numeric_limits<float>::infinity();
-			for (const auto &edge : node.edges) {
-				if (edge.child <= reverse || edge.child >= nodes_.size()) {
-					throw std::runtime_error("restricted graph is not an acyclic prefix graph");
-				}
-				best = std::max(best, -nodes_[edge.child].optimal_value);
-			}
-			node.optimal_value = std::clamp(best, -1.0F, 1.0F);
+		std::vector<std::uint8_t> status(nodes_.size(), 0);
+		for (const auto &[fen, root] : roots_) {
+			static_cast<void>(fen);
+			solve_node(root, status);
 		}
 	}
 
@@ -227,13 +302,11 @@ class RestrictedGraph {
 		std::size_t terminals = 0;
 		std::size_t decisions = 0;
 		std::size_t branching = 0;
-		int max_depth = 0;
 		for (const auto &node : nodes_) {
 			edges += node.edges.size();
 			terminals += node.terminal ? 1 : 0;
 			decisions += !node.terminal && !node.edges.empty() ? 1 : 0;
 			branching += node.edges.size() > 1 ? 1 : 0;
-			max_depth = std::max(max_depth, node.depth);
 		}
 		return {
 			{"episodes", episodes_},
@@ -243,15 +316,52 @@ class RestrictedGraph {
 			{"decision_nodes", decisions},
 			{"branching_nodes", branching},
 			{"terminal_nodes", terminals},
-			{"max_depth", max_depth},
+			{"transposition_reuses", transposition_reuses_},
+			{"max_depth", max_observed_depth_},
 		};
 	}
 
 	private:
+	static std::string graph_key(int component, const std::string &rule_key) {
+		return std::to_string(component) + '\n' + rule_key;
+	}
+
+	float solve_node(std::size_t index, std::vector<std::uint8_t> &status) {
+		if (index >= nodes_.size()) {
+			throw std::runtime_error("restricted graph edge is out of range");
+		}
+		if (status[index] == 2) {
+			return nodes_[index].optimal_value;
+		}
+		if (status[index] == 1) {
+			throw std::runtime_error(
+				"restricted graph contains a future-rule-state cycle");
+		}
+		status[index] = 1;
+		auto &node = nodes_[index];
+		if (node.terminal) {
+			node.optimal_value = node.terminal_value;
+		} else {
+			if (node.edges.empty()) {
+				throw std::runtime_error("restricted graph contains an unanchored leaf");
+			}
+			float best = -std::numeric_limits<float>::infinity();
+			for (const auto &edge : node.edges) {
+				best = std::max(best, -solve_node(edge.child, status));
+			}
+			node.optimal_value = std::clamp(best, -1.0F, 1.0F);
+		}
+		status[index] = 2;
+		return node.optimal_value;
+	}
+
 	std::vector<GraphNode> nodes_;
 	std::unordered_map<std::string, std::size_t> roots_;
+	std::unordered_map<std::string, std::size_t> node_lookup_;
 	int next_component_ = 0;
+	int max_observed_depth_ = 0;
 	std::int64_t episodes_ = 0;
+	std::int64_t transposition_reuses_ = 0;
 };
 
 struct TrainingRecord {
@@ -265,6 +375,25 @@ struct TrainingRecord {
 	std::vector<float> action_values;
 	float policy_weight = 0.0F;
 	float value_weight = 1.0F;
+};
+
+struct ValueTrainingRecord {
+	PackedState state{};
+	float target = 0.0F;
+	float weight = 0.0F;
+};
+
+struct PolicyTrainingRecord {
+	PackedState state{};
+	std::vector<int> legal_indices;
+	std::vector<float> target;
+	float weight = 0.0F;
+};
+
+struct AggregatedTrainingData {
+	std::vector<ValueTrainingRecord> values;
+	std::vector<PolicyTrainingRecord> policies;
+	nlohmann::json summary;
 };
 
 struct NetworkEvaluation {
@@ -300,6 +429,27 @@ struct GraphImprovement {
 struct SamplingSpec {
 	std::string fen;
 };
+
+// Serialize one complete trajectory for deterministic family assignment.
+std::string episode_key(const Episode &episode) {
+	std::string key = episode.start_fen;
+	key.push_back('\n');
+	for (const auto &step : episode.steps) {
+		key.append(std::to_string(step.action));
+		key.push_back(',');
+	}
+	return key;
+}
+
+// Compute a platform-stable FNV-1a hash for deterministic sampling and splits.
+std::uint64_t stable_hash(const std::string &value, std::uint64_t seed) {
+	std::uint64_t hash = 1469598103934665603ULL ^ seed;
+	for (const unsigned char byte : value) {
+		hash ^= byte;
+		hash *= 1099511628211ULL;
+	}
+	return hash;
+}
 
 // Convert failed HDF5 status codes to descriptive C++ exceptions.
 void require_h5(herr_t status, const std::string &operation) {
@@ -503,6 +653,7 @@ SelfplayBatch collect_selfplay(Model model, const torch::Device &device,
 				static_cast<int>((iteration - 1) * specs.size() + index + 1);
 			game.start_fen = specs[index].fen;
 			game.board = chess::Board(specs[index].fen);
+			game.history.initialize(game.board);
 			games.push_back(std::move(game));
 		}
 		std::vector<bool> done(games.size(), false);
@@ -543,8 +694,9 @@ SelfplayBatch collect_selfplay(Model model, const torch::Device &device,
 				const auto state = encode_state(game.board);
 				const auto choice = choose_behavior_action(
 					packed_key(state), legal, behavior, action_counts, state_visits);
-				game.steps.push_back({state, legal[choice]});
+				game.steps.push_back({state, legal[choice], game.history.key(game.board)});
 				game.board.makeMove(moves[choice]);
+				game.history.observe_after_move(game.board);
 				const bool terminal = game_is_over(game.board);
 				const bool truncated =
 					static_cast<int>(game.steps.size()) >= options.max_plies;
@@ -559,6 +711,8 @@ SelfplayBatch collect_selfplay(Model model, const torch::Device &device,
 						episode.start_fen = game.start_fen;
 						episode.steps = std::move(game.steps);
 						episode.final_board = game.board;
+						episode.final_rule_key = game.history.key(game.board);
+						episode.family_key = episode_key(episode);
 						completed_episodes.push_back(std::move(episode));
 					} else {
 						++truncated_games;
@@ -576,42 +730,194 @@ SelfplayBatch collect_selfplay(Model model, const torch::Device &device,
 		}
 	}
 
+	// Create one active sibling for every terminal primary trajectory. The branch
+	// point is deterministic for a run, excludes the primary action, and the
+	// resulting trajectory is admitted only when it reaches an exact terminal.
+	const std::size_t primary_completed_games = completed_episodes.size();
+	std::vector<WorkingGame> sibling_starts;
+	sibling_starts.reserve(primary_completed_games);
+	for (std::size_t episode_index = 0; episode_index < primary_completed_games;
+		 ++episode_index) {
+		const auto &episode = completed_episodes[episode_index];
+		std::vector<std::size_t> preferred;
+		std::vector<std::size_t> fallback;
+		chess::Board replay(episode.start_fen);
+		const std::size_t preferred_limit = std::max<std::size_t>(
+			1, std::min<std::size_t>(episode.steps.size(), options.max_plies / 2));
+		for (std::size_t step = 0; step < episode.steps.size(); ++step) {
+			const auto moves = legal_moves(replay);
+			if (moves.size() > 1) {
+				fallback.push_back(step);
+				if (step < preferred_limit) {
+					preferred.push_back(step);
+				}
+			}
+			const auto original =
+				std::find_if(moves.begin(), moves.end(), [&](const chess::Move &move) {
+					return move_to_index(move) == episode.steps[step].action;
+				});
+			if (original == moves.end()) {
+				throw std::runtime_error("BRCI primary trajectory cannot be replayed");
+			}
+			replay.makeMove(*original);
+		}
+		const auto &candidates = preferred.empty() ? fallback : preferred;
+		if (candidates.empty()) {
+			continue;
+		}
+		const auto branch = candidates[stable_hash(
+			episode.family_key, options.seed + static_cast<std::uint64_t>(iteration) * 911ULL) %
+									  candidates.size()];
+		WorkingGame sibling;
+		sibling.game_id = episode.game_id;
+		sibling.start_fen = episode.start_fen;
+		sibling.family_key = episode.family_key;
+		sibling.board = chess::Board(episode.start_fen);
+		sibling.history.initialize(sibling.board);
+		for (std::size_t step = 0; step < branch; ++step) {
+			const auto moves = legal_moves(sibling.board);
+			const auto original =
+				std::find_if(moves.begin(), moves.end(), [&](const chess::Move &move) {
+					return move_to_index(move) == episode.steps[step].action;
+				});
+			if (original == moves.end()) {
+				throw std::runtime_error("BRCI sibling prefix cannot be replayed");
+			}
+			sibling.steps.push_back(
+				{encode_state(sibling.board), episode.steps[step].action,
+				 sibling.history.key(sibling.board)});
+			sibling.board.makeMove(*original);
+			sibling.history.observe_after_move(sibling.board);
+		}
+		sibling.excluded_first_action = episode.steps[branch].action;
+		sibling_starts.push_back(std::move(sibling));
+	}
+
+	int sibling_finished = 0;
+	int sibling_completed = 0;
+	int sibling_truncated = 0;
+	std::int64_t sibling_positions = 0;
+	for (std::size_t group_start = 0; group_start < sibling_starts.size();
+		 group_start += std::max(1, options.games_in_flight)) {
+		const auto group_end = std::min(
+			sibling_starts.size(), group_start + std::max(1, options.games_in_flight));
+		std::vector<WorkingGame> games;
+		games.reserve(group_end - group_start);
+		for (std::size_t index = group_start; index < group_end; ++index) {
+			games.push_back(std::move(sibling_starts[index]));
+		}
+		std::vector<bool> done(games.size(), false);
+		while (std::find(done.begin(), done.end(), false) != done.end()) {
+			std::vector<std::size_t> active_indices;
+			std::vector<chess::Board> boards;
+			for (std::size_t index = 0; index < games.size(); ++index) {
+				if (!done[index]) {
+					active_indices.push_back(index);
+					boards.push_back(games[index].board);
+				}
+			}
+			const auto results = evaluate_chunks(
+				evaluator, boards, options.inference_batch_size);
+			for (std::size_t row = 0; row < active_indices.size(); ++row) {
+				auto &game = games[active_indices[row]];
+				const auto moves = legal_moves(game.board);
+				if (moves.empty()) {
+					throw std::runtime_error("non-terminal BRCI sibling has no legal move");
+				}
+				std::vector<int> legal;
+				std::vector<float> prior;
+				legal.reserve(moves.size());
+				prior.reserve(moves.size());
+				for (const auto &move : moves) {
+					const int action = move_to_index(move);
+					legal.push_back(action);
+					prior.push_back(results[row].policy[action]);
+				}
+				prior = normalize(std::move(prior));
+				const double temperature = std::max(1e-4, options.behavior_temperature);
+				std::vector<float> behavior(prior.size());
+				for (std::size_t index = 0; index < prior.size(); ++index) {
+					behavior[index] = static_cast<float>(
+						std::pow(std::clamp(static_cast<double>(prior[index]), 1e-12, 1.0),
+								 1.0 / temperature));
+				}
+				behavior = normalize(std::move(behavior));
+				const auto state = encode_state(game.board);
+				const auto state_key = packed_key(state);
+				std::size_t choice = 0;
+				if (game.excluded_first_action.has_value()) {
+					bool found = false;
+					float best = -1.0F;
+					for (std::size_t index = 0; index < legal.size(); ++index) {
+						if (legal[index] != *game.excluded_first_action &&
+							(!found || behavior[index] > best)) {
+							found = true;
+							best = behavior[index];
+							choice = index;
+						}
+					}
+					if (!found) {
+						throw std::runtime_error(
+							"BRCI sibling branch has no alternative legal action");
+					}
+					++state_visits[state_key];
+					++action_counts[state_key][legal[choice]];
+					game.excluded_first_action.reset();
+				} else {
+					choice = choose_behavior_action(
+						state_key, legal, behavior, action_counts, state_visits);
+				}
+				game.steps.push_back(
+					{state, legal[choice], game.history.key(game.board)});
+				game.board.makeMove(moves[choice]);
+				game.history.observe_after_move(game.board);
+				const bool terminal = game_is_over(game.board);
+				const bool truncated =
+					static_cast<int>(game.steps.size()) >= options.max_plies;
+				if (terminal || truncated) {
+					done[active_indices[row]] = true;
+					++sibling_finished;
+					sibling_positions += game.steps.size();
+					if (terminal) {
+						Episode episode;
+						episode.game_id = game.game_id;
+						episode.start_fen = game.start_fen;
+						episode.family_key = game.family_key;
+						episode.steps = std::move(game.steps);
+						episode.final_board = game.board;
+						episode.final_rule_key = game.history.key(game.board);
+						completed_episodes.push_back(std::move(episode));
+						++sibling_completed;
+					} else {
+						++sibling_truncated;
+					}
+				}
+			}
+		}
+	}
+
 	SelfplayBatch batch;
 	batch.completed = std::move(completed_episodes);
 	batch.summary = {
 		{"games", specs.size()},
 		{"source_positions", source_positions},
-		{"completed_games", batch.completed.size()},
-		{"truncated_games", truncated_games},
+		{"primary_completed_games", primary_completed_games},
+		{"primary_truncated_games", truncated_games},
 		{"completed_positions", completed_positions},
 		{"truncated_positions", truncated_positions},
+		{"sibling_attempts", sibling_starts.size()},
+		{"sibling_completed_games", sibling_completed},
+		{"sibling_truncated_games", sibling_truncated},
+		{"sibling_positions", sibling_positions},
+		{"terminal_episodes", batch.completed.size()},
 		{"starts", starts},
 	};
 	std::cout << "brci sampling summary: " << batch.summary.dump() << std::endl;
 	return batch;
 }
 
-std::string episode_key(const Episode &episode) {
-	std::string key = episode.start_fen;
-	key.push_back('\n');
-	for (const auto &step : episode.steps) {
-		key.append(std::to_string(step.action));
-		key.push_back(',');
-	}
-	return key;
-}
-
-std::uint64_t stable_hash(const std::string &value, std::uint64_t seed) {
-	std::uint64_t hash = 1469598103934665603ULL ^ seed;
-	for (const unsigned char byte : value) {
-		hash ^= byte;
-		hash *= 1099511628211ULL;
-	}
-	return hash;
-}
-
-// Assign each exact terminal trajectory signature to one partition for the
-// entire run. Repeated trajectories can never migrate from training to test.
+// Assign each primary trajectory family to one partition for the entire run.
+// Its actively generated sibling therefore cannot leak across the graph split.
 EpisodeSplit split_episodes(
 	std::vector<Episode> episodes, int games_per_iter, std::uint64_t seed,
 	std::unordered_map<std::string, bool> &test_assignments) {
@@ -624,7 +930,8 @@ EpisodeSplit split_episodes(
 	std::vector<std::string> keys;
 	keys.reserve(episodes.size());
 	for (const auto &episode : episodes) {
-		auto key = episode_key(episode);
+		const auto key =
+			episode.family_key.empty() ? episode_key(episode) : episode.family_key;
 		keys.push_back(key);
 		if (!test_assignments.contains(key)) {
 			test_assignments.emplace(
@@ -840,35 +1147,179 @@ std::vector<TrainingRecord> materialize_graph(RestrictedGraph &graph, Model mode
 	return records;
 }
 
+// Collapse targets that the network cannot distinguish. Value depends only on
+// PackedState. Policy additionally retains the exact observed graph-action mask.
+AggregatedTrainingData aggregate_training_records(
+	const std::vector<TrainingRecord> &records) {
+	struct ValueAccumulator {
+		PackedState state{};
+		double weighted_sum = 0.0;
+		double weighted_square_sum = 0.0;
+		double weight = 0.0;
+		std::size_t count = 0;
+	};
+	struct PolicyAccumulator {
+		PackedState state{};
+		std::vector<int> legal_indices;
+		std::vector<double> weighted_targets;
+		double weight = 0.0;
+		std::size_t count = 0;
+	};
+
+	std::vector<ValueAccumulator> value_accumulators;
+	std::vector<PolicyAccumulator> policy_accumulators;
+	std::unordered_map<std::string, std::size_t> value_groups;
+	std::unordered_map<std::string, std::size_t> policy_groups;
+	std::size_t source_policy_records = 0;
+	for (const auto &record : records) {
+		const double value_weight = std::max(0.0F, record.value_weight);
+		if (value_weight > 0.0) {
+			const auto key = packed_key(record.state);
+			auto [found, inserted] =
+				value_groups.emplace(key, value_accumulators.size());
+			if (inserted) {
+				ValueAccumulator accumulator;
+				accumulator.state = record.state;
+				value_accumulators.push_back(std::move(accumulator));
+			}
+			auto &accumulator = value_accumulators[found->second];
+			accumulator.weighted_sum += value_weight * record.value_target;
+			accumulator.weighted_square_sum +=
+				value_weight * record.value_target * record.value_target;
+			accumulator.weight += value_weight;
+			++accumulator.count;
+		}
+
+		const double policy_weight = std::max(0.0F, record.policy_weight);
+		if (policy_weight <= 0.0) {
+			continue;
+		}
+		++source_policy_records;
+		std::vector<std::size_t> permutation(record.legal_indices.size());
+		std::iota(permutation.begin(), permutation.end(), 0);
+		std::sort(permutation.begin(), permutation.end(), [&](std::size_t left,
+															 std::size_t right) {
+			return record.legal_indices[left] < record.legal_indices[right];
+		});
+		std::vector<int> legal;
+		std::vector<float> targets;
+		legal.reserve(permutation.size());
+		targets.reserve(permutation.size());
+		for (const auto index : permutation) {
+			legal.push_back(record.legal_indices[index]);
+			targets.push_back(record.policy_target[index]);
+		}
+		std::string key = packed_key(record.state);
+		key.push_back('|');
+		for (const int action : legal) {
+			key.append(reinterpret_cast<const char *>(&action), sizeof(action));
+		}
+		auto [found, inserted] =
+			policy_groups.emplace(key, policy_accumulators.size());
+		if (inserted) {
+			PolicyAccumulator accumulator;
+			accumulator.state = record.state;
+			accumulator.legal_indices = legal;
+			accumulator.weighted_targets.assign(legal.size(), 0.0);
+			policy_accumulators.push_back(std::move(accumulator));
+		}
+		auto &accumulator = policy_accumulators[found->second];
+		if (accumulator.legal_indices != legal) {
+			throw std::runtime_error("BRCI policy aggregation mask collision");
+		}
+		for (std::size_t index = 0; index < targets.size(); ++index) {
+			accumulator.weighted_targets[index] += policy_weight * targets[index];
+		}
+		accumulator.weight += policy_weight;
+		++accumulator.count;
+	}
+
+	AggregatedTrainingData aggregated;
+	aggregated.values.reserve(value_accumulators.size());
+	double alias_variance_sum = 0.0;
+	double alias_variance_weight = 0.0;
+	std::size_t value_aliases = 0;
+	for (const auto &accumulator : value_accumulators) {
+		ValueTrainingRecord record;
+		record.state = accumulator.state;
+		record.target =
+			static_cast<float>(accumulator.weighted_sum / accumulator.weight);
+		record.weight = static_cast<float>(accumulator.weight);
+		aggregated.values.push_back(std::move(record));
+		if (accumulator.count > 1) {
+			const double mean = accumulator.weighted_sum / accumulator.weight;
+			const double variance = std::max(
+				0.0, accumulator.weighted_square_sum / accumulator.weight - mean * mean);
+			alias_variance_sum += accumulator.weight * variance;
+			alias_variance_weight += accumulator.weight;
+			value_aliases += accumulator.count - 1;
+		}
+	}
+	aggregated.policies.reserve(policy_accumulators.size());
+	std::size_t policy_aliases = 0;
+	for (const auto &accumulator : policy_accumulators) {
+		PolicyTrainingRecord record;
+		record.state = accumulator.state;
+		record.legal_indices = accumulator.legal_indices;
+		record.target.resize(accumulator.weighted_targets.size());
+		for (std::size_t index = 0; index < record.target.size(); ++index) {
+			record.target[index] =
+				static_cast<float>(accumulator.weighted_targets[index] / accumulator.weight);
+		}
+		record.target = normalize(std::move(record.target));
+		record.weight = static_cast<float>(accumulator.weight);
+		aggregated.policies.push_back(std::move(record));
+		if (accumulator.count > 1) {
+			policy_aliases += accumulator.count - 1;
+		}
+	}
+	aggregated.summary = {
+		{"source_value_records", records.size()},
+		{"aggregated_value_records", aggregated.values.size()},
+		{"merged_value_records", value_aliases},
+		{"source_policy_records", source_policy_records},
+		{"aggregated_policy_records", aggregated.policies.size()},
+		{"merged_policy_records", policy_aliases},
+		{"mean_value_alias_variance",
+		 alias_variance_weight > 0.0 ? alias_variance_sum / alias_variance_weight : 0.0},
+	};
+	return aggregated;
+}
+
 nlohmann::json write_brci_h5(const std::filesystem::path &path,
-							 const std::vector<TrainingRecord> &records) {
-	if (records.empty()) {
+							 const AggregatedTrainingData &records) {
+	if (records.values.empty()) {
 		throw std::runtime_error("BRCI graph contains no training records");
 	}
-	const std::size_t legal_width =
-		std::max_element(records.begin(), records.end(), [](const auto &left, const auto &right) {
-			return left.legal_indices.size() < right.legal_indices.size();
-		})->legal_indices.size();
-	const std::size_t count = records.size();
-	std::vector<std::uint8_t> states(count * kStatePlanes * 8);
-	std::vector<std::int32_t> legal(count * legal_width, 0);
-	std::vector<float> policy(count * legal_width, 0.0F);
-	std::vector<std::uint8_t> legal_counts(count);
-	std::vector<float> values(count);
-	std::vector<float> policy_weights(count);
-	std::vector<float> value_weights(count);
-	std::vector<std::int32_t> components(count);
-	for (std::size_t row = 0; row < count; ++row) {
-		std::copy(records[row].state.begin(), records[row].state.end(),
-				  states.begin() + row * kStatePlanes * 8);
-		legal_counts[row] = static_cast<std::uint8_t>(records[row].legal_indices.size());
-		values[row] = records[row].value_target;
-		policy_weights[row] = records[row].policy_weight;
-		value_weights[row] = records[row].value_weight;
-		components[row] = records[row].component;
-		for (std::size_t column = 0; column < records[row].legal_indices.size(); ++column) {
-			legal[row * legal_width + column] = records[row].legal_indices[column];
-			policy[row * legal_width + column] = records[row].policy_target[column];
+	const std::size_t value_count = records.values.size();
+	const std::size_t policy_count = records.policies.size();
+	std::size_t legal_width = 1;
+	for (const auto &record : records.policies) {
+		legal_width = std::max(legal_width, record.legal_indices.size());
+	}
+	std::vector<std::uint8_t> value_states(value_count * kStatePlanes * 8);
+	std::vector<float> values(value_count);
+	std::vector<float> value_weights(value_count);
+	for (std::size_t row = 0; row < value_count; ++row) {
+		std::copy(records.values[row].state.begin(), records.values[row].state.end(),
+				  value_states.begin() + row * kStatePlanes * 8);
+		values[row] = records.values[row].target;
+		value_weights[row] = records.values[row].weight;
+	}
+	std::vector<std::uint8_t> policy_states(policy_count * kStatePlanes * 8);
+	std::vector<std::int32_t> legal(policy_count * legal_width, 0);
+	std::vector<float> policy(policy_count * legal_width, 0.0F);
+	std::vector<std::uint8_t> legal_counts(policy_count);
+	std::vector<float> policy_weights(policy_count);
+	for (std::size_t row = 0; row < policy_count; ++row) {
+		const auto &record = records.policies[row];
+		std::copy(record.state.begin(), record.state.end(),
+				  policy_states.begin() + row * kStatePlanes * 8);
+		legal_counts[row] = static_cast<std::uint8_t>(record.legal_indices.size());
+		policy_weights[row] = record.weight;
+		for (std::size_t column = 0; column < record.legal_indices.size(); ++column) {
+			legal[row * legal_width + column] = record.legal_indices[column];
+			policy[row * legal_width + column] = record.target[column];
 		}
 	}
 	if (!path.parent_path().empty()) {
@@ -878,62 +1329,188 @@ nlohmann::json write_brci_h5(const std::filesystem::path &path,
 		H5Fcreate(path.string().c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT), path.string());
 	write_string_attribute(file, "arch_type", kArchType);
 	write_string_attribute(file, "brci_formula", kBrciFormula);
-	write_dataset(file, "states", H5T_STD_U8LE, H5T_NATIVE_UINT8, {count, kStatePlanes, 8},
-				  states.data());
-	write_dataset(file, "legal_indices", H5T_STD_I32LE, H5T_NATIVE_INT32, {count, legal_width},
+	write_dataset(file, "value_states", H5T_STD_U8LE, H5T_NATIVE_UINT8,
+				  {value_count, kStatePlanes, 8}, value_states.data());
+	write_dataset(file, "value_targets", H5T_IEEE_F32LE, H5T_NATIVE_FLOAT,
+				  {value_count}, values.data());
+	write_dataset(file, "value_weights", H5T_IEEE_F32LE, H5T_NATIVE_FLOAT,
+				  {value_count}, value_weights.data());
+	write_dataset(file, "policy_states", H5T_STD_U8LE, H5T_NATIVE_UINT8,
+				  {policy_count, kStatePlanes, 8}, policy_states.data());
+	write_dataset(file, "policy_legal_indices", H5T_STD_I32LE, H5T_NATIVE_INT32,
+				  {policy_count, legal_width},
 				  legal.data());
 	write_dataset(file, "policy_targets", H5T_IEEE_F32LE, H5T_NATIVE_FLOAT,
-				  {count, legal_width}, policy.data());
-	write_dataset(file, "legal_counts", H5T_STD_U8LE, H5T_NATIVE_UINT8, {count},
+				  {policy_count, legal_width}, policy.data());
+	write_dataset(file, "policy_legal_counts", H5T_STD_U8LE, H5T_NATIVE_UINT8,
+				  {policy_count},
 				  legal_counts.data());
-	write_dataset(file, "value_targets", H5T_IEEE_F32LE, H5T_NATIVE_FLOAT, {count},
-				  values.data());
-	write_dataset(file, "policy_weights", H5T_IEEE_F32LE, H5T_NATIVE_FLOAT, {count},
+	write_dataset(file, "policy_weights", H5T_IEEE_F32LE, H5T_NATIVE_FLOAT,
+				  {policy_count},
 				  policy_weights.data());
-	write_dataset(file, "value_weights", H5T_IEEE_F32LE, H5T_NATIVE_FLOAT, {count},
-				  value_weights.data());
-	write_dataset(file, "components", H5T_STD_I32LE, H5T_NATIVE_INT32, {count},
-				  components.data());
 	H5Fclose(file);
 	return {
 		{"path", path.string()},
-		{"positions", count},
+		{"value_positions", value_count},
+		{"policy_positions", policy_count},
 		{"legal_width", legal_width},
 		{"formula", kBrciFormula},
+		{"aggregation", records.summary},
 	};
 }
 
-// Fit a raw proposal to the exact finite-graph targets. Parameter backtracking
-// later decides how much of this optimizer displacement is admissible.
+// Clone defined parameter gradients and represent absent objective paths by zero.
+std::vector<torch::Tensor> clone_gradients(const std::vector<torch::Tensor> &parameters) {
+	std::vector<torch::Tensor> gradients;
+	gradients.reserve(parameters.size());
+	for (const auto &parameter : parameters) {
+		gradients.push_back(
+			parameter.grad().defined() ? parameter.grad().detach().clone()
+									   : torch::zeros_like(parameter));
+	}
+	return gradients;
+}
+
+// Restore one objective's native gradients to an architecture-specific head.
+void assign_gradients(const std::vector<torch::Tensor> &parameters,
+					  const std::vector<torch::Tensor> &gradients) {
+	if (parameters.size() != gradients.size()) {
+		throw std::invalid_argument("BRCI gradient vectors are not aligned");
+	}
+	for (std::size_t index = 0; index < parameters.size(); ++index) {
+		parameters[index].mutable_grad() = gradients[index];
+	}
+}
+
+struct CommonGradientMetrics {
+	double lambda = 0.5;
+	double cosine = 0.0;
+};
+
+// Backpropagate both objectives separately. Heads keep their own gradients,
+// while the shared backbone receives the minimum-norm convex combination.
+CommonGradientMetrics assign_common_descent_gradients(
+	Model model, torch::optim::Optimizer &optimizer,
+	const torch::Tensor &policy_loss, const torch::Tensor &value_loss) {
+	const auto backbone_parameters = model->backbone->parameters();
+	const auto policy_parameters = model->policy_head->parameters();
+	const auto value_parameters = model->value_head->parameters();
+
+	optimizer.zero_grad();
+	policy_loss.backward({}, true);
+	const auto policy_backbone = clone_gradients(backbone_parameters);
+	const auto policy_head = clone_gradients(policy_parameters);
+
+	optimizer.zero_grad();
+	value_loss.backward();
+	const auto value_backbone = clone_gradients(backbone_parameters);
+	const auto value_head = clone_gradients(value_parameters);
+
+	auto scalar_options = torch::TensorOptions()
+							  .dtype(torch::kFloat64)
+							  .device(backbone_parameters.front().device());
+	auto policy_norm = torch::zeros({}, scalar_options);
+	auto value_norm = torch::zeros({}, scalar_options);
+	auto dot = torch::zeros({}, scalar_options);
+	for (std::size_t index = 0; index < backbone_parameters.size(); ++index) {
+		const auto policy = policy_backbone[index].to(torch::kFloat64);
+		const auto value = value_backbone[index].to(torch::kFloat64);
+		policy_norm += torch::sum(policy * policy);
+		value_norm += torch::sum(value * value);
+		dot += torch::sum(policy * value);
+	}
+	const double policy_norm_value = policy_norm.item<double>();
+	const double value_norm_value = value_norm.item<double>();
+	const double dot_value = dot.item<double>();
+	const double lambda = brci_common_descent_lambda(
+		policy_norm_value, value_norm_value, dot_value);
+	const double denominator =
+		std::sqrt(std::max(0.0, policy_norm_value * value_norm_value));
+	const double cosine = denominator > 0.0 ? dot_value / denominator : 0.0;
+
+	optimizer.zero_grad();
+	for (std::size_t index = 0; index < backbone_parameters.size(); ++index) {
+		backbone_parameters[index].mutable_grad() =
+			lambda * policy_backbone[index] + (1.0 - lambda) * value_backbone[index];
+	}
+	assign_gradients(policy_parameters, policy_head);
+	assign_gradients(value_parameters, value_head);
+	return {lambda, cosine};
+}
+
+// Fit a raw proposal from independent Policy and Value populations. Parameter
+// backtracking later decides how much optimizer displacement is admissible.
 nlohmann::json train_proposal(const std::filesystem::path &source,
 							  const std::filesystem::path &proposal, Model model,
 							  const torch::Device &device,
-							  const std::vector<TrainingRecord> &records,
+							  const AggregatedTrainingData &records,
 							  const BrciOptions &options, int iteration) {
+	if (records.values.empty()) {
+		throw std::runtime_error("BRCI training has no Value records");
+	}
 	model->to(device);
 	model->eval();
 	torch::optim::AdamW optimizer(
 		model->parameters(),
 		torch::optim::AdamWOptions(options.learning_rate).weight_decay(kWeightDecay));
-	std::vector<std::size_t> order(records.size());
-	std::iota(order.begin(), order.end(), 0);
+	std::vector<std::size_t> value_order(records.values.size());
+	std::vector<std::size_t> policy_order(records.policies.size());
+	std::iota(value_order.begin(), value_order.end(), 0);
+	std::iota(policy_order.begin(), policy_order.end(), 0);
 	std::mt19937_64 rng(options.seed + iteration * 313);
+	const std::size_t requested_batch =
+		static_cast<std::size_t>(std::max(1, options.batch_size));
+	const std::size_t policy_batch_size =
+		records.policies.empty() ? 0 : std::max<std::size_t>(1, requested_batch / 2);
+	const std::size_t value_batch_size =
+		std::max<std::size_t>(1, requested_batch - policy_batch_size);
 	std::int64_t steps = 0;
 	double total_policy = 0.0;
 	double total_value = 0.0;
 	double total_loss = 0.0;
+	double total_lambda = 0.0;
+	double total_cosine = 0.0;
 	for (int epoch = 0; epoch < std::max(0, options.epochs); ++epoch) {
-		std::shuffle(order.begin(), order.end(), rng);
-		for (std::size_t begin = 0; begin < order.size(); begin += std::max(1, options.batch_size)) {
-			const auto end = std::min(order.size(), begin + std::max(1, options.batch_size));
-			const auto batch = static_cast<std::int64_t>(end - begin);
-			std::size_t width = 1;
-			std::vector<std::uint8_t> packed(static_cast<std::size_t>(batch) * kStatePlanes * 8);
-			for (std::size_t index = begin; index < end; ++index) {
-				width = std::max(width, records[order[index]].legal_indices.size());
-				std::copy(records[order[index]].state.begin(), records[order[index]].state.end(),
-						  packed.begin() + (index - begin) * kStatePlanes * 8);
+		std::shuffle(value_order.begin(), value_order.end(), rng);
+		if (!policy_order.empty()) {
+			std::shuffle(policy_order.begin(), policy_order.end(), rng);
+		}
+		std::size_t policy_cursor = 0;
+		for (std::size_t value_begin = 0; value_begin < value_order.size();
+			 value_begin += value_batch_size) {
+			const auto value_end =
+				std::min(value_order.size(), value_begin + value_batch_size);
+			const std::size_t value_count = value_end - value_begin;
+			const std::size_t policy_count = policy_order.empty()
+				? 0
+				: std::min(policy_batch_size, policy_order.size());
+			const std::size_t total_count = policy_count + value_count;
+			std::vector<std::size_t> policy_rows;
+			policy_rows.reserve(policy_count);
+			for (std::size_t row = 0; row < policy_count; ++row) {
+				policy_rows.push_back(
+					policy_order[(policy_cursor + row) % policy_order.size()]);
 			}
+			if (!policy_order.empty()) {
+				policy_cursor = (policy_cursor + policy_count) % policy_order.size();
+			}
+
+			std::size_t width = 1;
+			for (const auto index : policy_rows) {
+				width = std::max(width, records.policies[index].legal_indices.size());
+			}
+			std::vector<std::uint8_t> packed(total_count * kStatePlanes * 8);
+			for (std::size_t row = 0; row < policy_count; ++row) {
+				const auto &record = records.policies[policy_rows[row]];
+				std::copy(record.state.begin(), record.state.end(),
+						  packed.begin() + row * kStatePlanes * 8);
+			}
+			for (std::size_t row = 0; row < value_count; ++row) {
+				const auto &record = records.values[value_order[value_begin + row]];
+				std::copy(record.state.begin(), record.state.end(),
+						  packed.begin() + (policy_count + row) * kStatePlanes * 8);
+			}
+
 			const bool pin_memory = device.is_cuda();
 			auto int_options =
 				torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
@@ -943,52 +1520,75 @@ nlohmann::json train_proposal(const std::filesystem::path &source,
 				int_options = int_options.pinned_memory(true);
 				float_options = float_options.pinned_memory(true);
 			}
-			auto legal =
-				torch::zeros({batch, static_cast<std::int64_t>(width)}, int_options);
-			auto targets =
-				torch::zeros({batch, static_cast<std::int64_t>(width)}, float_options);
-			auto counts = torch::zeros({batch}, int_options);
-			auto values = torch::zeros({batch}, float_options);
-			auto policy_weights = torch::zeros({batch}, float_options);
-			auto value_weights = torch::zeros({batch}, float_options);
+			auto legal = torch::zeros(
+				{static_cast<std::int64_t>(policy_count),
+				 static_cast<std::int64_t>(width)},
+				int_options);
+			auto targets = torch::zeros(
+				{static_cast<std::int64_t>(policy_count),
+				 static_cast<std::int64_t>(width)},
+				float_options);
+			auto counts =
+				torch::zeros({static_cast<std::int64_t>(policy_count)}, int_options);
+			auto policy_weights =
+				torch::zeros({static_cast<std::int64_t>(policy_count)}, float_options);
+			auto values =
+				torch::zeros({static_cast<std::int64_t>(value_count)}, float_options);
+			auto value_weights =
+				torch::zeros({static_cast<std::int64_t>(value_count)}, float_options);
 			auto legal_access = legal.accessor<std::int64_t, 2>();
 			auto target_access = targets.accessor<float, 2>();
 			auto count_access = counts.accessor<std::int64_t, 1>();
-			auto value_access = values.accessor<float, 1>();
 			auto policy_weight_access = policy_weights.accessor<float, 1>();
+			auto value_access = values.accessor<float, 1>();
 			auto value_weight_access = value_weights.accessor<float, 1>();
-			for (std::size_t index = begin; index < end; ++index) {
-				const auto &record = records[order[index]];
-				const auto row = static_cast<std::int64_t>(index - begin);
+			for (std::size_t row = 0; row < policy_count; ++row) {
+				const auto &record = records.policies[policy_rows[row]];
 				count_access[row] = record.legal_indices.size();
-				value_access[row] = record.value_target;
-				policy_weight_access[row] = record.policy_weight;
-				value_weight_access[row] = record.value_weight;
+				policy_weight_access[row] = record.weight;
 				for (std::size_t column = 0; column < record.legal_indices.size(); ++column) {
 					legal_access[row][column] = record.legal_indices[column];
-					target_access[row][column] = record.policy_target[column];
+					target_access[row][column] = record.target[column];
 				}
 			}
-			auto states = decode_states(packed.data(), batch, pin_memory).to(device, true);
+			for (std::size_t row = 0; row < value_count; ++row) {
+				const auto &record = records.values[value_order[value_begin + row]];
+				value_access[row] = record.target;
+				value_weight_access[row] = record.weight;
+			}
+
+			auto states = decode_states(
+				packed.data(), static_cast<std::int64_t>(total_count), pin_memory)
+							  .to(device, true);
 			legal = legal.to(device, true);
 			targets = targets.to(device, true);
 			counts = counts.to(device, true);
-			values = values.to(device, true);
 			policy_weights = policy_weights.to(device, true);
+			values = values.to(device, true);
 			value_weights = value_weights.to(device, true);
 
-			optimizer.zero_grad();
 			torch::Tensor logits;
 			torch::Tensor predicted;
 			{
 				AutocastGuard autocast(options.precision, device);
 				std::tie(logits, predicted) = model->forward(states);
 			}
-			auto selected = logits.to(torch::kFloat32).gather(1, legal);
 			predicted = predicted.reshape({-1}).to(torch::kFloat32);
-			auto policy_loss =
-				brci_masked_policy_loss(selected, targets, counts, policy_weights);
-			auto value_errors = torch::square(predicted - values);
+			torch::Tensor policy_loss;
+			if (policy_count > 0) {
+				auto selected =
+					logits.narrow(0, 0, static_cast<std::int64_t>(policy_count))
+						.to(torch::kFloat32)
+						.gather(1, legal);
+				policy_loss = brci_masked_policy_loss(
+					selected, targets, counts, policy_weights);
+			} else {
+				policy_loss = logits.sum() * 0.0;
+			}
+			auto predicted_values = predicted.narrow(
+				0, static_cast<std::int64_t>(policy_count),
+				static_cast<std::int64_t>(value_count));
+			auto value_errors = torch::square(predicted_values - values);
 			auto value_loss =
 				(value_errors * value_weights).sum() / value_weights.sum().clamp_min(1.0);
 			auto loss = policy_loss + value_loss;
@@ -1002,18 +1602,30 @@ nlohmann::json train_proposal(const std::filesystem::path &source,
 				 !torch::isfinite(loss).item<bool>())) {
 				throw std::runtime_error("BRCI training produced a non-finite loss");
 			}
-			loss.backward();
+			CommonGradientMetrics gradient_metrics;
+			if (policy_count > 0) {
+				gradient_metrics = assign_common_descent_gradients(
+					model, optimizer, policy_loss, value_loss);
+			} else {
+				optimizer.zero_grad();
+				value_loss.backward();
+				gradient_metrics.lambda = 0.0;
+			}
 			torch::nn::utils::clip_grad_norm_(model->parameters(), kGradientClip);
 			optimizer.step();
 			++steps;
 			total_policy += policy_loss.detach().item<double>();
 			total_value += value_loss.detach().item<double>();
 			total_loss += loss.detach().item<double>();
+			total_lambda += gradient_metrics.lambda;
+			total_cosine += gradient_metrics.cosine;
 			if (options.log_every > 0 && (steps == 1 || steps % options.log_every == 0)) {
 				std::cout << "brci train: step=" << steps
 						  << " policy=" << policy_loss.detach().item<double>()
 						  << " value=" << value_loss.detach().item<double>()
-						  << " loss=" << loss.detach().item<double>() << std::endl;
+						  << " loss=" << loss.detach().item<double>()
+						  << " shared_lambda=" << gradient_metrics.lambda
+						  << " shared_cosine=" << gradient_metrics.cosine << std::endl;
 			}
 			if (options.train_max_steps > 0 && steps >= options.train_max_steps) {
 				break;
@@ -1032,11 +1644,20 @@ nlohmann::json train_proposal(const std::filesystem::path &source,
 		{"epochs_requested", options.epochs},
 		{"proposal", proposal.string()},
 		{"batch_norm_running_stats", "frozen"},
+		{"batching",
+		 {
+			 {"policy_batch_size", policy_batch_size},
+			 {"value_batch_size", value_batch_size},
+			 {"policy_records", records.policies.size()},
+			 {"value_records", records.values.size()},
+		 }},
 		{"metrics",
 		 {
 			 {"loss", total_loss / divisor},
 			 {"policy", total_policy / divisor},
 			 {"value", total_value / divisor},
+			 {"shared_lambda", total_lambda / divisor},
+			 {"shared_gradient_cosine", total_cosine / divisor},
 		 }},
 	};
 }
@@ -1352,9 +1973,10 @@ void run_brci(const BrciOptions &options) {
 		nlohmann::json test_graph_summary;
 		auto test_records = materialize_graph(
 			test_graph, model, device, options, test_graph_summary);
+		auto aggregated_training = aggregate_training_records(training_records);
 		const auto data_path =
 			data_dir / ("brci_iter_" + zero_pad(iteration, 3) + ".h5");
-		auto data_summary = write_brci_h5(data_path, training_records);
+		auto data_summary = write_brci_h5(data_path, aggregated_training);
 		data_summary["sampling"] = sampled.summary;
 		data_summary["new_training_games"] = split.training.size();
 		data_summary["new_test_games"] = split.test.size();
@@ -1366,7 +1988,7 @@ void run_brci(const BrciOptions &options) {
 		const auto candidate =
 			model_dir / ("candidate_iter_" + zero_pad(iteration, 3) + ".pth");
 		auto train_summary = train_proposal(
-			current, raw, model, device, training_records, options, iteration);
+			current, raw, model, device, aggregated_training, options, iteration);
 		auto restriction_summary = select_restricted_candidate(
 			current, raw, candidate, device, options, test_records);
 		const bool restriction_ok = restriction_summary["accepted"].get<bool>();

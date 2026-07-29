@@ -14,7 +14,7 @@ int main(int argc, char **argv) {
 				<< "  --iterations <n> --games-per-iter <n> --games-in-flight <n> --max-plies <n>\n"
 				<< "  --opening-book <path|empty> --startpos-fraction <x>\n"
 				<< "  --counterfactual-budget <n> --behavior-temperature <x>\n"
-				<< "  --uniform-mix <x> --policy-weight <x> --value-weight <x>\n"
+				<< "  --policy-weight <x> --value-weight <x>\n"
 				<< "  --dueling-q-weight <x> --dynamics-weight <x> "
 					 "--imagined-value-weight <x>\n"
 				<< "  --epochs <n> --train-max-steps <n>\n"
@@ -48,7 +48,6 @@ int main(int argc, char **argv) {
 			args.get_int("counterfactual-budget", options.counterfactual_budget);
 		options.behavior_temperature =
 			args.get_double("behavior-temperature", options.behavior_temperature);
-		options.uniform_mix = args.get_double("uniform-mix", options.uniform_mix);
 		options.policy_weight = args.get_double("policy-weight", options.policy_weight);
 		options.value_weight = args.get_double("value-weight", options.value_weight);
 		options.dueling_q_weight =

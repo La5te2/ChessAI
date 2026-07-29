@@ -93,6 +93,11 @@ struct CounterfactualTree {
 	int evaluated_edges = 0;
 };
 
+struct BehaviorCoverage {
+	std::int64_t visits = 0;
+	std::unordered_map<int, std::int64_t> action_visits;
+};
+
 struct ReturnStatistics {
 	double sum = 0.0;
 	std::int64_t count = 0;
@@ -206,16 +211,38 @@ std::vector<float> stable_softmax(const std::vector<double> &logits) {
 	return normalize(std::move(values));
 }
 
-// Draw one categorical sample from an already normalized behavior distribution.
-std::size_t sample_index(const std::vector<float> &probabilities, std::mt19937_64 &rng) {
-	std::discrete_distribution<std::size_t> distribution(probabilities.begin(),
-														 probabilities.end());
-	return distribution(rng);
-}
-
 // Use model-visible packed state bytes as the aggregation and per-game deduplication key.
 std::string packed_key(const PackedState &state) {
 	return std::string(reinterpret_cast<const char *>(state.data()), state.size());
+}
+
+// Allocate repeated state visits by deficit against Melano's P+A behavior
+// distribution. This preserves architecture-specific action preferences while
+// removing independent categorical-sampling variance.
+std::size_t choose_behavior_action(const std::string &state_key,
+								   const std::vector<int> &legal,
+								   const std::vector<float> &behavior,
+								   std::unordered_map<std::string, BehaviorCoverage> &coverage) {
+	if (legal.empty() || legal.size() != behavior.size()) {
+		throw std::invalid_argument("behavior selection requires aligned legal probabilities");
+	}
+	auto &state = coverage[state_key];
+	const double next_visit = static_cast<double>(state.visits + 1);
+	std::size_t selected = 0;
+	double largest_deficit = -std::numeric_limits<double>::infinity();
+	for (std::size_t index = 0; index < legal.size(); ++index) {
+		const auto found = state.action_visits.find(legal[index]);
+		const double realized =
+			found == state.action_visits.end() ? 0.0 : static_cast<double>(found->second);
+		const double deficit = next_visit * static_cast<double>(behavior[index]) - realized;
+		if (deficit > largest_deficit) {
+			largest_deficit = deficit;
+			selected = index;
+		}
+	}
+	++state.visits;
+	++state.action_visits[legal[selected]];
+	return selected;
 }
 
 // Build a shuffled mixture of startpos and opening-book starts for one iteration.
@@ -335,7 +362,7 @@ std::vector<Position> collect_selfplay(Model model, const torch::Device &device,
 	Searcher evaluator(model, device, closed);
 	nlohmann::json starts;
 	const auto specs = make_sampling_specs(options, iteration, starts);
-	std::mt19937_64 rng(options.seed + iteration);
+	std::unordered_map<std::string, BehaviorCoverage> behavior_coverage;
 	std::vector<Trajectory> trajectories;
 	trajectories.reserve(specs.size());
 	int completed = 0;
@@ -395,16 +422,13 @@ std::vector<Position> collect_selfplay(Model model, const torch::Device &device,
 						temperature;
 				}
 				auto behavior = stable_softmax(behavior_logits);
-				const double mix = std::clamp(options.uniform_mix, 0.0, 1.0);
-				for (float &probability : behavior) {
-					probability =
-						static_cast<float>((1.0 - mix) * probability + mix / behavior.size());
-				}
-				const std::size_t choice = sample_index(behavior, rng);
+				const auto state = encode_state(board);
+				const std::size_t choice =
+					choose_behavior_action(packed_key(state), legal, behavior, behavior_coverage);
 				const int played = legal[choice];
 				Position position;
 				position.game_id = trajectory.game_id;
-				position.state = encode_state(board);
+				position.state = state;
 				position.fen = board.getFen();
 				position.root_value = results[row].value;
 				position.legal_indices = legal;
