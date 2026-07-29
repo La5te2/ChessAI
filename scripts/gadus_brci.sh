@@ -29,12 +29,16 @@ TRAIN_MAX_STEPS="${TRAIN_MAX_STEPS:-3000}"
 BATCH_SIZE="${BATCH_SIZE:-1024}"
 LEARNING_RATE="${LEARNING_RATE:-0.00002}"
 
-EVAL_GAMES="${EVAL_GAMES:-2000}"
+EVAL_GAMES="${EVAL_GAMES:-512}"
 EVAL_GAMES_IN_FLIGHT="${EVAL_GAMES_IN_FLIGHT:-256}"
-EVAL_MAX_PLIES="${EVAL_MAX_PLIES:-240}"
+EVAL_MAX_PLIES="${EVAL_MAX_PLIES:-160}"
 EVAL_OPENING_BOOK="${EVAL_OPENING_BOOK:-data/openings.gen.bin}"
 EVAL_BOOK_PLIES="${EVAL_BOOK_PLIES:-8}"
 EVAL_MAX_BOOK_POSITIONS="${EVAL_MAX_BOOK_POSITIONS:-50000}"
+EVAL_SEARCH_TYPE="${EVAL_SEARCH_TYPE:-only-mcts}"
+EVAL_SIMS="${EVAL_SIMS:-100}"
+EVAL_MCTS_BATCH_SIZE="${EVAL_MCTS_BATCH_SIZE:-512}"
+EVAL_MOVETIME_MS="${EVAL_MOVETIME_MS:-0}"
 EVAL_REPETITION_POLICY_PENALTY="${EVAL_REPETITION_POLICY_PENALTY:-1.0}"
 EVAL_INSTANT_MATE_FIRST="${EVAL_INSTANT_MATE_FIRST:-1}"
 EVAL_MIN_NET_WINS="${EVAL_MIN_NET_WINS:-4}"
@@ -49,6 +53,7 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 		"Environment overrides:" \
 		"  MODEL=models/gadus/gadus.pth ITERATIONS=5 GAMES_PER_ITER=2000" \
 		"  PRECISION=bf16 BATCH_SIZE=1024 INFERENCE_BATCH_SIZE=512 EVAL_GAMES=400" \
+		"  EVAL_SEARCH_TYPE=only-mcts EVAL_SIMS=100 EVAL_MCTS_BATCH_SIZE=512" \
 		"" \
 		"The process runs in the background. The launcher prints its run id, pid," \
 		"log path, tail command, and stop command."
@@ -102,6 +107,10 @@ COMMAND=(
 	--eval-opening-book "${EVAL_OPENING_BOOK}"
 	--eval-book-plies "${EVAL_BOOK_PLIES}"
 	--eval-max-book-positions "${EVAL_MAX_BOOK_POSITIONS}"
+	--eval-search-type "${EVAL_SEARCH_TYPE}"
+	--eval-sims "${EVAL_SIMS}"
+	--eval-mcts-batch-size "${EVAL_MCTS_BATCH_SIZE}"
+	--eval-movetime-ms "${EVAL_MOVETIME_MS}"
 	--eval-repetition-policy-penalty "${EVAL_REPETITION_POLICY_PENALTY}"
 	--eval-instant-mate-first "${EVAL_INSTANT_MATE_FIRST}"
 	--eval-min-net-wins "${EVAL_MIN_NET_WINS}"
@@ -117,7 +126,7 @@ echo "model=${MODEL} device=${DEVICE} precision=${PRECISION} iterations=${ITERAT
 echo "self-play: games=${GAMES_PER_ITER} games_in_flight=${GAMES_IN_FLIGHT} max_plies=${MAX_PLIES}"
 echo "restricted graph: terminal episodes accumulate across accepted and rejected iterations"
 echo "training: batch_size=${BATCH_SIZE} epochs=${EPOCHS} max_steps=${TRAIN_MAX_STEPS} lr=${LEARNING_RATE}"
-echo "arena: games=${EVAL_GAMES} search_type=closed sims=0 min_net_wins=${EVAL_MIN_NET_WINS}"
+echo "arena: games=${EVAL_GAMES} search_type=${EVAL_SEARCH_TYPE} sims=${EVAL_SIMS} min_net_wins=${EVAL_MIN_NET_WINS}"
 
 nohup "${COMMAND[@]}" >"${LAUNCH_LOG}" 2>&1 < /dev/null &
 PID=$!

@@ -900,7 +900,7 @@ $$
 
 候选集合优先选择 $\underline p_k$ 最大的步长。下界相同时，选择 Value 均方误差和 Policy 平均遗憾的相对降幅之和更大的步长。独立图缺少任一项可比较指标时，本轮拒绝。
 
-通过受限图判别的 candidate 继续参加 `closed` paired Arena。Arena 达到 `eval-min-net-wins` 后，candidate 才会原子写入该 run 的 `current.pth`。因此受限图判别负责有限图上的数值性质，Arena 负责实际走棋分布上的最终晋升。
+通过受限图判别的 candidate 继续参加 paired Arena。BRCI 启动脚本默认使用 `only-mcts` 和每步 100 simulations，使 Policy 先验与 Value 叶节点评价都参与晋升对战。Arena 达到 `eval-min-net-wins` 后，candidate 才会原子写入该 run 的 `current.pth`。因此受限图判别负责有限图上的数值性质，Arena 负责实际走棋分布上的最终晋升。
 
 #### 4.8.5 受限 Bellman 解的收敛
 
@@ -1038,7 +1038,7 @@ $$
 bash scripts/gadus_brci.sh
 ```
 
-`build/gadus/brci --help` 列出可覆盖的采样、拟合与 Arena 参数。
+脚本默认设置 `EVAL_SEARCH_TYPE=only-mcts`、`EVAL_SIMS=100`、`EVAL_MCTS_BATCH_SIZE=512` 和 `EVAL_MOVETIME_MS=0`。`EVAL_SIMS` 是每个局面的 MCTS simulation 上限，`EVAL_MOVETIME_MS=0` 表示不附加时间预算。`build/gadus/brci --help` 列出可覆盖的采样、拟合与 Arena 参数。
 
 每次运行创建独立的 `brci_<timestamp>_<id>` 数据目录和模型目录。受限图在该次运行的内存中跨迭代累积，candidate 是否通过晋升不影响已经取得的终局事实。
 

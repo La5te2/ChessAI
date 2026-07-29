@@ -16,7 +16,9 @@ int main(int argc, char **argv) {
 				<< "  --inference-batch-size <n> --behavior-temperature <x>\n"
 				<< "  --epochs <n> --train-max-steps <n> --batch-size <n> --lr <x>\n"
 				<< "  --eval-games <n> --eval-games-in-flight <n> --eval-max-plies <n>\n"
-				<< "  --eval-opening-book <path|empty> --eval-min-net-wins <n>\n"
+				<< "  --eval-opening-book <path|empty> --eval-search-type <closed|only-mcts>\n"
+				<< "  --eval-sims <n> --eval-mcts-batch-size <n> --eval-movetime-ms <ms>\n"
+				<< "  --eval-min-net-wins <n>\n"
 				<< "  --device <auto|cpu|cuda> --precision <fp32|bf16> --seed <n>\n";
 			return 0;
 		}
@@ -59,15 +61,19 @@ int main(int argc, char **argv) {
 			args.get_int("eval-max-book-positions", arena.max_book_positions);
 		arena.min_net_wins = args.get_int("eval-min-net-wins", 4);
 		arena.log_every = options.log_every;
-		arena.search.type = gadus::SearchType::Closed;
-		arena.search.mcts_sims = 0;
-		arena.search.movetime_ms = 0.0;
-		arena.search.precision = options.precision;
-		arena.search.repetition_policy_penalty =
+		auto &search = arena.search;
+		search.type =
+			gadus::parse_search_type(args.get("eval-search-type", "only-mcts"));
+		search.mcts_sims = args.get_int("eval-sims", search.mcts_sims);
+		search.mcts_batch_size =
+			args.get_int("eval-mcts-batch-size", search.mcts_batch_size);
+		search.movetime_ms = args.get_double("eval-movetime-ms", search.movetime_ms);
+		search.precision = options.precision;
+		search.repetition_policy_penalty =
 			args.get_double("eval-repetition-policy-penalty",
-							arena.search.repetition_policy_penalty);
-		arena.search.instant_mate_first =
-			args.get_bool("eval-instant-mate-first", arena.search.instant_mate_first);
+							search.repetition_policy_penalty);
+		search.instant_mate_first =
+			args.get_bool("eval-instant-mate-first", search.instant_mate_first);
 
 		gadus::run_brci(options);
 		return 0;
