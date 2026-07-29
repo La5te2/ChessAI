@@ -190,6 +190,26 @@ int main() {
 		std::filesystem::remove(pgn);
 		std::filesystem::remove(h5);
 
+		auto ema_online = melano::Model(8, 1);
+		auto ema_target = melano::Model(8, 1);
+		melano::initialize_target_encoder(ema_target, ema_online);
+		const auto ema_state = melano::encode_boards({board});
+		require(torch::allclose(ema_online->encode(ema_state), ema_target->encode(ema_state)),
+				"target encoder initialization mismatch");
+		for (const auto &parameter : ema_target->parameters()) {
+			require(!parameter.requires_grad(), "target encoder parameter still requires gradients");
+		}
+		auto online_embedding = ema_online->state_embedding->parameters().front();
+		auto target_embedding = ema_target->state_embedding->parameters().front();
+		auto target_before = target_embedding.clone();
+		{
+			torch::NoGradGuard no_grad;
+			online_embedding.add_(2.0);
+		}
+		melano::update_target_encoder(ema_target, ema_online, 0.75);
+		require(torch::allclose(target_embedding, target_before + 0.5),
+				"target encoder EMA update mismatch");
+
 		auto model = melano::Model(8, 1);
 		auto states = melano::encode_boards({board, board});
 		auto tokens = model->encode(states);

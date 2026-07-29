@@ -16,7 +16,7 @@ int main(int argc, char **argv) {
 				<< "  --counterfactual-budget <n> --behavior-temperature <x>\n"
 				<< "  --policy-weight <x> --value-weight <x>\n"
 				<< "  --dueling-q-weight <x> --dynamics-weight <x> "
-					 "--imagined-value-weight <x>\n"
+					 "--imagined-value-weight <x> --target-decay <x>\n"
 				<< "  --epochs <n> --train-max-steps <n>\n"
 				<< "  --batch-size <n> --lr <x> --weight-decay <x> --grad-clip <x>\n"
 				<< "  --eval-games <n> --eval-games-in-flight <n> --eval-max-plies <n>\n"
@@ -55,6 +55,7 @@ int main(int argc, char **argv) {
 		options.dynamics_weight = args.get_double("dynamics-weight", options.dynamics_weight);
 		options.imagined_value_weight =
 			args.get_double("imagined-value-weight", options.imagined_value_weight);
+		options.target_decay = args.get_double("target-decay", options.target_decay);
 		options.epochs = args.get_int("epochs", options.epochs);
 		options.train_max_steps = args.get_int64("train-max-steps", options.train_max_steps);
 		options.batch_size = args.get_int("batch-size", options.batch_size);

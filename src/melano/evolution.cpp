@@ -1177,6 +1177,12 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 							   const FcpiOptions &options) {
 	model->to(device);
 	model->train();
+	auto target_model = Model(model->channels(), model->blocks());
+	target_model->to(device);
+	initialize_target_encoder(target_model, model);
+	if (!(options.target_decay >= 0.0 && options.target_decay < 1.0)) {
+		throw std::invalid_argument("target-decay must be in [0, 1)");
+	}
 	torch::optim::AdamW optimizer(
 		model->parameters(),
 		torch::optim::AdamWOptions(options.learning_rate).weight_decay(options.weight_decay));
@@ -1296,7 +1302,7 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 					model->transition(repeated_tokens, candidate_indices.reshape({-1}));
 				{
 					torch::NoGradGuard no_grad;
-					target_next = model->encode(next_states).detach();
+					target_next = target_model->encode(next_states).detach();
 				}
 				imagined = model->predict(predicted_next);
 			}
@@ -1362,10 +1368,13 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 						options.dynamics_weight * dynamics_loss +
 						options.imagined_value_weight * imagined_value_loss;
 			loss.backward();
+			double gradient_norm = 0.0;
 			if (options.grad_clip > 0.0) {
-				torch::nn::utils::clip_grad_norm_(model->parameters(), options.grad_clip);
+				gradient_norm = torch::nn::utils::clip_grad_norm_(
+					model->parameters(), options.grad_clip, 2.0, true);
 			}
 			optimizer.step();
+			update_target_encoder(target_model, model, options.target_decay);
 			++steps;
 			metric_totals.add_(torch::stack(
 				{loss.detach(), policy_loss.detach(), value_loss.detach(),
@@ -1385,7 +1394,8 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 						  << " dueling_q=" << metric_values[2]
 						  << " dynamics=" << metric_values[3]
 						  << " imagined_value=" << metric_values[4]
-						  << " loss=" << metric_values[5] << std::endl;
+						  << " loss=" << metric_values[5]
+						  << " grad_norm=" << gradient_norm << std::endl;
 			}
 			if (options.train_max_steps > 0 && steps >= options.train_max_steps) {
 				break;
@@ -1406,6 +1416,7 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 		{"epochs_requested", options.epochs},
 		{"candidate", candidate.string()},
 		{"precision", compute_precision_name(options.precision)},
+		{"target_decay", options.target_decay},
 		{"metrics",
 		 {
 			 {"loss", metric_values[0] / divisor},

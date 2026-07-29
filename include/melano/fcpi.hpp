@@ -32,6 +32,7 @@ struct FcpiOptions {
 	double dueling_q_weight = 0.5;
 	double dynamics_weight = 0.25;
 	double imagined_value_weight = 0.25;
+	double target_decay = 0.995;
 	int epochs = 15;
 	std::int64_t train_max_steps = 2000;
 	int batch_size = 256;

@@ -276,4 +276,63 @@ std::int64_t parameter_count(const Model &model) {
 	return count;
 }
 
+namespace {
+
+// Return encoder tensors in registration order so online and target models stay aligned.
+std::vector<torch::Tensor> encoder_parameters(const Model &model) {
+	auto parameters = model->state_embedding->parameters();
+	auto trunk_parameters = model->trunk->parameters();
+	parameters.insert(parameters.end(), trunk_parameters.begin(), trunk_parameters.end());
+	return parameters;
+}
+
+// Relation ids and square indices are immutable, but copying them keeps the target exact.
+std::vector<torch::Tensor> encoder_buffers(const Model &model) {
+	auto buffers = model->state_embedding->buffers();
+	auto trunk_buffers = model->trunk->buffers();
+	buffers.insert(buffers.end(), trunk_buffers.begin(), trunk_buffers.end());
+	return buffers;
+}
+
+} // namespace
+
+// Start the slowly moving target from the exact online encoder and exclude it from autograd.
+void initialize_target_encoder(Model target, const Model &online) {
+	auto target_parameters = encoder_parameters(target);
+	const auto online_parameters = encoder_parameters(online);
+	auto target_buffers = encoder_buffers(target);
+	const auto online_buffers = encoder_buffers(online);
+	if (target_parameters.size() != online_parameters.size() ||
+		target_buffers.size() != online_buffers.size()) {
+		throw std::runtime_error("Melano target encoder does not match the online encoder");
+	}
+	torch::NoGradGuard no_grad;
+	for (std::size_t index = 0; index < target_parameters.size(); ++index) {
+		target_parameters[index].copy_(online_parameters[index]);
+	}
+	for (std::size_t index = 0; index < target_buffers.size(); ++index) {
+		target_buffers[index].copy_(online_buffers[index]);
+	}
+	for (auto &parameter : target->parameters()) {
+		parameter.set_requires_grad(false);
+	}
+	target->eval();
+}
+
+// EMA prevents one unstable online update from redefining both sides of latent consistency.
+void update_target_encoder(Model target, const Model &online, double decay) {
+	if (!(decay >= 0.0 && decay < 1.0)) {
+		throw std::invalid_argument("Melano target decay must be in [0, 1)");
+	}
+	auto target_parameters = encoder_parameters(target);
+	const auto online_parameters = encoder_parameters(online);
+	if (target_parameters.size() != online_parameters.size()) {
+		throw std::runtime_error("Melano target encoder parameter count changed");
+	}
+	torch::NoGradGuard no_grad;
+	for (std::size_t index = 0; index < target_parameters.size(); ++index) {
+		target_parameters[index].mul_(decay).add_(online_parameters[index], 1.0 - decay);
+	}
+}
+
 } // namespace melano

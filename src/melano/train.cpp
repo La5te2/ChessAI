@@ -16,7 +16,7 @@ int main(int argc, char **argv) {
 						 "--imagined-value-weight <x>\n"
 					  << "  --save-every <steps> --log-every <steps> --seed <n> --device "
 						 "<auto|cpu|cuda>\n"
-					  << "  --precision <fp32|bf16>\n";
+					  << "  --target-decay <x> --grad-clip <x> --precision <fp32|bf16>\n";
 			return 0;
 		}
 		melano::TrainOptions options;
@@ -35,6 +35,8 @@ int main(int argc, char **argv) {
 		options.dynamics_weight = args.get_double("dynamics-weight", options.dynamics_weight);
 		options.imagined_value_weight =
 			args.get_double("imagined-value-weight", options.imagined_value_weight);
+		options.target_decay = args.get_double("target-decay", options.target_decay);
+		options.grad_clip = args.get_double("grad-clip", options.grad_clip);
 		options.save_every = args.get_int("save-every", options.save_every);
 		options.log_every = args.get_int("log-every", options.log_every);
 		options.seed = static_cast<std::uint64_t>(args.get_int64("seed", options.seed));

@@ -84,6 +84,8 @@ struct TrainOptions {
 	double dueling_q_weight = 0.5;
 	double dynamics_weight = 0.25;
 	double imagined_value_weight = 0.25;
+	double target_decay = 0.995;
+	double grad_clip = 1.0;
 	int save_every = 5000;
 	int log_every = 100;
 	std::uint64_t seed = 2026;

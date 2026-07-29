@@ -1190,12 +1190,18 @@ Q_{target}(s,a)=\operatorname{clip}
 \left(V_{target}(s)+A_{target}(s,a),-1,1\right)
 $$
 
-精确棋规生成动作后的状态 $s'$。预测 latent 与停止梯度的精确 successor latent 分别为：
+精确棋规生成动作后的状态 $s'$。在线 encoder 参数记为 $\theta$，缓慢移动的 target encoder 参数记为 $\bar\theta$。预测 latent 与停止梯度的精确 successor latent 分别为：
 
 $$
-\widehat h'=D(E(s),a),
+\widehat h'=D(E_\theta(s),a),
 \qquad
-\overline h'=\operatorname{stopgrad}(E(s'))
+\overline h'=\operatorname{stopgrad}(E_{\bar\theta}(s'))
+$$
+
+每次在线模型更新后，target encoder 使用指数移动平均更新。记 `--target-decay` 为 $m$：
+
+$$
+\bar\theta\leftarrow m\bar\theta+(1-m)\theta
 $$
 
 潜在一致性损失 $L_D$ 逐 token 比较走后预测与精确棋规生成的走后状态编码：
@@ -1221,6 +1227,14 @@ L_{\mathrm{CE}}\left(P_\theta(\cdot\mid s),\delta_{a^*}\right)+
 \lambda_D L_D+\lambda_I L_I
 $$
 
+反向传播后的梯度以 `--grad-clip` 给出的 $c$ 做全局范数裁剪：
+
+$$
+g\leftarrow g\min\left(1,\frac{c}{\lVert g\rVert_2}\right)
+$$
+
+当 `--grad-clip` 大于 0 时，非有限梯度范数会终止训练，避免异常参数被优化器写入。target encoder 只存在于训练进程中，不进入 checkpoint，也不改变 Melano 推理架构。
+
 ```bash
 build/melano/train \
 	--data data/games.melano.h5 \
@@ -1236,6 +1250,8 @@ build/melano/train \
 	--dueling-q-weight 0.5 \
 	--dynamics-weight 0.25 \
 	--imagined-value-weight 0.25 \
+	--target-decay 0.995 \
+	--grad-clip 1.0 \
 	--device cuda \
 	--precision bf16 \
 	--log-every 50
@@ -1534,7 +1550,7 @@ $$
 
 其中每条树边都通过精确棋规生成 $s'$，并写入 `candidate_next_states`。$L_D$ 使用与监督训练相同的 latent cosine consistency。动作条件 dynamics 对树中每个已展开节点学习一步转移 $E(s)\rightarrow E(s')$，与 $K=2$ anchored latent MCTS 的运行时假设保持一致。
 
-Melano FCPI HDF5 保存 `tree_value_targets`、`tree_value_weights`、`candidate_q` 和逐动作的 `candidate_weights`。完整轨迹终局回报写入对应动作的 `candidate_q`，树目标与 Melano Value 定义保持一致。训练日志输出 `policy`、`value`、`dueling_q`、`dynamics`、`imagined_value` 与总损失。summary 另外记录终局边、事实动作边、反事实覆盖率、Advantage 幅度、Policy 总变差距离与 top-1 改变率。
+Melano FCPI HDF5 保存 `tree_value_targets`、`tree_value_weights`、`candidate_q` 和逐动作的 `candidate_weights`。完整轨迹终局回报写入对应动作的 `candidate_q`，树目标与 Melano Value 定义保持一致。FCPI 与监督训练使用相同的 EMA target encoder 和梯度保护。训练日志输出 `policy`、`value`、`dueling_q`、`dynamics`、`imagined_value`、总损失与裁剪前梯度范数。summary 另外记录终局边、事实动作边、反事实覆盖率、Advantage 幅度、Policy 总变差距离与 top-1 改变率。
 
 Melano 每轮依次执行自身 `current.pth` 自对战、完整轨迹事实回传、局面去重、事实锚定反事实展开、Policy/Value/Advantage 与 latent-dynamics 目标构造、candidate 训练和 paired-game arena。每次运行由程序生成 `fcpi_YYYYMMDD_HHMMSS_id`，创建对应的 `data/runs/<run-id>/` 与 `models/runs/<run-id>/`。其中 HDF5 schema、candidate 和 current checkpoint 均属于 Melano，candidate 达到 arena gate 后原子写入该 run 的 `current.pth`。`summary.json` 记录预算、决策节点数、终局/事实边数、评价边数、最大深度和 arena 结果。
 

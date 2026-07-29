@@ -139,5 +139,9 @@ TORCH_MODULE(Model);
 
 /// Counts all trainable and non-trainable model parameter elements.
 std::int64_t parameter_count(const Model &model);
+/// Copies the exact-state encoder into a frozen training-only target model.
+void initialize_target_encoder(Model target, const Model &online);
+/// Moves the frozen target encoder toward the online encoder with exponential averaging.
+void update_target_encoder(Model target, const Model &online, double decay);
 
 } // namespace melano
