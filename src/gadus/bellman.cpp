@@ -244,20 +244,20 @@ struct NetworkEvaluation {
 	float value = 0.0F;
 };
 
-struct ComponentRisk {
+struct ComponentError {
 	double policy_sum = 0.0;
 	double policy_weight = 0.0;
 	double value_sum = 0.0;
 	double value_weight = 0.0;
 };
 
-struct RiskMetrics {
+struct GraphErrorMetrics {
 	double policy_regret = 0.0;
-	double value_risk = 0.0;
+	double value_mse = 0.0;
 	double policy_weight = 0.0;
 	double value_weight = 0.0;
 	std::size_t positions = 0;
-	std::unordered_map<int, ComponentRisk> components;
+	std::unordered_map<int, ComponentError> components;
 };
 
 struct GraphImprovement {
@@ -1026,11 +1026,11 @@ std::vector<NetworkEvaluation> evaluate_records(
 		model, device, options.precision, options.inference_batch_size, states, actions);
 }
 
-RiskMetrics evaluate_risk(Model model, const torch::Device &device,
-						  const BrciOptions &options,
-						  const std::vector<TrainingRecord> &records) {
+GraphErrorMetrics evaluate_graph_error(Model model, const torch::Device &device,
+									   const BrciOptions &options,
+									   const std::vector<TrainingRecord> &records) {
 	const auto evaluations = evaluate_records(model, device, options, records);
-	RiskMetrics metrics;
+	GraphErrorMetrics metrics;
 	metrics.positions = records.size();
 	for (std::size_t row = 0; row < records.size(); ++row) {
 		const auto &record = records[row];
@@ -1047,7 +1047,7 @@ RiskMetrics evaluate_risk(Model model, const torch::Device &device,
 		const double policy_weight = std::max(0.0F, record.policy_weight);
 		const double value_weight = std::max(0.0F, record.value_weight);
 		metrics.policy_regret += policy_weight * policy_regret;
-		metrics.value_risk += value_weight * value_error * value_error;
+		metrics.value_mse += value_weight * value_error * value_error;
 		metrics.policy_weight += policy_weight;
 		metrics.value_weight += value_weight;
 		auto &component = metrics.components[record.component];
@@ -1060,13 +1060,13 @@ RiskMetrics evaluate_risk(Model model, const torch::Device &device,
 		metrics.policy_regret /= metrics.policy_weight;
 	}
 	if (metrics.value_weight > 0.0) {
-		metrics.value_risk /= metrics.value_weight;
+		metrics.value_mse /= metrics.value_weight;
 	}
 	return metrics;
 }
 
-GraphImprovement compare_components(const RiskMetrics &source,
-									const RiskMetrics &candidate) {
+GraphImprovement compare_components(const GraphErrorMetrics &source,
+									const GraphErrorMetrics &candidate) {
 	GraphImprovement result;
 	for (const auto &[component_id, source_component] : source.components) {
 		const auto found = candidate.components.find(component_id);
@@ -1136,12 +1136,12 @@ Model interpolate_models(const Model &source, const Model &raw,
 	return blended;
 }
 
-nlohmann::json risk_json(const RiskMetrics &metrics) {
+nlohmann::json graph_error_json(const GraphErrorMetrics &metrics) {
 	return {
 		{"positions", metrics.positions},
 		{"components", metrics.components.size()},
 		{"policy_regret", metrics.policy_regret},
-		{"value_risk", metrics.value_risk},
+		{"value_mse", metrics.value_mse},
 		{"policy_weight", metrics.policy_weight},
 		{"value_weight", metrics.value_weight},
 	};
@@ -1181,15 +1181,15 @@ nlohmann::json select_restricted_candidate(
 	}
 	source->eval();
 	raw->eval();
-	const auto source_metrics = evaluate_risk(source, device, options, test_records);
+	const auto source_metrics = evaluate_graph_error(source, device, options, test_records);
 	if (source_metrics.policy_weight <= 0.0 || source_metrics.value_weight <= 0.0) {
 		std::cout << "brci restriction unavailable: test graph has no jointly measurable "
-					 "Policy and Value risk"
+					 "Policy regret and Value error"
 				  << std::endl;
 		return {
 			{"accepted", false},
-			{"reason", "test_graph_has_no_joint_policy_value_risk"},
-			{"source", risk_json(source_metrics)},
+			{"reason", "test_graph_has_no_joint_policy_value_error"},
+			{"source", graph_error_json(source_metrics)},
 		};
 	}
 
@@ -1198,37 +1198,37 @@ nlohmann::json select_restricted_candidate(
 	double best_alpha = 0.0;
 	double best_probability = -1.0;
 	double best_reduction = -1.0;
-	RiskMetrics best_metrics;
+	GraphErrorMetrics best_metrics;
 	GraphImprovement best_graph;
 	for (int step = 0; step < kBacktrackingSteps; ++step) {
 		const double alpha = std::ldexp(1.0, -step);
 		auto blended =
 			interpolate_models(source, raw, source_architecture, device, alpha);
 		const auto candidate_metrics =
-			evaluate_risk(blended, device, options, test_records);
+			evaluate_graph_error(blended, device, options, test_records);
 		const auto graph_improvement =
 			compare_components(source_metrics, candidate_metrics);
 		const double policy_reduction =
 			source_metrics.policy_regret - candidate_metrics.policy_regret;
 		const double value_reduction =
-			source_metrics.value_risk - candidate_metrics.value_risk;
+			source_metrics.value_mse - candidate_metrics.value_mse;
 		const bool policy_ok = policy_reduction > kStrictTolerance;
 		const bool value_ok = value_reduction > kStrictTolerance;
 		const double relative_reduction =
 			policy_reduction / std::max(source_metrics.policy_regret, kStrictTolerance) +
-			value_reduction / std::max(source_metrics.value_risk, kStrictTolerance);
+			value_reduction / std::max(source_metrics.value_mse, kStrictTolerance);
 		attempts.push_back({
 			{"alpha", alpha},
 			{"policy_ok", policy_ok},
 			{"value_ok", value_ok},
 			{"policy_regret_reduction", policy_reduction},
-			{"value_risk_reduction", value_reduction},
-			{"metrics", risk_json(candidate_metrics)},
+			{"value_mse_reduction", value_reduction},
+			{"metrics", graph_error_json(candidate_metrics)},
 			{"graph_improvement", graph_improvement_json(graph_improvement)},
 		});
 		std::cout << "brci restriction: alpha=" << alpha
 				  << " policy_regret_reduction=" << policy_reduction
-				  << " value_risk_reduction=" << value_reduction
+				  << " value_mse_reduction=" << value_reduction
 				  << " graph_probability_lower_bound="
 				  << graph_improvement.probability_lower_bound
 				  << " admissible=" << (policy_ok && value_ok ? "true" : "false")
@@ -1254,15 +1254,15 @@ nlohmann::json select_restricted_candidate(
 		return {
 			{"accepted", false},
 			{"alpha", 0.0},
-			{"source", risk_json(source_metrics)},
+			{"source", graph_error_json(source_metrics)},
 			{"attempts", attempts},
 		};
 	}
 	return {
 		{"accepted", true},
 		{"alpha", best_alpha},
-		{"source", risk_json(source_metrics)},
-		{"candidate", risk_json(best_metrics)},
+		{"source", graph_error_json(source_metrics)},
+		{"candidate", graph_error_json(best_metrics)},
 		{"graph_improvement", graph_improvement_json(best_graph)},
 		{"attempts", attempts},
 	};
@@ -1355,7 +1355,7 @@ void run_brci(const BrciOptions &options) {
 			arena_summary = {
 				{"accepted", false},
 				{"skipped", true},
-				{"reason", "restricted_graph_risk_not_improved"},
+				{"reason", "restricted_graph_error_not_improved"},
 			};
 		}
 		if (accepted) {

@@ -33,7 +33,7 @@ struct BrciOptions {
 	std::uint64_t seed = 2026;
 };
 
-/// Runs terminal-anchored BRCI and promotes candidates that pass graph-risk and Arena gates.
+/// Runs terminal-anchored BRCI and promotes candidates that pass graph-error and Arena gates.
 void run_brci(const BrciOptions &options);
 
 } // namespace gadus

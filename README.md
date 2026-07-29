@@ -127,8 +127,6 @@ models/
 - `models/gadus/`、`models/melano/`：各架构的 LibTorch checkpoint，以及可直接注册到 UCI 客户端的引擎与运行库。
 - `models/stockfish/`：UCI 引擎示例。
 
-Gadus 与 Melano 的数据定义、数学公式和运行方法分别写在第 4、5 节。
-
 LibTorch checkpoint 的逻辑顶层固定为：
 
 ```text
@@ -136,7 +134,7 @@ model
 arch
 ```
 
-`model` 保存网络参数，`arch` 保存架构标识及构造网络所需的形状信息。训练轮次与步数记录在运行期日志中。
+`model` 保存网络参数，`arch` 保存架构标识及构造网络所需的形状信息。
 
 ## 2. 依赖
 
@@ -239,7 +237,7 @@ python scripts/check.py --model models/gadus/gadus.pth
 
 ## 4. Gadus
 
-### 4.1 数据与网络
+### 4.1 状态与动作编码
 
 Gadus 的状态编码为 `gadus_18_planes`：12 个棋子平面、1 个行棋方平面、4 个王车易位平面和 1 个 en passant 文件平面。每个平面按 8 个 rank bytes packbits，HDF5 中单个状态占 $18\times8$ bytes。
 
@@ -248,6 +246,8 @@ Gadus 的状态编码为 `gadus_18_planes`：12 个棋子平面、1 个行棋方
 $$
 |\mathcal A|=64\times(56+8+9)=4672
 $$
+
+### 4.2 网络
 
 模型由 ResNet trunk、linear Policy head 和 MLP Value head 组成：
 
@@ -260,6 +260,8 @@ $\ell(s)$ 是 4672 维 Policy logits。合法动作概率为：
 $$
 P(a\mid s)=\frac{\exp \ell_a(s)}{\sum_{b\in\mathcal A(s)}\exp \ell_b(s)}
 $$
+
+### 4.3 数据预处理
 
 Gadus HDF5 schema：
 
@@ -281,13 +283,7 @@ $$
 V_{target}(s)=\tanh\left(\frac{score_{stm}(s)}{3}\right)
 $$
 
-`--has-cmt 0` 使用最终胜负生成 $V_{target}\in\{-1,0,1\}$。监督损失为：
-
-$$
-L_{sup}=L_{CE}(\ell,a^*)+w_V\operatorname{MSE}(V,V_{target})
-$$
-
-### 4.2 Preprocess、Train 与 Search
+`--has-cmt 0` 使用最终胜负生成 $V_{target}\in\{-1,0,1\}$。
 
 ```bash
 build/gadus/preprocess \
@@ -297,7 +293,21 @@ build/gadus/preprocess \
 	--chunk-size 16384 \
 	--compression-level 1 \
 	--log-every 10000
+```
 
+`--max-games` 控制读取对局上限，`--chunk-size` 控制 HDF5 扩展单元，`--compression-level` 控制 deflate 等级，`--log-every` 控制对局进度输出。
+
+### 4.4 监督训练
+
+记 PGN 中的实际走法为 $a^*$，对应的 one-hot 分布为 $\delta_{a^*}$，Value loss 权重为 $w_V$。监督损失为：
+
+$$
+L_{\mathrm{sup}}=
+L_{\mathrm{CE}}\left(P_\theta(\cdot\mid s),\delta_{a^*}\right)+
+w_V\operatorname{MSE}(V,V_{\mathrm{target}})
+$$
+
+```bash
 build/gadus/train \
 	--data data/games.gadus.h5 \
 	--out models/gadus/gadus.pth \
@@ -314,31 +324,13 @@ build/gadus/train \
 	--precision bf16 \
 	--log-every 100 \
 	--seed 2026
-
-build/gadus/search \
-	--model models/gadus/gadus.pth \
-	--fen "startpos" \
-	--device cuda \
-	--precision bf16 \
-	--search-type only-mcts \
-	--mcts-sims 1000 \
-	--mcts-min-sims 100 \
-	--mcts-batch-size 64 \
-	--movetime-ms 5000 \
-	--c-puct 0.5 \
-	--c-puct-base 19652 \
-	--c-puct-factor 1.0 \
-	--fpu-reduction 0.15 \
-	--virtual-loss 0.0 \
-	--repetition-policy-penalty 0.0 \
-	--instant-mate-first 0 \
-	--root-topn 8
 ```
 
-- `preprocess --max-games` 控制读取对局上限，`--chunk-size` 控制 HDF5 扩展单元，`--compression-level` 控制 deflate 等级，`--log-every` 控制对局进度输出。
-- `train` 每次创建新的 Gadus 模型。`--channels` 和 `--blocks` 决定结构，`--max-steps` 是本次训练步数上限，`--save-every` 控制原子 checkpoint 写入周期。
-- `search --fen startpos` 使用标准初始局面，也可传入完整 FEN。
-- `--precision` 可取 `fp32` 或 `bf16`，默认 `fp32`。`bf16` 仅用于 CUDA 前向计算，Policy softmax、训练损失和指标累加使用 FP32，checkpoint 参数保持 FP32。CUDA 输入批次使用 pinned memory，Search 只把合法动作的 Policy 从 GPU 传回 CPU。
+`train` 每次创建新的 Gadus 模型。`--channels` 和 `--blocks` 决定网络结构，`--max-steps` 是本次训练步数上限，`--save-every` 控制原子 checkpoint 写入周期。
+
+`--precision` 可取 `fp32` 或 `bf16`，默认 `fp32`。`bf16` 仅用于 CUDA 前向计算，Policy softmax、训练损失和指标累加使用 FP32，checkpoint 参数保持 FP32。CUDA 训练批次使用 pinned memory。
+
+### 4.5 搜索
 
 `closed` 直接按合法动作 Policy 排序。`only-mcts` 使用 batched leaf inference。记根视角下边 $(s,a)$ 的实际访问数为 $N(s,a)$，节点访问数为 $N(s)=\sum_aN(s,a)$，平均叶节点回传为 $Q(s,a)$。记 $c_0$、$b$ 与 $f$ 分别为 PUCT 的初始系数、基数和增长系数。动态探索系数为：
 
@@ -390,24 +382,17 @@ $$
 
 其中 $N_{\min}$ 与 $N_{\mathrm{cap}}$ 是当前搜索的最小和最大 simulation 数，$u\in[0,1]$ 是根节点不确定性。IMF 与 RPP 位于最终决策层，只调整走法排序。
 
-### 4.3 Arena
-
 ```bash
-build/gadus/arena \
-	--candidate models/gadus/candidate.pth \
-	--baseline models/gadus/champion.pth \
+build/gadus/search \
+	--model models/gadus/gadus.pth \
+	--fen "startpos" \
 	--device cuda \
 	--precision bf16 \
-	--games 400 \
-	--games-in-flight 32 \
-	--max-plies 240 \
-	--opening-book data/openings.gen.bin \
-	--book-plies 8 \
-	--max-book-positions 50000 \
-	--search-type closed \
-	--sims 0 \
+	--search-type only-mcts \
+	--mcts-sims 1000 \
+	--mcts-min-sims 100 \
 	--mcts-batch-size 64 \
-	--movetime-ms 0 \
+	--movetime-ms 5000 \
 	--c-puct 0.5 \
 	--c-puct-base 19652 \
 	--c-puct-factor 1.0 \
@@ -415,23 +400,14 @@ build/gadus/arena \
 	--virtual-loss 0.0 \
 	--repetition-policy-penalty 0.0 \
 	--instant-mate-first 0 \
-	--min-net-wins 4 \
-	--pgn-output data/gadus-arena.pgn \
-	--log-every 1
+	--root-topn 8
 ```
+
+`--fen startpos` 使用标准初始局面，也可传入完整 FEN。CUDA 搜索只把合法动作的 Policy 从 GPU 传回 CPU。
+
+### 4.6 Arena
 
 `--games` 使用正偶数，使每个开局都能交换双方颜色完成配对。`--games-in-flight` 控制同时推进的对局数，candidate 与 baseline 各加载一次，轮到同一模型行棋的局面组成 inference batch。
-
-使用 `scripts/gadus_fcpi.sh` 时，脚本会等待 FCPI 完成全部迭代，再调用独立 Arena 追加一次最终 `current.pth` 对同一 run 的 `initial.pth` 的 `closed` paired 对战。它复用 `EVAL_GAMES`、开局书、并发数和最大步数，并将 MCTS 关闭。结果写入 `summary.json` 的 `final_arena`，棋谱写入 `current_vs_initial.pgn`。该累计赛只报告整次运行的净变化，不参与任何 candidate 晋升。直接运行 `build/gadus/fcpi` 时，流程在 FCPI 迭代结束处终止。
-
-从标准初始局面开始时，将开局书设为空：
-
-```bash
-build/gadus/arena \
-	--candidate models/gadus/candidate.pth \
-	--baseline models/gadus/gadus.pth \
-	--opening-book=
-```
 
 设 candidate 的胜、和、负局数为 $W,D,L$，总局数为 $G$：
 
@@ -461,45 +437,37 @@ $$
 W-L\geq min\_net\_wins
 $$
 
-### 4.4 FCPI
-
 ```bash
-build/gadus/fcpi \
-	--model models/gadus/gadus.pth \
+build/gadus/arena \
+	--candidate models/gadus/candidate.pth \
+	--baseline models/gadus/champion.pth \
 	--device cuda \
 	--precision bf16 \
-	--iterations 10 \
-	--games-per-iter 1000 \
-	--games-in-flight 64 \
+	--games 400 \
+	--games-in-flight 32 \
 	--max-plies 240 \
 	--opening-book data/openings.gen.bin \
-	--startpos-fraction 0.2 \
 	--book-plies 8 \
 	--max-book-positions 50000 \
-	--inference-batch-size 64 \
-	--target-records-per-batch 256 \
-	--counterfactual-budget 24 \
-	--behavior-temperature 1.0 \
-	--epochs 15 \
-	--train-max-steps 2000 \
-	--batch-size 256 \
-	--lr 0.00002 \
-	--eval-games 400 \
-	--eval-games-in-flight 32 \
-	--eval-max-plies 240 \
-	--eval-opening-book data/openings.gen.bin \
-	--eval-book-plies 8 \
-	--eval-max-book-positions 50000 \
-	--eval-search-type closed \
-	--eval-sims 0 \
-	--eval-mcts-batch-size 64 \
-	--eval-movetime-ms 0 \
-	--eval-repetition-policy-penalty 1.0 \
-	--eval-instant-mate-first 1 \
-	--eval-min-net-wins 4 \
-	--log-every 50 \
-	--seed 2026
+	--search-type closed \
+	--sims 0 \
+	--mcts-batch-size 64 \
+	--movetime-ms 0 \
+	--c-puct 0.5 \
+	--c-puct-base 19652 \
+	--c-puct-factor 1.0 \
+	--fpu-reduction 0.15 \
+	--virtual-loss 0.0 \
+	--repetition-policy-penalty 0.0 \
+	--instant-mate-first 0 \
+	--min-net-wins 4 \
+	--pgn-output data/gadus-arena.pgn \
+	--log-every 1
 ```
+
+从标准初始局面开始时，将 `--opening-book` 设为空。
+
+### 4.7 FCPI
 
 每轮 FCPI 使用冻结的 `current.pth` 进行模型自对战。记 $\mu(a\mid s)$ 为实际自对弈的行为策略，$T_b>0$ 为行为温度。Gadus 只对冻结 Policy 做温度变换：
 
@@ -518,7 +486,7 @@ $$
 
 该调度使实际动作频率跟随 $\mu$，同时避免独立随机抽样持续漏掉某个正概率动作。只要同一局面继续出现，任意满足 $\mu(a\mid s)>0$ 的动作都会在有限次访问内取得样本。
 
-规则终局提供无教师机自学习的事实信号。设终局时刻为 $\tau$，终局状态从行棋方视角观察的结果为 $z_\tau\in\{-1,0,1\}$，$G_t$ 为时刻 $t$ 的 MC 回报。完整结束的对局对整条轨迹执行无 bootstrap 的 MC 回传：
+规则终局提供自学习的事实信号。设终局时刻为 $\tau$，终局状态从行棋方视角观察的结果为 $z_\tau\in\{-1,0,1\}$，$G_t$ 为时刻 $t$ 的 MC 回报。完整结束的对局对整条轨迹执行无 bootstrap 的 MC 回传：
 
 $$
 G_\tau=z_\tau,\qquad G_t=-G_{t+1}
@@ -714,7 +682,7 @@ models/runs/<run-id>/
 
 candidate 达到 arena gate 后原子写入该 run 的 `current.pth`。
 
-针对 16 GiB RTX 4080 Super 的后台启动脚本为：
+后台启动脚本为：
 
 ```bash
 bash scripts/gadus_fcpi.sh
@@ -722,51 +690,13 @@ bash scripts/gadus_fcpi.sh
 
 脚本默认使用 `PRECISION=bf16`、较大的批次与 batched games。可通过环境变量覆盖，例如 `PRECISION=fp32 BATCH_SIZE=512 bash scripts/gadus_fcpi.sh`。
 
-### 4.5 BRCI
+脚本会等待 FCPI 完成全部迭代，再调用独立 Arena 追加一次最终 `current.pth` 对同一 run 的 `initial.pth` 的 `closed` paired 对战。它复用 `EVAL_GAMES`、开局书、并发数和最大步数，并将 MCTS 关闭。结果写入 `summary.json` 的 `final_arena`，棋谱写入 `current_vs_initial.pgn`。该累计赛只报告整次运行的净变化，不参与 candidate 晋升。直接运行 `build/gadus/fcpi` 时，流程在 FCPI 迭代结束处终止。
 
-BRCI 从完整自对弈轨迹建立终局锚定的有限受限图，在该图上精确计算 minimax 目标，再用独立受限图限制参数更新。运行入口为：
+### 4.8 BRCI
 
-```bash
-build/gadus/brci \
-	--model models/gadus/gadus.pth \
-	--device cuda \
-	--precision bf16 \
-	--iterations 10 \
-	--games-per-iter 2000 \
-	--games-in-flight 512 \
-	--max-plies 240 \
-	--opening-book data/openings.gen.bin \
-	--startpos-fraction 0.2 \
-	--book-plies 8 \
-	--max-book-positions 50000 \
-	--inference-batch-size 512 \
-	--behavior-temperature 1.0 \
-	--epochs 30 \
-	--train-max-steps 3000 \
-	--batch-size 1024 \
-	--lr 0.00002 \
-	--eval-games 2000 \
-	--eval-games-in-flight 256 \
-	--eval-max-plies 240 \
-	--eval-opening-book data/openings.gen.bin \
-	--eval-book-plies 8 \
-	--eval-max-book-positions 50000 \
-	--eval-repetition-policy-penalty 1.0 \
-	--eval-instant-mate-first 1 \
-	--eval-min-net-wins 4 \
-	--log-every 50 \
-	--seed 2026
-```
+BRCI 从完整自对弈轨迹建立终局锚定的有限受限图，在该图上精确计算 minimax 目标，再用独立受限图限制参数更新。
 
-生产参数也可通过后台脚本启动：
-
-```bash
-bash scripts/gadus_brci.sh
-```
-
-每次运行创建独立的 `brci_<timestamp>_<id>` 数据目录和模型目录。受限图在该次运行的内存中跨迭代累积，candidate 是否通过晋升不影响已经取得的终局事实。
-
-#### 4.5.1 轨迹采样与受限图
+#### 4.8.1 轨迹采样与受限图
 
 冻结源模型在 `closed` 模式下给出合法动作 Policy。记行为温度为 $T_b>0$，行为分布为：
 
@@ -787,26 +717,34 @@ $N_n(s,a)$ 是前 $n$ 次出现中动作 $a$ 的实际选择次数。该确定�
 
 只有由棋规判定结束的完整轨迹进入受限图。达到 `max-plies` 的轨迹计入诊断，但不生成图节点或训练目标。代码以“起始 FEN + 完整动作序列”为轨迹签名，并对签名执行由 `seed` 固定的哈希分区。同一条轨迹在整个 run 中始终属于训练图或测试图。测试签名的期望比例约为 $1/\sqrt{G}$，其中 $G$ 是每轮计划对局数，因此每轮测试轨迹的期望数量约为 $\sqrt G$。两个图分别跨迭代追加。
 
-图以起始 FEN 和完整动作前缀为节点身份。同一路径前缀可以合并，不同历史路径不会因棋盘摆放相同而合并。因此重复局面历史、半回合计数和其他棋规状态保留在图结构中。网络输入仍是 $\phi(x)$，所以状态编码省略的历史可能形成不可约拟合误差。
+受限图采用如下节点合并规则：两个轨迹前缀当且仅当起始 FEN 相同且动作序列逐项相同时表示同一个图节点。同一路径前缀可以合并，不同历史路径不会因棋盘摆放相同而合并。因此重复局面历史、半回合计数和其他棋规状态保留在图结构中。网络输入仍是 $\phi(x)$，所以状态编码省略的历史可能形成不可约拟合误差。
 
-记第 $k$ 轮累积后的有限训练图或测试图为 $\mathcal G_k$，节点 $x$ 的已观察动作集合为 $\mathcal A_k(x)$。每个叶节点都是规则终局。受限图 Value 与动作 Value 定义为：
+记第 $k$ 轮累积后的有限训练图或测试图为 $\mathcal G_k$，节点 $x$ 的已观察动作集合为 $\mathcal A_k(x)$。每个叶节点都是规则终局。BRCI 中的 Bellman 计算指受限图上的 Bellman 最优算子：
 
 $$
-V_k^*(x)=
+(\mathcal B_k V)(x)=
 \begin{cases}
 z(x),&x\text{ 是终局}\\
 \displaystyle\max_{a\in\mathcal A_k(x)}
-\left[-V_k^*(T(x,a))\right],&x\text{ 是内部节点}
+\left[-V(T(x,a))\right],&x\text{ 是内部节点}
 \end{cases}
 $$
+
+符号 $V_k^*$ 表示第 $k$ 个受限图上的最优 Value，即受限 Bellman 算子的不动点：
+
+$$
+V_k^*=\mathcal B_kV_k^*
+$$
+
+对应的动作 Value 为：
 
 $$
 Q_k^*(x,a)=-V_k^*(T(x,a))
 $$
 
-图是按动作前缀建立的有限无环图。终局节点值已知，按深度逆序计算即可唯一得到所有 $V_k^*$ 与 $Q_k^*$。该计算不调用网络 Value，也不使用截断局面的 bootstrap。
+图按动作前缀建立，因此是有限无环图。终局节点提供边界值，`RestrictedGraph::solve()` 按节点深度逆序执行 Bellman 最优递推，唯一确定所有 $V_k^*$ 与 $Q_k^*$。`materialize_graph()` 再把这些解转换成 Policy 和 Value 训练目标。该计算只使用图结构与规则终局值，截断局面不会进入受限图。
 
-#### 4.5.2 训练目标
+#### 4.8.2 训练目标
 
 模型 Policy 在受限动作集合上重新归一化，记为 $\pi_{\theta,k}(a\mid\phi(x))$。冻结源模型的受限 Policy 为 $\pi_{\mathrm{old},k}$。定义：
 
@@ -861,47 +799,47 @@ components
 
 `components` 标识起始 FEN 对应的图分量。具有不同完整历史但相同网络编码的节点保留为独立样本。
 
-#### 4.5.3 独立图风险
+#### 4.8.3 独立图误差
 
-记独立测试图的内部节点集合为 $\mathcal X_k^{\mathrm{test}}$。Value 平方风险定义为：
+记独立测试图的内部节点集合为 $\mathcal X_k^{\mathrm{test}}$。Value 均方误差定义为：
 
 $$
-R_{V,k}(\theta)=
+E_{V,k}(\theta)=
 \frac{1}{|\mathcal X_k^{\mathrm{test}}|}
 \sum_{x\in\mathcal X_k^{\mathrm{test}}}
 \left[V_\theta(\phi(x))-V_k^*(x)\right]^2
 $$
 
-测试节点上的 Policy regret 定义为：
+测试节点上的 Policy 单节点遗憾定义为：
 
 $$
-\mathcal R_{P,k}(\theta;x)=
+g_{P,k}(\theta;x)=
 V_k^*(x)-
 \sum_{a\in\mathcal A_k(x)}
 \pi_{\theta,k}(a\mid\phi(x))Q_k^*(x,a)
 $$
 
-由 $V_k^*(x)=\max_aQ_k^*(x,a)$ 可得 $\mathcal R_{P,k}(\theta;x)\geq0$。仅具有多个不同动作值的节点进入 Policy 风险。记这些节点组成 $\mathcal X_{P,k}^{\mathrm{test}}$：
+由 $V_k^*(x)=\max_aQ_k^*(x,a)$ 可得 $g_{P,k}(\theta;x)\geq0$。它表示模型受限 Policy 的期望动作值与该节点最优动作值之间的差距。仅具有多个不同动作值的节点进入 Policy 评价，记这些节点组成 $\mathcal X_{P,k}^{\mathrm{test}}$。Policy 平均遗憾定义为：
 
 $$
-R_{P,k}(\theta)=
+E_{P,k}(\theta)=
 \frac{1}{|\mathcal X_{P,k}^{\mathrm{test}}|}
 \sum_{x\in\mathcal X_{P,k}^{\mathrm{test}}}
-\mathcal R_{P,k}(\theta;x)
+g_{P,k}(\theta;x)
 $$
 
-从源模型 $\theta_{\mathrm{old}}$ 到候选模型 $\theta_{\mathrm{new}}$ 的两项风险改进量为：
+从源模型 $\theta_{\mathrm{old}}$ 到候选模型 $\theta_{\mathrm{new}}$ 的两项误差减少量为：
 
 $$
 \Delta_{V,k}=
-R_{V,k}(\theta_{\mathrm{old}})
--R_{V,k}(\theta_{\mathrm{new}})
+E_{V,k}(\theta_{\mathrm{old}})
+-E_{V,k}(\theta_{\mathrm{new}})
 $$
 
 $$
 \Delta_{P,k}=
-R_{P,k}(\theta_{\mathrm{old}})
--R_{P,k}(\theta_{\mathrm{new}})
+E_{P,k}(\theta_{\mathrm{old}})
+-E_{P,k}(\theta_{\mathrm{new}})
 $$
 
 代码要求：
@@ -914,7 +852,7 @@ $$
 
 $10^{-6}$ 是 FP32/BF16 推理与参数插值的数值分辨容差。满足两项不等式表示 candidate 在固定独立受限图上更接近精确 minimax Value，并且其受限 Policy 的期望动作值更高。
 
-#### 4.5.4 有限参数回溯
+#### 4.8.4 有限参数回溯
 
 优化器先产生未经限制的提案 $\theta_{\mathrm{raw}}$。令：
 
@@ -929,9 +867,9 @@ $$
 \qquad j\in\{0,1,\ldots,11\}
 $$
 
-每个步长都在同一独立测试图上重新计算 $R_{V,k}$ 与 $R_{P,k}$。只有两项风险都超过数值容差的步长进入候选集合。
+每个步长都在同一独立测试图上重新计算 $E_{V,k}$ 与 $E_{P,k}$。只有 Value 均方误差和 Policy 平均遗憾的减少量都超过数值容差时，该步长才进入候选集合。
 
-将测试图按起始 FEN 分成 $n$ 个具有可改进 Policy 和 Value 风险的分量。第 $i$ 个分量上的联合改进指示量为：
+将测试图按起始 FEN 分成 $n$ 个能够同时评价 Policy 和 Value 的分量。第 $i$ 个分量上的联合改进指示量为：
 
 $$
 I_i(\theta_j)=
@@ -960,58 +898,153 @@ $$
 \right)
 $$
 
-候选集合优先选择 $\underline p_k$ 最大的步长。下界相同时，选择两项相对风险降幅之和更大的步长。独立图缺少可比较的 Policy 或 Value 风险时，本轮拒绝。
+候选集合优先选择 $\underline p_k$ 最大的步长。下界相同时，选择 Value 均方误差和 Policy 平均遗憾的相对降幅之和更大的步长。独立图缺少任一项可比较指标时，本轮拒绝。
 
 通过受限图判别的 candidate 继续参加 `closed` paired Arena。Arena 达到 `eval-min-net-wins` 后，candidate 才会原子写入该 run 的 `current.pth`。因此受限图判别负责有限图上的数值性质，Arena 负责实际走棋分布上的最终晋升。
 
-#### 4.5.5 结论范围
+#### 4.8.5 受限 Bellman 解的收敛
 
-设完整国际象棋博弈图为 $\mathcal G$，完整 minimax Value 为 $V^*$。若受限图序列满足以下条件：
+设完整国际象棋博弈图为 $\mathcal G$。完整图上的 Bellman 最优算子定义为：
+
+$$
+(\mathcal B V)(x)=
+\begin{cases}
+z(x),&x\text{ 是终局}\\
+\displaystyle\max_{a\in\mathcal A(x)}
+\left[-V(T(x,a))\right],&x\text{ 是内部节点}
+\end{cases}
+$$
+
+符号 $V^*$ 表示完整图上的最优 Value，$Q^*$ 表示对应的最优动作 Value：
+
+$$
+V^*=\mathcal BV^*,
+\qquad
+Q^*(x,a)=-V^*(T(x,a))
+$$
+
+若受限图序列满足以下条件：
 
 1. 图节点区分所有影响棋规的环境历史。
 2. 每个叶节点都是精确规则终局。
 3. 已收录的状态动作边不会从后续图中删除。
 4. 每条可达合法边都在有限阶段后被收录。
 
-由于完整棋规状态图有限，存在有限的 $K$ 使 $\mathcal G_K=\mathcal G$，此时 $V_K^*=V^*$。证明方式是对有限边集合的收录阶段取最大值，再对终局距离执行逆向归纳。
-
-当前实现满足前两项，并在单次运行中满足第三项。第四项取决于行为 Policy、起始局面覆盖、运行迭代数和 `max-plies`。被截断的轨迹不会进入图，因此当前实现证明的是已构建有限受限图上的精确性与风险改进，不直接证明完整国际象棋上的单调改进。Arena 继续承担分布外行为与有限图覆盖误差的实证检验。
-
-受限图目标还需要通过有限次参数拟合传入网络。定义联合风险：
+由第三项可得嵌套关系：
 
 $$
-R_k(\theta)=R_{V,k}(\theta)+R_{P,k}(\theta)
+\mathcal G_1\subseteq\mathcal G_2\subseteq\cdots\subseteq\mathcal G
 $$
 
-记模型类在第 $k$ 个图上的最小可达风险为：
+由第四项可得穷尽覆盖：
 
 $$
-R_k^{\inf}=\inf_\theta R_k(\theta)
+\bigcup_{k=1}^{\infty}\mathcal G_k=\mathcal G
 $$
 
-记一次训练与受限回溯组成的拟合算子为 $\mathcal F_k$。若存在与迭代次数无关的常数 $\eta\in[0,1)$，使：
+**命题（穷尽覆盖下的有限阶段一致性）：** 存在有限整数 $K$，使得对所有 $k\geq K$、任意可达节点 $x$ 及其合法动作 $a$，受限 Bellman 解满足：
 
 $$
-R_k(\mathcal F_k(\theta))-R_k^{\inf}
+V_k^*(x)=V^*(x),
+\qquad
+Q_k^*(x,a)=Q^*(x,a)
+$$
+
+因此：
+
+$$
+\lim_{k\to\infty}V_k^*(x)=V^*(x)
+$$
+
+$$
+\lim_{k\to\infty}Q_k^*(x,a)=Q^*(x,a)
+$$
+
+**证明：** 按照第 4.8.1 节定义的节点合并规则，每个图节点由起始 FEN 与完整动作前缀唯一确定，重复局面历史和其他棋规状态不会在图合并过程中丢失。国际象棋的可达状态动作边集合有限。对每条边 $e$，记其首次进入受限图的阶段为 $k_e$。第四项保证每个 $k_e$ 都是有限整数。取：
+
+$$
+K=\max_{e\in\mathcal E(\mathcal G)}k_e
+$$
+
+则对所有 $k\geq K$ 都有 $\mathcal G_k=\mathcal G$。以下证明完整覆盖后的 Bellman 解相等。规则终局满足 $V_k^*(x)=V^*(x)=z(x)$。假设所有剩余合法长度小于 $d$ 的节点均满足 $V_k^*=V^*$，则对剩余合法长度为 $d$ 的节点有：
+
+$$
+\begin{aligned}
+V_k^*(x)
+&=\max_{a\in\mathcal A(x)}
+\left[-V_k^*(T(x,a))\right]\\
+&=\max_{a\in\mathcal A(x)}
+\left[-V^*(T(x,a))\right]\\
+&=V^*(x)
+\end{aligned}
+$$
+
+由剩余合法长度上的逆向归纳，对所有 $k\geq K$ 都有 $V_k^*=V^*$。再由 $Q_k^*(x,a)=-V_k^*(T(x,a))$ 可得 $Q_k^*=Q^*$。两个序列从第 $K$ 阶段起保持不变，因此上述极限成立。换言之，在穷尽覆盖条件下，BRCI 的受限 Bellman 解具有有限阶段稳定性，极限等价是该性质的直接结果。
+
+当前实现满足前两项，并在单次运行中满足第三项。第四项由行为 Policy、起始局面覆盖、运行迭代数和 `max-plies` 共同决定。当前实现能够精确求解已经构建的有限受限图，并在独立受限图上测量参数更新。完整国际象棋上的覆盖程度由实际采样决定，Arena 用于检验有限图之外的走棋表现。
+
+#### 4.8.6 Value 误差与 Policy 遗憾的条件收敛
+
+4.8.5 证明受限 Bellman 目标在穷尽覆盖条件下与完整博弈目标达到有限阶段一致。本节给出网络 Value 预测误差与 Policy 遗憾趋于零所需的附加条件。定义联合误差：
+
+$$
+E_k(\theta)=E_{V,k}(\theta)+E_{P,k}(\theta)
+$$
+
+记模型类在第 $k$ 个图上的最小可达误差为：
+
+$$
+E_k^{\inf}=\inf_\theta E_k(\theta)
+$$
+
+记一次训练与受限回溯组成的拟合算子为 $\mathcal F_k$。假设：
+
+1. 存在有限的 $K$，使 $\mathcal G_k=\mathcal G$ 对所有 $k\geq K$ 成立。
+2. 模型类能够表示 $V^*$ 和某个只选择最优动作的 Policy，因此 $E_K^{\inf}=0$。
+3. 存在与拟合次数无关的常数 $\eta\in[0,1)$，使 $\mathcal F_K$ 满足：
+
+$$
+E_K(\mathcal F_K(\theta))-E_K^{\inf}
 \leq
-\eta\left[R_k(\theta)-R_k^{\inf}\right]
+\eta\left[E_K(\theta)-E_K^{\inf}\right]
 $$
 
-连续执行 $m$ 次后有：
+连续执行 $m$ 次成功拟合后，由归纳法可得：
 
 $$
-R_k(\mathcal F_k^m(\theta))-R_k^{\inf}
+E_K(\mathcal F_K^m(\theta))-E_K^{\inf}
 \leq
-\eta^m\left[R_k(\theta)-R_k^{\inf}\right]
+\eta^m\left[E_K(\theta)-E_K^{\inf}\right]
 $$
 
-因此对任意 $\varepsilon>0$，都存在有限的 $m$ 使风险与 $R_k^{\inf}$ 的距离小于 $\varepsilon$。若图已经覆盖完整博弈，且模型类能够表示 $V^*$ 与对应最优 Policy，则 $R_k^{\inf}=0$。收缩条件和可表示性是有限拟合逼近完整博弈目标的充分条件。实际神经网络不自动满足这些条件，独立图风险与 Arena 分别检验当前参数步的有限图性质和走棋表现。
+因为 $\eta<1$ 且 $E_K^{\inf}=0$，所以：
 
-`summary.json` 记录每轮新增终局轨迹、训练图和测试图规模、分支节点数、Policy 目标变化、训练损失、12 个回溯步长的两项风险、分量改进率、Arena 结果与最终晋升状态。
+$$
+\lim_{m\to\infty}
+E_K(\mathcal F_K^m(\theta))=0
+$$
+
+当联合误差大于零时，每次成功拟合都会严格降低该误差。完整博弈图有限，并且每个测试节点具有正权重，因此 Value 均方误差趋于零可推出每个节点的网络 Value 收敛到 $V^*$。Policy 平均遗憾趋于零可推出网络 Policy 的期望动作值收敛到该节点的最优动作值。最优动作存在并列时，Policy 分布不需要收敛到唯一分布。
+
+上述条件收敛结论只涉及完整博弈节点上的 Value 预测误差和 Policy 遗憾，不要求网络参数、Policy logits 或并列最优动作之间的概率分配收敛。神经网络存在通道置换和等价参数化，不同参数可以表示相同函数。
+
+当前实现对 12 个有限回溯步长计算独立图误差，并只把误差严格下降的步长交给 Arena。这保证每个通过受限图判别的 candidate 在该独立图上变好。当前实现尚未证明对任意非最优参数都存在能够通过判别的步长，也未证明 Arena 会接受每个满足受限图条件的 candidate。因此，上述结论给出 BRCI 从 Bellman 目标通向 Value 误差与 Policy 遗憾收敛的充分条件，实际运行仍可能因拟合停滞或 Arena 拒绝而保持原模型。
+
+`summary.json` 记录每轮新增终局轨迹、训练图和测试图规模、分支节点数、Policy 目标变化、训练损失、12 个回溯步长的 Value 均方误差与 Policy 平均遗憾、分量改进率、Arena 结果与最终晋升状态。
+
+复现实验使用：
+
+```bash
+bash scripts/gadus_brci.sh
+```
+
+`build/gadus/brci --help` 列出可覆盖的采样、拟合与 Arena 参数。
+
+每次运行创建独立的 `brci_<timestamp>_<id>` 数据目录和模型目录。受限图在该次运行的内存中跨迭代累积，candidate 是否通过晋升不影响已经取得的终局事实。
 
 ## 5. Melano
 
-### 5.1 数据与网络
+### 5.1 状态与动作编码
 
 Melano 将局面编码为 67 个整数：64 个棋盘格 piece tokens、1 个行棋方 token、1 个王车易位 bitmask 和 1 个 en passant 文件 token。空格编码为 0，白方六种棋子编码为 1 到 6，黑方六种棋子编码为 7 到 12。模型把它们展开为 64 个 square tokens 与 1 个 global token。piece、square、side、castling 和 en passant embeddings 共同形成初始表示。
 
@@ -1022,6 +1055,8 @@ $$
 $$
 
 普通走法和后升变使用 source-destination 编码。马、象、车升变使用每个起点的 3 个方向乘 3 个升变棋子编码。
+
+### 5.2 网络
 
 每个 geometry attention block 包含 pre-norm multi-head self-attention、32 类静态棋盘几何关系 bias、global token 生成的动态关系 bias、residual connection 和 pre-norm feed-forward network。
 
@@ -1043,6 +1078,19 @@ $$
 Q(s,a)=\operatorname{clip}(V(s)+A(s,a),-1,1)
 $$
 
+记精确状态 encoder 为 $E$，动作条件 latent dynamics 为 $D$。潜在转移使用动作 embedding 条件化一个 residual geometry-attention block。记 $\mathcal B$ 为该 block，$c(a)$ 为动作条件向量，$g(a)$ 为逐通道门控 logits，$\sigma$ 为 sigmoid，$\odot$ 为逐元素乘法：
+
+$$
+h=E(s)
+$$
+
+$$
+\widehat h'=D(h,a)=\operatorname{LN}\left(h+\sigma(g(a))\odot
+\left[\mathcal B(h+c(a))-h\right]\right)
+$$
+
+### 5.3 数据预处理
+
 Melano HDF5 schema：
 
 ```text
@@ -1062,7 +1110,7 @@ value_perspective=side_to_move
 has_cmt=0|1
 ```
 
-带评注 PGN 的 Value target 与 Gadus 使用相同映射。记 $score_{\mathrm{stm}}(s)$ 为转成当前行棋方视角后的兵值评分：
+对带评注 PGN，记 $score_{\mathrm{stm}}(s)$ 为转成当前行棋方视角后的兵值评分。Value target 为：
 
 $$
 V_{target}(s)=\tanh\left(\frac{score_{stm}(s)}{3}\right)
@@ -1077,7 +1125,23 @@ $$
 
 每盘棋的第一个有效评分建立 Value 基准，对应动作的 $A_{target}=0$。`--has-cmt 0` 使用终局结果生成 Value target，监督损失中的 dueling-Q 项权重取 0。
 
-监督训练使用：
+`next_values` 独立保存走后局面在新行棋方视角下的 Value target。它直接来自当前走法后的评注，因此每盘棋第一条有效评注也能监督走后 latent。
+
+```bash
+build/melano/preprocess \
+	--input data/games.cmt.pgn \
+	--output data/games.melano.h5 \
+	--has-cmt 1 \
+	--chunk-size 4096 \
+	--compression-level 1 \
+	--log-every 10000
+```
+
+`--max-games` 控制读取对局上限，`--chunk-size` 与 `--compression-level` 控制 Melano HDF5 写入。
+
+### 5.4 监督训练
+
+监督训练的 dueling action Value 与目标为：
 
 $$
 \widehat Q(s,a)=\operatorname{clip}(V(s)+A(s,a),-1,1)
@@ -1088,15 +1152,12 @@ Q_{target}(s,a)=\operatorname{clip}
 \left(V_{target}(s)+A_{target}(s,a),-1,1\right)
 $$
 
-$$
-h=E(s),\qquad \widehat h'=D(h,a),\qquad \overline h'=\operatorname{stopgrad}(E(s'))
-$$
-
-其中 $E$ 是精确状态 encoder，$D$ 是动作条件 latent dynamics，$\operatorname{stopgrad}$ 表示停止梯度传播。潜在转移使用动作 embedding 条件化一个 residual geometry-attention block。记 $\mathcal B$ 为该 block，$c(a)$ 为动作条件向量，$g(a)$ 为逐通道门控 logits，$\sigma$ 为 sigmoid，$\odot$ 为逐元素乘法：
+精确棋规生成动作后的状态 $s'$。预测 latent 与停止梯度的精确 successor latent 分别为：
 
 $$
-\widehat h'=\operatorname{LN}\left(h+\sigma(g(a))\odot
-\left[\mathcal B(h+c(a))-h\right]\right)
+\widehat h'=D(E(s),a),
+\qquad
+\overline h'=\operatorname{stopgrad}(E(s'))
 $$
 
 潜在一致性损失 $L_D$ 逐 token 比较走后预测与精确棋规生成的走后状态编码：
@@ -1106,31 +1167,23 @@ L_D=1-\frac{1}{65}\sum_{i=1}^{65}
 \cos(\widehat h'_i,\overline h'_i)
 $$
 
-`next_values` 独立保存走后局面在新行棋方视角下的 Value target。它直接来自当前走法后的评注，因此每盘棋第一条有效评注也能监督走后 latent。Imagined Value 损失 $L_I$ 定义为：
+Imagined Value 损失 $L_I$ 定义为：
 
 $$
 L_I=\operatorname{MSE}(V(\widehat h'),V_{target}(s'))
 $$
 
-记 $\lambda_V$、$\lambda_Q$、$\lambda_D$ 与 $\lambda_I$ 分别为 Value、dueling action Value、latent dynamics 和 imagined Value 的损失系数。完整监督损失为：
+记 PGN 中实际走法的 one-hot 分布为 $\delta_{a^*}$。记 $\lambda_V$、$\lambda_Q$、$\lambda_D$ 与 $\lambda_I$ 分别为 Value、dueling action Value、latent dynamics 和 imagined Value 的损失系数。完整监督损失为：
 
 $$
-L_{\mathrm{sup}}=L_{\mathrm{CE}}+\lambda_V\operatorname{MSE}(V,V_{\mathrm{target}})+
+L_{\mathrm{sup}}=
+L_{\mathrm{CE}}\left(P_\theta(\cdot\mid s),\delta_{a^*}\right)+
+\lambda_V\operatorname{MSE}(V,V_{\mathrm{target}})+
 \lambda_Q\operatorname{MSE}(\widehat Q,Q_{target})+
 \lambda_D L_D+\lambda_I L_I
 $$
 
-### 5.2 Preprocess、Train 与 Search
-
 ```bash
-build/melano/preprocess \
-	--input data/games.cmt.pgn \
-	--output data/games.melano.h5 \
-	--has-cmt 1 \
-	--chunk-size 4096 \
-	--compression-level 1 \
-	--log-every 10000
-
 build/melano/train \
 	--data data/games.melano.h5 \
 	--out models/melano/melano.pth \
@@ -1148,31 +1201,13 @@ build/melano/train \
 	--device cuda \
 	--precision bf16 \
 	--log-every 50
-
-build/melano/search \
-	--model models/melano/melano.pth \
-	--fen "startpos" \
-	--device cuda \
-	--precision bf16 \
-	--search-type only-mcts \
-	--mcts-sims 1000 \
-	--mcts-min-sims 250 \
-	--mcts-batch-size 64 \
-	--movetime-ms 5000 \
-	--c-puct 0.5 \
-	--c-puct-base 19652 \
-	--c-puct-factor 1.0 \
-	--fpu-reduction 0.15 \
-	--virtual-loss 0.0 \
-	--repetition-policy-penalty 0.0 \
-	--instant-mate-first 0 \
-	--root-topn 8
 ```
 
-- `preprocess --max-games` 控制读取对局上限，`--chunk-size` 与 `--compression-level` 控制 Melano HDF5 写入。
-- `train` 每次创建新的 Melano 模型。`--channels` 和 `--blocks` 决定 geometry attention 宽度与层数，checkpoint 通过临时文件和 rename 原子写回。
-- Melano checkpoint 的逻辑顶层为 `model` 与 `arch`，其中 `arch` 保存架构标识、`channels`、`blocks` 和 `action_size`。
-- `--precision` 可取 `fp32` 或 `bf16`，默认 `fp32`。`bf16` 用于 CUDA 前向计算，Policy softmax、P/V/A 与 latent dynamics 损失、指标累计和 checkpoint 参数保持 FP32。CUDA 输入批次使用 pinned memory，Search 只把合法动作的 Policy 与 Advantage 从 GPU 传回 CPU。
+`train` 每次创建新的 Melano 模型。`--channels` 和 `--blocks` 决定 geometry attention 宽度与层数，checkpoint 通过临时文件和 rename 原子写回。Melano checkpoint 的逻辑顶层为 `model` 与 `arch`，其中 `arch` 保存架构标识、`channels`、`blocks` 和 `action_size`。
+
+`--precision` 可取 `fp32` 或 `bf16`，默认 `fp32`。`bf16` 用于 CUDA 前向计算，Policy softmax、P/V/A 与 latent dynamics 损失、指标累计和 checkpoint 参数保持 FP32。CUDA 训练批次使用 pinned memory。
+
+### 5.5 搜索
 
 `closed` 按 Melano Policy 排序。`only-mcts` 使用 anchored latent MCTS。锚定周期 $K=2$ 表示每经过两个 ply 重新从精确棋盘编码 latent，因此任意预测 latent 最多跨越一个动作。每条边还具有一份伪访问。本文所称的伪访问，是 $V+A$ 提供的动作价值先验以一个统计样本的权重参与边价值估计。实际访问次数与叶节点回传保持独立计数。
 
@@ -1255,25 +1290,17 @@ $$
 
 其中 $N_{\min}$ 与 $N_{\mathrm{cap}}$ 是当前搜索的最小和最大 simulation 数，$u\in[0,1]$ 是根节点不确定性。
 
-### 5.3 Arena
-
 ```bash
-build/melano/arena \
-	--candidate models/melano-candidate.pth \
-	--baseline models/melano/melano.pth \
+build/melano/search \
+	--model models/melano/melano.pth \
+	--fen "startpos" \
 	--device cuda \
 	--precision bf16 \
-	--games 400 \
-	--games-in-flight 32 \
-	--max-plies 240 \
-	--opening-book data/openings.gen.bin \
-	--book-plies 8 \
-	--max-book-positions 50000 \
 	--search-type only-mcts \
-	--sims 64 \
-	--mcts-min-sims 32 \
-	--mcts-batch-size 32 \
-	--movetime-ms 0 \
+	--mcts-sims 1000 \
+	--mcts-min-sims 250 \
+	--mcts-batch-size 64 \
+	--movetime-ms 5000 \
 	--c-puct 0.5 \
 	--c-puct-base 19652 \
 	--c-puct-factor 1.0 \
@@ -1281,10 +1308,12 @@ build/melano/arena \
 	--virtual-loss 0.0 \
 	--repetition-policy-penalty 0.0 \
 	--instant-mate-first 0 \
-	--min-net-wins 4 \
-	--pgn-output data/melano-arena.pgn \
-	--log-every 1
+	--root-topn 8
 ```
+
+CUDA 搜索只把合法动作的 Policy 与 Advantage 从 GPU 传回 CPU。
+
+### 5.6 Arena
 
 Melano arena 采用自身模型与搜索 backend。paired openings 让同一开局交换双方颜色，`--games-in-flight` 让两份已加载模型批量评估多盘棋。设 candidate 的胜、和、负局数为 $W,D,L$，总局数为 $G$：
 
@@ -1312,57 +1341,36 @@ $$
 W-L\geq min\_net\_wins
 $$
 
-### 5.4 FCPI
-
 ```bash
-build/melano/fcpi \
-	--model models/melano/melano.pth \
+build/melano/arena \
+	--candidate models/melano/candidate.pth \
+	--baseline models/melano/melano.pth \
 	--device cuda \
 	--precision bf16 \
-	--iterations 5 \
-	--games-per-iter 1000 \
-	--games-in-flight 64 \
+	--games 400 \
+	--games-in-flight 32 \
 	--max-plies 240 \
 	--opening-book data/openings.gen.bin \
-	--startpos-fraction 0.5 \
 	--book-plies 8 \
 	--max-book-positions 50000 \
-	--inference-batch-size 64 \
-	--target-records-per-batch 256 \
-	--counterfactual-budget 24 \
-	--behavior-temperature 0.85 \
-	--uniform-mix 0.02 \
-	--policy-weight 1.0 \
-	--value-weight 1.0 \
-	--dueling-q-weight 0.5 \
-	--dynamics-weight 0.25 \
-	--imagined-value-weight 0.25 \
-	--epochs 15 \
-	--train-max-steps 2000 \
-	--batch-size 256 \
-	--lr 0.00002 \
-	--weight-decay 0.0001 \
-	--grad-clip 1.0 \
-	--eval-games 400 \
-	--eval-games-in-flight 32 \
-	--eval-max-plies 240 \
-	--eval-opening-book data/openings.gen.bin \
-	--eval-book-plies 8 \
-	--eval-max-book-positions 50000 \
-	--eval-search-type closed \
-	--eval-sims 0 \
-	--eval-mcts-batch-size 64 \
-	--eval-movetime-ms 0 \
-	--eval-c-puct 0.5 \
-	--eval-c-puct-base 19652 \
-	--eval-c-puct-factor 1.0 \
-	--eval-fpu-reduction 0.15 \
-	--eval-repetition-policy-penalty 0.0 \
-	--eval-instant-mate-first 0 \
-	--eval-min-net-wins 4 \
-	--log-every 50 \
-	--seed 2026
+	--search-type only-mcts \
+	--sims 64 \
+	--mcts-min-sims 32 \
+	--mcts-batch-size 32 \
+	--movetime-ms 0 \
+	--c-puct 0.5 \
+	--c-puct-base 19652 \
+	--c-puct-factor 1.0 \
+	--fpu-reduction 0.15 \
+	--virtual-loss 0.0 \
+	--repetition-policy-penalty 0.0 \
+	--instant-mate-first 0 \
+	--min-net-wins 4 \
+	--pgn-output data/melano-arena.pgn \
+	--log-every 1
 ```
+
+### 5.7 FCPI
 
 Melano 自对战行为分布同时使用 Policy 与非正 Advantage。记 $\sigma_A(s)$ 为该状态合法动作上的最大 Advantage 绝对值：
 
@@ -1501,7 +1509,7 @@ bash scripts/melano_fcpi.sh
 
 ## 6. UCI
 
-两个 C++ UCI 程序直接加载对应 LibTorch checkpoint：
+### 6.1 Gadus
 
 ```powershell
 build\gadus\uci.exe `
@@ -1511,6 +1519,10 @@ build\gadus\uci.exe `
 	--mcts-sims 100
 ```
 
+Gadus UCI 加载 Gadus checkpoint。`SearchType=closed` 使用 Gadus Policy，`SearchType=only-mcts` 使用第 4.5 节定义的 Gadus MCTS。
+
+### 6.2 Melano
+
 ```powershell
 build\melano\uci.exe `
 	--model models\melano\melano.pth `
@@ -1519,15 +1531,17 @@ build\melano\uci.exe `
 	--mcts-sims 1000
 ```
 
-UCI 输出包含 MultiPV、side-to-move `score cp`、节点数、NPS、耗时和 PV。搜索开始时先发布模型直觉结果，MCTS 期间按 `ProgressIntervalMS` 发布中间结果。
+Melano UCI 加载 Melano checkpoint。`SearchType=closed` 使用 Melano Policy，`SearchType=only-mcts` 使用第 5.5 节定义的 anchored latent MCTS。
 
-### 6.1 Gadus UCI options
+两个程序都输出 MultiPV、side-to-move `score cp`、节点数、NPS、耗时和 PV。搜索开始时先发布模型 Policy 结果，MCTS 期间按 `ProgressIntervalMS` 发布中间结果。
 
-Gadus 在 `uci` 握手中公开以下 option：
+### 6.3 UCI options
 
-- `ModelPath`：checkpoint 路径。打包引擎默认读取可执行文件同目录的 `gadus.pth`。
+Gadus 与 Melano 当前公开相同的 UCI 控制项。选项作用于各自的模型与搜索实现：
+
+- `ModelPath`：checkpoint 路径。打包后的 Gadus 与 Melano 分别读取可执行文件同目录的 `gadus.pth` 与 `melano.pth`。
 - `Device`：`auto`、`cpu` 或 `cuda`。
-- `SearchType`：`closed` 表示只使用模型 Policy，`only-mcts` 表示使用 Gadus MCTS。
+- `SearchType`：`closed` 表示只使用对应架构的 Policy，`only-mcts` 表示使用对应架构的 MCTS。
 - `MCTSSims`：MCTS simulation 上限，默认 `100`。客户端发送 `go nodes <n>` 时以 `<n>` 为当前搜索上限。
 - `MCTSMinSims`：时间预算结束前至少完成的 simulation 数，默认 `0`。
 - `MCTSBatchSize`：一次神经网络叶子批量，默认 `32`。
@@ -1565,7 +1579,7 @@ Gadus 在 `uci` 握手中公开以下 option：
 }
 ```
 
-`MCTSSims` 设置 Gadus 在 UCI 客户端没有提供 `go nodes <n>` 时使用的默认 simulation 上限。GUI Search 区域的 `Node / simulation limit` 会为每次搜索发送 `go nodes <n>` 并覆盖该次搜索的 `MCTSSims`。设为 `0` 时不发送 nodes 限制。`Device` 与 `MultiPV` 使用 GUI 对应控件填写，`Launch arguments` 通常留空。
+`MCTSSims` 设置引擎在 UCI 客户端没有提供 `go nodes <n>` 时使用的默认 simulation 上限。GUI Search 区域的 `Node / simulation limit` 会为每次搜索发送 `go nodes <n>` 并覆盖该次搜索的 `MCTSSims`。设为 `0` 时不发送 nodes 限制。`Device` 与 `MultiPV` 使用 GUI 对应控件填写，`Launch arguments` 通常留空。
 
 其他 UCI 客户端使用标准命令设置同一组选项：
 
@@ -1578,7 +1592,7 @@ setoption name RepetitionPolicyPenalty value 1.0
 setoption name InstantMateFirst value true
 ```
 
-### 6.2 Gadidae 引擎目录
+### 6.4 Gadidae 引擎目录
 
 Windows 可将指定 checkpoint 包装到对应的 `models/<architecture>/` UCI 引擎目录：
 
@@ -1748,6 +1762,10 @@ python scripts/opening_book.py \
 
 `scripts/build.bat` 与 `scripts/build.sh` 在发布可执行文件前运行 CTest。测试失败时构建停止，现场保留在 `build/.build-work/`。
 
+### 10.1 Gadus
+
 Gadus 测试覆盖 `gadus_18_planes`、普通走法与特殊走法编码、棋规、Policy/Value 输出形状、有限数值、反向传播和 checkpoint 往返。本地 Windows CPU 烟测覆盖单盘 PGN 生成 HDF5、一步监督训练、closed 搜索、batched MCTS、两盘 paired arena、PGN 输出以及一轮 FCPI 的采样、反事实展开、训练、arena gate 和 current 晋升。
+
+### 10.2 Melano
 
 Melano 测试覆盖 `melano_square_tokens`、普通走法与升变编码、棋规、Policy/Value/Advantage 输出形状、Advantage 范围、动作条件 latent successor、$K=2$ anchored latent MCTS 路径、有限数值、反向传播和 checkpoint 往返。本地 Windows CPU 烟测覆盖单盘 PGN 生成含 `next_states` 与 `next_values` 的 HDF5、一步监督训练以及一轮树一致 Melano FCPI 的候选后继训练与 arena gate。
