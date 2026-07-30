@@ -11,9 +11,9 @@ int main(int argc, char **argv) {
 		if (args.has("help")) {
 			std::cout
 				<< "Usage: fcpi --model <gadus.pth> [options]\n"
-				<< "  --iterations <n> --games-per-iter <games-per-opponent-group>\n"
+				<< "  --iterations <n> --games-per-iter <games>\n"
 				<< "  --games-in-flight <n> --max-plies <n>\n"
-				<< "  --opening-book <path|empty> --startpos-fraction <x>\n"
+				<< "  --opening-book <sampling-book|empty> --max-book-positions <n>\n"
 				<< "  --counterfactual-budget <deep-edges> --behavior-temperature <x>\n"
 				<< "  --epochs <n> --train-max-steps <n>\n"
 				<< "  --batch-size <n> --lr <x>\n"
@@ -35,8 +35,6 @@ int main(int argc, char **argv) {
 		options.games_in_flight = args.get_int("games-in-flight", options.games_in_flight);
 		options.max_plies = args.get_int("max-plies", options.max_plies);
 		options.opening_book = args.get("opening-book", options.opening_book);
-		options.startpos_fraction = args.get_double("startpos-fraction", options.startpos_fraction);
-		options.book_plies = args.get_int("book-plies", options.book_plies);
 		options.max_book_positions = args.get_int("max-book-positions", options.max_book_positions);
 		options.inference_batch_size =
 			args.get_int("inference-batch-size", options.inference_batch_size);

@@ -93,6 +93,52 @@ def load_polyglot_positions(
     return positions
 
 
+def load_reachable_polyglot_positions(
+    path: str,
+    max_positions: int = 50000,
+    seed: int = 2026,
+) -> List[str]:
+    """Returns unique non-terminal states from every reachable ply, including startpos."""
+    book_path = Path(path)
+    if book_path.suffix.lower() != ".bin":
+        raise ValueError(f"opening book must be a Polyglot .bin file: {path}")
+    if not book_path.exists():
+        raise FileNotFoundError(f"opening book not found: {path}")
+
+    target = max(1, int(max_positions))
+    rng = random.Random(int(seed))
+    positions: List[str] = []
+    visited = set()
+    pending = [chess.Board()]
+
+    with chess.polyglot.open_reader(str(book_path)) as reader:
+        while pending and len(positions) < target:
+            board = pending.pop()
+            state_key = opening_state_key(board.fen())
+            if state_key in visited:
+                continue
+            visited.add(state_key)
+            if board.is_game_over(claim_draw=True):
+                continue
+            positions.append(board.fen())
+
+            entries = [
+                entry
+                for entry in reader.find_all(board)
+                if entry.move in board.legal_moves
+            ]
+            rng.shuffle(entries)
+            for entry in entries:
+                child = board.copy(stack=False)
+                child.push(entry.move)
+                if not child.is_game_over(claim_draw=True):
+                    pending.append(child)
+
+    if not positions:
+        positions.append(chess.Board().fen())
+    return positions
+
+
 def opening_state_key(fen: str) -> str:
     board = chess.Board(fen)
     ep = chess.square_name(board.ep_square) if board.ep_square is not None else "-"
@@ -452,6 +498,199 @@ def validate_written_book(path: str, book_plies: int, min_fens: int) -> int:
             f"written opening book expanded positions below --min-fens: {readable_fens} < {min_fens}"
         )
     return readable_fens
+
+
+def validate_sampling_book(path: str, min_fens: int, seed: int) -> int:
+    readable_fens = len(
+        load_reachable_polyglot_positions(
+            path,
+            max_positions=min_fens,
+            seed=seed,
+        )
+    )
+    if readable_fens < min_fens:
+        raise RuntimeError(
+            f"sampling book reachable positions below --min-fens: "
+            f"{readable_fens} < {min_fens}"
+        )
+    return readable_fens
+
+
+def extract_sampling_book_from_polyglot(
+    source: Path,
+    output: str,
+    min_fens: int,
+    seed: int,
+    log_every: int,
+) -> Dict[str, object]:
+    rng = random.Random(seed)
+    pending = [chess.Board()]
+    visited = set()
+    entries: Dict[Tuple[int, int], PolyglotOutputEntry] = {}
+    next_log = max(1, log_every)
+
+    with chess.polyglot.open_reader(str(source)) as reader:
+        while pending and len(visited) < min_fens:
+            board = pending.pop()
+            state_key = opening_state_key(board.fen())
+            if state_key in visited or board.is_game_over(claim_draw=True):
+                continue
+            visited.add(state_key)
+
+            available = [
+                entry
+                for entry in reader.find_all(board)
+                if entry.move in board.legal_moves
+            ]
+            rng.shuffle(available)
+            for entry in available:
+                entries[(int(entry.key), int(entry.raw_move))] = PolyglotOutputEntry(
+                    key=int(entry.key),
+                    raw_move=int(entry.raw_move),
+                    weight=max(1, int(entry.weight)),
+                    learn=int(entry.learn),
+                )
+                child = board.copy(stack=False)
+                child.push(entry.move)
+                if not child.is_game_over(claim_draw=True):
+                    pending.append(child)
+
+            if log_every > 0 and len(visited) >= next_log:
+                print(
+                    "sampling book:",
+                    f"readable_fens={len(visited)}/{min_fens}",
+                    f"unique_entries={len(entries)}",
+                    flush=True,
+                )
+                next_log += log_every
+
+    if len(visited) < min_fens:
+        raise RuntimeError(
+            f"source book has too few reachable positions: {len(visited)} < {min_fens}"
+        )
+    write_polyglot_book(output, entries.values())
+    readable_fens = validate_sampling_book(output, min_fens, seed)
+    return {
+        "input": str(source),
+        "output": str(output),
+        "source_type": "polyglot",
+        "readable_fens": int(readable_fens),
+        "min_fens": int(min_fens),
+        "unique_entries": len(entries),
+        "seed": int(seed),
+    }
+
+
+def generate_sampling_book_from_pgn(
+    source: Path,
+    output: str,
+    min_fens: int,
+    seed: int,
+    log_every: int,
+) -> Dict[str, object]:
+    counts: Dict[Tuple[int, int], int] = {}
+    readable = {opening_state_key(chess.Board().fen())}
+    games = 0
+    checked = 0
+    illegal = 0
+    next_log = max(1, log_every)
+
+    with open(source, "r", encoding="utf-8", errors="replace") as handle:
+        while len(readable) < min_fens:
+            game = chess.pgn.read_game(handle)
+            if game is None:
+                break
+            games += 1
+            board = game.board()
+            for move in game.mainline_moves():
+                if move not in board.legal_moves:
+                    illegal += 1
+                    break
+                child = board.copy(stack=False)
+                child.push(move)
+                checked += 1
+                if child.is_game_over(claim_draw=True):
+                    break
+                edge = (
+                    int(chess.polyglot.zobrist_hash(board)),
+                    int(encode_polyglot_move(board, move)),
+                )
+                counts[edge] = counts.get(edge, 0) + 1
+                board = child
+                readable.add(opening_state_key(board.fen()))
+
+                if log_every > 0 and len(readable) >= next_log:
+                    print(
+                        "sampling pgn:",
+                        f"games={games}",
+                        f"checked={checked}",
+                        f"readable_fens={len(readable)}/{min_fens}",
+                        f"unique_entries={len(counts)}",
+                        flush=True,
+                    )
+                    next_log += log_every
+                if len(readable) >= min_fens:
+                    break
+
+    if len(readable) < min_fens:
+        raise RuntimeError(
+            f"PGN has too few reachable positions: {len(readable)} < {min_fens}"
+        )
+    entries = [
+        PolyglotOutputEntry(
+            key=key,
+            raw_move=raw_move,
+            weight=min(65535, max(1, int(weight))),
+        )
+        for (key, raw_move), weight in counts.items()
+    ]
+    write_polyglot_book(output, entries)
+    readable_fens = validate_sampling_book(output, min_fens, seed)
+    return {
+        "input": str(source),
+        "output": str(output),
+        "source_type": "pgn",
+        "games": int(games),
+        "checked_positions": int(checked),
+        "readable_fens": int(readable_fens),
+        "min_fens": int(min_fens),
+        "unique_entries": len(entries),
+        "illegal_moves": int(illegal),
+        "seed": int(seed),
+    }
+
+
+def generate_sampling_book(args):
+    source = Path(args.sampling_source)
+    if not source.exists():
+        raise FileNotFoundError(f"sampling source not found: {source}")
+    output = args.output or "data/openings.sam.bin"
+    if Path(output).resolve() == source.resolve():
+        raise ValueError("sampling output must differ from its source")
+    min_fens = max(1, int(args.min_fens))
+    seed = int(args.seed)
+    log_every = max(0, int(args.log_every))
+    start = time.monotonic()
+    print(
+        "sampling book start:",
+        f"input={source}",
+        f"output={output}",
+        f"min_fens={min_fens}",
+        f"seed={seed}",
+        flush=True,
+    )
+    if source.suffix.lower() == ".bin":
+        summary = extract_sampling_book_from_polyglot(
+            source, output, min_fens, seed, log_every
+        )
+    else:
+        summary = generate_sampling_book_from_pgn(
+            source, output, min_fens, seed, log_every
+        )
+    summary["elapsed_sec"] = round(time.monotonic() - start, 3)
+    print("sampling book summary:", flush=True)
+    print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+    return summary
 
 
 def verify_opening_book(args):
@@ -844,6 +1083,7 @@ def parse_args():
     )
     parser.add_argument("--verify", default=None)
     parser.add_argument("--pgn", default=None)
+    parser.add_argument("--sampling-source", default=None)
     parser.add_argument("--uci", default=UCI_PATH)
     parser.add_argument("--output", default=None)
     parser.add_argument("--in-place", action="store_true", default=False)
@@ -856,12 +1096,16 @@ def parse_args():
     parser.add_argument("--uci-threads", type=int, default=4)
     parser.add_argument("--uci-hash-mb", type=int, default=512)
     parser.add_argument("--log-every", type=int, default=100)
+    parser.add_argument("--seed", type=int, default=2026)
     args = parser.parse_args()
     return args
 
 
 def main():
     args = parse_args()
+    if args.sampling_source:
+        generate_sampling_book(args)
+        return
     if args.verify:
         verify_opening_book(args)
         return
@@ -869,7 +1113,9 @@ def main():
         generate_opening_book_from_pgn(args)
         return
     raise SystemExit(
-        "usage: python scripts/opening_book.py --verify data/openings.bin --uci <engine>"
+        "usage: python scripts/opening_book.py "
+        "--sampling-source <book.bin|games.pgn> --output data/openings.sam.bin "
+        "or --verify data/openings.bin --uci <engine>"
     )
 
 

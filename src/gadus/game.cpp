@@ -82,6 +82,28 @@ chess::Move decode_polyglot_move(std::uint16_t raw, const chess::Board &board) {
 // Use repetition-relevant FEN fields as the opening traversal identity.
 std::string state_key(const chess::Board &board) { return board.getFen(false); }
 
+using PolyglotEntries = std::unordered_multimap<std::uint64_t, std::uint16_t>;
+
+// Load the compact Polyglot edge table once so fixed-depth and all-depth traversals agree.
+PolyglotEntries read_polyglot_entries(const std::string &path) {
+	std::ifstream input(path, std::ios::binary);
+	if (!input) {
+		throw std::runtime_error("opening book not found: " + path);
+	}
+	PolyglotEntries entries;
+	while (input.peek() != std::char_traits<char>::eof()) {
+		const auto key = read_be64(input);
+		const auto move = read_be16(input);
+		static_cast<void>(read_be16(input));
+		static_cast<void>(read_be32(input));
+		if (!input) {
+			throw std::runtime_error("truncated Polyglot opening book: " + path);
+		}
+		entries.emplace(key, move);
+	}
+	return entries;
+}
+
 } // namespace
 
 // Delegate legal move generation to chess-library and return an owning vector.
@@ -362,21 +384,7 @@ std::vector<std::string> load_opening_positions(const std::string &path, int boo
 	if (path.empty()) {
 		return {std::string(chess::constants::STARTPOS)};
 	}
-	std::ifstream input(path, std::ios::binary);
-	if (!input) {
-		throw std::runtime_error("opening book not found: " + path);
-	}
-	std::unordered_multimap<std::uint64_t, std::uint16_t> entries;
-	while (input.peek() != std::char_traits<char>::eof()) {
-		const auto key = read_be64(input);
-		const auto move = read_be16(input);
-		static_cast<void>(read_be16(input));
-		static_cast<void>(read_be32(input));
-		if (!input) {
-			throw std::runtime_error("truncated Polyglot opening book: " + path);
-		}
-		entries.emplace(key, move);
-	}
+	const auto entries = read_polyglot_entries(path);
 
 	struct Pending {
 		chess::Board board;
@@ -421,6 +429,54 @@ std::vector<std::string> load_opening_positions(const std::string &path, int boo
 			child.makeMove(move);
 			if (!game_is_over(child)) {
 				queue.push({std::move(child), current.ply + 1});
+			}
+		}
+	}
+	if (positions.empty()) {
+		positions.push_back(std::string(chess::constants::STARTPOS));
+	}
+	return positions;
+}
+
+// Walk the sampling book as a randomized depth-first graph. Every reachable ply is eligible,
+// while state_key removes transpositions and startpos is emitted like every other state.
+std::vector<std::string> load_reachable_opening_positions(const std::string &path,
+														  int max_positions,
+														  std::uint64_t seed) {
+	if (path.empty()) {
+		return {std::string(chess::constants::STARTPOS)};
+	}
+	const auto entries = read_polyglot_entries(path);
+	const int target = std::max(1, max_positions);
+	std::vector<chess::Board> pending{chess::Board()};
+	std::unordered_set<std::string> visited;
+	std::vector<std::string> positions;
+	positions.reserve(target);
+	std::mt19937_64 rng(seed);
+
+	while (!pending.empty() && static_cast<int>(positions.size()) < target) {
+		auto board = std::move(pending.back());
+		pending.pop_back();
+		const auto identity = state_key(board);
+		if (!visited.insert(identity).second || game_is_over(board)) {
+			continue;
+		}
+		positions.push_back(board.getFen());
+
+		std::vector<chess::Move> moves;
+		const auto range = entries.equal_range(board.hash());
+		for (auto it = range.first; it != range.second; ++it) {
+			const auto move = decode_polyglot_move(it->second, board);
+			if (move.move() != chess::Move::NO_MOVE) {
+				moves.push_back(move);
+			}
+		}
+		std::shuffle(moves.begin(), moves.end(), rng);
+		for (const auto &move : moves) {
+			auto child = board;
+			child.makeMove(move);
+			if (!game_is_over(child)) {
+				pending.push_back(std::move(child));
 			}
 		}
 	}

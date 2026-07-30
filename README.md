@@ -467,9 +467,9 @@ build/gadus/arena \
 
 ### 4.7 FCPI
 
-记当前已接受模型为 $C_t$，此前两份已接受模型为 $C_{t-1}$ 与 $C_{t-2}$。每轮 FCPI 分别采样 $C_t$ 对 $C_t$、$C_t$ 对 $C_{t-1}$、$C_t$ 对 $C_{t-2}$ 三组对局；`--games-per-iter` 表示每组局数，因此每轮总局数为其三倍。历史不足两代时对应组回退到 `initial.pth`。历史模型只扩展采样分布，三组样本进入同一套事实回报、反事实树、损失和 candidate 对 current 的 arena gate。
+记当前已接受模型为 $C_t$。每轮 FCPI 从 `openings.sam.bin` 中无放回选择 `--games-per-iter` 个唯一起始局面，并由 $C_t$ 与自身完成全部对局。采样书允许任意 ply 的非终局状态，标准初始局面也作为普通可达状态存在。历史模型不参与采样。
 
-历史对局中 $C_t$ 均衡执白、执黑。记 $\mu(a\mid s)$ 为控制当前行棋方的采样模型所使用的行为策略，$T_b>0$ 为行为温度。Gadus 对该模型的冻结 Policy 做温度变换：
+记 $\mu(a\mid s)$ 为当前模型使用的行为策略，$T_b>0$ 为行为温度。Gadus 对冻结 Policy 做温度变换：
 
 $$
 \mu(a\mid s)=
@@ -508,35 +508,18 @@ $$
 \qquad g_a\sim\operatorname{Gumbel}(0,1)
 $$
 
-树使用冻结的 `current.pth` 批量评价精确棋盘子局面。记 $N_G(s,a)$ 为完整轨迹实际经过状态—动作对 $(s,a)$ 的次数，$G_i(s,a)$ 为其中第 $i$ 个终局回报。完整对局形成事实动作回报均值：
-
-$$
-\widehat G(s,a)=
-\frac{1}{N_G(s,a)}
-\sum_{i=1}^{N_G(s,a)}G_i(s,a)
-$$
-
-对样本中的环境状态 $x$ 及动作 $a$，记环境后继为 $x_a'=T(x,a)$，网络后继为 $s_a'=\phi(x_a')$。动作价值按信息强度依次确定：
+树使用冻结的 `current.pth` 批量评价精确棋盘子局面。对样本中的环境状态 $x$ 及动作 $a$，记环境后继为 $x_a'=T(x,a)$，网络后继为 $s_a'=\phi(x_a')$。同一棵树中的全部非终局动作使用相同的冻结模型估计器，动作价值定义为：
 
 $$
 Q(s,a)=
 \begin{cases}
 z_{s,a}, & x_a'\text{ 是终局}\\
-\widehat G(s,a), & N_G(s,a)>0\\
 -\overline V(s_a'), & a\text{ 已展开}\\
 V_{old}(s), & a\text{ 未展开}
 \end{cases}
 $$
 
-其中 $z_{s,a}=-z(x_a')$ 是终局结果转换到父状态 $s$ 的行棋方视角后的值。事实回报是当前行为策略从该动作继续行棋至终局的 MC 样本均值，它取代该边的浅层 Value bootstrap。其余已展开动作使用子树回传值，冻结模型基线负责评价其余合法动作。
-
-对只有模型回传信息的已展开动作：
-
-$$
-Q(s,a)=-\overline V(s_a')
-$$
-
-其中 $\overline V(s_a')$ 是子树从叶节点回传到网络后继 $s_a'$ 的聚合值。
+其中 $z_{s,a}=-z(x_a')$ 是终局结果转换到父状态 $s$ 的行棋方视角后的值，$\overline V(s_a')$ 是子树从叶节点回传到网络后继 $s_a'$ 的聚合值。规则终局边使用精确结果，已展开非终局动作使用反事实子树，冻结模型基线负责评价其余合法动作。完整轨迹的 MC 回报不覆盖实际动作的 $Q(s,a)$，从而避免把一个动作的单次长程终局结果与其他动作的冻结 Value 估计直接混合。
 
 设冻结 Policy 下的局部均值为：
 
@@ -584,7 +567,7 @@ $$
 \pi^+(a\mid s)\left(Q(s,a)-V_{old}(s)\right)
 $$
 
-因此树覆盖率已经进入残差本身。预算较小时，未展开概率质量把 $\overline V(s)$ 拉回冻结基线。预算增加后，更多反事实结论进入修正。完整对局结果同时训练局面 Value，并作为实际动作的事实 $Q$ 参与 Policy 比较。这一步把终局事实传入动作排序，使各层冻结 Value 的自洽关系受到事实回报校正。
+因此树覆盖率已经进入残差本身。预算较小时，未展开概率质量把 $\overline V(s)$ 拉回冻结基线。预算增加后，更多反事实结论进入修正。完整对局结果只监督局面 Value，不在同一轮中作为实际动作的 $Q$ 参与 Policy 比较。
 
 对同一局面的两个动作 $a$ 与 $b$，一次精确拟合后的目标赔率满足：
 
@@ -602,7 +585,7 @@ k>
 \frac{\log P_0(b\mid s)-\log P_0(a\mid s)}{\Delta}
 $$
 
-这证明了正回报差异能够在有限次局部改进中改变排序。该结论的范围是固定动作价值差下的局部 Policy 排序。动作的博弈论真值仍由终局样本或完整求解确定。根节点全动作评价与概率欠额采样为每个正概率动作提供有限访问机会。
+这证明了正动作价值差能够在有限次局部改进中改变排序。该结论的范围是固定动作价值差下的局部 Policy 排序。动作的博弈论真值仍由规则终局或完整求解确定。根节点全动作评价与概率欠额采样为每个正概率动作提供有限访问机会。
 
 待展开前沿按到达概率与 Bellman residual 排序。记 $p_{\mathrm{reach}}(s)$ 为冻结行为策略沿当前树路径到达状态 $s$ 的概率，$d$ 为子节点 $s'$ 的树深度：
 
@@ -664,9 +647,9 @@ $$
 
 Policy、Value 和共享 residual backbone 通过同一次反向传播联合更新。AdamW weight decay 与梯度裁剪使用固定训练常量，FCPI 命令行只提供学习率、batch、epoch 与 step 上限。
 
-FCPI HDF5 保存 `policy_targets`、`policy_weights`、`mc_value_targets`、`mc_value_weights`、`tree_value_targets` 与 `tree_value_weights`。训练日志只输出 `policy`、`value_mc`、`value_tree`、合并后的 `value` 和 `loss`。反事实 summary 记录树数、决策节点数、评价边数、事实回报边数、终局边数、最大深度、平均 Bellman residual、平均覆盖率、平均 Value 修正和 Policy top-1 改变率。
+FCPI HDF5 保存 `policy_targets`、`policy_weights`、`mc_value_targets`、`mc_value_weights`、`tree_value_targets` 与 `tree_value_weights`。训练日志只输出 `policy`、`value_mc`、`value_tree`、合并后的 `value` 和 `loss`。反事实 summary 记录树数、决策节点数、评价边数、终局边数、最大深度、平均 Bellman residual、平均覆盖率、平均 Value 修正和 Policy top-1 改变率。
 
-每轮依次执行 `current.pth` 自对战、全局面去重采集、冻结反事实树展开、Monte Carlo/反事实 Value 目标构造、candidate 训练和 paired-game arena。每局按完整 Gadus 编码对全部局面去重。
+每轮依次执行 `current.pth` 自对战、全局面去重采集、冻结反事实树展开、Monte Carlo/反事实 Value 目标构造、candidate 训练和 paired-game arena。当前轮的终局 MC 更新 candidate 的 Value，当前轮的 Policy target 只由冻结的 `current.pth` 与规则终局边构造。candidate 晋升后，其 Value 在下一轮成为新的冻结估计器并进入反事实动作比较。该过程形成跨迭代的 Policy evaluation 与 Policy improvement。每局按完整 Gadus 编码对全部局面去重。
 
 每次运行由程序生成 `fcpi_YYYYMMDD_HHMMSS_id`，并创建：
 
@@ -688,7 +671,7 @@ candidate 达到 arena gate 后原子写入该 run 的 `current.pth`。
 bash scripts/gadus_fcpi.sh
 ```
 
-脚本默认使用 `PRECISION=bf16`、`GAMES_PER_ITER=2000`、`TRAIN_MAX_STEPS=6000`、较大的批次与 batched games。默认每轮三组各采样 2000 局，共 6000 局。可通过环境变量覆盖，例如 `PRECISION=fp32 BATCH_SIZE=512 bash scripts/gadus_fcpi.sh`。
+脚本默认使用 `PRECISION=bf16`、`GAMES_PER_ITER=6000`、`TRAIN_MAX_STEPS=6000`、`data/openings.sam.bin`、较大的批次与 batched games。每轮从采样书选择 6000 个不同起始局面进行 current-self 对局。可通过环境变量覆盖，例如 `PRECISION=fp32 BATCH_SIZE=512 bash scripts/gadus_fcpi.sh`。
 
 脚本会等待 FCPI 完成全部迭代，再调用独立 Arena 追加一次最终 `current.pth` 对同一 run 的 `initial.pth` 的 `closed` paired 对战。它复用 `EVAL_GAMES`、开局书、并发数和最大步数，并将 MCTS 关闭。结果写入 `summary.json` 的 `final_arena`，棋谱写入 `current_vs_initial.pgn`。该累计赛只报告整次运行的净变化，不参与 candidate 晋升。直接运行 `build/gadus/fcpi` 时，流程在 FCPI 迭代结束处终止。
 
@@ -1399,12 +1382,22 @@ Windows 路径示例： `models/stockfish/stockfish.exe`。
 
 ## 9. Opening Book
 
+Gadus FCPI 的采样书不调用 UCI 教师机，也不限定固定 ply 或局面均衡度。下列命令从现有 Polyglot book 的整张可达图中提取至少 10000 个唯一非终局状态，标准初始局面会自然包含在其中：
+
+```powershell
+python scripts/opening_book.py --sampling-source data/openings.bin --output data/openings.sam.bin --min-fens 10000 --log-every 1000
+```
+
+`--sampling-source` 也可指向 PGN。此时脚本读取所有合法主线，不进行 UCI 评分，并将任意 ply 的可达状态写入同一 Polyglot 格式。FCPI 通过 `--opening-book data/openings.sam.bin --max-book-positions 10000` 使用该池。
+
+Arena 验收继续使用固定第 8 ply 的 `openings.gen.bin`，同一个局面交换双方颜色组成 paired games。该书由 UCI 均衡过滤生成：
+
 ```bash
-bash scripts/run_opening.sh data/games.pgn 50000 data/openings.gen.bin
+bash scripts/run_opening.sh data/games.pgn 1000 data/openings.gen.bin
 ```
 
 ```powershell
-scripts\run_opening.bat data\games.pgn 50000 data\openings.gen.bin
+scripts\run_opening.bat data\games.pgn 1000 data\openings.gen.bin
 ```
 
 ```bash
@@ -1414,7 +1407,7 @@ python scripts/opening_book.py \
 	--output data/openings.gen.bin \
 	--max-abs-cp 80 \
 	--book-plies 8 \
-	--min-fens 50000 \
+	--min-fens 1000 \
 	--uci-depth 10 \
 	--uci-threads 4 \
 	--uci-hash-mb 512 \

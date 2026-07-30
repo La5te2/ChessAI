@@ -68,6 +68,11 @@ struct OpeningSpec {
 std::vector<std::string> load_opening_positions(const std::string &path, int book_plies,
 												int max_positions, std::uint64_t seed);
 
+/// Traverses every reachable book depth and returns unique non-terminal states, including startpos.
+std::vector<std::string> load_reachable_opening_positions(const std::string &path,
+														  int max_positions,
+														  std::uint64_t seed);
+
 /// Creates paired arena starts so candidate and baseline receive both colors per position.
 std::vector<OpeningSpec> make_arena_specs(int games, const std::string &opening_book,
 										  int book_plies, int max_positions, std::uint64_t seed);
