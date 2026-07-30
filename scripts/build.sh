@@ -84,8 +84,6 @@ for architecture in gadus melano; do
 		cp "${WORK_DIR}/${architecture}/${executable}" "${PUBLISH_DIR}/${architecture}/"
 	done
 done
-test -x "${WORK_DIR}/gadus/brci"
-cp "${WORK_DIR}/gadus/brci" "${PUBLISH_DIR}/gadus/"
 if [[ "${BUILD_GRAPHICS}" == "ON" ]]; then
 	mkdir -p "${PUBLISH_DIR}/graphics"
 	test -x "${WORK_DIR}/graphics/Gadidae"

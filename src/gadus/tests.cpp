@@ -7,7 +7,6 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
-#include "gadus/brci.hpp"
 #include "gadus/checkpoint.hpp"
 #include "gadus/game.hpp"
 #include "gadus/model.hpp"
@@ -130,28 +129,6 @@ int main() {
 		require(value.abs().max().item<float>() <= 1.000001F, "value range mismatch");
 		(policy.mean() + value.mean()).backward();
 		require_finite_gradients(model);
-
-		// Variable graph widths must not create 0 * -infinity in BRCI cross-entropy.
-		auto brci_logits =
-			torch::tensor({{2.0F, 1.0F, 0.0F}, {0.5F, -0.5F, 4.0F}},
-						  torch::TensorOptions().requires_grad(true));
-		auto brci_targets =
-			torch::tensor({{0.75F, 0.25F, 0.0F}, {1.0F, 0.0F, 0.0F}});
-		auto brci_counts = torch::tensor({2, 1}, torch::kInt64);
-		auto brci_weights = torch::tensor({1.0F, 1.0F});
-		auto brci_loss = gadus::brci_masked_policy_loss(
-			brci_logits, brci_targets, brci_counts, brci_weights);
-		require(torch::isfinite(brci_loss).item<bool>(),
-				"BRCI masked policy loss is non-finite");
-		brci_loss.backward();
-		require(torch::isfinite(brci_logits.grad()).all().item<bool>(),
-				"BRCI masked policy gradient is non-finite");
-		require(std::abs(gadus::brci_common_descent_lambda(4.0, 1.0, 0.0) - 0.2) <
-					1e-12,
-				"BRCI common-descent weight mismatch");
-		require(std::abs(gadus::brci_common_descent_lambda(1.0, 1.0, 0.0) - 0.5) <
-					1e-12,
-				"BRCI symmetric common-descent weight mismatch");
 
 		const auto checkpoint = std::filesystem::temp_directory_path() / "gadustest.pth";
 		model->eval();

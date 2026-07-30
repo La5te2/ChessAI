@@ -74,7 +74,6 @@ endif()
 add_library(gadus
 	src/gadus/checkpoint.cpp
 	src/gadus/args.cpp
-	src/gadus/bellman.cpp
 	src/gadus/dataset.cpp
 	src/gadus/evolution.cpp
 	src/gadus/game.cpp
@@ -153,7 +152,6 @@ gadusexecutable(preprocess src/gadus/preprocess.cpp)
 gadusexecutable(train src/gadus/train.cpp)
 gadusexecutable(search src/gadus/search.cpp)
 gadusexecutable(arena src/gadus/arena.cpp)
-gadusexecutable(brci src/gadus/brci.cpp)
 gadusexecutable(fcpi src/gadus/fcpi.cpp)
 gadusexecutable(uci src/gadus/uci.cpp)
 
