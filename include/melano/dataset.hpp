@@ -24,6 +24,7 @@ struct SupervisedBatch {
 
 struct DatasetInfo {
 	std::int64_t length = 0;
+	std::int64_t chunk_rows = 1;
 	int has_comments = 1;
 	std::string arch_type;
 	std::string state_encoding;
@@ -51,6 +52,9 @@ class SupervisedH5 {
 	/// Reads arbitrary rows and decodes state, move, value, and advantage tensors.
 	SupervisedBatch read(const std::vector<std::int64_t> &indices,
 						 bool pinned_memory = false) const;
+	/// Reads one contiguous range while preserving alignment across every Melano target.
+	SupervisedBatch read_contiguous(std::int64_t begin, std::int64_t count,
+									bool pinned_memory = false) const;
 
 	private:
 	struct Impl;

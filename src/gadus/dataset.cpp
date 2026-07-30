@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <numeric>
 #include <random>
@@ -378,6 +379,20 @@ struct SupervisedH5::Impl {
 		info.length = static_cast<std::int64_t>(dimensions[0]);
 		if (info.length <= 0)
 			throw std::runtime_error("supervised HDF5 is empty");
+		const hid_t properties =
+			require_id(H5Dget_create_plist(states), "get states creation properties");
+		if (H5Pget_layout(properties) == H5D_CHUNKED) {
+			hsize_t chunk_dimensions[3]{};
+			if (H5Pget_chunk(properties, 3, chunk_dimensions) != 3 ||
+				chunk_dimensions[0] == 0) {
+				H5Pclose(properties);
+				throw std::runtime_error("states has an invalid HDF5 chunk shape");
+			}
+			info.chunk_rows = static_cast<std::int64_t>(chunk_dimensions[0]);
+		} else {
+			info.chunk_rows = info.length;
+		}
+		H5Pclose(properties);
 	}
 
 	// Close every opened dataset before closing the HDF5 file.
@@ -479,6 +494,66 @@ SupervisedBatch SupervisedH5::read(const std::vector<std::int64_t> &requested,
 	};
 }
 
+// Read one physical HDF5 range with three hyperslabs instead of hundreds of random rows.
+SupervisedBatch SupervisedH5::read_contiguous(std::int64_t begin, std::int64_t count,
+											  bool pinned_memory) const {
+	if (begin < 0 || count <= 0 || begin > impl_->info.length - count)
+		throw std::out_of_range("contiguous HDF5 row range");
+	const hsize_t batch = static_cast<hsize_t>(count);
+	std::vector<std::uint8_t> packed(batch * kStatePlanes * 8);
+	std::vector<std::uint16_t> moves(batch);
+	auto move_options = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
+	auto value_options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+	if (pinned_memory) {
+		move_options = move_options.pinned_memory(true);
+		value_options = value_options.pinned_memory(true);
+	}
+	auto move_tensor = torch::empty({count}, move_options);
+	auto value_tensor = torch::empty({count}, value_options);
+
+	const hid_t state_space = require_id(H5Dget_space(impl_->states), "get states range");
+	const hsize_t state_start[] = {static_cast<hsize_t>(begin), 0, 0};
+	const hsize_t state_count[] = {batch, kStatePlanes, 8};
+	require_h5(H5Sselect_hyperslab(state_space, H5S_SELECT_SET, state_start, nullptr,
+								   state_count, nullptr),
+			   "select states range");
+	const hid_t state_memory =
+		require_id(H5Screate_simple(3, state_count, nullptr), "create states range memory");
+	require_h5(H5Dread(impl_->states, H5T_NATIVE_UINT8, state_memory, state_space, H5P_DEFAULT,
+					   packed.data()),
+			   "read states range");
+	H5Sclose(state_memory);
+	H5Sclose(state_space);
+
+	for (const auto &[dataset, type, destination] : {
+			 std::tuple<hid_t, hid_t, void *>{impl_->moves, H5T_NATIVE_UINT16, moves.data()},
+			 std::tuple<hid_t, hid_t, void *>{impl_->values, H5T_NATIVE_FLOAT,
+											  value_tensor.data_ptr<float>()},
+		 }) {
+		const hid_t space = require_id(H5Dget_space(dataset), "get scalar range");
+		const hsize_t start[] = {static_cast<hsize_t>(begin)};
+		const hsize_t dimensions[] = {batch};
+		require_h5(H5Sselect_hyperslab(space, H5S_SELECT_SET, start, nullptr, dimensions,
+									   nullptr),
+				   "select scalar range");
+		const hid_t memory =
+			require_id(H5Screate_simple(1, dimensions, nullptr), "create scalar range memory");
+		require_h5(H5Dread(dataset, type, memory, space, H5P_DEFAULT, destination),
+				   "read scalar range");
+		H5Sclose(memory);
+		H5Sclose(space);
+	}
+	auto *move_destination = move_tensor.data_ptr<std::int64_t>();
+	for (std::size_t index = 0; index < moves.size(); ++index)
+		move_destination[index] = moves[index];
+
+	return {
+		decode_states(packed.data(), count, pinned_memory),
+		std::move(move_tensor),
+		std::move(value_tensor),
+	};
+}
+
 // Stream PGN input through the visitor and finalize a fresh Gadus dataset.
 void preprocess_pgn(const PreprocessOptions &options) {
 	if (options.has_comments != 0 && options.has_comments != 1) {
@@ -520,8 +595,6 @@ void train_supervised(const TrainOptions &options) {
 		model->parameters(),
 		torch::optim::AdamWOptions(options.learning_rate).weight_decay(options.weight_decay));
 
-	std::vector<std::int64_t> order(static_cast<std::size_t>(data.info().length));
-	std::iota(order.begin(), order.end(), 0);
 	std::mt19937_64 rng(options.seed);
 	std::int64_t global_step = 0;
 	bool stop = false;
@@ -533,60 +606,96 @@ void train_supervised(const TrainOptions &options) {
 			  << std::endl;
 	std::cout << "created model: channels=" << options.channels << " blocks=" << options.blocks
 			  << " parameters=" << parameter_count(model) << std::endl;
+	std::cout << "training input: rows=" << data.info().length
+			  << " hdf5_chunk_rows=" << data.info().chunk_rows
+			  << " loader=chunk_shuffle_prefetch" << std::endl;
 
 	for (int epoch = 0; epoch < options.epochs && !stop; ++epoch) {
-		std::shuffle(order.begin(), order.end(), rng);
+		std::vector<std::int64_t> chunk_starts;
+		for (std::int64_t begin = 0; begin < data.info().length;
+			 begin += data.info().chunk_rows) {
+			chunk_starts.push_back(begin);
+		}
+		std::shuffle(chunk_starts.begin(), chunk_starts.end(), rng);
 		auto metric_totals =
 			torch::zeros({2}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
 		std::int64_t batches = 0;
-		for (std::int64_t begin = 0; begin < data.info().length; begin += options.batch_size) {
-			const auto end = std::min<std::int64_t>(begin + options.batch_size, data.info().length);
-			std::vector<std::int64_t> indices(order.begin() + begin, order.begin() + end);
-			auto batch = data.read(indices, device.is_cuda());
-			auto states = batch.states.to(device, true);
-			auto moves = batch.moves.to(device, true);
-			auto values = batch.values.to(device, true);
-			optimizer.zero_grad();
+		auto launch_read = [&](std::size_t chunk_index) {
+			const auto begin = chunk_starts[chunk_index];
+			const auto count =
+				std::min(data.info().chunk_rows, data.info().length - begin);
+			return std::async(std::launch::async, [&data, begin, count, &device] {
+				return data.read_contiguous(begin, count, device.is_cuda());
+			});
+		};
+		auto prefetched = launch_read(0);
+		for (std::size_t chunk_index = 0; chunk_index < chunk_starts.size() && !stop;
+			 ++chunk_index) {
+			auto chunk = prefetched.get();
+			if (chunk_index + 1 < chunk_starts.size())
+				prefetched = launch_read(chunk_index + 1);
 
-			torch::Tensor logits;
-			torch::Tensor predicted;
-			{
-				AutocastGuard autocast(options.precision, device);
-				std::tie(logits, predicted) = model->forward(states);
-			}
-			logits = logits.to(torch::kFloat32);
-			predicted = predicted.to(torch::kFloat32);
-			auto policy_loss = torch::nn::functional::cross_entropy(logits, moves);
-			auto value_loss = torch::mse_loss(predicted.squeeze(1), values);
-			auto loss = policy_loss + options.value_weight * value_loss;
-			loss.backward();
-			optimizer.step();
+			const auto chunk_rows = chunk.states.size(0);
+			std::vector<std::int64_t> local_order(static_cast<std::size_t>(chunk_rows));
+			std::iota(local_order.begin(), local_order.end(), 0);
+			std::shuffle(local_order.begin(), local_order.end(), rng);
+			auto permutation =
+				torch::from_blob(local_order.data(), {chunk_rows},
+								 torch::TensorOptions().dtype(torch::kInt64))
+					.clone();
+			chunk.states = chunk.states.index_select(0, permutation);
+			chunk.moves = chunk.moves.index_select(0, permutation);
+			chunk.values = chunk.values.index_select(0, permutation);
 
-			++global_step;
-			++batches;
-			metric_totals.add_(
-				torch::stack({policy_loss.detach(), value_loss.detach()}));
-			if (options.log_every > 0 &&
-				(global_step == 1 || global_step % options.log_every == 0)) {
-				auto metrics = torch::stack(
-								   {policy_loss.detach(), value_loss.detach(), loss.detach()})
-								   .to(torch::kCPU)
-								   .contiguous();
-				auto metric_values = metrics.accessor<float, 1>();
-				std::cout << "train step: epoch=" << epoch << " global_step=" << global_step
-						  << " policy=" << metric_values[0]
-						  << " value=" << metric_values[1]
-						  << " loss=" << metric_values[2] << std::endl;
-			}
-			if (options.save_every > 0 && global_step % options.save_every == 0) {
-				save_checkpoint_atomic(options.output, model,
-								   {options.channels, options.blocks});
-				std::cout << "checkpoint saved: path=" << options.output.string()
-						  << " global_step=" << global_step << std::endl;
-			}
-			if (options.max_steps >= 0 && global_step >= options.max_steps) {
-				stop = true;
-				break;
+			for (std::int64_t begin = 0; begin < chunk_rows; begin += options.batch_size) {
+				const auto count =
+					std::min<std::int64_t>(options.batch_size, chunk_rows - begin);
+				auto states = chunk.states.narrow(0, begin, count).to(device, true);
+				auto moves = chunk.moves.narrow(0, begin, count).to(device, true);
+				auto values = chunk.values.narrow(0, begin, count).to(device, true);
+				optimizer.zero_grad();
+
+				torch::Tensor logits;
+				torch::Tensor predicted;
+				{
+					AutocastGuard autocast(options.precision, device);
+					std::tie(logits, predicted) = model->forward(states);
+				}
+				logits = logits.to(torch::kFloat32);
+				predicted = predicted.to(torch::kFloat32);
+				auto policy_loss = torch::nn::functional::cross_entropy(logits, moves);
+				auto value_loss = torch::mse_loss(predicted.squeeze(1), values);
+				auto loss = policy_loss + options.value_weight * value_loss;
+				loss.backward();
+				optimizer.step();
+
+				++global_step;
+				++batches;
+				metric_totals.add_(
+					torch::stack({policy_loss.detach(), value_loss.detach()}));
+				if (options.log_every > 0 &&
+					(global_step == 1 || global_step % options.log_every == 0)) {
+					auto metrics = torch::stack(
+									   {policy_loss.detach(), value_loss.detach(), loss.detach()})
+									   .to(torch::kCPU)
+									   .contiguous();
+					auto metric_values = metrics.accessor<float, 1>();
+					std::cout << "train step: epoch=" << epoch
+							  << " global_step=" << global_step
+							  << " policy=" << metric_values[0]
+							  << " value=" << metric_values[1]
+							  << " loss=" << metric_values[2] << std::endl;
+				}
+				if (options.save_every > 0 && global_step % options.save_every == 0) {
+					save_checkpoint_atomic(options.output, model,
+										   {options.channels, options.blocks});
+					std::cout << "checkpoint saved: path=" << options.output.string()
+							  << " global_step=" << global_step << std::endl;
+				}
+				if (options.max_steps >= 0 && global_step >= options.max_steps) {
+					stop = true;
+					break;
+				}
 			}
 		}
 		save_checkpoint_atomic(options.output, model, {options.channels, options.blocks});

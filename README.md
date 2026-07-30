@@ -284,12 +284,13 @@ $$
 
 ```bash
 build/gadus/preprocess \
-	--input data/games.pgn \
+	--input data/ccrl.pgn \
 	--output data/games.gadus.h5 \
 	--has-cmt 1 \
-	--chunk-size 16384 \
+	--chunk-size 4096 \
 	--compression-level 1 \
-	--log-every 10000
+	--log-every 10000 \
+	--max-games 1000000
 ```
 
 `--max-games` 控制读取对局上限，`--chunk-size` 控制 HDF5 扩展单元，`--compression-level` 控制 deflate 等级，`--log-every` 控制对局进度输出。
@@ -309,17 +310,17 @@ build/gadus/train \
 	--data data/games.gadus.h5 \
 	--out models/gadus/gadus.pth \
 	--channels 128 \
-	--blocks 10 \
+	--blocks 20 \
 	--epochs 10 \
 	--batch-size 512 \
-	--max-steps 80000 \
+	--max-steps 500000 \
 	--lr 0.001 \
 	--weight-decay 0.0001 \
 	--value-weight 0.25 \
 	--save-every 5000 \
 	--device cuda \
 	--precision bf16 \
-	--log-every 100 \
+	--log-every 50 \
 	--seed 2026
 ```
 
@@ -855,7 +856,7 @@ build/melano/train \
 	--epochs 3 \
 	--batch-size 256 \
 	--max-steps 200000 \
-	--lr 0.0005 \
+	--lr 0.0002 \
 	--weight-decay 0.0001 \
 	--value-weight 1.0 \
 	--dueling-q-weight 0.5 \
