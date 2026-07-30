@@ -1261,6 +1261,24 @@ build/melano/train \
 
 `--precision` 可取 `fp32` 或 `bf16`，默认 `fp32`。`bf16` 用于 CUDA 前向计算，Policy softmax、P/V/A 与 latent dynamics 损失、指标累计和 checkpoint 参数保持 FP32。CUDA 训练批次使用 pinned memory。
 
+`--lr` 表示 AdamW 的峰值学习率。设计划训练步数为 $T$，warmup 步数为
+
+$$
+T_w=\min\left(T,\ 2000,\ \max\left(100,\left\lfloor\frac{T}{100}\right\rfloor\right)\right)
+$$
+
+第 $t$ 步的学习率为
+
+$$
+\eta_t=
+\begin{cases}
+\eta_{\max}\dfrac{t}{T_w}, & t\le T_w,\\
+\eta_{\max}\sqrt{\dfrac{T_w}{t}}, & t>T_w.
+\end{cases}
+$$
+
+该轨迹在训练初期逐步建立 AdamW 统计量，随后降低 Transformer 参数更新幅度。latent dynamics 的 cosine 归一化使用固定非零范数下限，避免退化 latent 产生奇异导数。日志中的 `grad_norm_before_clip` 是裁剪前的全局梯度范数，实际送入 `optimizer.step()` 的范数不超过 `--grad-clip`。
+
 ### 5.5 搜索
 
 `closed` 按 Melano Policy 排序。`only-mcts` 使用 anchored latent MCTS。锚定周期 $K=2$ 表示每经过两个 ply 重新从精确棋盘编码 latent，因此任意预测 latent 最多跨越一个动作。每条边还具有一份伪访问。本文所称的伪访问，是 $V+A$ 提供的动作价值先验以一个统计样本的权重参与边价值估计。实际访问次数与叶节点回传保持独立计数。
@@ -1614,26 +1632,7 @@ Gadus 与 Melano 当前公开相同的 UCI 控制项。选项作用于各自的�
 - `MultiPV`：输出的分析行数，默认 `5`。
 - `ScoreScale`：把 $[-1,1]$ Value/Q 映射为 `score cp` 的显示比例，默认 `1000`。
 
-在 Gadidae GUI 中，`Device` 与 `MultiPV` 使用专用控件，思考时间和 simulation 上限使用 `Search` 区域。`UCI options` 可以直接填写 JSON object，例如：
-
-```json
-{
-  "SearchType": "only-mcts",
-  "MCTSSims": 1000,
-  "MCTSMinSims": 0,
-  "MCTSBatchSize": 64,
-  "CPuct": 0.5,
-  "CPuctBase": 19652,
-  "CPuctFactor": 1.0,
-  "FPUReduction": 0.15,
-  "VirtualLoss": 0.0,
-  "RepetitionPolicyPenalty": 1.0,
-  "InstantMateFirst": true,
-  "ScoreScale": 1000
-}
-```
-
-`MCTSSims` 设置引擎在 UCI 客户端没有提供 `go nodes <n>` 时使用的默认 simulation 上限。GUI Search 区域的 `Node / simulation limit` 会为每次搜索发送 `go nodes <n>` 并覆盖该次搜索的 `MCTSSims`。设为 `0` 时不发送 nodes 限制。`Device`、`MultiPV` 与 `ProgressIntervalMS` 分别由 GUI 的专用控件填写，其中 `Display update (ms)` 同时控制 GUI 刷新节奏，并在引擎公开 `ProgressIntervalMS` 时下发该选项。`Launch arguments` 通常留空。
+Gadidae GUI 在导入引擎时执行标准 UCI 握手，并读取全部 `option name ...` 声明。Settings 根据 option 类型自动生成 checkbox、整数输入、下拉框、文本框或命令按钮，不再提供固定的 Search 参数组或原始 JSON 输入框。Gadus、Melano、Stockfish 以及其他 UCI 引擎因此只显示自身实际公开的选项。选项值随引擎配置保存，命令按钮在 Apply 后向对应引擎发送一次。`Launch arguments` 只用于必须在进程启动命令中传入的非 UCI 参数，通常留空。
 
 其他 UCI 客户端使用标准命令设置同一组选项：
 
@@ -1700,7 +1699,7 @@ GADIDAE_BUILD_GRAPHICS=1 bash scripts/build.sh
 
 Windows 双击 `build/graphics/Gadidae.exe`，具有 X11 或 Wayland 图形会话的 Linux 运行 `build/graphics/Gadidae`。程序默认进入 Simulator，顶部模式控件可切换到 Stadium。GUI 的 FreeType 压缩支持静态编译进可执行文件。SSH 服务器需要 X11 forwarding、远程桌面或其他可见显示服务才能实际操作 GUI。`xvfb-run` 适合自动化启动测试，交互操作则需要可见显示服务。
 
-Simulator 用于局面分析。Settings 的 `Engine` 区域填写 UCI 可执行文件、显示名称和设备，`Launch` 区域填写启动进程时附加的命令行参数，`Search` 区域填写时间或节点预算、MultiPV 行数与显示刷新间隔。`UCI options` 在握手完成后发送对应的 `setoption` 命令。`Run` 同时显示 `Open` 与 `Close`，勾选项表示实时分析的当前状态。也可以从命令行指定常用参数：
+Simulator 用于局面分析。Settings 的 `Engine` 区域填写 UCI 可执行文件和显示名称。程序完成 UCI 握手后，`Options` 区域自动列出该引擎公开的全部设置；例如 Gadus 会显示 `Device`、`SearchType`、`MCTSSims` 与 `MultiPV`，Stockfish 会显示其自身的 `Threads`、`Hash` 等选项。`Launch arguments` 用于进程启动参数，默认折叠。`Run` 同时显示 `Open` 与 `Close`，勾选项表示实时分析的当前状态。也可以从命令行指定常用参数：
 
 ```powershell
 build\graphics\Gadidae.exe `
@@ -1714,7 +1713,7 @@ build\graphics\Gadidae.exe `
 	--theme dark
 ```
 
-Stadium 用于同时组织多盘独立对局。`Tools > Matches` 可新建、进入和关闭对局，切换到 Simulator 或进入另一盘棋时，其余对局继续在后台运行。默认名称为 `#<id> <white> vs. <black>`，名称留空时自动采用该格式。每个席位都必须填写参赛者名称。Human toggle 打开时 UCI 设置整体置灰，走棋由用户直接在棋盘上完成。Human toggle 关闭时，席位还需要填写 UCI 可执行文件，并可分别设置 UCI options、启动参数、计算预算与 MultiPV。`Match` 区域设置双方共用的初始时间、每步加秒、显示延迟与最大 ply，初始时间设为 0 时关闭棋钟。`Run > Start/Pause/Stop` 只控制当前进入的对局，关闭程序会终止全部对局拥有的 UCI 子进程。可从命令行预填首盘对局的双方引擎：
+Stadium 用于同时组织多盘独立对局。`Tools > Matches` 可新建、进入和关闭对局，切换到 Simulator 或进入另一盘棋时，其余对局继续在后台运行。默认名称为 `#<id> <white> vs. <black>`，名称留空时自动采用该格式。每个席位都必须填写参赛者名称。Human toggle 打开时引擎设置整体置灰，走棋由用户直接在棋盘上完成。Human toggle 关闭时，席位需要填写 UCI 可执行文件，并分别使用握手生成的 Options 与可选启动参数。`Match` 区域设置双方共用的初始时间、每步加秒、显示延迟与最大 ply，初始时间设为 0 时关闭棋钟。`Run > Start/Pause/Stop` 只控制当前进入的对局，关闭程序会终止全部对局拥有的 UCI 子进程。可从命令行预填首盘对局的双方引擎：
 
 ```powershell
 build\graphics\Gadidae.exe `
@@ -1767,8 +1766,6 @@ GADIDAE_BUILD_GRAPHICS=1 bash scripts/build.sh
 ```
 
 导入前应确认许可证允许复制、修改和随项目分发，并遵守署名、相同方式共享、源代码提供或用途限制等条款。经过修改的素材应在对应声明中注明修改内容。由多个来源组合的样式应分别列出各来源及其许可证。
-
-`UCI options` 使用 JSON object。图形程序按引擎公开的 option 名称进行匹配，未知名称会报告错误。`Device` 与 `MultiPV` 由专用控件管理，其余 options 用于 `Hash`、`Threads` 等引擎自有设置。`Device` 在目标引擎公开该 option 时生效，因此同一界面可直接运行 Stockfish 等通用 UCI 引擎。
 
 Simulator 首次打开分析时在后台启动并加载一次 UCI 引擎，后续局面复用同一子进程。切换局面时会异步停止上一轮计算、丢弃其后续输出，再把最新局面交给已经加载的引擎。Gadus 与 Melano 的 UCI 命令循环和搜索线程彼此分离，MCTS 搜索会在批次边界响应 `stop`。图形程序在窗口持续移动或缩放时暂停 OpenGL 提交，操作停止后清空 GPU 命令队列并按新尺寸交换完整帧。
 

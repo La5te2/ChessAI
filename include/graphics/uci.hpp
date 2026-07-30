@@ -16,19 +16,36 @@
 
 namespace gadidae::graphics {
 
-/// User-facing process, protocol, and search settings for one UCI engine.
+/// One engine-defined setting discovered from an `option name ...` UCI line.
+struct UciOption {
+	std::string name;
+	std::string type;
+	std::string default_value;
+	std::optional<std::int64_t> minimum;
+	std::optional<std::int64_t> maximum;
+	std::vector<std::string> choices;
+
+	bool operator==(const UciOption &) const = default;
+};
+
+/// Persistent process and protocol settings for one UCI engine.
 struct EngineConfig {
 	std::filesystem::path path;
 	std::string name;
-	std::string device = "auto";
 	std::string arguments;
 	std::string options = "{}";
 	int movetime_ms = 3000;
 	std::uint64_t node_limit = 0;
-	int multipv = 8;
-	int progress_interval_ms = 750;
+	std::vector<UciOption> discovered_options;
+	std::vector<std::string> button_commands;
 
-	bool operator==(const EngineConfig &) const = default;
+	bool operator==(const EngineConfig &other) const {
+		return path == other.path && name == other.name &&
+			   arguments == other.arguments && options == other.options &&
+			   movetime_ms == other.movetime_ms &&
+			   node_limit == other.node_limit &&
+			   button_commands == other.button_commands;
+	}
 };
 
 /// One MultiPV row reported by an engine for the current position.
@@ -90,6 +107,12 @@ public:
 	/// Returns the effective engine name from the UCI handshake or user override.
 	std::string display_name() const;
 
+	/// Returns all option definitions reported by the current UCI engine.
+	std::vector<UciOption> option_definitions() const;
+
+	/// Performs only the UCI handshake and returns the engine-defined option schema.
+	static std::vector<UciOption> discover_options(const EngineConfig &config);
+
 private:
 	class Process;
 	struct AnalysisRequest {
@@ -122,7 +145,7 @@ private:
 	/// Parses bestmove and marks the active search as complete.
 	void parse_bestmove_line(const std::string &line);
 
-	/// Applies JSON UCI options and the optional Device option.
+	/// Applies persistent option values and queued one-shot button commands.
 	void configure();
 
 	std::unique_ptr<Process> process_;
@@ -144,6 +167,7 @@ private:
 	AnalysisSnapshot snapshot_;
 	std::string reported_name_;
 	std::unordered_map<std::string, std::string> option_names_;
+	std::vector<UciOption> option_definitions_;
 };
 
 } // namespace gadidae::graphics

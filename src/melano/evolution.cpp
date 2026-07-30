@@ -1345,9 +1345,15 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 			auto predicted_next_fp32 = predicted_next.to(torch::kFloat32);
 			auto target_next_fp32 = target_next.to(torch::kFloat32);
 			auto predicted_unit = predicted_next_fp32 /
-				predicted_next_fp32.square().sum(-1, true).sqrt().clamp_min(1e-8);
+				predicted_next_fp32.square()
+					.sum(-1, true)
+					.sqrt()
+					.clamp_min(kLatentNormEpsilon);
 			auto target_unit = target_next_fp32 /
-				target_next_fp32.square().sum(-1, true).sqrt().clamp_min(1e-8);
+				target_next_fp32.square()
+					.sum(-1, true)
+					.sqrt()
+					.clamp_min(kLatentNormEpsilon);
 			auto dynamics_errors =
 				(1.0 - (predicted_unit * target_unit).sum(-1).mean(-1))
 					.reshape({batch, static_cast<std::int64_t>(candidate_width)});
@@ -1395,7 +1401,7 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 						  << " dynamics=" << metric_values[3]
 						  << " imagined_value=" << metric_values[4]
 						  << " loss=" << metric_values[5]
-						  << " grad_norm=" << gradient_norm << std::endl;
+						  << " grad_norm_before_clip=" << gradient_norm << std::endl;
 			}
 			if (options.train_max_steps > 0 && steps >= options.train_max_steps) {
 				break;

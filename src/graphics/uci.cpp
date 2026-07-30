@@ -51,6 +51,68 @@ std::vector<std::string> tokens_of(const std::string &line) {
 	return tokens;
 }
 
+/// Joins one token range so option names, defaults, and combo choices retain spaces.
+std::string join_tokens(const std::vector<std::string> &tokens,
+						std::size_t begin, std::size_t end) {
+	std::ostringstream joined;
+	for(std::size_t index = begin; index < end; ++index) {
+		if(index > begin) {
+			joined << ' ';
+		}
+		joined << tokens[index];
+	}
+	return joined.str();
+}
+
+/// Parses the complete metadata carried by one standard UCI option declaration.
+std::optional<UciOption> parse_option_definition(const std::string &line) {
+	const auto tokens = tokens_of(line);
+	if(tokens.size() < 5 || tokens[0] != "option" || tokens[1] != "name") {
+		return std::nullopt;
+	}
+	const auto type_at =
+		std::find(tokens.begin() + 2, tokens.end(), std::string("type"));
+	if(type_at == tokens.end() || type_at + 1 == tokens.end()) {
+		return std::nullopt;
+	}
+	const auto type_index =
+		static_cast<std::size_t>(std::distance(tokens.begin(), type_at));
+	UciOption option;
+	option.name = join_tokens(tokens, 2, type_index);
+	option.type = lowercase(tokens[type_index + 1]);
+	const auto is_marker = [](const std::string &token) {
+		return token == "default" || token == "min" ||
+			   token == "max" || token == "var";
+	};
+	std::size_t index = type_index + 2;
+	while(index < tokens.size()) {
+		const std::string marker = tokens[index++];
+		const std::size_t value_begin = index;
+		while(index < tokens.size() && !is_marker(tokens[index])) {
+			++index;
+		}
+		const std::string value = join_tokens(tokens, value_begin, index);
+		if(marker == "default") {
+			option.default_value = value == "<empty>" ? "" : value;
+		} else if(marker == "min" && !value.empty()) {
+			try {
+				option.minimum = std::stoll(value);
+			} catch(...) {
+			}
+		} else if(marker == "max" && !value.empty()) {
+			try {
+				option.maximum = std::stoll(value);
+			} catch(...) {
+			}
+		} else if(marker == "var") {
+			option.choices.push_back(value);
+		}
+	}
+	return option.name.empty() || option.type.empty()
+			   ? std::nullopt
+			   : std::optional<UciOption>(std::move(option));
+}
+
 /// Builds a platform shell command while preserving the user-entered argument tail.
 std::string command_text(const EngineConfig &config) {
 	if(config.path.empty()) {
@@ -330,6 +392,7 @@ void UciEngine::initialize(const EngineConfig &config) {
 	process_ready_ = false;
 	reported_name_.clear();
 	option_names_.clear();
+	option_definitions_.clear();
 	{
 		std::lock_guard lock(mutex_);
 		snapshot_ = {};
@@ -491,6 +554,30 @@ std::string UciEngine::display_name() const {
 	return config_.path.filename().string();
 }
 
+std::vector<UciOption> UciEngine::option_definitions() const {
+	std::lock_guard lock(mutex_);
+	return option_definitions_;
+}
+
+std::vector<UciOption> UciEngine::discover_options(const EngineConfig &config) {
+	UciEngine probe;
+	probe.config_ = config;
+	probe.closing_ = false;
+	probe.starting_ = true;
+	try {
+		probe.process_ = std::make_unique<Process>(command_text(config));
+		probe.reader_ = std::thread(&UciEngine::reader_loop, &probe);
+		probe.send("uci");
+		probe.wait_for_flag(probe.uciok_, std::chrono::seconds(15), "uciok");
+		auto definitions = probe.option_definitions();
+		probe.close();
+		return definitions;
+	} catch(...) {
+		probe.close();
+		throw;
+	}
+}
+
 void UciEngine::send(const std::string &line) {
 	std::lock_guard send_lock(send_mutex_);
 	if(!process_) {
@@ -552,19 +639,17 @@ void UciEngine::reader_loop() {
 
 void UciEngine::parse_handshake_line(const std::string &line) {
 	if(line.rfind("id name ", 0) == 0) {
+		std::lock_guard lock(mutex_);
 		reported_name_ = trim(line.substr(8));
 		return;
 	}
-	constexpr std::string_view prefix = "option name ";
-	if(line.rfind(prefix, 0) != 0) {
+	const auto definition = parse_option_definition(line);
+	if(!definition) {
 		return;
 	}
-	const auto type = line.find(" type ", prefix.size());
-	if(type == std::string::npos) {
-		return;
-	}
-	const std::string name = trim(line.substr(prefix.size(), type - prefix.size()));
-	option_names_[lowercase(name)] = name;
+	std::lock_guard lock(mutex_);
+	option_names_[lowercase(definition->name)] = definition->name;
+	option_definitions_.push_back(*definition);
 }
 
 void UciEngine::parse_info_line(const std::string &line) {
@@ -684,31 +769,17 @@ void UciEngine::configure() {
 		send("setoption name " + found->second + " value " + text);
 	};
 	for(auto iterator = requested.begin(); iterator != requested.end(); ++iterator) {
-		const auto key = lowercase(iterator.key());
-		if(key == "device" || key == "multipv" ||
-		   key == "progressintervalms") {
-			throw std::invalid_argument(
-				iterator.key() +
-				" is managed by its dedicated GUI field and must be removed from UCI options");
-		}
 		apply_option(iterator.key(), iterator.value());
 	}
-	if(lowercase(config_.device) != "auto") {
-		const auto device = option_names_.find("device");
-		if(device != option_names_.end()) {
-			send("setoption name " + device->second + " value " + config_.device);
+	for(const auto &requested_name : config_.button_commands) {
+		const auto found = option_names_.find(lowercase(requested_name));
+		if(found == option_names_.end()) {
+			throw std::invalid_argument("UCI engine does not expose option " +
+										requested_name);
 		}
+		send("setoption name " + found->second);
 	}
-	const auto multipv = option_names_.find("multipv");
-	if(multipv != option_names_.end()) {
-		send("setoption name " + multipv->second + " value " +
-			 std::to_string(std::max(1, config_.multipv)));
-	}
-	const auto progress = option_names_.find("progressintervalms");
-	if(progress != option_names_.end()) {
-		send("setoption name " + progress->second + " value " +
-			 std::to_string(std::clamp(config_.progress_interval_ms, 0, 60000)));
-	}
+	config_.button_commands.clear();
 }
 
 } // namespace gadidae::graphics

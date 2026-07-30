@@ -18,6 +18,26 @@ namespace melano {
 
 namespace {
 
+// Use the standard Transformer warmup/inverse-square-root schedule without another CLI knob.
+double scheduled_learning_rate(double peak_learning_rate, std::int64_t step,
+							   std::int64_t warmup_steps) {
+	const auto positive_step = std::max<std::int64_t>(1, step);
+	const auto positive_warmup = std::max<std::int64_t>(1, warmup_steps);
+	if (positive_step <= positive_warmup) {
+		return peak_learning_rate * static_cast<double>(positive_step) /
+			   static_cast<double>(positive_warmup);
+	}
+	return peak_learning_rate *
+		   std::sqrt(static_cast<double>(positive_warmup) / static_cast<double>(positive_step));
+}
+
+// Apply the current scheduled rate to every AdamW parameter group.
+void set_learning_rate(torch::optim::AdamW &optimizer, double learning_rate) {
+	for (auto &group : optimizer.param_groups()) {
+		static_cast<torch::optim::AdamWOptions &>(group.options()).lr(learning_rate);
+	}
+}
+
 // Turn a negative HDF5 status into an operation-specific C++ exception.
 void require_h5(herr_t status, const std::string &operation) {
 	if (status < 0) {
@@ -673,6 +693,18 @@ void train_supervised(const TrainOptions &options) {
 	torch::optim::AdamW optimizer(
 		model->parameters(),
 		torch::optim::AdamWOptions(options.learning_rate).weight_decay(options.weight_decay));
+	const auto steps_per_epoch =
+		std::max<std::int64_t>(1, (data.info().length + options.batch_size - 1) /
+									 options.batch_size);
+	const auto epoch_step_limit =
+		std::max<std::int64_t>(1, static_cast<std::int64_t>(options.epochs) * steps_per_epoch);
+	const auto planned_steps =
+		options.max_steps >= 0 ? std::max<std::int64_t>(
+									 1, std::min(options.max_steps, epoch_step_limit))
+							 : epoch_step_limit;
+	const auto warmup_steps = std::min<std::int64_t>(
+		planned_steps, std::min<std::int64_t>(
+						   2000, std::max<std::int64_t>(100, planned_steps / 100)));
 
 	std::vector<std::int64_t> order(static_cast<std::size_t>(data.info().length));
 	std::iota(order.begin(), order.end(), 0);
@@ -686,6 +718,8 @@ void train_supervised(const TrainOptions &options) {
 			  << " precision=" << compute_precision_name(options.precision)
 			  << " target_decay=" << options.target_decay
 			  << " grad_clip=" << options.grad_clip
+			  << " lr_peak=" << options.learning_rate
+			  << " lr_warmup_steps=" << warmup_steps
 			  << std::endl;
 	std::cout << "created model: channels=" << options.channels << " blocks=" << options.blocks
 			  << " parameters=" << parameter_count(model) << std::endl;
@@ -706,6 +740,9 @@ void train_supervised(const TrainOptions &options) {
 			auto next_values = batch.next_values.to(device, true);
 			auto advantage_moves = batch.advantage_moves.to(device, true);
 			auto advantage_values = batch.advantage_values.to(device, true);
+			const double learning_rate =
+				scheduled_learning_rate(options.learning_rate, global_step + 1, warmup_steps);
+			set_learning_rate(optimizer, learning_rate);
 			optimizer.zero_grad();
 
 			torch::Tensor tokens;
@@ -741,9 +778,15 @@ void train_supervised(const TrainOptions &options) {
 			auto predicted_next_fp32 = predicted_next.to(torch::kFloat32);
 			auto target_next_fp32 = target_next.to(torch::kFloat32);
 			auto predicted_unit = predicted_next_fp32 /
-				predicted_next_fp32.square().sum(-1, true).sqrt().clamp_min(1e-8);
+				predicted_next_fp32.square()
+					.sum(-1, true)
+					.sqrt()
+					.clamp_min(kLatentNormEpsilon);
 			auto target_unit = target_next_fp32 /
-				target_next_fp32.square().sum(-1, true).sqrt().clamp_min(1e-8);
+				target_next_fp32.square()
+					.sum(-1, true)
+					.sqrt()
+					.clamp_min(kLatentNormEpsilon);
 			auto dynamics_loss = 1.0 - (predicted_unit * target_unit).sum(-1).mean();
 			auto imagined_value_loss =
 				torch::mse_loss(imagined.value.squeeze(1).to(torch::kFloat32), next_values);
@@ -781,7 +824,8 @@ void train_supervised(const TrainOptions &options) {
 						  << " dynamics=" << metric_values[3]
 						  << " imagined_value=" << metric_values[4]
 						  << " loss=" << metric_values[5]
-						  << " grad_norm=" << gradient_norm << std::endl;
+						  << " grad_norm_before_clip=" << gradient_norm
+						  << " lr=" << learning_rate << std::endl;
 			}
 			if (options.save_every > 0 && global_step % options.save_every == 0) {
 				save_checkpoint_atomic(options.output, model,

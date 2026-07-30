@@ -392,16 +392,30 @@ enum class MenuCommand {
 
 /// Converts one engine configuration to its persisted JSON representation.
 nlohmann::json engine_json(const EngineConfig &config) {
+	nlohmann::json definitions = nlohmann::json::array();
+	for(const auto &option : config.discovered_options) {
+		nlohmann::json definition = {
+			{"name", option.name},
+			{"type", option.type},
+			{"default", option.default_value},
+			{"choices", option.choices},
+		};
+		if(option.minimum) {
+			definition["min"] = *option.minimum;
+		}
+		if(option.maximum) {
+			definition["max"] = *option.maximum;
+		}
+		definitions.push_back(std::move(definition));
+	}
 	return {
 		{"path", config.path.string()},
 		{"name", config.name},
-		{"device", config.device},
 		{"arguments", config.arguments},
 		{"options", config.options},
 		{"movetime_ms", config.movetime_ms},
 		{"node_limit", config.node_limit},
-		{"multipv", config.multipv},
-		{"progress_interval_ms", config.progress_interval_ms},
+		{"option_definitions", std::move(definitions)},
 	};
 }
 
@@ -411,34 +425,86 @@ void read_engine_json(const nlohmann::json &json, EngineConfig &config) {
 		config.path = json.value("path", "");
 	}
 	config.name = json.value("name", config.name);
-	config.device = json.value("device", config.device);
 	config.arguments = json.value("arguments", config.arguments);
 	config.options = json.value("options", config.options);
 	config.movetime_ms = json.value("movetime_ms", config.movetime_ms);
 	config.node_limit = json.value("node_limit", config.node_limit);
-	config.multipv = json.value("multipv", config.multipv);
-	config.progress_interval_ms =
-		json.value("progress_interval_ms", config.progress_interval_ms);
-}
-
-/// Validates additional setoption values while reserving fields managed by the GUI.
-nlohmann::json additional_uci_options(const std::string &text) {
-	const auto options = nlohmann::json::parse(text.empty() ? "{}" : text);
-	if(!options.is_object()) {
-		throw std::invalid_argument("UCI options must be a JSON object");
-	}
-	for(auto iterator = options.begin(); iterator != options.end(); ++iterator) {
-		std::string key = iterator.key();
-		std::transform(key.begin(), key.end(), key.begin(), [](unsigned char character) {
-			return static_cast<char>(std::tolower(character));
-		});
-		if(key == "device" || key == "multipv") {
-			throw std::invalid_argument(
-				iterator.key() +
-				" is managed by its dedicated field and must be removed from UCI options");
+	config.discovered_options.clear();
+	if(json.contains("option_definitions") &&
+	   json["option_definitions"].is_array()) {
+		for(const auto &entry : json["option_definitions"]) {
+			if(!entry.is_object()) {
+				continue;
+			}
+			UciOption option;
+			option.name = entry.value("name", "");
+			option.type = entry.value("type", "");
+			option.default_value = entry.value("default", "");
+			option.choices =
+				entry.value("choices", std::vector<std::string>{});
+			if(entry.contains("min") && entry["min"].is_number_integer()) {
+				option.minimum = entry["min"].get<std::int64_t>();
+			}
+			if(entry.contains("max") && entry["max"].is_number_integer()) {
+				option.maximum = entry["max"].get<std::int64_t>();
+			}
+			if(!option.name.empty() && !option.type.empty()) {
+				config.discovered_options.push_back(std::move(option));
+			}
 		}
 	}
+}
+
+/// Decodes the persisted values behind the generated UCI option controls.
+nlohmann::json option_values(const std::string &text) {
+	const auto options = nlohmann::json::parse(text.empty() ? "{}" : text);
+	if(!options.is_object()) {
+		throw std::invalid_argument("stored UCI option values must be an object");
+	}
 	return options;
+}
+
+/// Normalizes a UCI option name for protocol-level case-insensitive matching.
+std::string normalized_option_name(std::string name) {
+	std::transform(name.begin(), name.end(), name.begin(),
+				   [](unsigned char character) {
+					   return static_cast<char>(std::tolower(character));
+				   });
+	return name;
+}
+
+/// Finds one stored option value regardless of the engine's preferred casing.
+const nlohmann::json *find_option_value(const nlohmann::json &options,
+									   const std::string &name) {
+	const auto target = normalized_option_name(name);
+	for(auto iterator = options.begin(); iterator != options.end(); ++iterator) {
+		if(normalized_option_name(iterator.key()) == target) {
+			return &iterator.value();
+		}
+	}
+	return nullptr;
+}
+
+/// Stores one option under the casing reported by the current engine.
+void write_option_value(nlohmann::json &options, const std::string &name,
+						const nlohmann::json &value) {
+	const auto target = normalized_option_name(name);
+	for(auto iterator = options.begin(); iterator != options.end();) {
+		if(normalized_option_name(iterator.key()) == target) {
+			iterator = options.erase(iterator);
+		} else {
+			++iterator;
+		}
+	}
+	options[name] = value;
+}
+
+/// Replaces one case-preserving UCI option override in an engine configuration.
+void set_uci_option(EngineConfig &config, const std::string &name,
+					const nlohmann::json &value) {
+	auto options = option_values(config.options);
+	write_option_value(options, name, value);
+	config.options = options.dump();
 }
 
 /// Produces a side-to-move UCI score string for one analysis row.
@@ -1007,13 +1073,14 @@ private:
 			} else if(argument == "--arguments") {
 				simulator_.config().arguments = value();
 			} else if(argument == "--device") {
-				simulator_.config().device = value();
+				set_uci_option(simulator_.config(), "Device", value());
 			} else if(argument == "--movetime-ms") {
 				simulator_.config().movetime_ms = std::stoi(value());
 			} else if(argument == "--node-limit") {
 				simulator_.config().node_limit = std::stoull(value());
 			} else if(argument == "--multipv") {
-				simulator_.config().multipv = std::stoi(value());
+				set_uci_option(simulator_.config(), "MultiPV",
+							   std::stoi(value()));
 			} else if(argument == "--fen") {
 				simulator_.set_start_fen(value());
 				simulator_.reset();
@@ -1709,11 +1776,18 @@ private:
 		theme_edit_ = theme_;
 		if(mode == Mode::Simulator) {
 			simulator_edit_ = simulator_.config();
+			discover_options_if_needed(simulator_edit_);
 		} else {
 			white_edit_ = stadium().white_config();
 			black_edit_ = stadium().black_config();
 			white_human_edit_ = white_edit_.path.empty();
 			black_human_edit_ = black_edit_.path.empty();
+			if(!white_human_edit_) {
+				discover_options_if_needed(white_edit_);
+			}
+			if(!black_human_edit_) {
+				discover_options_if_needed(black_edit_);
+			}
 			match_name_edit_ = stadium().name();
 			clock_minutes_edit_ =
 				static_cast<int>(stadium().clock_initial_ms() / 60'000);
@@ -1725,6 +1799,18 @@ private:
 		settings_open_ = true;
 	}
 
+	/// Completes option metadata for legacy settings and direct executable paths.
+	void discover_options_if_needed(EngineConfig &config) {
+		if(config.path.empty() || !config.discovered_options.empty()) {
+			return;
+		}
+		try {
+			config.discovered_options = UciEngine::discover_options(config);
+		} catch(const std::exception &error) {
+			show_error(error.what());
+		}
+	}
+
 	/// Adds one executable to the reusable UCI engine registry.
 	void import_uci_engine() {
 		if(const auto path =
@@ -1733,6 +1819,8 @@ private:
 				EngineConfig engine;
 				engine.path = *path;
 				engine.name = path->stem().string();
+				engine.discovered_options =
+					UciEngine::discover_options(engine);
 				registry_.add(std::move(engine));
 				save_settings();
 			} catch(const std::exception &error) {
@@ -1848,7 +1936,107 @@ private:
 		ImGui::EndPopup();
 	}
 
-	/// Presents one engine's generic process and UCI controls.
+	/// Renders engine-defined UCI options from the schema reported during handshake.
+	void option_editor(EngineConfig &config) {
+		if(config.discovered_options.empty()) {
+			ImGui::TextDisabled(
+				"Engine options will appear after a successful UCI handshake.");
+			return;
+		}
+		auto values = option_values(config.options);
+		bool changed = false;
+		const auto text_value = [&](const UciOption &option) {
+			const auto *found = find_option_value(values, option.name);
+			if(found == nullptr) {
+				return option.default_value;
+			}
+			if(found->is_string()) {
+				return found->get<std::string>();
+			}
+			return found->dump();
+		};
+		for(const auto &option : config.discovered_options) {
+			ImGui::PushID(option.name.c_str());
+			if(option.type == "check") {
+				const std::string initial = text_value(option);
+				bool value =
+					initial == "true" || initial == "1" || initial == "on";
+				if(ImGui::Checkbox(option.name.c_str(), &value)) {
+					write_option_value(values, option.name, value);
+					changed = true;
+				}
+			} else if(option.type == "spin") {
+				std::int64_t value = 0;
+				try {
+					value = std::stoll(text_value(option));
+				} catch(...) {
+				}
+				ImGui::TextUnformatted(option.name.c_str());
+				ImGui::SetNextItemWidth(-1.0F);
+				const std::int64_t step = 1;
+				if(ImGui::InputScalar("##value", ImGuiDataType_S64, &value,
+									  &step)) {
+					if(option.minimum) {
+						value = std::max(value, *option.minimum);
+					}
+					if(option.maximum) {
+						value = std::min(value, *option.maximum);
+					}
+					write_option_value(values, option.name, value);
+					changed = true;
+				}
+			} else if(option.type == "combo") {
+				std::string value = text_value(option);
+				ImGui::TextUnformatted(option.name.c_str());
+				ImGui::SetNextItemWidth(-1.0F);
+				if(ImGui::BeginCombo("##value", value.c_str())) {
+					for(const auto &choice : option.choices) {
+						const bool selected = value == choice;
+						if(ImGui::Selectable(choice.c_str(), selected)) {
+							value = choice;
+							write_option_value(values, option.name, value);
+							changed = true;
+						}
+						if(selected) {
+							ImGui::SetItemDefaultFocus();
+						}
+					}
+					ImGui::EndCombo();
+				}
+			} else if(option.type == "string") {
+				std::string value = text_value(option);
+				ImGui::TextUnformatted(option.name.c_str());
+				ImGui::SetNextItemWidth(-1.0F);
+				if(ImGui::InputText("##value", &value)) {
+					write_option_value(values, option.name, value);
+					changed = true;
+				}
+			} else if(option.type == "button") {
+				if(ImGui::Button(option.name.c_str())) {
+					if(std::find(config.button_commands.begin(),
+								 config.button_commands.end(),
+								 option.name) == config.button_commands.end()) {
+						config.button_commands.push_back(option.name);
+					}
+				}
+				if(std::find(config.button_commands.begin(),
+							 config.button_commands.end(),
+							 option.name) != config.button_commands.end()) {
+					ImGui::SameLine();
+					ImGui::TextDisabled("queued");
+				}
+			} else {
+				ImGui::TextDisabled("%s (%s)", option.name.c_str(),
+									option.type.c_str());
+			}
+			ImGui::PopID();
+		}
+		if(changed) {
+			config.options = values.dump();
+		}
+	}
+
+	/// Presents one engine's process identity and discovered UCI controls.
 	void engine_editor(const char *identifier, EngineConfig &config,
 					   bool include_name = true) {
 		ImGui::PushID(identifier);
@@ -1885,12 +2073,26 @@ private:
 		ImGui::SetNextItemWidth(path_width);
 		if(ImGui::InputText("##path", &path)) {
 			config.path = path;
+			config.options = "{}";
+			config.discovered_options.clear();
+			config.button_commands.clear();
+		}
+		if(ImGui::IsItemDeactivatedAfterEdit()) {
+			discover_options_if_needed(config);
 		}
 		ImGui::SameLine();
 		if(ImGui::Button("Browse")) {
 			if(const auto selected =
 				   file_dialog(false, L"Executables\0*.exe\0All files\0*.*\0", L"exe")) {
-				config.path = *selected;
+				try {
+					config.path = *selected;
+					config.options = "{}";
+					config.button_commands.clear();
+					config.discovered_options =
+						UciEngine::discover_options(config);
+				} catch(const std::exception &error) {
+					show_error(error.what());
+				}
 			}
 		}
 		if(include_name) {
@@ -1898,35 +2100,21 @@ private:
 			ImGui::SetNextItemWidth(-1.0F);
 			ImGui::InputText("##name", &config.name);
 		}
-		ImGui::TextUnformatted("Device (managed UCI option)");
-		const char *devices[] = {"auto", "cpu", "cuda"};
-		int device = config.device == "cpu" ? 1 : config.device == "cuda" ? 2 : 0;
-		if(ImGui::Combo("##device", &device, devices, 3)) {
-			config.device = devices[device];
-		}
 		ImGui::Spacing();
-		ImGui::SeparatorText("Search");
-		step_input("Move time (ms)", config.movetime_ms);
-		step_input("Node / simulation limit", config.node_limit);
-		step_input("Analysis lines (MultiPV)", config.multipv);
-		step_input("Display update (ms)", config.progress_interval_ms);
-		config.movetime_ms = std::max(0, config.movetime_ms);
-		config.multipv = std::max(1, config.multipv);
-		config.progress_interval_ms = std::max(50, config.progress_interval_ms);
-		ImGui::Spacing();
-		ImGui::SeparatorText("UCI options");
-		ImGui::TextDisabled(
-			"JSON values become setoption commands after launch. Device and MultiPV are managed above.");
-		const float options_height =
-			std::max(180.0F, ImGui::GetTextLineHeightWithSpacing() * 10.0F);
-		ImGui::InputTextMultiline("##options", &config.options,
-								  {-1.0F, options_height});
+		ImGui::SeparatorText("Options");
+		option_editor(config);
 		ImGui::Spacing();
 		if(ImGui::CollapsingHeader("Launch arguments")) {
 			ImGui::TextDisabled(
 				"Optional process arguments passed before the UCI handshake.");
 			ImGui::SetNextItemWidth(-1.0F);
-			ImGui::InputText("##arguments", &config.arguments);
+			if(ImGui::InputText("##arguments", &config.arguments)) {
+				config.discovered_options.clear();
+				config.button_commands.clear();
+			}
+			if(ImGui::IsItemDeactivatedAfterEdit()) {
+				discover_options_if_needed(config);
+			}
 		}
 		ImGui::PopID();
 	}
@@ -2045,14 +2233,14 @@ private:
 					validate_match_side("Black", new_black_,
 										new_black_human_);
 					if(!new_white_human_) {
-						static_cast<void>(
-							additional_uci_options(new_white_.options));
+						discover_options_if_needed(new_white_);
+						static_cast<void>(option_values(new_white_.options));
 					} else {
 						new_white_.path.clear();
 					}
 					if(!new_black_human_) {
-						static_cast<void>(
-							additional_uci_options(new_black_.options));
+						discover_options_if_needed(new_black_);
+						static_cast<void>(option_values(new_black_.options));
 					} else {
 						new_black_.path.clear();
 					}
@@ -2260,7 +2448,7 @@ private:
 			try {
 				const auto primary_options =
 					settings_mode_ == Mode::Simulator || !white_human_edit_
-						? additional_uci_options(
+						? option_values(
 							  settings_mode_ == Mode::Simulator
 								  ? simulator_edit_.options
 								  : white_edit_.options)
@@ -2273,7 +2461,7 @@ private:
 					const auto secondary_options =
 						black_human_edit_
 							? nlohmann::json::object()
-							: additional_uci_options(black_edit_.options);
+							: option_values(black_edit_.options);
 					static_cast<void>(secondary_options);
 				}
 				static_cast<void>(primary_options);

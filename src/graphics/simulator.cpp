@@ -56,9 +56,10 @@ void SimulatorWorkspace::update_analysis() {
 			}
 			return;
 		}
+		config_.discovered_options = engine_.option_definitions();
+		config_.button_commands.clear();
 		if(analysis_fen_ != fen) {
-			engine_.analyse(
-				fen, config_.movetime_ms == 0 && config_.node_limit == 0);
+			engine_.analyse(fen, true);
 			analysis_fen_ = fen;
 			last_display_ = Clock::time_point{};
 		}
@@ -66,8 +67,7 @@ void SimulatorWorkspace::update_analysis() {
 		const auto snapshot = engine_.snapshot();
 		if(last_display_ == Clock::time_point{} ||
 		   now - last_display_ >=
-			   std::chrono::milliseconds(
-				   std::max(50, config_.progress_interval_ms)) ||
+			   std::chrono::milliseconds(100) ||
 		   snapshot.finished) {
 			display_ = snapshot;
 			last_display_ = now;

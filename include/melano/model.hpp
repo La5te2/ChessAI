@@ -10,6 +10,8 @@ namespace melano {
 
 inline constexpr int kTokenCount = kBoardSquares + 1;
 inline constexpr int kGeometryRelations = 32;
+/// Prevents cosine-latent objectives from creating singular gradients near a zero vector.
+inline constexpr double kLatentNormEpsilon = 1e-4;
 
 /// Chooses the largest supported attention-head count that evenly divides channels.
 int attention_heads_for_channels(int channels);

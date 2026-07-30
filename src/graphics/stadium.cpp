@@ -175,10 +175,24 @@ bool StadiumSession::engines_ready() {
 		throw std::runtime_error(std::string(side) +
 								 " engine initialization failed");
 	};
-	return check("White", white_engine_,
-				 engine_configured(chess::Color::WHITE)) &&
-		   check("Black", black_engine_,
-				 engine_configured(chess::Color::BLACK));
+	const bool ready =
+		check("White", white_engine_,
+			  engine_configured(chess::Color::WHITE)) &&
+		check("Black", black_engine_,
+			  engine_configured(chess::Color::BLACK));
+	if(ready) {
+		if(engine_configured(chess::Color::WHITE)) {
+			white_config_.discovered_options =
+				white_engine_.option_definitions();
+			white_config_.button_commands.clear();
+		}
+		if(engine_configured(chess::Color::BLACK)) {
+			black_config_.discovered_options =
+				black_engine_.option_definitions();
+			black_config_.button_commands.clear();
+		}
+	}
+	return ready;
 }
 
 void StadiumSession::start() {
@@ -332,8 +346,7 @@ void StadiumSession::update() {
 		if(!snapshot.error.empty()) {
 			throw std::runtime_error(snapshot.error);
 		}
-		const auto interval =
-			std::max(50, active_config().progress_interval_ms);
+		constexpr int interval = 100;
 		if(last_display_ == Clock::time_point{} ||
 		   now - last_display_ >= std::chrono::milliseconds(interval) ||
 		   snapshot.finished) {
