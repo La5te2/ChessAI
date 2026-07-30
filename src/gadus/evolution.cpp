@@ -56,6 +56,7 @@ struct Position {
 
 struct Trajectory {
 	int game_id = 0;
+	bool current_white = true;
 	chess::Board board;
 	std::vector<Position> positions;
 };
@@ -341,26 +342,38 @@ std::vector<int> choose_candidates(const std::vector<int> &legal, const std::vec
 	return selected;
 }
 
-// Generate stochastic closed-policy games and exact Monte Carlo targets for completed games.
-std::vector<Position> collect_selfplay(Model model, const torch::Device &device,
+// Generate one closed-policy sampling group. Current plays both colors evenly
+// against the selected opponent, and every sampled position follows the same
+// FCPI target construction used by current self-play.
+std::vector<Position> collect_selfplay(Model current_model, Model opponent_model,
+									   const torch::Device &device,
 									   const FcpiOptions &options, int iteration,
+									   int group_index, int game_id_offset,
+									   const std::string &group_name,
+									   const std::string &opponent_path,
+									   bool selfplay,
 									   nlohmann::json &sampling_summary) {
 	SearchOptions closed;
 	closed.type = SearchType::Closed;
 	closed.precision = options.precision;
 	closed.mcts_sims = 0;
 	closed.mcts_batch_size = options.inference_batch_size;
-	Searcher evaluator(model, device, closed);
+	Searcher current_evaluator(current_model, device, closed);
+	Searcher opponent_evaluator(opponent_model, device, closed);
 	nlohmann::json starts;
-	const auto specs = make_sampling_specs(options, iteration, starts);
-	std::unordered_map<std::string, BehaviorCoverage> behavior_coverage;
+	const auto specs =
+		make_sampling_specs(options, iteration + group_index * 1'000'003, starts);
+	std::unordered_map<std::string, BehaviorCoverage> current_behavior_coverage;
+	std::unordered_map<std::string, BehaviorCoverage> opponent_behavior_coverage;
 	std::vector<Trajectory> trajectories;
 	trajectories.reserve(specs.size());
 	int completed = 0;
-	std::cout << "fcpi self-play start: iteration=" << iteration << " arch_type=" << kArchType
+	std::cout << "fcpi sampling group start: iteration=" << iteration
+			  << " group=" << group_name << " arch_type=" << kArchType
 			  << " games=" << specs.size() << " max_plies=" << options.max_plies
 			  << " device=" << device.str() << std::endl;
-	std::cout << "fcpi starts: " << starts.dump() << std::endl;
+	std::cout << "fcpi sampling opponent: " << opponent_path << std::endl;
+	std::cout << "fcpi starts: group=" << group_name << ' ' << starts.dump() << std::endl;
 
 	for (std::size_t group_start = 0; group_start < specs.size();
 		 group_start += std::max(1, options.games_in_flight)) {
@@ -369,68 +382,101 @@ std::vector<Position> collect_selfplay(Model model, const torch::Device &device,
 		std::vector<Trajectory> group;
 		for (std::size_t index = group_start; index < group_end; ++index) {
 			Trajectory trajectory;
-			trajectory.game_id = static_cast<int>(index) + 1;
+			trajectory.game_id = game_id_offset + static_cast<int>(index) + 1;
+			trajectory.current_white = index % 2 == 0;
 			trajectory.board = chess::Board(specs[index].fen);
 			group.push_back(std::move(trajectory));
 		}
 		std::vector<bool> done(group.size(), false);
 		while (std::find(done.begin(), done.end(), false) != done.end()) {
-			std::vector<std::size_t> active_indices;
-			std::vector<chess::Board> boards;
+			std::vector<std::size_t> current_indices;
+			std::vector<std::size_t> opponent_indices;
+			std::vector<chess::Board> current_boards;
+			std::vector<chess::Board> opponent_boards;
 			for (std::size_t index = 0; index < group.size(); ++index) {
-				if (!done[index]) {
-					active_indices.push_back(index);
-					boards.push_back(group[index].board);
+				if (done[index]) {
+					continue;
+				}
+				const bool white_turn =
+					group[index].board.sideToMove() == chess::Color::WHITE;
+				const bool current_turn =
+					selfplay || white_turn == group[index].current_white;
+				if (current_turn) {
+					current_indices.push_back(index);
+					current_boards.push_back(group[index].board);
+				} else {
+					opponent_indices.push_back(index);
+					opponent_boards.push_back(group[index].board);
 				}
 			}
-			const auto results = evaluate_chunks(evaluator, boards, options.inference_batch_size);
-			for (std::size_t row = 0; row < active_indices.size(); ++row) {
-				auto &trajectory = group[active_indices[row]];
-				auto &board = trajectory.board;
-				const auto moves = legal_moves(board);
-				std::vector<int> legal;
-				std::vector<float> prior;
-				for (const auto &move : moves) {
-					const int action = move_to_index(move);
-					legal.push_back(action);
-					prior.push_back(results[row].policy[action]);
-				}
-				prior = normalize(std::move(prior));
-				const double temperature = std::max(1e-4, options.behavior_temperature);
-				std::vector<float> behavior(prior.size());
-				for (std::size_t index = 0; index < prior.size(); ++index) {
-					behavior[index] = static_cast<float>(
-						std::pow(std::clamp(static_cast<double>(prior[index]), 1e-12, 1.0),
-								 1.0 / temperature));
-				}
-				behavior = normalize(std::move(behavior));
-				const auto state = encode_state(board);
-				const std::size_t choice =
-					choose_behavior_action(packed_key(state), legal, behavior, behavior_coverage);
-				const int played = legal[choice];
-				Position position;
-				position.game_id = trajectory.game_id;
-				position.state = state;
-				position.fen = board.getFen();
-				position.root_value = results[row].value;
-				position.legal_indices = legal;
-				position.legal_prior = prior;
-				position.played_index = played;
-				trajectory.positions.push_back(std::move(position));
-				board.makeMove(moves[choice]);
-				const bool terminal = game_is_over(board);
-				const bool truncated =
-					static_cast<int>(trajectory.positions.size()) >= options.max_plies;
-				if (terminal || truncated) {
-					done[active_indices[row]] = true;
-					++completed;
-					std::cout << "fcpi game: completed=" << completed << '/' << specs.size()
-							  << " game_id=" << trajectory.game_id
-							  << " plies=" << trajectory.positions.size()
-							  << " result=" << (terminal ? game_result(board) : "truncated")
-							  << " truncated=" << (truncated && !terminal ? "true" : "false")
-							  << std::endl;
-				}
+
+			auto apply_results =
+				[&](const std::vector<std::size_t> &indices,
+					const std::vector<SearchResult> &results,
+					std::unordered_map<std::string, BehaviorCoverage> &behavior_coverage) {
+					for (std::size_t row = 0; row < indices.size(); ++row) {
+						auto &trajectory = group[indices[row]];
+						auto &board = trajectory.board;
+						const auto moves = legal_moves(board);
+						std::vector<int> legal;
+						std::vector<float> prior;
+						for (const auto &move : moves) {
+							const int action = move_to_index(move);
+							legal.push_back(action);
+							prior.push_back(results[row].policy[action]);
+						}
+						prior = normalize(std::move(prior));
+						const double temperature =
+							std::max(1e-4, options.behavior_temperature);
+						std::vector<float> behavior(prior.size());
+						for (std::size_t index = 0; index < prior.size(); ++index) {
+							behavior[index] = static_cast<float>(std::pow(
+								std::clamp(static_cast<double>(prior[index]), 1e-12, 1.0),
+								1.0 / temperature));
+						}
+						behavior = normalize(std::move(behavior));
+						const auto state = encode_state(board);
+						const std::size_t choice = choose_behavior_action(
+							packed_key(state), legal, behavior, behavior_coverage);
+						const int played = legal[choice];
+						Position position;
+						position.game_id = trajectory.game_id;
+						position.state = state;
+						position.fen = board.getFen();
+						position.root_value = results[row].value;
+						position.legal_indices = legal;
+						position.legal_prior = prior;
+						position.played_index = played;
+						trajectory.positions.push_back(std::move(position));
+						board.makeMove(moves[choice]);
+						const bool terminal = game_is_over(board);
+						const bool truncated =
+							static_cast<int>(trajectory.positions.size()) >= options.max_plies;
+						if (terminal || truncated) {
+							done[indices[row]] = true;
+							++completed;
+							std::cout << "fcpi game: group=" << group_name
+									  << " completed=" << completed << '/' << specs.size()
+									  << " game_id=" << trajectory.game_id
+									  << " plies=" << trajectory.positions.size()
+									  << " result="
+									  << (terminal ? game_result(board) : "truncated")
+									  << " truncated="
+									  << (truncated && !terminal ? "true" : "false")
+									  << std::endl;
+						}
+					}
+				};
+
+			if (!current_boards.empty()) {
+				const auto results = evaluate_chunks(
+					current_evaluator, current_boards, options.inference_batch_size);
+				apply_results(current_indices, results, current_behavior_coverage);
+			}
+			if (!opponent_boards.empty()) {
+				const auto results = evaluate_chunks(
+					opponent_evaluator, opponent_boards, options.inference_batch_size);
+				apply_results(opponent_indices, results, opponent_behavior_coverage);
 			}
 		}
 		for (auto &trajectory : group) {
@@ -480,6 +526,9 @@ std::vector<Position> collect_selfplay(Model model, const torch::Device &device,
 		}
 	}
 	sampling_summary = {
+		{"group", group_name},
+		{"opponent_model", opponent_path},
+		{"selfplay", selfplay},
 		{"games", trajectories.size()},
 		{"source_positions", source_positions},
 		{"unique_positions", unique_positions},
@@ -1229,6 +1278,7 @@ void run_fcpi(const FcpiOptions &options) {
 	const auto current = model_dir / "current.pth";
 	atomic_copy(options.model, initial);
 	atomic_copy(initial, current);
+	std::vector<std::filesystem::path> accepted_models = {initial};
 	const auto device = resolve_device(options.device);
 	validate_compute_precision(options.precision, device);
 	std::cout << "fcpi run id: " << run_id << std::endl;
@@ -1241,8 +1291,69 @@ void run_fcpi(const FcpiOptions &options) {
 	for (int iteration = 1; iteration <= options.iterations; ++iteration) {
 		std::cout << "fcpi iteration " << iteration << std::endl;
 		auto model = load_checkpoint(current, device);
-		nlohmann::json sampling;
-		auto records = collect_selfplay(model, device, options, iteration, sampling);
+		const auto accepted_model = [&](std::size_t generations_back) {
+			if (accepted_models.size() > generations_back) {
+				return accepted_models[accepted_models.size() - 1 - generations_back];
+			}
+			return initial;
+		};
+		const std::vector<std::filesystem::path> opponents = {
+			current,
+			accepted_model(1),
+			accepted_model(2),
+		};
+		const std::vector<std::string> group_names = {
+			"current_self",
+			"previous_accept_1",
+			"previous_accept_2",
+		};
+		nlohmann::json sampling_groups = nlohmann::json::array();
+		std::vector<Position> records;
+		std::int64_t source_positions = 0;
+		std::int64_t unique_positions = 0;
+		std::int64_t selected_positions = 0;
+		std::int64_t completed_games = 0;
+		std::int64_t truncated_games = 0;
+		std::int64_t completed_positions = 0;
+		std::int64_t truncated_positions = 0;
+		for (std::size_t group = 0; group < opponents.size(); ++group) {
+			const bool selfplay = group == 0;
+			auto opponent_model =
+				selfplay ? model : load_checkpoint(opponents[group], device);
+			nlohmann::json group_summary;
+			auto group_records = collect_selfplay(
+				model, opponent_model, device, options, iteration,
+				static_cast<int>(group),
+				static_cast<int>(group) * options.games_per_iter,
+				group_names[group], opponents[group].string(), selfplay, group_summary);
+			source_positions += group_summary["source_positions"].get<std::int64_t>();
+			unique_positions += group_summary["unique_positions"].get<std::int64_t>();
+			selected_positions += group_summary["selected_positions"].get<std::int64_t>();
+			completed_games += group_summary["completed_games"].get<std::int64_t>();
+			truncated_games += group_summary["truncated_games"].get<std::int64_t>();
+			completed_positions +=
+				group_summary["completed_positions"].get<std::int64_t>();
+			truncated_positions +=
+				group_summary["truncated_positions"].get<std::int64_t>();
+			sampling_groups.push_back(std::move(group_summary));
+			records.insert(records.end(),
+						   std::make_move_iterator(group_records.begin()),
+						   std::make_move_iterator(group_records.end()));
+		}
+		nlohmann::json sampling = {
+			{"games_per_group", options.games_per_iter},
+			{"groups_count", opponents.size()},
+			{"games", options.games_per_iter * static_cast<int>(opponents.size())},
+			{"source_positions", source_positions},
+			{"unique_positions", unique_positions},
+			{"selected_positions", selected_positions},
+			{"completed_games", completed_games},
+			{"truncated_games", truncated_games},
+			{"completed_positions", completed_positions},
+			{"truncated_positions", truncated_positions},
+			{"groups", std::move(sampling_groups)},
+		};
+		std::cout << "fcpi sampling summary: " << sampling.dump() << std::endl;
 		TargetSummary target_summary;
 		construct_targets(records, model, device, options, target_summary);
 		const auto data_path = data_dir / ("fcpi_iter_" + zero_pad(iteration, 3) + ".h5");
@@ -1294,6 +1405,7 @@ void run_fcpi(const FcpiOptions &options) {
 		const bool accepted = arena_summary["accepted"].get<bool>();
 		if (accepted) {
 			atomic_copy(candidate, current);
+			accepted_models.push_back(candidate);
 			std::cout << "fcpi promoted: " << current.string() << std::endl;
 		} else {
 			std::cout << "fcpi candidate rejected: " << candidate.string() << std::endl;

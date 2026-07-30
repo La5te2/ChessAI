@@ -4,14 +4,15 @@
 #include "gadus/args.hpp"
 #include "gadus/fcpi.hpp"
 
-// Parse self-play, counterfactual, optimizer, and arena controls, then run FCPI.
+// Parse sampling, counterfactual, optimizer, and arena controls, then run FCPI.
 int main(int argc, char **argv) {
 	try {
 		gadus::Args args(argc, argv);
 		if (args.has("help")) {
 			std::cout
 				<< "Usage: fcpi --model <gadus.pth> [options]\n"
-				<< "  --iterations <n> --games-per-iter <n> --games-in-flight <n> --max-plies <n>\n"
+				<< "  --iterations <n> --games-per-iter <games-per-opponent-group>\n"
+				<< "  --games-in-flight <n> --max-plies <n>\n"
 				<< "  --opening-book <path|empty> --startpos-fraction <x>\n"
 				<< "  --counterfactual-budget <deep-edges> --behavior-temperature <x>\n"
 				<< "  --epochs <n> --train-max-steps <n>\n"

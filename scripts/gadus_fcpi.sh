@@ -29,7 +29,7 @@ COUNTERFACTUAL_BUDGET="${COUNTERFACTUAL_BUDGET:-24}"
 BEHAVIOR_TEMPERATURE="${BEHAVIOR_TEMPERATURE:-1.0}"
 
 EPOCHS="${EPOCHS:-30}"
-TRAIN_MAX_STEPS="${TRAIN_MAX_STEPS:-3000}"
+TRAIN_MAX_STEPS="${TRAIN_MAX_STEPS:-6000}"
 BATCH_SIZE="${BATCH_SIZE:-1024}"
 LEARNING_RATE="${LEARNING_RATE:-0.00002}"
 
@@ -232,7 +232,7 @@ LAUNCH_LOG="data/runs/.gadus_fcpi_$(date +%Y%m%d_%H%M%S)_$$.log"
 
 echo "Gadus FCPI launch"
 echo "model=${MODEL} device=${DEVICE} precision=${PRECISION} iterations=${ITERATIONS}"
-echo "self-play: games=${GAMES_PER_ITER} games_in_flight=${GAMES_IN_FLIGHT} max_plies=${MAX_PLIES}"
+echo "sampling: games_per_group=${GAMES_PER_ITER} groups=3 total_games=$((GAMES_PER_ITER * 3)) games_in_flight=${GAMES_IN_FLIGHT} max_plies=${MAX_PLIES}"
 echo "counterfactual: deep_budget_per_root=${COUNTERFACTUAL_BUDGET}"
 echo "training: batch_size=${BATCH_SIZE} epochs=${EPOCHS} max_steps=${TRAIN_MAX_STEPS} lr=${LEARNING_RATE}"
 echo "arena: games=${EVAL_GAMES} search_type=${EVAL_SEARCH_TYPE} sims=${EVAL_SIMS} min_net_wins=${EVAL_MIN_NET_WINS}"

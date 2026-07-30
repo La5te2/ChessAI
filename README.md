@@ -469,7 +469,9 @@ build/gadus/arena \
 
 ### 4.7 FCPI
 
-每轮 FCPI 使用冻结的 `current.pth` 进行模型自对战。记 $\mu(a\mid s)$ 为实际自对弈的行为策略，$T_b>0$ 为行为温度。Gadus 只对冻结 Policy 做温度变换：
+记当前已接受模型为 $C_t$，此前两份已接受模型为 $C_{t-1}$ 与 $C_{t-2}$。每轮 FCPI 分别采样 $C_t$ 对 $C_t$、$C_t$ 对 $C_{t-1}$、$C_t$ 对 $C_{t-2}$ 三组对局；`--games-per-iter` 表示每组局数，因此每轮总局数为其三倍。历史不足两代时对应组回退到 `initial.pth`。历史模型只扩展采样分布，三组样本进入同一套事实回报、反事实树、损失和 candidate 对 current 的 arena gate。
+
+历史对局中 $C_t$ 均衡执白、执黑。记 $\mu(a\mid s)$ 为控制当前行棋方的采样模型所使用的行为策略，$T_b>0$ 为行为温度。Gadus 对该模型的冻结 Policy 做温度变换：
 
 $$
 \mu(a\mid s)=
@@ -688,7 +690,7 @@ candidate 达到 arena gate 后原子写入该 run 的 `current.pth`。
 bash scripts/gadus_fcpi.sh
 ```
 
-脚本默认使用 `PRECISION=bf16`、较大的批次与 batched games。可通过环境变量覆盖，例如 `PRECISION=fp32 BATCH_SIZE=512 bash scripts/gadus_fcpi.sh`。
+脚本默认使用 `PRECISION=bf16`、`GAMES_PER_ITER=2000`、`TRAIN_MAX_STEPS=6000`、较大的批次与 batched games。默认每轮三组各采样 2000 局，共 6000 局。可通过环境变量覆盖，例如 `PRECISION=fp32 BATCH_SIZE=512 bash scripts/gadus_fcpi.sh`。
 
 脚本会等待 FCPI 完成全部迭代，再调用独立 Arena 追加一次最终 `current.pth` 对同一 run 的 `initial.pth` 的 `closed` paired 对战。它复用 `EVAL_GAMES`、开局书、并发数和最大步数，并将 MCTS 关闭。结果写入 `summary.json` 的 `final_arena`，棋谱写入 `current_vs_initial.pgn`。该累计赛只报告整次运行的净变化，不参与 candidate 晋升。直接运行 `build/gadus/fcpi` 时，流程在 FCPI 迭代结束处终止。
 

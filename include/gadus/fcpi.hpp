@@ -15,6 +15,7 @@ struct FcpiOptions {
 	std::string device = "auto";
 	ComputePrecision precision = ComputePrecision::Fp32;
 	int iterations = 1;
+	// Number of games in each of current-self, previous-accept-1, and previous-accept-2.
 	int games_per_iter = 500;
 	int games_in_flight = 64;
 	int max_plies = 240;
