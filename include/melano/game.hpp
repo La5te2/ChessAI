@@ -40,9 +40,15 @@ PackedState encode_state(const chess::Board &board);
 /// Expands packed rows into an int64 tensor shaped [count, 67].
 torch::Tensor decode_states(const std::uint8_t *packed, std::int64_t count,
 							bool pinned_memory = false);
+/// Transfers compact token bytes first and widens them to embedding indices on the device.
+torch::Tensor decode_states_device(const std::uint8_t *packed, std::int64_t count,
+								   const torch::Device &device);
 /// Encodes live boards directly into a batched Melano token tensor.
 torch::Tensor encode_boards(const std::vector<chess::Board> &boards,
 							bool pinned_memory = false);
+/// Encodes live boards while keeping the host-to-device transfer compact.
+torch::Tensor encode_boards_device(const std::vector<chess::Board> &boards,
+								   const torch::Device &device);
 
 /// Applies all chess terminal rules represented by the chess library.
 bool game_is_over(const chess::Board &board);

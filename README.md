@@ -5,7 +5,7 @@ Gadidae 是一个实验性国际象棋神经网络引擎项目。当前架构如
 - `Gadus`：ResNet + linear policy/value，使用 `gadus_18_planes` state encoding 和 `alphazero_64x73` move encoding。
 - `Melano`：residual geometry attention + action-conditioned latent dynamics + source-destination policy/value/advantage，使用 `melano_square_tokens` state encoding 和 `sd_64x64_underpromo9` move encoding。
 
-两套架构分别实现 preprocess、train、search、arena、事实—反事实策略迭代（Factual-Counterfactual Policy Iteration，FCPI）和通用国际象棋接口（Universal Chess Interface，UCI）。它们共享 LibTorch、第五版层次数据格式（Hierarchical Data Format 5，HDF5）、chess-library、nlohmann-json、zlib 与构建基础设施。
+两套架构分别实现 preprocess、train、search、arena 和通用国际象棋接口（Universal Chess Interface，UCI）。Gadus 另有折叠反事实策略迭代（Folded Counterfactual Policy Iteration，FCPI）自学习链路。它们共享 LibTorch、第五版层次数据格式（Hierarchical Data Format 5，HDF5）、chess-library、nlohmann-json、zlib 与构建基础设施。
 
 ## 记号与缩写
 
@@ -26,7 +26,7 @@ Gadidae 是一个实验性国际象棋神经网络引擎项目。当前架构如
 - **FEN**：Forsyth-Edwards Notation，单局面描述格式。
 - **UCI**：Universal Chess Interface，图形客户端与国际象棋引擎之间的文本协议。
 - **HDF5**：Hierarchical Data Format 5，训练数据容器格式。
-- **FCPI**：Factual-Counterfactual Policy Iteration，事实—反事实策略迭代。
+- **FCPI**：Folded Counterfactual Policy Iteration，折叠反事实策略迭代。
 - **MCTS**：Monte Carlo Tree Search，蒙特卡洛树搜索。
 - **PUCT**：Predictor + Upper Confidence bounds applied to Trees，结合网络先验的树上置信上界选择规则。
 - **FPU**：First Play Urgency，未访问边的初始动作价值。
@@ -113,8 +113,8 @@ models/
 ```
 
 - `include/gadus/`、`src/gadus/`：Gadus 独立实现。`dataset` 负责 PGN、HDF5 与监督训练，`game` 负责状态、动作和棋规，`model` 负责 ResNet Policy/Value，`searcher` 负责 closed 与 MCTS，`match` 负责 arena，`evolution` 负责 FCPI。
-- `include/melano/`、`src/melano/`：Melano 独立实现。文件职责与入口形式和 Gadus 对称，状态编码、动作编码、网络、搜索与 FCPI 方程均由 Melano 自身实现。
-- `preprocess.cpp`、`train.cpp`、`search.cpp`、`arena.cpp`、`fcpi.cpp`、`uci.cpp`：每套架构的六个命令入口。
+- `include/melano/`、`src/melano/`：Melano 独立实现。`dataset` 负责 PGN、HDF5 与监督训练，`game` 负责状态、动作和棋规，`model` 负责 residual geometry attention、Policy/Value/Advantage 与 latent dynamics，`searcher` 负责 closed 与 anchored latent MCTS，`match` 负责 arena。
+- `preprocess.cpp`、`train.cpp`、`search.cpp`、`arena.cpp`、`uci.cpp`：两套架构的监督学习与推理入口。Gadus 另有 `fcpi.cpp` 自学习入口。
 - `tests.cpp`：每套架构的状态编码、特殊走法、棋规、网络前反向、数值范围与 checkpoint 往返测试。
 - `scripts/`：通用 UCI 工具、模型检查与构建启动脚本。
 - `api/`：仓库本地 C++ 依赖与安装脚本。
@@ -169,7 +169,7 @@ sudo apt install xorg-dev
 GADIDAE_TORCH_VARIANT=cu126 bash api/setup.sh
 ```
 
-`setup.sh` 与 `build.sh` 默认根据 `DISPLAY` 或 `WAYLAND_DISPLAY` 判断当前 Linux 是否具有图形会话。Windows 的 `setup.bat` 与 `build.bat` 在 `auto` 模式下构建 Graphics。纯命令行服务器会跳过 GLFW、OpenGL 图形依赖和 `Gadidae` GUI，同时保留 Gadus、Melano 的完整命令行训练、搜索、竞技场、FCPI 与 UCI 链路。可使用 `GADIDAE_BUILD_GRAPHICS=0` 明确选择命令行构建，或使用 `GADIDAE_BUILD_GRAPHICS=1` 强制编译 GUI。
+`setup.sh` 与 `build.sh` 默认根据 `DISPLAY` 或 `WAYLAND_DISPLAY` 判断当前 Linux 是否具有图形会话。Windows 的 `setup.bat` 与 `build.bat` 在 `auto` 模式下构建 Graphics。纯命令行服务器会跳过 GLFW、OpenGL 图形依赖和 `Gadidae` GUI，同时保留两套架构的命令行监督训练、搜索、竞技场与 UCI 链路，以及 Gadus FCPI。可使用 `GADIDAE_BUILD_GRAPHICS=0` 明确选择命令行构建，或使用 `GADIDAE_BUILD_GRAPHICS=1` 强制编译 GUI。
 
 ## 3. 构建
 
@@ -207,7 +207,6 @@ build/melano/preprocess
 build/melano/train
 build/melano/search
 build/melano/arena
-build/melano/fcpi
 build/melano/uci
 ```
 
@@ -219,7 +218,7 @@ Windows 程序带 `.exe` 后缀。`build/gadus/` 与 `build/melano/` 保存发�
 
 ```bash
 build/gadus/search --help
-build/melano/fcpi --help
+build/melano/train --help
 ```
 
 ### 3.1 模型检查
@@ -1061,205 +1060,6 @@ build/melano/arena \
 	--log-every 1
 ```
 
-### 5.7 FCPI
-
-Melano 自对战行为分布同时使用 Policy 与非正 Advantage。记 $\sigma_A(s)$ 为该状态合法动作上的最大 Advantage 绝对值：
-
-$$
-\sigma_A(s)=\max_a|A(s,a)|
-$$
-
-当 $\sigma_A(s)<10^{-4}$ 时，行为策略等于温度变换后的 Policy。其余情况构造 Advantage 修正分布：
-
-$$
-\mu(a\mid s)=\operatorname{softmax}_a\left(
-\frac{\log(P(a\mid s)+\varepsilon)+A(s,a)/\sigma_A(s)}{T_b}
-\right)
-$$
-
-同一编码局面第 $n$ 次出现时，记 $N_{n-1}^{\mu}(s,a)$ 为前 $n-1$ 次访问中实际选择动作 $a$ 的次数。Melano 对自己的 P+A 行为分布使用概率欠额分配：
-
-$$
-a_n=\arg\max_a\left[n\mu(a\mid s)-N_{n-1}^{\mu}(s,a)\right]
-$$
-
-其中 $T_b>0$ 是行为温度，$\varepsilon>0$ 只用于保证对数数值稳定。该调度保持 Melano 的 P+A 动作偏好，同时避免独立随机抽样持续漏掉正概率动作。完整结束的自对弈使用终局事实生成 MC 回报。设终局时刻为 $\tau$，终局行棋方视角回报为 $z_\tau$：
-
-$$
-G_\tau=z_\tau,\qquad G_t=-G_{t+1}
-$$
-
-达到 `max-plies` 的截断对局只提供反事实树根。每局先按 Melano state encoding 去重，再使用全部不同局面。终局回报不直接写入反事实动作值表。直接令已走动作 $Q=G_t$ 再计算 $V=\max_aQ(s,a)$ 会产生不对称偏差：胜局样本可立即抬高最大值，败局样本却可能被另一个自举动作的较高估计掩盖。
-
-记 $a_t$ 为实际动作。完整轨迹为该动作提供归一化 MC Advantage：
-
-$$
-A_{\mathrm{MC}}(s_t,a_t)=
-\frac{G_t-V_{old}(s_t)}{2}\in[-1,1]
-$$
-
-$V_{old}(s_t)$ 是与动作无关的冻结基线。该带符号残差只更新实际观察到的动作。定义 $\widetilde\mu_{new}$ 为使用新 Policy logits 与冻结 Advantage 修正重建的行为分布，MC Policy 损失为：
-
-$$
-\widetilde\mu_{new}(a\mid s)=\operatorname{softmax}_a\left(
-\frac{\ell_{new}(s,a)+
-\operatorname{stopgrad}(A_{old}(s,a)/\sigma_A(s))}{T_b}
-\right)
-$$
-
-$$
-L_{\mathrm{MC}\pi}=
--\frac{1}{N_{\mathrm{MC}}}
-\sum_{(s_t,a_t,G_t)}
-A_{\mathrm{MC}}(s_t,a_t)
-\log\widetilde\mu_{new}(a_t\mid s_t)
-$$
-
-冻结 Advantage 修正不接收该项梯度，因此终局事实通过 Policy 学习实际动作的好坏，Advantage 仍由下文的动作价值约束训练。
-
-Melano 的反事实树在根节点评价全部合法动作。`--counterfactual-budget` 表示根节点之后可额外评价的动作边数。非根节点的局部宽度、Gumbel 无放回候选和前沿优先级由剩余预算自动产生。Melano 的候选分布 $\nu$ 使用：
-
-$$
-\nu(a\mid s)=\operatorname{softmax}_a\left(
-\log(P(a\mid s)+\varepsilon)+A(s,a)/\sigma_A(s)
-\right)
-$$
-
-终局事实同时校准非终局 Bellman 修正的统一步长。对每个后继尚未终局的事实样本 $i$，定义冻结动作值、冻结一步回传值、一步差值和事实残差：
-
-$$
-Q_{old,i}=\operatorname{clip}
-\left(V_{old}(s_i)+A_{old}(s_i,a_i),-1,1\right)
-$$
-
-$$
-Q_{1,i}=-V_{old}(s_i'),\qquad
-d_i=Q_{1,i}-Q_{old,i},\qquad
-r_i=G_i-Q_{old,i}
-$$
-
-其中 $s_i'=\phi(T(x_i,a_i))$。Bellman 步长 $\alpha_B$ 是区间 $[0,1]$ 上的最小二乘解：
-
-$$
-\alpha_B=
-\operatorname{clip}_{[0,1]}
-\left(
-\frac{\sum_i d_i r_i}{\sum_i d_i^2}
-\right)
-$$
-
-若分母为零，则取 $\alpha_B=0$。该闭式解不增加命令行参数，并保证校准样本上的
-$\operatorname{MSE}(G,Q_{old}+\alpha_Bd)$ 不高于区间端点中较优者。规则终局边不参与拟合，因为其动作值已经由棋规精确给出。
-
-对样本中的环境状态 $x$ 及动作 $a$，记 $x_a'=T(x,a)$、$s_a'=\phi(x_a')$。冻结 Melano 的 dueling 动作值为：
-
-$$
-Q_{old}(s,a)=\operatorname{clip}
-\left(V_{old}(s)+A_{old}(s,a),-1,1\right)
-$$
-
-反事实树的动作值定义为：
-
-$$
-Q_T(s,a)=
-\begin{cases}
-z_{s,a}, & x_a'\text{ 是终局}\\
-\operatorname{clip}\left(
-Q_{old}(s,a)+\alpha_B[-\overline V_T(s_a')-Q_{old}(s,a)],-1,1
-\right), & a\text{ 已展开且非终局}\\
-Q_{old}(s,a), & a\text{ 未展开}
-\end{cases}
-$$
-
-其中 $z_{s,a}=-z(x_a')$ 是父状态行棋方视角下的精确终局值。完整轨迹的事实回报可以提高对应状态—动作边的前沿优先级，但不会覆盖 $Q_T$。因此树可以优先检查模型实际犯错的位置，而 Value、Advantage 和 imagined Value 只拟合经过校准的 Bellman 目标。
-
-Melano 根据 Policy、Value 与 Advantage 动作值计算节点内均值：
-
-$$
-m(s)=\sum_aP_{old}(a\mid s)Q_T(s,a)
-$$
-
-$$
-\pi^+(a\mid s)=
-\frac{P_{old}(a\mid s)\exp(Q_T(s,a)-m(s))}
-{\sum_bP_{old}(b\mid s)\exp(Q_T(s,b)-m(s))}
-$$
-
-该更新使用 Melano 动作值的原生尺度。summary 中的 KL、总变差距离、Advantage 幅度和 top-1 改变率均为诊断量。
-
-下标 $T$ 在本小节表示反事实树目标。Melano 的 $A(s,a)\leq0$ 表示动作相对局面能力上界的损失。反事实树使用所有合法动作的动作值上界：
-
-$$
-\overline V_T(s)=\max_{a\in\mathcal A(s)}Q_T(s,a)
-$$
-
-对应的非正 Advantage target 为：
-
-$$
-A_T(s,a)=\operatorname{clip}
-\left(Q_T(s,a)-\overline V_T(s),-2,0\right)
-$$
-
-因此 $V$、$Q$ 与 $A$ 使用同一棵经过事实校准的反事实树，并满足 $Q_T(s,a)\leq\overline V_T(s)$。冻结模型的原 Value 估计可能偏高或偏低，校准后的 Bellman 残差允许修正方向为正或负，同时避免单次长程胜负直接进入最大值算子。
-
-记 $\mathcal E_T(s)$ 为实际展开并通过精确棋规评价的动作集合，其在改进 Policy 下的覆盖质量为：
-
-$$
-c_T(s)=\sum_{a\in\mathcal E_T(s)}\pi^+(a\mid s)
-$$
-
-每棵树的节点 Policy 权重仍为：
-
-$$
-w_P(s)=\frac{n(s)}{\sum_{u\in\mathcal T_{root}}n(u)}
-$$
-
-树 Value 权重使用同一预算份额：
-
-$$
-w_T(s)=w_P(s)
-$$
-
-因此每棵树满足 $\sum_s w_T(s)=1$。覆盖率 $c_T(s)$ 用于诊断。其余动作通过冻结 $V+A$ 进入 $\overline V_T(s)$，有限树预算会自然缩小修正。所有展开节点使用 $\overline V_T(s)$ 训练 Value：
-
-$$
-L_V=
-\frac{\sum_s w_T(s)\operatorname{SL1}(V_{new}(s)-\overline V_T(s))}
-{\sum_s w_T(s)}
-$$
-
-每个已展开节点及其精确子状态同时训练 Policy、Value、Advantage 与 latent transition。Dueling action Value 和 imagined Value 直接拟合同一份 $Q_T$。记 $L_{\mathrm{CF}\pi}=L_{\mathrm{CE}}(\pi_{new},\pi^+)$ 为反事实 Policy 拟合项。Policy 总损失为：
-
-$$
-L_P=L_{\mathrm{CF}\pi}+L_{\mathrm{MC}\pi}
-$$
-
-记 $\lambda_P$、$\lambda_V$、$\lambda_Q$、$\lambda_D$ 与 $\lambda_I$ 为五项命令行系数。FCPI 损失为：
-
-$$
-L=\lambda_P L_P+
-\lambda_V L_V+
-\lambda_Q \operatorname{SL1}(\widehat Q,Q_T)+
-\lambda_D L_D+
-\lambda_I \operatorname{SL1}(-V(\widehat h'),Q_T)
-$$
-
-其中每条树边都通过精确棋规生成 $s'$，并写入 `candidate_next_states`。$L_D$ 使用与监督训练相同的 latent cosine consistency。动作条件 dynamics 对树中每个已展开节点学习一步转移 $E(s)\rightarrow E(s')$，与 $K=2$ anchored latent MCTS 的运行时假设保持一致。
-
-Melano FCPI HDF5 保存 `tree_value_targets`、`tree_value_weights`、`candidate_q`、逐动作的 `candidate_weights`、`mc_policy_advantage_sums` 与 `mc_policy_weights`。FCPI 与监督训练使用相同的 EMA target encoder 和梯度保护。父局面在每个 batch 中只编码一次，只有真实候选边进入 latent 训练，矩形 HDF5 中的 padding 不参与计算。候选后继按固定上限分块执行 latent transition 与 target encoding。每块损失使用整批共同的权重分母，其 latent 梯度累积后通过一次向量—雅可比乘积传回父 encoder。
-
-训练日志输出 `policy`、`value`、`dueling_q`、`dynamics`、`imagined_value`、总损失与裁剪前梯度范数。summary 另外记录 `policy_counterfactual`、`policy_mc`、事实样本数、Bellman 校准样本数、$\alpha_B$、校准前后 MSE、终局边、反事实覆盖率、Advantage 幅度、Policy 总变差距离与 top-1 改变率。
-
-Melano 每轮依次执行自身 `current.pth` 自对战、完整轨迹事实回传、局面去重、Bellman 步长校准、反事实展开、Policy/Value/Advantage 与 latent-dynamics 目标构造、candidate 训练和 paired-game arena。每次运行由程序生成 `fcpi_YYYYMMDD_HHMMSS_id`，创建对应的 `data/runs/<run-id>/` 与 `models/runs/<run-id>/`。其中 HDF5 schema、candidate 和 current checkpoint 均属于 Melano，candidate 达到 arena gate 后原子写入该 run 的 `current.pth`。
-
-云端可用同一组默认参数后台启动：
-
-```bash
-bash scripts/melano_fcpi.sh
-```
-
-参数通过环境变量覆盖，例如 `GAMES_PER_ITER=2000 BATCH_SIZE=512 bash scripts/melano_fcpi.sh`。脚本会打印 run id、PID、日志路径、`tail` 命令和停止命令。
-
 ## 6. UCI
 
 ### 6.1 Gadus
@@ -1509,4 +1309,4 @@ Gadus 测试覆盖 `gadus_18_planes`、普通走法与特殊走法编码、棋�
 
 ### 10.2 Melano
 
-Melano 测试覆盖 `melano_square_tokens`、普通走法与升变编码、棋规、Policy/Value/Advantage 输出形状、Advantage 范围、动作条件 latent successor、$K=2$ anchored latent MCTS 路径、有限数值、反向传播和 checkpoint 往返。本地 Windows CPU 烟测覆盖单盘 PGN 生成含 `next_states` 与 `next_values` 的 HDF5、一步监督训练以及一轮树一致 Melano FCPI 的候选后继训练与 arena gate。
+Melano 测试覆盖 `melano_square_tokens`、普通走法与升变编码、棋规、Policy/Value/Advantage 输出形状、Advantage 范围、动作条件 latent successor、$K=2$ anchored latent MCTS 路径、有限数值、反向传播和 checkpoint 往返。本地 Windows CPU 烟测覆盖单盘 PGN 生成含 `next_states` 与 `next_values` 的 HDF5、一步监督训练、closed 搜索与 MCTS 搜索。

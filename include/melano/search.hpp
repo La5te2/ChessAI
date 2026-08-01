@@ -65,6 +65,7 @@ struct SearchResult {
 // Frozen closed-policy output in legal-action form for high-throughput data generation.
 struct ClosedEvaluation {
 	std::vector<int> legal_indices;
+	std::vector<chess::Move> moves;
 	std::vector<float> legal_policy;
 	std::vector<float> legal_advantages;
 	float value = 0.0F;

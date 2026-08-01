@@ -130,9 +130,11 @@ struct Searcher::Impl {
 	std::vector<ClosedEvaluation> collect_closed(ModelOutput prediction,
 											  const std::vector<chess::Board> &boards) {
 		std::vector<std::vector<int>> legal_actions(boards.size());
+		std::vector<std::vector<chess::Move>> legal_move_rows(boards.size());
 		std::size_t legal_width = 1;
 		for (std::size_t row = 0; row < boards.size(); ++row) {
-			for (const auto &move : legal_moves(boards[row])) {
+			legal_move_rows[row] = legal_moves(boards[row]);
+			for (const auto &move : legal_move_rows[row]) {
 				legal_actions[row].push_back(move_to_index(move));
 			}
 			legal_width = std::max(legal_width, legal_actions[row].size());
@@ -188,6 +190,7 @@ struct Searcher::Impl {
 		auto advantage_rows = advantages.accessor<float, 2>();
 		for (std::size_t row = 0; row < rows; ++row) {
 			output[row].legal_indices = std::move(legal_actions[row]);
+			output[row].moves = std::move(legal_move_rows[row]);
 			output[row].legal_policy.resize(output[row].legal_indices.size());
 			output[row].legal_advantages.resize(output[row].legal_indices.size());
 			output[row].value = value_rows[static_cast<std::int64_t>(row)];
@@ -234,8 +237,7 @@ struct Searcher::Impl {
 			return {};
 		}
 		torch::InferenceMode guard;
-		const bool pin_memory = device.is_cuda();
-		auto states = encode_boards(boards, pin_memory).to(device, true);
+		auto states = encode_boards_device(boards, device);
 		torch::Tensor latents;
 		ModelOutput prediction;
 		{
@@ -252,8 +254,7 @@ struct Searcher::Impl {
 			return {};
 		}
 		torch::InferenceMode guard;
-		const bool pin_memory = device.is_cuda();
-		auto states = encode_boards(boards, pin_memory).to(device, true);
+		auto states = encode_boards_device(boards, device);
 		ModelOutput prediction;
 		{
 			AutocastGuard autocast(options.precision, device);

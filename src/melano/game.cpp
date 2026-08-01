@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstring>
 #include <fstream>
 #include <queue>
 #include <stdexcept>
@@ -194,6 +195,20 @@ torch::Tensor decode_states(const std::uint8_t *packed, std::int64_t count,
 	return output;
 }
 
+// Keep Melano's one-byte categorical tokens compact across PCIe and widen on the GPU.
+torch::Tensor decode_states_device(const std::uint8_t *packed, std::int64_t count,
+								   const torch::Device &device) {
+	if (!device.is_cuda()) {
+		return decode_states(packed, count, false).to(device);
+	}
+	auto host = torch::empty(
+		{count, kStateFeatures},
+		torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU).pinned_memory(true));
+	std::memcpy(host.data_ptr<std::uint8_t>(), packed,
+				static_cast<std::size_t>(count) * kStateFeatures);
+	return host.to(device, true).to(torch::kInt64);
+}
+
 // Encode live positions through exactly the same representation used by HDF5 rows.
 torch::Tensor encode_boards(const std::vector<chess::Board> &boards, bool pinned_memory) {
 	std::vector<std::uint8_t> packed(boards.size() * kStateFeatures);
@@ -203,6 +218,17 @@ torch::Tensor encode_boards(const std::vector<chess::Board> &boards, bool pinned
 	}
 	return decode_states(packed.data(), static_cast<std::int64_t>(boards.size()),
 						 pinned_memory);
+}
+
+// Pack live positions once, then use the compact device transfer used by FCPI inference.
+torch::Tensor encode_boards_device(const std::vector<chess::Board> &boards,
+								   const torch::Device &device) {
+	std::vector<std::uint8_t> packed(boards.size() * kStateFeatures);
+	for (std::size_t index = 0; index < boards.size(); ++index) {
+		const auto state = encode_state(boards[index]);
+		std::copy(state.begin(), state.end(), packed.begin() + index * state.size());
+	}
+	return decode_states_device(packed.data(), static_cast<std::int64_t>(boards.size()), device);
 }
 
 // Report any library-recognized terminal reason, including mate and rule draws.

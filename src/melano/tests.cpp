@@ -8,7 +8,6 @@
 #include <unordered_set>
 #include "melano/checkpoint.hpp"
 #include "melano/dataset.hpp"
-#include "melano/fcpi.hpp"
 #include "melano/game.hpp"
 #include "melano/model.hpp"
 #include "melano/search.hpp"
@@ -277,10 +276,13 @@ int main() {
 		require(compact_result.size() == 1, "compact Melano evaluation row count mismatch");
 		require(compact_result[0].legal_indices.size() == compact_result[0].legal_policy.size() &&
 				compact_result[0].legal_indices.size() ==
-					compact_result[0].legal_advantages.size(),
+					compact_result[0].legal_advantages.size() &&
+				compact_result[0].legal_indices.size() == compact_result[0].moves.size(),
 				"compact Melano evaluation width mismatch");
 		for (std::size_t column = 0; column < compact_result[0].legal_indices.size(); ++column) {
 			const int action = compact_result[0].legal_indices[column];
+			require(melano::move_to_index(compact_result[0].moves[column]) == action,
+					"compact Melano evaluation changed legal move alignment");
 			require(std::abs(compact_result[0].legal_policy[column] -
 							 closed_result.policy[action]) < 1e-6F,
 					"compact Melano evaluation changed a legal probability");

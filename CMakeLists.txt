@@ -173,7 +173,6 @@ add_library(melano
 	src/melano/checkpoint.cpp
 	src/melano/args.cpp
 	src/melano/dataset.cpp
-	src/melano/evolution.cpp
 	src/melano/game.cpp
 	src/melano/match.cpp
 	src/melano/model.cpp
@@ -223,7 +222,6 @@ melanoexecutable(preprocess src/melano/preprocess.cpp)
 melanoexecutable(train src/melano/train.cpp)
 melanoexecutable(search src/melano/search.cpp)
 melanoexecutable(arena src/melano/arena.cpp)
-melanoexecutable(fcpi src/melano/fcpi.cpp)
 melanoexecutable(uci src/melano/uci.cpp)
 
 add_executable(melanotests src/melano/tests.cpp)
