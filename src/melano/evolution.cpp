@@ -10,6 +10,7 @@
 #include <iostream>
 #include <limits>
 #include <numeric>
+#include <queue>
 #include <random>
 #include <sstream>
 #include <stdexcept>
@@ -77,6 +78,7 @@ struct TreeNode {
 	std::vector<float> legal_prior;
 	std::vector<float> advantages;
 	std::vector<int> candidate_indices;
+	std::vector<std::size_t> candidate_slots;
 	std::vector<int> children;
 	std::vector<float> candidate_q;
 	std::vector<float> policy_target;
@@ -89,9 +91,24 @@ struct TreeNode {
 	bool expanded = false;
 };
 
+struct FrontierEntry {
+	double priority = 0.0;
+	int node = 0;
+};
+
+struct FrontierEarlier {
+	bool operator()(const FrontierEntry &left, const FrontierEntry &right) const {
+		if (left.priority != right.priority) {
+			return left.priority < right.priority;
+		}
+		return left.node > right.node;
+	}
+};
+
 struct CounterfactualTree {
 	std::size_t root_record = 0;
 	std::vector<TreeNode> nodes;
+	std::priority_queue<FrontierEntry, std::vector<FrontierEntry>, FrontierEarlier> frontier;
 	int remaining_budget = 0;
 	int evaluated_edges = 0;
 };
@@ -106,8 +123,20 @@ struct ReturnStatistics {
 	std::int64_t count = 0;
 };
 
+// Hash model-visible bytes directly so large FCPI maps avoid allocating string keys.
+struct PackedStateHash {
+	std::size_t operator()(const PackedState &state) const noexcept {
+		std::size_t hash = sizeof(std::size_t) == 8 ? 1469598103934665603ULL : 2166136261U;
+		const std::size_t prime = sizeof(std::size_t) == 8 ? 1099511628211ULL : 16777619U;
+		for (const auto byte : state) {
+			hash = (hash ^ static_cast<std::size_t>(byte)) * prime;
+		}
+		return hash;
+	}
+};
+
 using FactualReturns =
-	std::unordered_map<std::string, std::unordered_map<int, ReturnStatistics>>;
+	std::unordered_map<PackedState, std::unordered_map<int, ReturnStatistics>, PackedStateHash>;
 
 struct TargetSummary {
 	std::int64_t trees = 0;
@@ -227,18 +256,13 @@ std::vector<float> stable_softmax(const std::vector<double> &logits) {
 	return normalize(std::move(values));
 }
 
-// Use model-visible packed state bytes as the aggregation and per-game deduplication key.
-std::string packed_key(const PackedState &state) {
-	return std::string(reinterpret_cast<const char *>(state.data()), state.size());
-}
-
 // Allocate repeated state visits by deficit against Melano's P+A behavior
 // distribution. This preserves architecture-specific action preferences while
 // removing independent categorical-sampling variance.
-std::size_t choose_behavior_action(const std::string &state_key,
+std::size_t choose_behavior_action(const PackedState &state_key,
 								   const std::vector<int> &legal,
 								   const std::vector<float> &behavior,
-								   std::unordered_map<std::string, BehaviorCoverage> &coverage) {
+								   std::unordered_map<PackedState, BehaviorCoverage, PackedStateHash> &coverage) {
 	if (legal.empty() || legal.size() != behavior.size()) {
 		throw std::invalid_argument("behavior selection requires aligned legal probabilities");
 	}
@@ -310,16 +334,36 @@ std::vector<SamplingSpec> make_sampling_specs(const FcpiOptions &options, int it
 }
 
 // Evaluate arbitrarily many positions through bounded neural batches.
-std::vector<SearchResult> evaluate_chunks(Searcher &searcher,
-										  const std::vector<chess::Board> &boards, int batch_size) {
-	std::vector<SearchResult> output;
+std::vector<ClosedEvaluation> evaluate_chunks(Searcher &searcher,
+											 const std::vector<chess::Board> &boards, int batch_size) {
+	std::unordered_map<PackedState, std::size_t, PackedStateHash> unique_rows;
+	std::vector<chess::Board> unique_boards;
+	std::vector<std::size_t> source_rows;
+	unique_boards.reserve(boards.size());
+	source_rows.reserve(boards.size());
+	for (const auto &board : boards) {
+		const auto state = encode_state(board);
+		const auto [found, inserted] = unique_rows.emplace(state, unique_boards.size());
+		if (inserted) {
+			unique_boards.push_back(board);
+		}
+		source_rows.push_back(found->second);
+	}
+
+	std::vector<ClosedEvaluation> unique_output;
+	unique_output.reserve(unique_boards.size());
+	for (std::size_t begin = 0; begin < unique_boards.size(); begin += std::max(1, batch_size)) {
+		const auto end = std::min(unique_boards.size(), begin + std::max(1, batch_size));
+		std::vector<chess::Board> chunk(unique_boards.begin() + begin,
+										   unique_boards.begin() + end);
+		auto results = searcher.evaluate_closed_many(chunk);
+		unique_output.insert(unique_output.end(), std::make_move_iterator(results.begin()),
+							 std::make_move_iterator(results.end()));
+	}
+	std::vector<ClosedEvaluation> output;
 	output.reserve(boards.size());
-	for (std::size_t begin = 0; begin < boards.size(); begin += std::max(1, batch_size)) {
-		const auto end = std::min(boards.size(), begin + std::max(1, batch_size));
-		std::vector<chess::Board> chunk(boards.begin() + begin, boards.begin() + end);
-		auto results = searcher.search_many(chunk);
-		output.insert(output.end(), std::make_move_iterator(results.begin()),
-					  std::make_move_iterator(results.end()));
+	for (const auto row : source_rows) {
+		output.push_back(unique_output[row]);
 	}
 	return output;
 }
@@ -378,7 +422,7 @@ std::vector<Position> collect_selfplay(Model model, const torch::Device &device,
 	Searcher evaluator(model, device, closed);
 	nlohmann::json starts;
 	const auto specs = make_sampling_specs(options, iteration, starts);
-	std::unordered_map<std::string, BehaviorCoverage> behavior_coverage;
+	std::unordered_map<PackedState, BehaviorCoverage, PackedStateHash> behavior_coverage;
 	std::vector<Trajectory> trajectories;
 	trajectories.reserve(specs.size());
 	int completed = 0;
@@ -387,41 +431,39 @@ std::vector<Position> collect_selfplay(Model model, const torch::Device &device,
 			  << " device=" << device.str() << std::endl;
 	std::cout << "fcpi starts: " << starts.dump() << std::endl;
 
-	for (std::size_t group_start = 0; group_start < specs.size();
-		 group_start += std::max(1, options.games_in_flight)) {
-		const auto group_end =
-			std::min(specs.size(), group_start + std::max(1, options.games_in_flight));
-		std::vector<Trajectory> group;
-		for (std::size_t index = group_start; index < group_end; ++index) {
-			Trajectory trajectory;
-			trajectory.game_id = static_cast<int>(index) + 1;
-			trajectory.board = chess::Board(specs[index].fen);
-			group.push_back(std::move(trajectory));
-		}
-		std::vector<bool> done(group.size(), false);
-		while (std::find(done.begin(), done.end(), false) != done.end()) {
+	const std::size_t slot_count =
+		std::min(specs.size(), static_cast<std::size_t>(std::max(1, options.games_in_flight)));
+	std::vector<Trajectory> slots(slot_count);
+	std::vector<bool> active(slot_count, false);
+	std::size_t next_spec = 0;
+	const auto fill_slot = [&](std::size_t slot) {
+		Trajectory trajectory;
+		trajectory.game_id = static_cast<int>(next_spec) + 1;
+		trajectory.board = chess::Board(specs[next_spec].fen);
+		slots[slot] = std::move(trajectory);
+		active[slot] = true;
+		++next_spec;
+	};
+	for (std::size_t slot = 0; slot < slot_count; ++slot) {
+		fill_slot(slot);
+	}
+	while (completed < static_cast<int>(specs.size())) {
 			std::vector<std::size_t> active_indices;
 			std::vector<chess::Board> boards;
-			for (std::size_t index = 0; index < group.size(); ++index) {
-				if (!done[index]) {
+			for (std::size_t index = 0; index < slots.size(); ++index) {
+				if (active[index]) {
 					active_indices.push_back(index);
-					boards.push_back(group[index].board);
+					boards.push_back(slots[index].board);
 				}
 			}
 			const auto results = evaluate_chunks(evaluator, boards, options.inference_batch_size);
 			for (std::size_t row = 0; row < active_indices.size(); ++row) {
-				auto &trajectory = group[active_indices[row]];
+				const std::size_t slot = active_indices[row];
+				auto &trajectory = slots[slot];
 				auto &board = trajectory.board;
-				const auto moves = legal_moves(board);
-				std::vector<int> legal;
-				std::vector<float> prior;
-				std::vector<float> advantages;
-				for (const auto &move : moves) {
-					const int action = move_to_index(move);
-					legal.push_back(action);
-					prior.push_back(results[row].policy[action]);
-					advantages.push_back(results[row].advantages[action]);
-				}
+				std::vector<int> legal = results[row].legal_indices;
+				std::vector<float> prior = results[row].legal_policy;
+				std::vector<float> advantages = results[row].legal_advantages;
 				prior = normalize(std::move(prior));
 				const double temperature = std::max(1e-4, options.behavior_temperature);
 				std::vector<double> behavior_logits(prior.size());
@@ -440,7 +482,7 @@ std::vector<Position> collect_selfplay(Model model, const torch::Device &device,
 				auto behavior = stable_softmax(behavior_logits);
 				const auto state = encode_state(board);
 				const std::size_t choice =
-					choose_behavior_action(packed_key(state), legal, behavior, behavior_coverage);
+					choose_behavior_action(state, legal, behavior, behavior_coverage);
 				const int played = legal[choice];
 				Position position;
 				position.game_id = trajectory.game_id;
@@ -454,26 +496,36 @@ std::vector<Position> collect_selfplay(Model model, const torch::Device &device,
 				position.mc_policy_advantage_sums.assign(legal.size(), 0.0F);
 				position.mc_policy_weights.assign(legal.size(), 0.0F);
 				trajectory.positions.push_back(std::move(position));
-				board.makeMove(moves[choice]);
+				const auto move = index_to_move(legal[choice], board);
+				if (move.move() == chess::Move::NO_MOVE) {
+					throw std::runtime_error("FCPI selected an illegal behavior action");
+				}
+				board.makeMove(move);
 				const bool terminal = game_is_over(board);
 				const bool truncated =
 					static_cast<int>(trajectory.positions.size()) >= options.max_plies;
 				if (terminal || truncated) {
-					done[active_indices[row]] = true;
 					++completed;
-					std::cout << "fcpi game: completed=" << completed << '/' << specs.size()
-							  << " game_id=" << trajectory.game_id
-							  << " plies=" << trajectory.positions.size()
-							  << " result=" << (terminal ? game_result(board) : "truncated")
-							  << " truncated=" << (truncated && !terminal ? "true" : "false")
-							  << std::endl;
+					if (completed == 1 || completed == static_cast<int>(specs.size()) ||
+						(options.log_every > 0 && completed % options.log_every == 0)) {
+						std::cout << "fcpi game: completed=" << completed << '/' << specs.size()
+								  << " game_id=" << trajectory.game_id
+								  << " plies=" << trajectory.positions.size()
+								  << " result="
+								  << (terminal ? game_result(board) : "truncated")
+								  << " truncated="
+								  << (truncated && !terminal ? "true" : "false")
+								  << std::endl;
+					}
+					trajectories.push_back(std::move(trajectory));
+					if (next_spec < specs.size()) {
+						fill_slot(slot);
+					} else {
+						active[slot] = false;
+					}
 				}
 			}
 		}
-		for (auto &trajectory : group) {
-			trajectories.push_back(std::move(trajectory));
-		}
-	}
 
 	int terminal_games = 0;
 	int truncated_games = 0;
@@ -515,10 +567,10 @@ std::vector<Position> collect_selfplay(Model model, const torch::Device &device,
 	std::int64_t unique_positions = 0;
 	for (auto &trajectory : trajectories) {
 		source_positions += trajectory.positions.size();
-		std::unordered_set<std::string> seen;
+		std::unordered_set<PackedState, PackedStateHash> seen;
 		std::vector<std::size_t> indices;
 		for (std::size_t index = 0; index < trajectory.positions.size(); ++index) {
-			if (seen.insert(packed_key(trajectory.positions[index].state)).second) {
+			if (seen.insert(trajectory.positions[index].state).second) {
 				indices.push_back(index);
 			}
 		}
@@ -548,7 +600,7 @@ std::vector<Position> collect_selfplay(Model model, const torch::Device &device,
 BellmanCalibration calibrate_bellman_step(const std::vector<Position> &records,
 										 Searcher &evaluator, int batch_size) {
 	std::vector<chess::Board> successors;
-	std::unordered_map<std::string, std::size_t> successor_rows;
+	std::unordered_map<PackedState, std::size_t, PackedStateHash> successor_rows;
 	std::vector<std::size_t> sample_successors;
 	std::vector<double> old_q;
 	std::vector<double> returns;
@@ -578,7 +630,7 @@ BellmanCalibration calibrate_bellman_step(const std::vector<Position> &records,
 									 static_cast<double>(record.legal_advantage[column]),
 								 -1.0, 1.0));
 		returns.push_back(record.factual_return);
-		const auto key = packed_key(encode_state(board));
+		const auto key = encode_state(board);
 		const auto [found, inserted] = successor_rows.emplace(key, successors.size());
 		if (inserted) {
 			successors.push_back(std::move(board));
@@ -621,7 +673,7 @@ BellmanCalibration calibrate_bellman_step(const std::vector<Position> &records,
 }
 
 // Materialize one exact Melano decision node with frozen P/V/A predictions.
-TreeNode make_tree_node(const chess::Board &board, const SearchResult &evaluation, int parent,
+TreeNode make_tree_node(const chess::Board &board, const ClosedEvaluation &evaluation, int parent,
 						int parent_action, int depth, double reach_probability) {
 	TreeNode node;
 	node.board = board;
@@ -632,12 +684,9 @@ TreeNode make_tree_node(const chess::Board &board, const SearchResult &evaluatio
 	node.parent_action = parent_action;
 	node.depth = depth;
 	node.reach_probability = reach_probability;
-	for (const auto &move : legal_moves(board)) {
-		const int action = move_to_index(move);
-		node.legal_indices.push_back(action);
-		node.legal_prior.push_back(evaluation.policy[action]);
-		node.advantages.push_back(evaluation.advantages[action]);
-	}
+	node.legal_indices = evaluation.legal_indices;
+	node.legal_prior = evaluation.legal_policy;
+	node.advantages = evaluation.legal_advantages;
 	node.legal_prior = normalize(std::move(node.legal_prior));
 	return node;
 }
@@ -664,20 +713,16 @@ std::vector<float> pva_distribution(const std::vector<float> &prior,
 }
 
 // Select the unexpanded node with the largest reach-weighted Bellman residual.
-int select_tree_frontier(const CounterfactualTree &tree) {
-	int selected = -1;
-	double best = -1.0;
-	for (std::size_t index = 0; index < tree.nodes.size(); ++index) {
-		const auto &node = tree.nodes[index];
-		if (node.terminal || node.expanded || node.legal_indices.empty()) {
-			continue;
-		}
-		if (node.priority > best) {
-			best = node.priority;
-			selected = static_cast<int>(index);
+int select_tree_frontier(CounterfactualTree &tree) {
+	while (!tree.frontier.empty()) {
+		const int selected = tree.frontier.top().node;
+		tree.frontier.pop();
+		const auto &node = tree.nodes[static_cast<std::size_t>(selected)];
+		if (!node.terminal && !node.expanded && !node.legal_indices.empty()) {
+			return selected;
 		}
 	}
-	return selected;
+	return -1;
 }
 
 // Couple local width and reachable depth to one per-root edge budget.
@@ -745,14 +790,8 @@ void record_policy_diagnostics(TargetSummary &summary, const std::vector<float> 
 // edges. Unexpanded PVA estimates remain useful baselines but add no tree evidence.
 float evaluated_policy_mass(const TreeNode &node) {
 	float mass = 0.0F;
-	for (const int action : node.candidate_indices) {
-		const auto legal =
-			std::find(node.legal_indices.begin(), node.legal_indices.end(), action);
-		if (legal == node.legal_indices.end()) {
-			throw std::runtime_error("tree candidate is absent from legal actions");
-		}
-		const auto index = static_cast<std::size_t>(legal - node.legal_indices.begin());
-		mass += node.policy_target[index];
+	for (const auto slot : node.candidate_slots) {
+		mass += node.policy_target[slot];
 	}
 	return std::clamp(mass, 0.0F, 1.0F);
 }
@@ -777,7 +816,7 @@ void construct_targets(std::vector<Position> &records, Model model, const torch:
 			continue;
 		}
 		++summary.factual_policy_samples;
-		auto &statistics = factual_returns[packed_key(record.state)][record.played_index];
+		auto &statistics = factual_returns[record.state][record.played_index];
 		statistics.sum += record.factual_return;
 		++statistics.count;
 	}
@@ -815,6 +854,7 @@ void construct_targets(std::vector<Position> &records, Model model, const torch:
 			root.legal_prior = record.legal_prior;
 			root.advantages = record.legal_advantage;
 			tree.nodes.push_back(std::move(root));
+			tree.frontier.push({tree.nodes.front().priority, 0});
 			trees.push_back(std::move(tree));
 		}
 
@@ -846,6 +886,8 @@ void construct_targets(std::vector<Position> &records, Model model, const torch:
 					// Exhaustive root coverage is required to discover factual or terminal
 					// alternatives that the frozen P/A ranking currently undervalues.
 					node.candidate_indices = node.legal_indices;
+					node.candidate_slots.resize(node.legal_indices.size());
+					std::iota(node.candidate_slots.begin(), node.candidate_slots.end(), 0);
 				} else {
 					const int width = std::min<int>(
 						expansion_width(tree), static_cast<int>(node.legal_indices.size()));
@@ -853,6 +895,16 @@ void construct_targets(std::vector<Position> &records, Model model, const torch:
 						pva_distribution(node.legal_prior, node.advantages);
 					node.candidate_indices =
 						choose_candidates(node.legal_indices, proposals, -1, width, rng);
+					node.candidate_slots.reserve(node.candidate_indices.size());
+					for (const int action : node.candidate_indices) {
+						const auto legal =
+							std::find(node.legal_indices.begin(), node.legal_indices.end(), action);
+						if (legal == node.legal_indices.end()) {
+							throw std::runtime_error("tree candidate is absent from legal actions");
+						}
+						node.candidate_slots.push_back(
+							static_cast<std::size_t>(legal - node.legal_indices.begin()));
+					}
 					tree.remaining_budget -= static_cast<int>(node.candidate_indices.size());
 				}
 				node.children.assign(node.candidate_indices.size(), -1);
@@ -895,11 +947,7 @@ void construct_targets(std::vector<Position> &records, Model model, const torch:
 				auto &request = pending[pending_index];
 				auto &tree = trees[request.tree];
 				const auto &parent = tree.nodes[static_cast<std::size_t>(request.parent)];
-				const auto legal_position =
-					std::find(parent.legal_indices.begin(), parent.legal_indices.end(), request.action);
-				const float edge_prior =
-					parent.legal_prior[static_cast<std::size_t>(legal_position -
-																parent.legal_indices.begin())];
+				const float edge_prior = parent.legal_prior[parent.candidate_slots[request.slot]];
 				TreeNode child;
 				if (request.terminal) {
 					child.board = request.board;
@@ -921,7 +969,7 @@ void construct_targets(std::vector<Position> &records, Model model, const torch:
 				child.reach_probability = parent.reach_probability * edge_prior;
 				float edge_q = -child.value;
 				if (!child.terminal) {
-					const auto state = factual_returns.find(packed_key(parent.state));
+					const auto state = factual_returns.find(parent.state);
 					if (state != factual_returns.end()) {
 						const auto action = state->second.find(request.action);
 						if (action != state->second.end() && action->second.count > 0) {
@@ -939,6 +987,9 @@ void construct_targets(std::vector<Position> &records, Model model, const torch:
 				summary.max_depth = std::max(summary.max_depth, child.depth);
 				const int child_index = static_cast<int>(tree.nodes.size());
 				tree.nodes.push_back(std::move(child));
+				if (!tree.nodes.back().terminal && !tree.nodes.back().legal_indices.empty()) {
+					tree.frontier.push({tree.nodes.back().priority, child_index});
+				}
 				tree.nodes[static_cast<std::size_t>(request.parent)].children[request.slot] =
 					child_index;
 			}
@@ -957,13 +1008,9 @@ void construct_targets(std::vector<Position> &records, Model model, const torch:
 						std::clamp(node.value + node.advantages[index], -1.0F, 1.0F);
 				}
 				for (std::size_t slot = 0; slot < node.candidate_indices.size(); ++slot) {
-					const int action = node.candidate_indices[slot];
-					const auto legal = std::find(node.legal_indices.begin(),
-											node.legal_indices.end(), action);
 					const auto &child =
 						tree.nodes[static_cast<std::size_t>(node.children[slot])];
-					const auto legal_index =
-						static_cast<std::size_t>(legal - node.legal_indices.begin());
+					const auto legal_index = node.candidate_slots[slot];
 					const float old_q = action_values[legal_index];
 					const float raw_q = std::clamp(-child.backed_value, -1.0F, 1.0F);
 					// Exact terminal edges need no damping. Every non-terminal Bellman
@@ -1098,13 +1145,12 @@ void construct_targets(std::vector<Position> &records, Model model, const torch:
 // Merge model-indistinguishable states and average their stochastic P/V/A targets.
 std::vector<Position> aggregate_records(std::vector<Position> records, nlohmann::json &summary) {
 	const std::size_t source_count = records.size();
-	std::unordered_map<std::string, std::size_t> groups;
+	std::unordered_map<PackedState, std::size_t, PackedStateHash> groups;
 	std::vector<Position> output;
 	for (auto &record : records) {
-		const auto key = packed_key(record.state);
-		const auto found = groups.find(key);
+		const auto found = groups.find(record.state);
 		if (found == groups.end()) {
-			groups.emplace(key, output.size());
+			groups.emplace(record.state, output.size());
 			output.push_back(std::move(record));
 			continue;
 		}

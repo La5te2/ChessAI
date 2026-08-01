@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstring>
 #include <fstream>
 #include <queue>
 #include <stdexcept>
@@ -271,6 +272,26 @@ torch::Tensor decode_states(const std::uint8_t *packed, std::int64_t count,
 	return output;
 }
 
+// Keep the compact 144-byte representation across PCIe, then expand its bits in parallel.
+torch::Tensor decode_states_device(const std::uint8_t *packed, std::int64_t count,
+								   const torch::Device &device) {
+	if (!device.is_cuda()) {
+		return decode_states(packed, count, false).to(device);
+	}
+	auto host = torch::empty(
+		{count, kStatePlanes, 8},
+		torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU).pinned_memory(true));
+	std::memcpy(host.data_ptr<std::uint8_t>(), packed,
+				static_cast<std::size_t>(count) * kStatePlanes * 8);
+	auto device_packed = host.to(device, true);
+	auto masks = torch::tensor(
+		{128, 64, 32, 16, 8, 4, 2, 1},
+		torch::TensorOptions().dtype(torch::kUInt8).device(device));
+	return torch::bitwise_and(device_packed.unsqueeze(-1), masks)
+		.ne(0)
+		.to(torch::kFloat32);
+}
+
 // Pack a live batch first, then use the same decoder as persisted training data.
 torch::Tensor encode_boards(const std::vector<chess::Board> &boards, bool pinned_memory) {
 	std::vector<std::uint8_t> packed(boards.size() * kStatePlanes * 8);
@@ -280,6 +301,17 @@ torch::Tensor encode_boards(const std::vector<chess::Board> &boards, bool pinned
 	}
 	return decode_states(packed.data(), static_cast<std::int64_t>(boards.size()),
 						 pinned_memory);
+}
+
+// Encode to packed host rows and use device-side expansion for CUDA inference.
+torch::Tensor encode_boards_device(const std::vector<chess::Board> &boards,
+								   const torch::Device &device) {
+	std::vector<std::uint8_t> packed(boards.size() * kStatePlanes * 8);
+	for (std::size_t index = 0; index < boards.size(); ++index) {
+		const auto state = encode_state(boards[index]);
+		std::copy(state.begin(), state.end(), packed.begin() + index * state.size());
+	}
+	return decode_states_device(packed.data(), static_cast<std::int64_t>(boards.size()), device);
 }
 
 // Report any library-recognized terminal reason, including mate and rule draws.

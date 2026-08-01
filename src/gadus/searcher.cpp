@@ -115,8 +115,8 @@ struct Searcher::Impl {
 		model->eval();
 	}
 
-	// Evaluate a batch and return only legal policy entries across the device boundary.
-	Evaluation evaluate(const std::vector<chess::Board> &boards) {
+	// Evaluate a frozen batch and keep legal actions compact on both sides of the device boundary.
+	std::vector<ClosedEvaluation> evaluate_closed(const std::vector<chess::Board> &boards) {
 		if (boards.empty()) {
 			return {};
 		}
@@ -159,7 +159,7 @@ struct Searcher::Impl {
 		}
 
 		torch::InferenceMode guard;
-		auto states = encode_boards(boards, pin_memory).to(device, true);
+		auto states = encode_boards_device(boards, device);
 		auto device_indices = legal_indices.to(device, true);
 		auto device_mask = legal_mask.to(device, true);
 		torch::Tensor logits;
@@ -178,18 +178,34 @@ struct Searcher::Impl {
 						  .to(torch::kCPU)
 						  .contiguous();
 
-		Evaluation output;
-		output.policies.resize(boards.size(), std::vector<float>(kActionSize, 0.0F));
-		output.values.resize(boards.size());
+		std::vector<ClosedEvaluation> output(boards.size());
 		auto probability_rows = probabilities.accessor<float, 2>();
 		auto value_rows = values.accessor<float, 1>();
 		for (std::size_t row = 0; row < boards.size(); ++row) {
-			for (std::size_t column = 0; column < legal_actions[row].size(); ++column) {
-				output.policies[row][legal_actions[row][column]] =
+			output[row].legal_indices = std::move(legal_actions[row]);
+			output[row].legal_policy.resize(output[row].legal_indices.size());
+			for (std::size_t column = 0; column < output[row].legal_indices.size(); ++column) {
+				output[row].legal_policy[column] =
 					probability_rows[static_cast<std::int64_t>(row)]
 									[static_cast<std::int64_t>(column)];
 			}
-			output.values[row] = value_rows[static_cast<std::int64_t>(row)];
+			output[row].value = value_rows[static_cast<std::int64_t>(row)];
+		}
+		return output;
+	}
+
+	// Densify only for MCTS and user-facing search, whose node logic indexes the full action space.
+	Evaluation evaluate(const std::vector<chess::Board> &boards) {
+		auto compact = evaluate_closed(boards);
+		Evaluation output;
+		output.policies.resize(compact.size(), std::vector<float>(kActionSize, 0.0F));
+		output.values.resize(compact.size());
+		for (std::size_t row = 0; row < compact.size(); ++row) {
+			for (std::size_t column = 0; column < compact[row].legal_indices.size(); ++column) {
+				output.policies[row][compact[row].legal_indices[column]] =
+					compact[row].legal_policy[column];
+			}
+			output.values[row] = compact[row].value;
 		}
 		return output;
 	}
@@ -629,6 +645,12 @@ SearchResult Searcher::search(const chess::Board &board,
 // Search a batch without progress callbacks, as used by arena and FCPI.
 std::vector<SearchResult> Searcher::search_many(const std::vector<chess::Board> &boards) {
 	return impl_->search_many(boards);
+}
+
+// Return the compact frozen-model contract used by FCPI generation.
+std::vector<ClosedEvaluation>
+Searcher::evaluate_closed_many(const std::vector<chess::Board> &boards) {
+	return impl_->evaluate_closed(boards);
 }
 
 // Convert the command-line search mode to the strongly typed enum.

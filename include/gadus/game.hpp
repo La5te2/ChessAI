@@ -39,9 +39,15 @@ PackedState encode_state(const chess::Board &board);
 /// Expands packed rows into a float tensor shaped [count, 18, 8, 8].
 torch::Tensor decode_states(const std::uint8_t *packed, std::int64_t count,
 							bool pinned_memory = false);
+/// Transfers packed rows first and expands their bits on the destination device.
+torch::Tensor decode_states_device(const std::uint8_t *packed, std::int64_t count,
+								   const torch::Device &device);
 /// Encodes live boards directly into a batched Gadus input tensor.
 torch::Tensor encode_boards(const std::vector<chess::Board> &boards,
 							bool pinned_memory = false);
+/// Encodes live boards and expands packed planes on the destination device.
+torch::Tensor encode_boards_device(const std::vector<chess::Board> &boards,
+								   const torch::Device &device);
 
 /// Applies all chess terminal rules represented by the chess library.
 bool game_is_over(const chess::Board &board);

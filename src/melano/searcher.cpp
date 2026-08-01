@@ -127,8 +127,8 @@ struct Searcher::Impl {
 	}
 
 	// Gather only legal P/A entries before crossing the device boundary.
-	Evaluation collect(ModelOutput prediction, const std::vector<chess::Board> &boards,
-					   const torch::Tensor &latents = {}) {
+	std::vector<ClosedEvaluation> collect_closed(ModelOutput prediction,
+											  const std::vector<chess::Board> &boards) {
 		std::vector<std::vector<int>> legal_actions(boards.size());
 		std::size_t legal_width = 1;
 		for (std::size_t row = 0; row < boards.size(); ++row) {
@@ -182,27 +182,44 @@ struct Searcher::Impl {
 							  .contiguous();
 		const auto rows = static_cast<std::size_t>(values.size(0));
 
-		Evaluation output;
-		output.policies.resize(rows, std::vector<float>(kActionSize, 0.0F));
-		output.values.resize(rows);
-		output.advantages.resize(rows, std::vector<float>(kActionSize, 0.0F));
-		if (latents.defined()) {
-			output.latents.reserve(rows);
-		}
+		std::vector<ClosedEvaluation> output(rows);
 		auto probability_rows = probabilities.accessor<float, 2>();
 		auto value_rows = values.accessor<float, 1>();
 		auto advantage_rows = advantages.accessor<float, 2>();
 		for (std::size_t row = 0; row < rows; ++row) {
-			output.values[row] = value_rows[static_cast<std::int64_t>(row)];
-			for (std::size_t column = 0; column < legal_actions[row].size(); ++column) {
-				const int action = legal_actions[row][column];
-				output.policies[row][action] =
+			output[row].legal_indices = std::move(legal_actions[row]);
+			output[row].legal_policy.resize(output[row].legal_indices.size());
+			output[row].legal_advantages.resize(output[row].legal_indices.size());
+			output[row].value = value_rows[static_cast<std::int64_t>(row)];
+			for (std::size_t column = 0; column < output[row].legal_indices.size(); ++column) {
+				output[row].legal_policy[column] =
 					probability_rows[static_cast<std::int64_t>(row)]
 									[static_cast<std::int64_t>(column)];
-				output.advantages[row][action] =
+				output[row].legal_advantages[column] =
 					advantage_rows[static_cast<std::int64_t>(row)]
 								  [static_cast<std::int64_t>(column)];
 			}
+		}
+		return output;
+	}
+
+	// Rebuild dense arrays only for MCTS, which indexes action values throughout its tree.
+	Evaluation densify(std::vector<ClosedEvaluation> compact,
+					   const torch::Tensor &latents = {}) {
+		Evaluation output;
+		output.policies.resize(compact.size(), std::vector<float>(kActionSize, 0.0F));
+		output.values.resize(compact.size());
+		output.advantages.resize(compact.size(), std::vector<float>(kActionSize, 0.0F));
+		if (latents.defined()) {
+			output.latents.reserve(compact.size());
+		}
+		for (std::size_t row = 0; row < compact.size(); ++row) {
+			for (std::size_t column = 0; column < compact[row].legal_indices.size(); ++column) {
+				const int action = compact[row].legal_indices[column];
+				output.policies[row][action] = compact[row].legal_policy[column];
+				output.advantages[row][action] = compact[row].legal_advantages[column];
+			}
+			output.values[row] = compact[row].value;
 			if (latents.defined()) {
 				output.latents.push_back(
 					latents.index({static_cast<std::int64_t>(row)}).contiguous());
@@ -226,7 +243,23 @@ struct Searcher::Impl {
 			latents = model->encode(states);
 			prediction = model->predict(latents);
 		}
-		return collect(std::move(prediction), boards, latents);
+		return densify(collect_closed(std::move(prediction), boards), latents);
+	}
+
+	// Evaluate exact P/V/A for FCPI without retaining latent anchors or dense action arrays.
+	std::vector<ClosedEvaluation> evaluate_closed(const std::vector<chess::Board> &boards) {
+		if (boards.empty()) {
+			return {};
+		}
+		torch::InferenceMode guard;
+		const bool pin_memory = device.is_cuda();
+		auto states = encode_boards(boards, pin_memory).to(device, true);
+		ModelOutput prediction;
+		{
+			AutocastGuard autocast(options.precision, device);
+			prediction = model->forward(states);
+		}
+		return collect_closed(std::move(prediction), boards);
 	}
 
 	// Predict odd-depth leaves from their exact even-depth parent anchors.
@@ -249,7 +282,7 @@ struct Searcher::Impl {
 			auto successors = model->transition(parent_batch, action_batch);
 			prediction = model->predict(successors);
 		}
-		return collect(std::move(prediction), boards);
+		return densify(collect_closed(std::move(prediction), boards));
 	}
 
 	// Expand legal edges and derive each current-player Q prior as clamp(V(s)+A(s,a)).
@@ -765,6 +798,12 @@ SearchResult Searcher::search(const chess::Board &board,
 // Search a batch without progress callbacks, as used by arena and FCPI.
 std::vector<SearchResult> Searcher::search_many(const std::vector<chess::Board> &boards) {
 	return impl_->search_many(boards);
+}
+
+// Return the compact frozen-model contract used by FCPI generation.
+std::vector<ClosedEvaluation>
+Searcher::evaluate_closed_many(const std::vector<chess::Board> &boards) {
+	return impl_->evaluate_closed(boards);
 }
 
 // Convert the command-line search mode to the strongly typed enum.
