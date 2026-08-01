@@ -28,6 +28,7 @@ namespace melano {
 namespace {
 
 inline constexpr const char *kFcpiFormula = "factual_counterfactual_latent";
+inline constexpr std::int64_t kLatentTransitionsPerChunk = 512;
 
 // Format iteration numbers for stable, lexically sortable artifact names.
 std::string zero_pad(int value, int width) {
@@ -50,6 +51,8 @@ struct Position {
 	bool has_factual_return = false;
 	float tree_value_target = 0.0F;
 	std::vector<float> policy_target;
+	std::vector<float> mc_policy_advantage_sums;
+	std::vector<float> mc_policy_weights;
 	std::vector<float> candidate_q;
 	std::vector<float> candidate_target_weights;
 	std::vector<float> advantage_target;
@@ -111,7 +114,12 @@ struct TargetSummary {
 	std::int64_t decision_nodes = 0;
 	std::int64_t evaluated_edges = 0;
 	std::int64_t terminal_edges = 0;
-	std::int64_t factual_edges = 0;
+	std::int64_t factual_policy_samples = 0;
+	std::int64_t bellman_calibration_samples = 0;
+	double bellman_step = 0.0;
+	double bellman_old_mse = 0.0;
+	double bellman_raw_mse = 0.0;
+	double bellman_calibrated_mse = 0.0;
 	int max_depth = 0;
 	double residual_sum = 0.0;
 	std::int64_t residual_count = 0;
@@ -125,6 +133,14 @@ struct TargetSummary {
 	double max_abs_advantage = 0.0;
 	std::int64_t policy_top1_changes = 0;
 	std::int64_t policy_diagnostic_nodes = 0;
+};
+
+struct BellmanCalibration {
+	std::int64_t samples = 0;
+	double step = 0.0;
+	double old_mse = 0.0;
+	double raw_mse = 0.0;
+	double calibrated_mse = 0.0;
 };
 
 struct SamplingSpec {
@@ -435,6 +451,8 @@ std::vector<Position> collect_selfplay(Model model, const torch::Device &device,
 				position.legal_prior = prior;
 				position.legal_advantage = advantages;
 				position.played_index = played;
+				position.mc_policy_advantage_sums.assign(legal.size(), 0.0F);
+				position.mc_policy_weights.assign(legal.size(), 0.0F);
 				trajectory.positions.push_back(std::move(position));
 				board.makeMove(moves[choice]);
 				const bool terminal = game_is_over(board);
@@ -470,9 +488,20 @@ std::vector<Position> collect_selfplay(Model model, const torch::Device &device,
 			for (int index = static_cast<int>(trajectory.positions.size()) - 1; index >= 0;
 				 --index) {
 				const float current_return = -next_return;
-				trajectory.positions[index].factual_return =
-					std::clamp(current_return, -1.0F, 1.0F);
-				trajectory.positions[index].has_factual_return = true;
+				auto &position = trajectory.positions[index];
+				position.factual_return = std::clamp(current_return, -1.0F, 1.0F);
+				position.has_factual_return = true;
+				const auto played = std::find(position.legal_indices.begin(),
+									  position.legal_indices.end(), position.played_index);
+				if (played == position.legal_indices.end()) {
+					throw std::runtime_error("FCPI behavior action is absent from legal actions");
+				}
+				const auto column = static_cast<std::size_t>(played - position.legal_indices.begin());
+				// A terminal result supplies a signed score-function residual for the
+				// observed action. It does not become a hard Q entry under max backup.
+				position.mc_policy_advantage_sums[column] = std::clamp(
+					0.5F * (position.factual_return - position.root_value), -1.0F, 1.0F);
+				position.mc_policy_weights[column] = 1.0F;
 				next_return = current_return;
 			}
 		} else {
@@ -511,6 +540,84 @@ std::vector<Position> collect_selfplay(Model model, const torch::Device &device,
 	};
 	std::cout << "fcpi position sampling: " << sampling_summary.dump() << std::endl;
 	return records;
+}
+
+// Fit the single damped Bellman step that best predicts completed-trajectory
+// returns from the frozen model's one-step residuals. Terminal successors are
+// excluded because chess rules already provide their exact edge values.
+BellmanCalibration calibrate_bellman_step(const std::vector<Position> &records,
+										 Searcher &evaluator, int batch_size) {
+	std::vector<chess::Board> successors;
+	std::unordered_map<std::string, std::size_t> successor_rows;
+	std::vector<std::size_t> sample_successors;
+	std::vector<double> old_q;
+	std::vector<double> returns;
+	for (const auto &record : records) {
+		if (!record.has_factual_return) {
+			continue;
+		}
+		if (record.legal_indices.size() != record.legal_advantage.size()) {
+			throw std::runtime_error("Melano factual calibration requires aligned legal A values");
+		}
+		const auto legal = std::find(record.legal_indices.begin(), record.legal_indices.end(),
+									 record.played_index);
+		if (legal == record.legal_indices.end()) {
+			throw std::runtime_error("Melano factual calibration action is illegal");
+		}
+		chess::Board board(record.fen);
+		const auto move = index_to_move(record.played_index, board);
+		if (move.move() == chess::Move::NO_MOVE) {
+			throw std::runtime_error("Melano factual calibration move cannot be decoded");
+		}
+		board.makeMove(move);
+		if (game_is_over(board)) {
+			continue;
+		}
+		const auto column = static_cast<std::size_t>(legal - record.legal_indices.begin());
+		old_q.push_back(std::clamp(static_cast<double>(record.root_value) +
+									 static_cast<double>(record.legal_advantage[column]),
+								 -1.0, 1.0));
+		returns.push_back(record.factual_return);
+		const auto key = packed_key(encode_state(board));
+		const auto [found, inserted] = successor_rows.emplace(key, successors.size());
+		if (inserted) {
+			successors.push_back(std::move(board));
+		}
+		sample_successors.push_back(found->second);
+	}
+
+	BellmanCalibration calibration;
+	calibration.samples = static_cast<std::int64_t>(old_q.size());
+	if (old_q.empty()) {
+		return calibration;
+	}
+	const auto evaluations = evaluate_chunks(evaluator, successors, batch_size);
+	double numerator = 0.0;
+	double denominator = 0.0;
+	std::vector<double> raw_q(old_q.size());
+	for (std::size_t index = 0; index < old_q.size(); ++index) {
+		raw_q[index] = std::clamp(
+			-static_cast<double>(evaluations[sample_successors[index]].value), -1.0, 1.0);
+		const double delta = raw_q[index] - old_q[index];
+		const double residual = returns[index] - old_q[index];
+		numerator += delta * residual;
+		denominator += delta * delta;
+	}
+	if (denominator > 1e-12) {
+		calibration.step = std::clamp(numerator / denominator, 0.0, 1.0);
+	}
+	for (std::size_t index = 0; index < old_q.size(); ++index) {
+		const double calibrated =
+			old_q[index] + calibration.step * (raw_q[index] - old_q[index]);
+		calibration.old_mse += std::pow(returns[index] - old_q[index], 2.0);
+		calibration.raw_mse += std::pow(returns[index] - raw_q[index], 2.0);
+		calibration.calibrated_mse += std::pow(returns[index] - calibrated, 2.0);
+	}
+	const double divisor = static_cast<double>(old_q.size());
+	calibration.old_mse /= divisor;
+	calibration.raw_mse /= divisor;
+	calibration.calibrated_mse /= divisor;
+	return calibration;
 }
 
 // Materialize one exact Melano decision node with frozen P/V/A predictions.
@@ -650,8 +757,8 @@ float evaluated_policy_mass(const TreeNode &node) {
 	return std::clamp(mass, 0.0F, 1.0F);
 }
 
-// Expand exact-board counterfactual trees. Exact terminal and completed-trajectory
-// returns anchor P/V/A targets; every expanded edge also trains latent dynamics.
+// Expand exact-board counterfactual trees. Exact terminal edges remain undamped;
+// completed trajectories calibrate non-terminal Bellman movement and Policy feedback.
 void construct_targets(std::vector<Position> &records, Model model, const torch::Device &device,
 					   const FcpiOptions &options, TargetSummary &summary) {
 	if (options.counterfactual_budget < 0) {
@@ -669,14 +776,24 @@ void construct_targets(std::vector<Position> &records, Model model, const torch:
 		if (!record.has_factual_return) {
 			continue;
 		}
+		++summary.factual_policy_samples;
 		auto &statistics = factual_returns[packed_key(record.state)][record.played_index];
 		statistics.sum += record.factual_return;
 		++statistics.count;
 	}
+	const auto calibration =
+		calibrate_bellman_step(records, evaluator, options.inference_batch_size);
+	summary.bellman_calibration_samples = calibration.samples;
+	summary.bellman_step = calibration.step;
+	summary.bellman_old_mse = calibration.old_mse;
+	summary.bellman_raw_mse = calibration.raw_mse;
+	summary.bellman_calibrated_mse = calibration.calibrated_mse;
 	std::vector<Position> tree_records;
 	tree_records.reserve(records.size() * 2);
 	std::cout << "fcpi counterfactual tree start: positions=" << records.size()
-			  << " deep_budget_per_root=" << options.counterfactual_budget << std::endl;
+			  << " deep_budget_per_root=" << options.counterfactual_budget
+			  << " factual_samples=" << summary.factual_policy_samples
+			  << " bellman_step=" << summary.bellman_step << std::endl;
 
 	for (std::size_t subset_begin = 0; subset_begin < records.size();
 		 subset_begin += std::max(1, options.target_records_per_batch)) {
@@ -842,25 +959,21 @@ void construct_targets(std::vector<Position> &records, Model model, const torch:
 				for (std::size_t slot = 0; slot < node.candidate_indices.size(); ++slot) {
 					const int action = node.candidate_indices[slot];
 					const auto legal = std::find(node.legal_indices.begin(),
-												node.legal_indices.end(), action);
+											node.legal_indices.end(), action);
 					const auto &child =
 						tree.nodes[static_cast<std::size_t>(node.children[slot])];
-					float q = -child.backed_value;
-					if (!child.terminal) {
-						const auto state = factual_returns.find(packed_key(node.state));
-						if (state != factual_returns.end()) {
-							const auto factual =
-								state->second.find(node.candidate_indices[slot]);
-							if (factual != state->second.end() &&
-								factual->second.count > 0) {
-								q = static_cast<float>(
-									factual->second.sum /
-									static_cast<double>(factual->second.count));
-								++summary.factual_edges;
-							}
-						}
-					}
-					action_values[static_cast<std::size_t>(legal - node.legal_indices.begin())] = q;
+					const auto legal_index =
+						static_cast<std::size_t>(legal - node.legal_indices.begin());
+					const float old_q = action_values[legal_index];
+					const float raw_q = std::clamp(-child.backed_value, -1.0F, 1.0F);
+					// Exact terminal edges need no damping. Every non-terminal Bellman
+					// correction uses the step fitted from completed trajectories.
+					const float q = child.terminal
+						? raw_q
+						: std::clamp(old_q + static_cast<float>(summary.bellman_step) *
+										 (raw_q - old_q),
+								 -1.0F, 1.0F);
+					action_values[legal_index] = q;
 					node.candidate_q[slot] = q;
 				}
 				node.policy_target = improve_policy(node.legal_prior, action_values);
@@ -893,6 +1006,17 @@ void construct_targets(std::vector<Position> &records, Model model, const torch:
 				record.played_index = node_index == 0 ? root.played_index : -1;
 				record.candidate_indices = node.candidate_indices;
 				record.policy_target = node.policy_target;
+				record.mc_policy_advantage_sums.assign(node.legal_indices.size(), 0.0F);
+				record.mc_policy_weights.assign(node.legal_indices.size(), 0.0F);
+				if (node_index == 0) {
+					if (root.mc_policy_advantage_sums.size() != node.legal_indices.size() ||
+						root.mc_policy_weights.size() != node.legal_indices.size()) {
+						throw std::runtime_error(
+							"Melano factual Policy feedback is not aligned with legal actions");
+					}
+					record.mc_policy_advantage_sums = root.mc_policy_advantage_sums;
+					record.mc_policy_weights = root.mc_policy_weights;
+				}
 				record.candidate_q = node.candidate_q;
 				record.policy_weight =
 					static_cast<float>(node.candidate_indices.size()) / edge_total;
@@ -937,7 +1061,10 @@ void construct_targets(std::vector<Position> &records, Model model, const torch:
 			  << " decision_nodes=" << summary.decision_nodes
 			  << " evaluated_edges=" << summary.evaluated_edges
 			  << " terminal_edges=" << summary.terminal_edges
-			  << " factual_edges=" << summary.factual_edges
+			  << " factual_samples=" << summary.factual_policy_samples
+			  << " bellman_step=" << summary.bellman_step
+			  << " bellman_mse=" << summary.bellman_old_mse << "->"
+			  << summary.bellman_calibrated_mse
 			  << " max_depth=" << summary.max_depth << " mean_residual="
 			  << (summary.residual_count > 0 ? summary.residual_sum / summary.residual_count : 0.0)
 			  << " tree_value_nodes=" << summary.tree_value_count
@@ -985,6 +1112,12 @@ std::vector<Position> aggregate_records(std::vector<Position> records, nlohmann:
 		if (merged.legal_indices != record.legal_indices) {
 			throw std::runtime_error("identical encoded states produced different legal actions");
 		}
+		if (merged.mc_policy_advantage_sums.size() != merged.legal_indices.size() ||
+			merged.mc_policy_weights.size() != merged.legal_indices.size() ||
+			record.mc_policy_advantage_sums.size() != record.legal_indices.size() ||
+			record.mc_policy_weights.size() != record.legal_indices.size()) {
+			throw std::runtime_error("Melano factual Policy feedback has invalid width");
+		}
 		const float old_count = static_cast<float>(merged.aggregate_count);
 		const float new_count = old_count + 1.0F;
 		const float old_policy_weight = merged.policy_weight;
@@ -1006,6 +1139,9 @@ std::vector<Position> aggregate_records(std::vector<Position> records, nlohmann:
 			merged.legal_advantage[index] =
 				(merged.legal_advantage[index] * old_count + record.legal_advantage[index]) /
 				new_count;
+			merged.mc_policy_advantage_sums[index] +=
+				record.mc_policy_advantage_sums[index];
+			merged.mc_policy_weights[index] += record.mc_policy_weights[index];
 		}
 		if (new_tree_value_weight > 0.0F) {
 			merged.tree_value_target =
@@ -1089,6 +1225,8 @@ nlohmann::json write_fcpi_h5(const std::filesystem::path &path, std::vector<Posi
 	std::vector<std::int32_t> legal(count * legal_width, 0);
 	std::vector<float> priors(count * legal_width, 0.0F);
 	std::vector<float> policy(count * legal_width, 0.0F);
+	std::vector<float> mc_policy_advantage_sums(count * legal_width, 0.0F);
+	std::vector<float> mc_policy_weights(count * legal_width, 0.0F);
 	std::vector<std::uint8_t> legal_counts(count);
 	std::vector<float> tree_values(count);
 	std::vector<float> policy_weights(count);
@@ -1100,6 +1238,7 @@ nlohmann::json write_fcpi_h5(const std::filesystem::path &path, std::vector<Posi
 	std::vector<std::uint8_t> candidate_next_states(
 		count * candidate_width * static_cast<std::size_t>(kStateFeatures));
 	std::vector<std::uint8_t> candidate_counts(count);
+	double mc_policy_samples = 0.0;
 	for (std::size_t row = 0; row < count; ++row) {
 		std::copy(records[row].state.begin(), records[row].state.end(),
 				  states.begin() + row * kStateFeatures);
@@ -1112,6 +1251,11 @@ nlohmann::json write_fcpi_h5(const std::filesystem::path &path, std::vector<Posi
 			legal[row * legal_width + column] = records[row].legal_indices[column];
 			priors[row * legal_width + column] = records[row].legal_prior[column];
 			policy[row * legal_width + column] = records[row].policy_target[column];
+			mc_policy_advantage_sums[row * legal_width + column] =
+				records[row].mc_policy_advantage_sums[column];
+			mc_policy_weights[row * legal_width + column] =
+				records[row].mc_policy_weights[column];
+			mc_policy_samples += records[row].mc_policy_weights[column];
 		}
 		for (std::size_t column = 0; column < records[row].candidate_indices.size(); ++column) {
 			candidates[row * candidate_width + column] = records[row].candidate_indices[column];
@@ -1141,6 +1285,10 @@ nlohmann::json write_fcpi_h5(const std::filesystem::path &path, std::vector<Posi
 				  priors.data());
 	write_dataset(file, "policy_targets", H5T_IEEE_F32LE, H5T_NATIVE_FLOAT, {count, legal_width},
 				  policy.data());
+	write_dataset(file, "mc_policy_advantage_sums", H5T_IEEE_F32LE, H5T_NATIVE_FLOAT,
+				  {count, legal_width}, mc_policy_advantage_sums.data());
+	write_dataset(file, "mc_policy_weights", H5T_IEEE_F32LE, H5T_NATIVE_FLOAT,
+				  {count, legal_width}, mc_policy_weights.data());
 	write_dataset(file, "legal_counts", H5T_STD_U8LE, H5T_NATIVE_UINT8, {count},
 				  legal_counts.data());
 	write_dataset(file, "tree_value_targets", H5T_IEEE_F32LE, H5T_NATIVE_FLOAT, {count},
@@ -1165,12 +1313,13 @@ nlohmann::json write_fcpi_h5(const std::filesystem::path &path, std::vector<Posi
 	return {
 		{"path", path.string()},	  {"positions", count},
 		{"legal_width", legal_width}, {"counterfactual_width", candidate_width},
+		{"mc_policy_samples", mc_policy_samples},
 		{"formula", kFcpiFormula},	  {"aggregation", aggregation},
 	};
 }
 
-// Train P/V/A/dynamics on fact-anchored counterfactual trees. Monte Carlo
-// outcomes supervise factual action Q; the tree maximum supervises V.
+// Train P/V/A/dynamics on calibrated counterfactual trees. Monte Carlo outcomes
+// update observed Policy actions without becoming hard entries in the max-Q table.
 nlohmann::json train_candidate(const std::filesystem::path &source,
 							   const std::filesystem::path &candidate, Model model,
 							   const torch::Device &device, std::vector<Position> &records,
@@ -1191,7 +1340,7 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 	std::mt19937_64 rng(options.seed);
 	std::int64_t steps = 0;
 	auto metric_totals =
-		torch::zeros({6}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+		torch::zeros({8}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
 	for (int epoch = 0; epoch < std::max(0, options.epochs); ++epoch) {
 		std::shuffle(order.begin(), order.end(), rng);
 		for (std::size_t begin = 0; begin < order.size();
@@ -1200,15 +1349,17 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 			const std::int64_t batch = static_cast<std::int64_t>(end - begin);
 			std::size_t width = 1;
 			std::vector<std::uint8_t> packed(batch * kStateFeatures);
-			std::size_t candidate_width = 1;
+			std::size_t candidate_count = 0;
 			for (std::size_t index = begin; index < end; ++index) {
 				width = std::max(width, records[order[index]].legal_indices.size());
-				candidate_width =
-					std::max(candidate_width, records[order[index]].candidate_indices.size());
+				candidate_count += records[order[index]].candidate_indices.size();
 				std::copy(records[order[index]].state.begin(), records[order[index]].state.end(),
 						  packed.begin() + (index - begin) * kStateFeatures);
 			}
-			std::vector<std::uint8_t> packed_next(batch * candidate_width * kStateFeatures);
+			if (candidate_count == 0) {
+				throw std::runtime_error("Melano FCPI batch contains no candidate edges");
+			}
+			std::vector<std::uint8_t> packed_next(candidate_count * kStateFeatures);
 			const bool pin_memory = device.is_cuda();
 			auto int_options =
 				torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
@@ -1223,27 +1374,36 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 				torch::zeros({batch, static_cast<std::int64_t>(width)}, int_options);
 			auto targets =
 				torch::zeros({batch, static_cast<std::int64_t>(width)}, float_options);
+			auto mc_policy_advantage_sums =
+				torch::zeros({batch, static_cast<std::int64_t>(width)}, float_options);
+			auto mc_policy_weights =
+				torch::zeros({batch, static_cast<std::int64_t>(width)}, float_options);
 			auto counts = torch::zeros({batch}, int_options);
 			auto tree_values = torch::zeros({batch}, float_options);
 			auto policy_weights = torch::zeros({batch}, float_options);
 			auto tree_value_weights = torch::zeros({batch}, float_options);
 			auto candidate_indices =
-				torch::zeros({batch, static_cast<std::int64_t>(candidate_width)}, int_options);
+				torch::zeros({static_cast<std::int64_t>(candidate_count)}, int_options);
+			auto candidate_parent_rows =
+				torch::zeros({static_cast<std::int64_t>(candidate_count)}, int_options);
 			auto candidate_q_targets =
-				torch::zeros({batch, static_cast<std::int64_t>(candidate_width)}, float_options);
+				torch::zeros({static_cast<std::int64_t>(candidate_count)}, float_options);
 			auto candidate_weights =
-				torch::zeros({batch, static_cast<std::int64_t>(candidate_width)}, float_options);
-			auto candidate_counts = torch::zeros({batch}, int_options);
+				torch::zeros({static_cast<std::int64_t>(candidate_count)}, float_options);
 			auto legal_access = legal.accessor<std::int64_t, 2>();
 			auto target_access = targets.accessor<float, 2>();
+			auto mc_policy_advantage_access =
+				mc_policy_advantage_sums.accessor<float, 2>();
+			auto mc_policy_weight_access = mc_policy_weights.accessor<float, 2>();
 			auto count_access = counts.accessor<std::int64_t, 1>();
 			auto tree_value_access = tree_values.accessor<float, 1>();
 			auto policy_weight_access = policy_weights.accessor<float, 1>();
 			auto tree_value_weight_access = tree_value_weights.accessor<float, 1>();
-			auto candidate_access = candidate_indices.accessor<std::int64_t, 2>();
-			auto candidate_q_access = candidate_q_targets.accessor<float, 2>();
-			auto candidate_weight_access = candidate_weights.accessor<float, 2>();
-			auto candidate_count_access = candidate_counts.accessor<std::int64_t, 1>();
+			auto candidate_access = candidate_indices.accessor<std::int64_t, 1>();
+			auto candidate_parent_access = candidate_parent_rows.accessor<std::int64_t, 1>();
+			auto candidate_q_access = candidate_q_targets.accessor<float, 1>();
+			auto candidate_weight_access = candidate_weights.accessor<float, 1>();
+			std::size_t candidate_cursor = 0;
 			for (std::size_t index = begin; index < end; ++index) {
 				const auto &record = records[order[index]];
 				const auto row = static_cast<std::int64_t>(index - begin);
@@ -1251,71 +1411,79 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 				tree_value_access[row] = record.tree_value_target;
 				policy_weight_access[row] = record.policy_weight;
 				tree_value_weight_access[row] = record.tree_value_weight;
-				candidate_count_access[row] = record.candidate_indices.size();
 				for (std::size_t column = 0; column < record.legal_indices.size(); ++column) {
 					legal_access[row][column] = record.legal_indices[column];
 					target_access[row][column] = record.policy_target[column];
+					mc_policy_advantage_access[row][column] =
+						record.mc_policy_advantage_sums[column];
+					mc_policy_weight_access[row][column] = record.mc_policy_weights[column];
 				}
 				for (std::size_t column = 0; column < record.candidate_indices.size(); ++column) {
-					candidate_access[row][column] = record.candidate_indices[column];
-					candidate_q_access[row][column] = record.candidate_q[column];
-					candidate_weight_access[row][column] =
+					candidate_access[candidate_cursor] = record.candidate_indices[column];
+					candidate_parent_access[candidate_cursor] = row;
+					candidate_q_access[candidate_cursor] = record.candidate_q[column];
+					candidate_weight_access[candidate_cursor] =
 						record.candidate_target_weights[column];
 					std::copy(record.candidate_next_states[column].begin(),
 							  record.candidate_next_states[column].end(),
-							  packed_next.begin() +
-								  (row * candidate_width + column) * kStateFeatures);
+							  packed_next.begin() + candidate_cursor * kStateFeatures);
+					++candidate_cursor;
 				}
 			}
-			auto next_states =
-				decode_states(packed_next.data(),
-							  batch * static_cast<std::int64_t>(candidate_width), pin_memory)
-					.to(device, true);
+			if (candidate_cursor != candidate_count) {
+				throw std::runtime_error("Melano FCPI candidate packing count changed");
+			}
+			// Successor states stay in pinned host memory until their latent-training chunk runs.
+			auto next_states = decode_states(
+				packed_next.data(), static_cast<std::int64_t>(candidate_count), pin_memory);
 			legal = legal.to(device, true);
 			targets = targets.to(device, true);
+			mc_policy_advantage_sums = mc_policy_advantage_sums.to(device, true);
+			mc_policy_weights = mc_policy_weights.to(device, true);
 			counts = counts.to(device, true);
 			tree_values = tree_values.to(device, true);
 			policy_weights = policy_weights.to(device, true);
 			tree_value_weights = tree_value_weights.to(device, true);
 			candidate_indices = candidate_indices.to(device, true);
+			candidate_parent_rows = candidate_parent_rows.to(device, true);
 			candidate_q_targets = candidate_q_targets.to(device, true);
 			candidate_weights = candidate_weights.to(device, true);
-			candidate_counts = candidate_counts.to(device, true);
 
 			optimizer.zero_grad();
 			torch::Tensor tokens;
-			torch::Tensor predicted_next;
-			torch::Tensor target_next;
 			ModelOutput output;
-			ModelOutput imagined;
 			{
 				AutocastGuard autocast(options.precision, device);
 				tokens = model->encode(states);
 				output = model->predict(tokens);
-				auto repeated_tokens =
-					tokens.unsqueeze(1)
-						.expand({batch, static_cast<std::int64_t>(candidate_width), kTokenCount,
-								 model->channels()})
-						.reshape({batch * static_cast<std::int64_t>(candidate_width), kTokenCount,
-								  model->channels()});
-				predicted_next =
-					model->transition(repeated_tokens, candidate_indices.reshape({-1}));
-				{
-					torch::NoGradGuard no_grad;
-					target_next = target_model->encode(next_states).detach();
-				}
-				imagined = model->predict(predicted_next);
 			}
 			auto selected = output.policy.to(torch::kFloat32).gather(1, legal);
 			auto columns = torch::arange(static_cast<std::int64_t>(width), counts.options());
 			auto mask = columns.unsqueeze(0) < counts.unsqueeze(1);
 			selected = selected.masked_fill(~mask, -1e9);
 			auto log_probability = torch::log_softmax(selected, 1);
+			// Self-play samples Melano's P+A behavior. The detached A correction
+			// reconstructs that distribution while keeping terminal score-function
+			// gradients in Policy; A remains governed by Bellman Q targets.
+			auto selected_legal_advantages =
+				output.advantages.to(torch::kFloat32).gather(1, legal).detach();
+			auto advantage_scale =
+				(selected_legal_advantages.abs() * mask).amax(1, true).clamp_min(1e-4);
+			const double behavior_temperature = std::max(1e-4, options.behavior_temperature);
+			auto behavior_scores =
+				(selected + selected_legal_advantages / advantage_scale) /
+				behavior_temperature;
+			behavior_scores = behavior_scores.masked_fill(~mask, -1e9);
+			auto behavior_log_probability = torch::log_softmax(behavior_scores, 1);
 			auto masked_targets = targets * mask;
 			masked_targets = masked_targets / masked_targets.sum(1, true).clamp_min(1e-8);
 			auto policy_errors = -(masked_targets * log_probability).sum(1);
-			auto policy_loss =
+			auto counterfactual_policy_loss =
 				(policy_errors * policy_weights).sum() / policy_weights.sum().clamp_min(1e-8);
+			auto mc_policy_loss =
+				-(mc_policy_advantage_sums * behavior_log_probability * mask).sum() /
+				 mc_policy_weights.sum().clamp_min(1.0);
+			auto policy_loss = counterfactual_policy_loss + mc_policy_loss;
 			auto predicted_values = output.value.squeeze(1).to(torch::kFloat32);
 			auto tree_value_errors = torch::nn::functional::smooth_l1_loss(
 				predicted_values, tree_values,
@@ -1325,55 +1493,93 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 				(tree_value_errors * tree_value_weights).sum() /
 				tree_weight_sum.clamp_min(1.0);
 			auto value_loss = tree_value_loss;
-			auto selected_advantages =
-				output.advantages.to(torch::kFloat32).gather(1, candidate_indices);
-			auto predicted_q = torch::clamp(predicted_values.unsqueeze(1) + selected_advantages,
-										 -1.0, 1.0);
+			auto advantage_offsets = candidate_parent_rows * kActionSize + candidate_indices;
+			auto selected_advantages = output.advantages.to(torch::kFloat32)
+									  .reshape({-1})
+									  .index_select(0, advantage_offsets);
+			auto predicted_q = torch::clamp(
+				predicted_values.index_select(0, candidate_parent_rows) + selected_advantages,
+				-1.0, 1.0);
 			auto target_q = torch::clamp(candidate_q_targets, -1.0, 1.0);
-			auto candidate_columns = torch::arange(
-				static_cast<std::int64_t>(candidate_width), candidate_counts.options());
-			auto candidate_mask = candidate_columns.unsqueeze(0) < candidate_counts.unsqueeze(1);
-			auto weighted_candidate_mask =
-				candidate_mask * candidate_weights;
 			auto q_errors = torch::nn::functional::smooth_l1_loss(
 				predicted_q, target_q,
 				torch::nn::functional::SmoothL1LossFuncOptions().reduction(torch::kNone));
 			auto dueling_q_loss =
-				(q_errors * weighted_candidate_mask).sum() /
-				weighted_candidate_mask.sum().clamp_min(1e-8);
-			// Exact successor states teach the action-conditioned latent world step.
-			auto predicted_next_fp32 = predicted_next.to(torch::kFloat32);
-			auto target_next_fp32 = target_next.to(torch::kFloat32);
-			auto predicted_unit = predicted_next_fp32 /
-				predicted_next_fp32.square()
-					.sum(-1, true)
-					.sqrt()
-					.clamp_min(kLatentNormEpsilon);
-			auto target_unit = target_next_fp32 /
-				target_next_fp32.square()
-					.sum(-1, true)
-					.sqrt()
-					.clamp_min(kLatentNormEpsilon);
-			auto dynamics_errors =
-				(1.0 - (predicted_unit * target_unit).sum(-1).mean(-1))
-					.reshape({batch, static_cast<std::int64_t>(candidate_width)});
-			auto dynamics_loss =
-				(dynamics_errors * weighted_candidate_mask).sum() /
-				weighted_candidate_mask.sum().clamp_min(1e-8);
-			auto imagined_q =
-				-imagined.value.to(torch::kFloat32).squeeze(1).reshape(
-					{batch, static_cast<std::int64_t>(candidate_width)});
-			auto imagined_errors = torch::nn::functional::smooth_l1_loss(
-				imagined_q, target_q,
-				torch::nn::functional::SmoothL1LossFuncOptions().reduction(torch::kNone));
-			auto imagined_value_loss =
-				(imagined_errors * weighted_candidate_mask).sum() /
-				weighted_candidate_mask.sum().clamp_min(1e-8);
-			auto loss = options.policy_weight * policy_loss + options.value_weight * value_loss +
-						options.dueling_q_weight * dueling_q_loss +
-						options.dynamics_weight * dynamics_loss +
+				(q_errors * candidate_weights).sum() / candidate_weights.sum().clamp_min(1e-8);
+			auto head_loss = options.policy_weight * policy_loss + options.value_weight * value_loss +
+						 options.dueling_q_weight * dueling_q_loss;
+
+			// Latent successor attention scales with the number of real candidate edges. Chunks
+			// backpropagate through detached latent leaves, then one vector-Jacobian product sends
+			// their accumulated latent gradient through the shared parent encoder exactly once.
+			auto dynamics_loss = torch::zeros({}, tree_values.options());
+			auto imagined_value_loss = torch::zeros({}, tree_values.options());
+			auto token_gradient = torch::zeros_like(tokens);
+			const auto candidate_weight_sum = candidate_weights.sum().clamp_min(1e-8);
+			const auto candidate_edges = static_cast<std::int64_t>(candidate_count);
+			for (std::int64_t edge_begin = 0; edge_begin < candidate_edges;
+				 edge_begin += kLatentTransitionsPerChunk) {
+				const auto edge_count =
+					std::min(kLatentTransitionsPerChunk, candidate_edges - edge_begin);
+				auto chunk_actions = candidate_indices.narrow(0, edge_begin, edge_count);
+				auto chunk_parent_rows =
+					candidate_parent_rows.narrow(0, edge_begin, edge_count);
+				auto chunk_weights = candidate_weights.narrow(0, edge_begin, edge_count);
+				auto chunk_targets = target_q.narrow(0, edge_begin, edge_count);
+				auto chunk_next_states =
+					next_states.narrow(0, edge_begin, edge_count).to(device, true);
+				torch::Tensor predicted_next;
+				torch::Tensor target_next;
+				ModelOutput imagined;
+				auto chunk_tokens = tokens.index_select(0, chunk_parent_rows).detach();
+				chunk_tokens.requires_grad_(true);
+				{
+					AutocastGuard autocast(options.precision, device);
+					predicted_next = model->transition(chunk_tokens, chunk_actions);
+					{
+						torch::NoGradGuard no_grad;
+						target_next = target_model->encode(chunk_next_states).detach();
+					}
+					imagined = model->predict(predicted_next);
+				}
+
+				// Exact successor states teach the action-conditioned latent world step.
+				auto predicted_next_fp32 = predicted_next.to(torch::kFloat32);
+				auto target_next_fp32 = target_next.to(torch::kFloat32);
+				auto predicted_unit = predicted_next_fp32 /
+					predicted_next_fp32.square()
+						.sum(-1, true)
+						.sqrt()
+						.clamp_min(kLatentNormEpsilon);
+				auto target_unit = target_next_fp32 /
+					target_next_fp32.square()
+						.sum(-1, true)
+						.sqrt()
+						.clamp_min(kLatentNormEpsilon);
+				auto dynamics_errors =
+					1.0 - (predicted_unit * target_unit).sum(-1).mean(-1);
+				auto chunk_dynamics_loss =
+					(dynamics_errors * chunk_weights).sum() / candidate_weight_sum;
+				auto imagined_q = -imagined.value.to(torch::kFloat32).squeeze(1);
+				auto imagined_errors = torch::nn::functional::smooth_l1_loss(
+					imagined_q, chunk_targets,
+					torch::nn::functional::SmoothL1LossFuncOptions().reduction(torch::kNone));
+				auto chunk_imagined_value_loss =
+					(imagined_errors * chunk_weights).sum() / candidate_weight_sum;
+				auto chunk_loss = options.dynamics_weight * chunk_dynamics_loss +
+							  options.imagined_value_weight * chunk_imagined_value_loss;
+				chunk_loss.backward();
+				if (!chunk_tokens.grad().defined()) {
+					throw std::runtime_error("Melano FCPI latent chunk produced no encoder gradient");
+				}
+				token_gradient.index_add_(0, chunk_parent_rows, chunk_tokens.grad());
+				dynamics_loss.add_(chunk_dynamics_loss.detach());
+				imagined_value_loss.add_(chunk_imagined_value_loss.detach());
+			}
+			head_loss.backward({}, true);
+			tokens.backward(token_gradient);
+			auto loss = head_loss.detach() + options.dynamics_weight * dynamics_loss +
 						options.imagined_value_weight * imagined_value_loss;
-			loss.backward();
 			double gradient_norm = 0.0;
 			if (options.grad_clip > 0.0) {
 				gradient_norm = torch::nn::utils::clip_grad_norm_(
@@ -1383,8 +1589,9 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 			update_target_encoder(target_model, model, options.target_decay);
 			++steps;
 			metric_totals.add_(torch::stack(
-				{loss.detach(), policy_loss.detach(), value_loss.detach(),
-				 dueling_q_loss.detach(), dynamics_loss.detach(),
+				{loss.detach(), policy_loss.detach(), counterfactual_policy_loss.detach(),
+				 mc_policy_loss.detach(), value_loss.detach(), dueling_q_loss.detach(),
+				 dynamics_loss.detach(),
 				 imagined_value_loss.detach()}));
 			if (options.log_every > 0 && (steps == 1 || steps % options.log_every == 0)) {
 				auto metrics =
@@ -1423,15 +1630,17 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 		{"candidate", candidate.string()},
 		{"precision", compute_precision_name(options.precision)},
 		{"target_decay", options.target_decay},
-		{"metrics",
-		 {
+		 {"metrics",
+		  {
 			 {"loss", metric_values[0] / divisor},
 			 {"policy", metric_values[1] / divisor},
-			 {"value", metric_values[2] / divisor},
-			 {"dueling_q", metric_values[3] / divisor},
-			 {"dynamics", metric_values[4] / divisor},
-			 {"imagined_value", metric_values[5] / divisor},
-		 }},
+			 {"policy_counterfactual", metric_values[2] / divisor},
+			 {"policy_mc", metric_values[3] / divisor},
+			 {"value", metric_values[4] / divisor},
+			 {"dueling_q", metric_values[5] / divisor},
+			 {"dynamics", metric_values[6] / divisor},
+			 {"imagined_value", metric_values[7] / divisor},
+		  }},
 	};
 }
 
@@ -1482,7 +1691,12 @@ void run_fcpi(const FcpiOptions &options) {
 			{"decision_nodes", target_summary.decision_nodes},
 			{"evaluated_edges", target_summary.evaluated_edges},
 			{"terminal_edges", target_summary.terminal_edges},
-			{"factual_edges", target_summary.factual_edges},
+			{"factual_policy_samples", target_summary.factual_policy_samples},
+			{"bellman_calibration_samples", target_summary.bellman_calibration_samples},
+			{"bellman_step", target_summary.bellman_step},
+			{"bellman_old_mse", target_summary.bellman_old_mse},
+			{"bellman_raw_mse", target_summary.bellman_raw_mse},
+			{"bellman_calibrated_mse", target_summary.bellman_calibrated_mse},
 			{"max_depth", target_summary.max_depth},
 			{"tree_value_nodes", target_summary.tree_value_count},
 			{"tree_value_weight", target_summary.tree_value_weight_sum},

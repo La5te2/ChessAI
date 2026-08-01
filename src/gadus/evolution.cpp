@@ -43,11 +43,14 @@ struct Position {
 	PackedState state{};
 	std::string fen;
 	float root_value = 0.0F;
+	int behavior_action = -1;
 	std::vector<int> legal_indices;
 	std::vector<float> legal_prior;
 	float mc_value_target = 0.0F;
 	float tree_value_target = 0.0F;
 	std::vector<float> policy_target;
+	std::vector<float> mc_policy_advantage_sums;
+	std::vector<float> mc_policy_weights;
 	float policy_weight = 1.0F;
 	float mc_value_weight = 0.0F;
 	float tree_value_weight = 0.0F;
@@ -393,8 +396,11 @@ std::vector<Position> collect_selfplay(Model model, const torch::Device &device,
 				position.state = state;
 				position.fen = board.getFen();
 				position.root_value = results[row].value;
+				position.behavior_action = legal[choice];
 				position.legal_indices = legal;
 				position.legal_prior = prior;
+				position.mc_policy_advantage_sums.assign(legal.size(), 0.0F);
+				position.mc_policy_weights.assign(legal.size(), 0.0F);
 				trajectory.positions.push_back(std::move(position));
 				board.makeMove(moves[choice]);
 				const bool terminal = game_is_over(board);
@@ -434,6 +440,18 @@ std::vector<Position> collect_selfplay(Model model, const torch::Device &device,
 				trajectory.positions[index].mc_value_target =
 					std::clamp(current_return, -1.0F, 1.0F);
 				trajectory.positions[index].mc_value_weight = 1.0F;
+				auto &position = trajectory.positions[index];
+				const auto behavior = std::find(position.legal_indices.begin(),
+												position.legal_indices.end(), position.behavior_action);
+				if (behavior == position.legal_indices.end()) {
+					throw std::runtime_error("FCPI behavior action is absent from legal actions");
+				}
+				const auto column = static_cast<std::size_t>(behavior - position.legal_indices.begin());
+				// G-V_old is an action-specific factual residual, not a replacement Q value.
+				// Division by two maps the natural [-2, 2] range to [-1, 1].
+				position.mc_policy_advantage_sums[column] =
+					std::clamp(0.5F * (current_return - position.root_value), -1.0F, 1.0F);
+				position.mc_policy_weights[column] = 1.0F;
 				next_return = current_return;
 			}
 		} else {
@@ -780,6 +798,8 @@ void construct_targets(std::vector<Position> &records, Model model, const torch:
 				record.legal_indices = node.legal_indices;
 				record.legal_prior = node.legal_prior;
 				record.policy_target = node.policy_target;
+				record.mc_policy_advantage_sums.assign(node.legal_indices.size(), 0.0F);
+				record.mc_policy_weights.assign(node.legal_indices.size(), 0.0F);
 				const float budget_weight =
 					static_cast<float>(node.candidate_indices.size()) / edge_total;
 				record.policy_weight = budget_weight;
@@ -787,6 +807,14 @@ void construct_targets(std::vector<Position> &records, Model model, const torch:
 					node_index == 0 ? root.mc_value_target : 0.0F;
 				record.mc_value_weight =
 					node_index == 0 ? root.mc_value_weight : 0.0F;
+				if (node_index == 0) {
+					if (root.mc_policy_advantage_sums.size() != node.legal_indices.size() ||
+						root.mc_policy_weights.size() != node.legal_indices.size()) {
+						throw std::runtime_error("FCPI Monte Carlo Policy target width changed");
+					}
+					record.mc_policy_advantage_sums = root.mc_policy_advantage_sums;
+					record.mc_policy_weights = root.mc_policy_weights;
+				}
 
 				// The target itself is coverage-aware because every unexpanded action
 				// contributes V_old(s). The budget weight only distributes one unit of
@@ -863,6 +891,11 @@ std::vector<Position> aggregate_records(std::vector<Position> records, nlohmann:
 		if (merged.legal_indices != record.legal_indices) {
 			throw std::runtime_error("identical encoded states produced different legal actions");
 		}
+		if (merged.mc_policy_advantage_sums.size() != record.mc_policy_advantage_sums.size() ||
+			merged.mc_policy_weights.size() != record.mc_policy_weights.size() ||
+			merged.mc_policy_advantage_sums.size() != merged.legal_indices.size()) {
+			throw std::runtime_error("identical encoded states produced incompatible MC Policy data");
+		}
 		const float old_policy_weight = merged.policy_weight;
 		const float new_policy_weight = old_policy_weight + record.policy_weight;
 		const float old_mc_value_weight = merged.mc_value_weight;
@@ -877,6 +910,8 @@ std::vector<Position> aggregate_records(std::vector<Position> records, nlohmann:
 					 record.policy_target[index] * record.policy_weight) /
 					new_policy_weight;
 			}
+			merged.mc_policy_advantage_sums[index] += record.mc_policy_advantage_sums[index];
+			merged.mc_policy_weights[index] += record.mc_policy_weights[index];
 		}
 		if (new_mc_value_weight > 0.0F) {
 			merged.mc_value_target =
@@ -921,12 +956,15 @@ nlohmann::json write_fcpi_h5(const std::filesystem::path &path, std::vector<Posi
 	std::vector<std::uint8_t> states(count * kStatePlanes * 8);
 	std::vector<std::int32_t> legal(count * legal_width, 0);
 	std::vector<float> policy(count * legal_width, 0.0F);
+	std::vector<float> mc_policy_advantage_sums(count * legal_width, 0.0F);
+	std::vector<float> mc_policy_weights(count * legal_width, 0.0F);
 	std::vector<std::uint8_t> legal_counts(count);
 	std::vector<float> mc_values(count);
 	std::vector<float> tree_values(count);
 	std::vector<float> policy_weights(count);
 	std::vector<float> mc_value_weights(count);
 	std::vector<float> tree_value_weights(count);
+	double mc_policy_samples = 0.0;
 	for (std::size_t row = 0; row < count; ++row) {
 		std::copy(records[row].state.begin(), records[row].state.end(),
 				  states.begin() + row * kStatePlanes * 8);
@@ -939,6 +977,11 @@ nlohmann::json write_fcpi_h5(const std::filesystem::path &path, std::vector<Posi
 		for (std::size_t column = 0; column < records[row].legal_indices.size(); ++column) {
 			legal[row * legal_width + column] = records[row].legal_indices[column];
 			policy[row * legal_width + column] = records[row].policy_target[column];
+			mc_policy_advantage_sums[row * legal_width + column] =
+				records[row].mc_policy_advantage_sums[column];
+			mc_policy_weights[row * legal_width + column] =
+				records[row].mc_policy_weights[column];
+			mc_policy_samples += records[row].mc_policy_weights[column];
 		}
 	}
 	if (!path.parent_path().empty()) {
@@ -954,6 +997,10 @@ nlohmann::json write_fcpi_h5(const std::filesystem::path &path, std::vector<Posi
 				  legal.data());
 	write_dataset(file, "policy_targets", H5T_IEEE_F32LE, H5T_NATIVE_FLOAT, {count, legal_width},
 				  policy.data());
+	write_dataset(file, "mc_policy_advantage_sums", H5T_IEEE_F32LE, H5T_NATIVE_FLOAT,
+				  {count, legal_width}, mc_policy_advantage_sums.data());
+	write_dataset(file, "mc_policy_weights", H5T_IEEE_F32LE, H5T_NATIVE_FLOAT,
+				  {count, legal_width}, mc_policy_weights.data());
 	write_dataset(file, "legal_counts", H5T_STD_U8LE, H5T_NATIVE_UINT8, {count},
 				  legal_counts.data());
 	write_dataset(file, "mc_value_targets", H5T_IEEE_F32LE, H5T_NATIVE_FLOAT, {count},
@@ -971,6 +1018,7 @@ nlohmann::json write_fcpi_h5(const std::filesystem::path &path, std::vector<Posi
 		{"path", path.string()},
 		{"positions", count},
 		{"legal_width", legal_width},
+		{"mc_policy_samples", mc_policy_samples},
 		{"formula", kFcpiFormula},
 		{"aggregation", aggregation},
 	};
@@ -994,7 +1042,7 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 	std::mt19937_64 rng(options.seed);
 	std::int64_t steps = 0;
 	auto metric_totals =
-		torch::zeros({5}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+		torch::zeros({7}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
 	for (int epoch = 0; epoch < std::max(0, options.epochs); ++epoch) {
 		std::shuffle(order.begin(), order.end(), rng);
 		for (std::size_t begin = 0; begin < order.size(); begin += std::max(1, options.batch_size)) {
@@ -1022,6 +1070,10 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 				torch::zeros({batch, static_cast<std::int64_t>(width)}, int_options);
 			auto targets =
 				torch::zeros({batch, static_cast<std::int64_t>(width)}, float_options);
+			auto mc_policy_advantage_sums =
+				torch::zeros({batch, static_cast<std::int64_t>(width)}, float_options);
+			auto mc_policy_weights =
+				torch::zeros({batch, static_cast<std::int64_t>(width)}, float_options);
 			auto counts = torch::zeros({batch}, int_options);
 			auto mc_values = torch::zeros({batch}, float_options);
 			auto tree_values = torch::zeros({batch}, float_options);
@@ -1030,6 +1082,8 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 			auto tree_value_weights = torch::zeros({batch}, float_options);
 			auto legal_access = legal.accessor<std::int64_t, 2>();
 			auto target_access = targets.accessor<float, 2>();
+			auto mc_policy_advantage_access = mc_policy_advantage_sums.accessor<float, 2>();
+			auto mc_policy_weight_access = mc_policy_weights.accessor<float, 2>();
 			auto count_access = counts.accessor<std::int64_t, 1>();
 			auto mc_value_access = mc_values.accessor<float, 1>();
 			auto tree_value_access = tree_values.accessor<float, 1>();
@@ -1048,10 +1102,15 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 				for (std::size_t column = 0; column < record.legal_indices.size(); ++column) {
 					legal_access[row][column] = record.legal_indices[column];
 					target_access[row][column] = record.policy_target[column];
+					mc_policy_advantage_access[row][column] =
+						record.mc_policy_advantage_sums[column];
+					mc_policy_weight_access[row][column] = record.mc_policy_weights[column];
 				}
 			}
 			legal = legal.to(device, true);
 			targets = targets.to(device, true);
+			mc_policy_advantage_sums = mc_policy_advantage_sums.to(device, true);
+			mc_policy_weights = mc_policy_weights.to(device, true);
 			counts = counts.to(device, true);
 			mc_values = mc_values.to(device, true);
 			tree_values = tree_values.to(device, true);
@@ -1072,11 +1131,21 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 			auto mask = columns.unsqueeze(0) < counts.unsqueeze(1);
 			selected = selected.masked_fill(~mask, -1e9);
 			auto log_probability = torch::log_softmax(selected, 1);
+			const double behavior_temperature = std::max(1e-4, options.behavior_temperature);
+			auto behavior_log_probability =
+				torch::log_softmax(selected / behavior_temperature, 1);
 			auto masked_targets = targets * mask;
 			masked_targets = masked_targets / masked_targets.sum(1, true).clamp_min(1e-8);
 			auto policy_errors = -(masked_targets * log_probability).sum(1);
-			auto policy_loss =
+			auto counterfactual_policy_loss =
 				(policy_errors * policy_weights).sum() / policy_weights.sum().clamp_min(1e-8);
+			// This is a behavior-policy score-function update around the frozen Value baseline.
+			// Signed advantages raise or lower only the action actually observed in a
+			// completed trajectory; they never replace the counterfactual Q table.
+			auto mc_policy_loss =
+				-(mc_policy_advantage_sums * behavior_log_probability * mask).sum() /
+				 mc_policy_weights.sum().clamp_min(1.0);
+			auto policy_loss = counterfactual_policy_loss + mc_policy_loss;
 			auto mc_value_errors = torch::nn::functional::smooth_l1_loss(
 				predicted.squeeze(1), mc_values,
 				torch::nn::functional::SmoothL1LossFuncOptions().reduction(torch::kNone));
@@ -1103,8 +1172,9 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 			optimizer.step();
 			++steps;
 			metric_totals.add_(
-				torch::stack({loss.detach(), policy_loss.detach(), value_loss.detach(),
-							  mc_value_loss.detach(), tree_value_loss.detach()}));
+				torch::stack({loss.detach(), policy_loss.detach(),
+							  counterfactual_policy_loss.detach(), mc_policy_loss.detach(),
+							  value_loss.detach(), mc_value_loss.detach(), tree_value_loss.detach()}));
 			if (options.log_every > 0 && (steps == 1 || steps % options.log_every == 0)) {
 				auto metrics =
 					torch::stack({policy_loss.detach(), mc_value_loss.detach(),
@@ -1143,9 +1213,11 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 		 {
 			 {"loss", metric_values[0] / divisor},
 			 {"policy", metric_values[1] / divisor},
-			 {"value", metric_values[2] / divisor},
-			 {"value_mc", metric_values[3] / divisor},
-			 {"value_tree", metric_values[4] / divisor},
+			 {"policy_counterfactual", metric_values[2] / divisor},
+			 {"policy_mc", metric_values[3] / divisor},
+			 {"value", metric_values[4] / divisor},
+			 {"value_mc", metric_values[5] / divisor},
+			 {"value_tree", metric_values[6] / divisor},
 		 }},
 	};
 }
