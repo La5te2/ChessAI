@@ -10,3 +10,4 @@ __pycache__/
 !/api/setup.sh
 !/api/verify.cmake
 !/api/versions.env
+AGENTS.md

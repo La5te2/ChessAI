@@ -343,7 +343,7 @@ struct Searcher::Impl {
 		return exploitation + exploration - options.virtual_loss * child->virtual_visits;
 	}
 
-	// Choose the maximum PUCT edge with deterministic prior and UCI tie breaks.
+	// Break equal PUCT scores by policy prior, then by Melano's edge value.
 	Node *select_child(Node *parent) const {
 		if (parent->children.empty()) {
 			return nullptr;
@@ -358,7 +358,8 @@ struct Searcher::Impl {
 									if (left->prior != right->prior) {
 										return left->prior < right->prior;
 									}
-									return move_uci(left->move) < move_uci(right->move);
+									return edge_value(parent, left.get()) <
+										   edge_value(parent, right.get());
 								})
 			->get();
 	}

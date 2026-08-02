@@ -65,14 +65,20 @@ mkdir "%PUBLISH_DIR%\gadus" || goto :failed
 mkdir "%PUBLISH_DIR%\melano" || goto :failed
 if "%BUILD_GRAPHICS%"=="ON" mkdir "%PUBLISH_DIR%\graphics" || goto :failed
 
-for %%A in (gadus melano) do (
-	for %%F in (preprocess train search arena fcpi uci) do (
-		if not exist "%WORK_DIR%\%%A\%%F.exe" goto :failed
-		copy /y "%WORK_DIR%\%%A\%%F.exe" "%PUBLISH_DIR%\%%A\%%F.exe" >nul || goto :failed
-	)
-	for %%F in ("%WORK_DIR%\%%A\*.dll") do (
-		copy /y "%%~fF" "%PUBLISH_DIR%\%%A\%%~nxF" >nul || goto :failed
-	)
+for %%F in (preprocess train search arena fcpi uci) do (
+	if not exist "%WORK_DIR%\gadus\%%F.exe" goto :failed
+	copy /y "%WORK_DIR%\gadus\%%F.exe" "%PUBLISH_DIR%\gadus\%%F.exe" >nul || goto :failed
+)
+for %%F in ("%WORK_DIR%\gadus\*.dll") do (
+	copy /y "%%~fF" "%PUBLISH_DIR%\gadus\%%~nxF" >nul || goto :failed
+)
+
+for %%F in (preprocess train search arena uci) do (
+	if not exist "%WORK_DIR%\melano\%%F.exe" goto :failed
+	copy /y "%WORK_DIR%\melano\%%F.exe" "%PUBLISH_DIR%\melano\%%F.exe" >nul || goto :failed
+)
+for %%F in ("%WORK_DIR%\melano\*.dll") do (
+	copy /y "%%~fF" "%PUBLISH_DIR%\melano\%%~nxF" >nul || goto :failed
 )
 
 if "%BUILD_GRAPHICS%"=="ON" (

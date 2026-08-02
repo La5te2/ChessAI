@@ -240,6 +240,11 @@ struct Searcher::Impl {
 										 std::sqrt(visited_policy_mass(parent)));
 	}
 
+	// Return the edge value in the parent side-to-move perspective.
+	float edge_value(const Node *parent, const Node *child) const {
+		return child->visits > 0 ? -child->q() : fpu(parent);
+	}
+
 	// Increase exploration logarithmically with parent visits: c_init + factor*log((N+base+1)/base).
 	double scheduled_c_puct(const Node *parent) const {
 		const double visits = std::max(0, parent->visits + parent->virtual_visits);
@@ -251,7 +256,7 @@ struct Searcher::Impl {
 
 	// Score an edge with PUCT: Q + c_puct*P*sqrt(N_parent)/(1+N_child) - virtual loss.
 	double selection_score(const Node *parent, const Node *child) const {
-		const double exploitation = child->visits > 0 ? -child->q() : fpu(parent);
+		const double exploitation = edge_value(parent, child);
 		const int child_visits = child->visits + child->virtual_visits;
 		const double exploration = scheduled_c_puct(parent) * child->prior *
 								   std::sqrt(parent->visits + parent->virtual_visits + 1.0) /
@@ -259,7 +264,7 @@ struct Searcher::Impl {
 		return exploitation + exploration - options.virtual_loss * child->virtual_visits;
 	}
 
-	// Choose the maximum PUCT edge with deterministic prior and UCI tie breaks.
+	// Break equal PUCT scores by policy prior, then by the edge value in the parent perspective.
 	Node *select_child(Node *parent) const {
 		if (parent->children.empty()) {
 			return nullptr;
@@ -274,7 +279,8 @@ struct Searcher::Impl {
 									if (left->prior != right->prior) {
 										return left->prior < right->prior;
 									}
-									return move_uci(left->move) < move_uci(right->move);
+									return edge_value(parent, left.get()) <
+										   edge_value(parent, right.get());
 								})
 			->get();
 	}
@@ -480,7 +486,7 @@ struct Searcher::Impl {
 				if (child->move == move) {
 					root_move.prior = child->prior;
 					root_move.visits = child->visits;
-					root_move.q = child->visits > 0 ? -child->q() : fpu(state.root.get());
+					root_move.q = edge_value(state.root.get(), child.get());
 					break;
 				}
 			}
