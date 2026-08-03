@@ -1,6 +1,6 @@
 # Gadidae Graphics
 
-Gadidae provides a native graphical client for engines that implement the Universal Chess Interface (UCI). The client uses GLFW, OpenGL 3.3, GLAD, Dear ImGui and FreeType, while the UCI boundary keeps its interface independent of any particular engine architecture.
+Gadidae provides a native graphical client for engines that implement the Universal Chess Interface (UCI). The client uses GLFW, OpenGL 3.3, GLAD, Dear ImGui and FreeType for its graphical interface. The UCI boundary allows the client to work with engines independently of their internal architecture.
 
 ## 1. Installation and Build
 
@@ -24,7 +24,7 @@ The build produces `build/graphics/Gadidae.exe` on Windows and `build/graphics/G
 
 Importing an engine starts its process and performs a standard UCI handshake. The client reads every `option name ...` declaration returned by the engine and generates a matching control. UCI options configure the running engine after the handshake, whereas `Launch arguments` supplies arguments when the operating system starts the engine process.
 
-The client keeps each imported engine process alive for the lifetime of its session. A position change sends `stop` to the current search, discards subsequent output associated with the previous position and submits the new position to the same process. The engine determines how quickly an active search responds to `stop`.
+The client keeps each imported engine process alive for the duration of the importing session. A position change sends `stop` to the current search, discards subsequent output associated with the previous position and submits the new position to the same process. The engine determines how quickly an active search responds to `stop`.
 
 ## 3. Simulator
 
@@ -46,7 +46,7 @@ Simulator accepts any executable that implements the UCI protocol. The `--uci` a
 
 ## 4. Stadium
 
-Stadium manages multiple independent games. `Tools > Matches` creates games, selects the game shown in the active view and closes games, while games outside the active view continue in the background. Each seat requires a participant name. A Human seat accepts moves from the board. An engine seat requires a UCI executable and stores its own UCI option values and launch arguments.
+Stadium manages multiple independent games. `Tools > Matches` creates games, selects the game shown in the active view and closes games. Games outside the active view continue in the background. Each seat requires a participant name. A Human seat accepts moves from the board. An engine seat requires a UCI executable and stores its own UCI option values and launch arguments.
 
 Match settings define the initial clock, increment, display delay, maximum ply count and starting position in Forsyth-Edwards Notation (FEN). An initial clock of zero disables clock timing. `Run > Start`, `Run > Pause` and `Run > Stop` control the active game. Closing Gadidae terminates every UCI subprocess owned by every open match.
 
@@ -61,7 +61,7 @@ build\graphics\Gadidae.exe `
 	--black-name "Stockfish"
 ```
 
-Replacing the White executable and name with `models\melano\melano.exe` and `Melano` creates the corresponding Melano game.
+Replacing the White executable and name with `models\melano\melano.exe` and `Melano` creates a Melano-versus-Stockfish game.
 
 ## 5. Appearance
 
@@ -69,7 +69,7 @@ Appearance settings include dark and light application themes, base font size, b
 
 ## 6. Piece Import
 
-`scripts/import_pieces.py` converts one Scalable Vector Graphics (SVG) set into pre-triangulated indexed meshes stored in `src/graphics/pieces.gpack`. The input directory must contain `wK.svg`, `wQ.svg`, `wR.svg`, `wB.svg`, `wN.svg`, `wP.svg`, `bK.svg`, `bQ.svg`, `bR.svg`, `bB.svg`, `bN.svg` and `bP.svg`. A stable style name begins with a lowercase letter and contains lowercase letters, digits or hyphens.
+`scripts/import_pieces.py` converts one Scalable Vector Graphics (SVG) set into pre-triangulated indexed meshes stored in `src/graphics/pieces.gpack`. The input directory must contain `wK.svg`, `wQ.svg`, `wR.svg`, `wB.svg`, `wN.svg`, `wP.svg`, `bK.svg`, `bQ.svg`, `bR.svg`, `bB.svg`, `bN.svg` and `bP.svg`. A valid style name begins with a lowercase letter and contains only lowercase letters, digits or hyphens.
 
 Import a style and rebuild the client on Windows with
 
@@ -91,6 +91,6 @@ python scripts/import_pieces.py \
 GADIDAE_BUILD_GRAPHICS=1 bash scripts/build.sh
 ```
 
-A new style name appends an embedded style, while reimporting an existing name atomically replaces that style. The `--curve-step` argument controls the curve-sampling distance and defaults to `1.5`. Smaller values produce smoother and larger meshes, while larger values reduce package size and import cost.
+Importing a new style name adds that style to the embedded archive, whereas reimporting an existing name atomically replaces the stored style. The `--curve-step` argument controls the curve-sampling distance and defaults to `1.5`. Smaller values produce smoother, denser meshes and larger archives, whereas larger values reduce archive size and import time.
 
-Every imported third-party style requires an independent declaration in `THIRD_PARTY.md`. The declaration records the author, permanent source URL, license name and version, license-text URL, modifications and every source used by a combined style.
+Every imported third-party style requires a separate declaration in `THIRD_PARTY.md`. The declaration records the author, permanent source URL, license name and version, license-text URL, modifications and every source used by a combined style.

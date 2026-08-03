@@ -1,21 +1,22 @@
 # Gadus
 
-Gadus is a residual policy-value network for chess with an AlphaZero-style action space. 
+Gadus is a residual policy-value network for chess with an AlphaZero-style action space.
 
 ## 1. Notation and Abbreviations
 
-> Unless stated otherwise, $V$, $Q$ and terminal outcomes use the perspective of the side to move.
+> Throughout this document, $V$, $Q$ and terminal outcomes use the perspective of the side to move. A definition states its perspective explicitly when it uses a different one.
 
 - $\mathcal X$ is the set of complete game states. A state $x\in\mathcal X$ contains the board, side to move, castling rights, en passant state, halfmove clock and repetition history.
 - $\mathcal A(x)$ is the set of legal actions in $x$. An action is written as $a\in\mathcal A(x)$, and $T(x,a)$ is the deterministic successor state produced by the chess rules.
-- $z(x)\in\{-1,0,1\}$ is the outcome of a terminal state $x$ from the perspective of the side to move in $x$.
-- $\phi_G:\mathcal X\rightarrow\mathcal S_G$ is the Gadus state encoder, and $s=\phi_G(x)$ is the network input corresponding to $x$.
+- $z(x)\in\lbrace -1,0,1\rbrace$ is the outcome of a terminal state $x$ from the perspective of the side to move in $x$.
+- $\mathcal S_G$ is the Gadus encoded-state space. The map $\phi_G:\mathcal X\rightarrow\mathcal S_G$ is the Gadus state encoder, and $s=\phi_G(x)$ is the network input corresponding to $x$.
 - $\mathcal I_G$ is the Gadus action-index set, and $i_G(a)\in\mathcal I_G$ is the index assigned to action $a$.
 - $\theta$ denotes trainable network parameters. $\ell_\theta(s,i)$ is the policy logit for action index $i$, $P_\theta(a\mid s)$ is the policy probability assigned to legal move $a$, and $V_\theta(s)$ is the scalar evaluation that the model assigns to $s$.
 - $Q(s,a)$ denotes a scalar evaluation of legal move $a$ in encoded position $s$. A subscript on $Q$ identifies the estimator that supplies the evaluation.
 - A hat, as in $\widehat y$, denotes an estimate produced by finite data or finite search. A bar, as in $\overline y$, denotes a backed-up or aggregated quantity.
 - A target is a fixed scalar or distribution used as the comparison value in a loss. Automatic differentiation treats targets as constants.
-- $L_{\mathrm{CE}}(p,q)=-\sum_iq_i\log p_i$ is the cross-entropy from target distribution $q$ to predicted distribution $p$. $\operatorname{MSE}(u,v)$ is the mean squared error between corresponding elements.
+- $L_{\mathrm{CE}}(p,q)=-\sum_iq_i\log p_i$ is the cross-entropy from target distribution $q$ to predicted distribution $p$. $\mathrm{MSE}(u,v)$ is the mean squared error between corresponding elements.
+- $D_{\mathrm{KL}}(p\,\|\,q)=\sum_ip_i\log(p_i/q_i)$ is the Kullback-Leibler divergence from distribution $p$ to distribution $q$.
 - Subscripts `old` and `new` identify the frozen source model and the trainable candidate within one FCPI iteration. A superscript `+` identifies a policy target produced by local policy improvement.
 
 The following abbreviations are used throughout this document.
@@ -63,9 +64,9 @@ $$
 The Gadus network contains a ResNet trunk, a linear policy head and an MLP value head. Let $C$ be the channel count supplied by `--channels`, and let $B$ be the residual-block count supplied by `--blocks`. For encoded input $s\in\mathbb R^{18\times8\times8}$, the stem applies a bias-free $3\times3$ convolution from 18 input planes to $C$ channels, followed by BatchNorm and ReLU:
 
 $$
-h_0=\operatorname{ReLU}\left(
-\operatorname{BN}_{\mathrm{stem}}\left(
-\operatorname{Conv}^{18\rightarrow C}_{3\times3,\mathrm{stem}}(s)
+h_0=\mathrm{ReLU}\left(
+\mathrm{BN}_{\mathrm{stem}}\left(
+\mathrm{Conv}^{18\rightarrow C}_{3\times3,\mathrm{stem}}(s)
 \right)\right)
 \in\mathbb R^{C\times8\times8}.
 $$
@@ -73,25 +74,25 @@ $$
 The tensor $h_0$ is the input to residual block 0. The residual transform in block $j$ is
 
 $$
-F_j(h)=\operatorname{BN}_{j,2}\left(
-\operatorname{Conv}^{C\rightarrow C}_{3\times3,j,2}\left(
-\operatorname{ReLU}\left(
-\operatorname{BN}_{j,1}\left(
-\operatorname{Conv}^{C\rightarrow C}_{3\times3,j,1}(h)
+F_j(h)=\mathrm{BN}_{j,2}\left(
+\mathrm{Conv}^{C\rightarrow C}_{3\times3,j,2}\left(
+\mathrm{ReLU}\left(
+\mathrm{BN}_{j,1}\left(
+\mathrm{Conv}^{C\rightarrow C}_{3\times3,j,1}(h)
 \right)\right)\right)\right),
 $$
 
 Residual block $j$ then produces
 
 $$
-h_{j+1}=\operatorname{ReLU}(h_j+F_j(h_j)),\qquad 0\leq j<B.
+h_{j+1}=\mathrm{ReLU}(h_j+F_j(h_j)),\qquad 0\leq j<B.
 $$
 
-For $j=0$, the recurrence computes $h_1$ from $h_0$. Repeating the recurrence through block $B-1$ produces the trunk output $h_B$. Every $3\times3$ convolution uses one-square padding and preserves the $8\times8$ spatial dimensions, so each tensor $h_j$ belongs to $\mathbb R^{C\times8\times8}$.
+For $j=0$, the recurrence computes $h_1$ from $h_0$. Repeating the recurrence through block $B-1$ produces the trunk output $h_B$. Every $3\times3$ convolution uses one-square padding and preserves the $8\times8$ spatial dimensions, so each tensor $h_j$ lies in $\mathbb R^{C\times8\times8}$.
 
 Both output heads receive $h_B$. The policy head applies a bias-free $1\times1$ convolution from $C$ channels to 32 channels, followed by BatchNorm, ReLU, flattening and a linear map from 2048 features to 4672 logits. The value head has an independent $1\times1$ convolution from $C$ channels to 32 channels, followed by BatchNorm, ReLU, flattening, a 2048-to-256 linear layer, ReLU, a scalar output layer and a hyperbolic tangent.
 
-The complete forward pass is
+Writing $f_\theta$ for the complete network, its forward pass is
 
 $$
 (\ell_\theta(s),V_\theta(s))=f_\theta(s),\qquad
@@ -132,24 +133,11 @@ q_{\mathrm{stm}}(s_t)=\rho(x_t)q_t,
 V_{\mathrm{target}}(s_t)=\tanh\left(\frac{q_{\mathrm{stm}}(s_t)}{3}\right).
 $$
 
-If the preceding comment contains no parseable evaluation, preprocessing sets $q_{\mathrm{stm}}=0$. In `--has-cmt 1` mode, a game is included when at least one comment contains a parseable evaluation. In `--has-cmt 0` mode, $V_{\mathrm{target}}\in\{-1,0,1\}$ is derived from the final result and expressed from the side-to-move perspective.
-
-```bash
-build/gadus/preprocess \
-	--input data/ccrl.pgn \
-	--output data/games.gadus.h5 \
-	--has-cmt 1 \
-	--chunk-size 4096 \
-	--compression-level 1 \
-	--log-every 10000 \
-	--max-games 1000000
-```
-
-`--max-games` limits the number of PGN games read. `--chunk-size` controls HDF5 dataset extension units. `--compression-level` selects the deflate level. `--log-every` controls progress reporting by game count.
+If the preceding comment contains no parseable evaluation, preprocessing sets $q_{\mathrm{stm}}=0$. In `--has-cmt 1` mode, a game is included when at least one comment contains a parseable evaluation. In `--has-cmt 0` mode, $V_{\mathrm{target}}\in\lbrace -1,0,1\rbrace$ is derived from the final result and expressed from the side-to-move perspective.
 
 ## 5. Supervised Training
 
-Let $a^*$ be the move recorded in the PGN, and let $i^*=i_G(a^*)$ be its action index. For network input $s$, the Policy head produces one logit $\ell_\theta(s,i)$ for every action index $i\in\mathcal I_G$. Applying softmax to all 4672 logits gives the supervised Policy distribution $R_\theta$:
+Let $a^{\ast}$ be the move recorded in the PGN, and let $i^{\ast}=i_G(a^{\ast})$ be its action index. For a network input $s$, the Policy head produces one logit $\ell_\theta(s,i)$ for every action index $i\in\mathcal I_G$. Applying softmax to all 4672 logits gives the supervised Policy distribution $R_\theta$:
 
 $$
 R_\theta(i\mid s)=
@@ -159,12 +147,12 @@ $$
 
 $R_\theta$ and the legal-move distribution $P_\theta$ defined in Section 3 use the same logits. $R_\theta$ normalizes over the complete action-index set during supervised training, whereas $P_\theta$ normalizes over the legal moves of the current game state during inference.
 
-Let $\delta_{i^*}$ be the one-hot target distribution that assigns probability 1 to $i^*$ and probability 0 to every other action index. The supervised Policy loss is
+Let $\delta_{i^{\ast}}$ be the one-hot target distribution that assigns probability 1 to $i^{\ast}$ and probability 0 to every other action index. The supervised Policy loss is
 
 $$
 L_{P,\mathrm{sup}}=
-L_{\mathrm{CE}}\left(R_\theta(\cdot\mid s),\delta_{i^*}\right)
-=-\log R_\theta(i^*\mid s).
+L_{\mathrm{CE}}\left(R_\theta(\cdot\mid s),\delta_{i^{\ast}}\right)
+=-\log R_\theta(i^{\ast}\mid s).
 $$
 
 The Policy loss $L_{P,\mathrm{sup}}$ decreases as the probability assigned to the recorded move increases.
@@ -173,7 +161,7 @@ The Value head predicts $V_\theta(s)$, and the preprocessing stage supplies $V_{
 
 $$
 L_{V,\mathrm{sup}}=
-\operatorname{MSE}\left(V_\theta(s),V_{\mathrm{target}}(s)\right).
+\mathrm{MSE}\left(V_\theta(s),V_{\mathrm{target}}(s)\right).
 $$
 
 Let $w_V$ be the nonnegative loss coefficient given by `--value-weight`. The complete supervised objective is
@@ -183,25 +171,6 @@ L_{\mathrm{sup}}=
 L_{P,\mathrm{sup}}+w_VL_{V,\mathrm{sup}}.
 $$
 
-```bash
-build/gadus/train \
-	--data data/games.gadus.h5 \
-	--out models/gadus/gadus.pth \
-	--channels 128 \
-	--blocks 20 \
-	--epochs 10 \
-	--batch-size 512 \
-	--max-steps 500000 \
-	--lr 0.001 \
-	--weight-decay 0.0001 \
-	--value-weight 0.25 \
-	--save-every 5000 \
-	--device cuda \
-	--precision bf16 \
-	--log-every 50 \
-	--seed 2026
-```
-
 Each training invocation initializes a new Gadus model. `--channels` and `--blocks` determine its width and depth. `--max-steps` limits the number of optimizer steps, and `--save-every` sets the interval between atomic checkpoint writes. `--seed` controls parameter initialization and dataset shuffling.
 
 `--precision` accepts `fp32` or `bf16` and defaults to `fp32`. CUDA forward computation uses BF16 in `bf16` mode. The Policy softmax, loss calculations, metric accumulation and checkpoint parameters remain in FP32. CUDA training batches use pinned host memory.
@@ -209,11 +178,9 @@ Each training invocation initializes a new Gadus model. `--channels` and `--bloc
 Each checkpoint contains exactly two top-level keys:
 
 ```text
-model
-arch
+model #stores the network parameters
+arch  #stores the Gadus identifier and the dimensions required to reconstruct the network
 ```
-
-`model` stores the network parameters. `arch` stores the Gadus identifier and the dimensions required to reconstruct the network.
 
 ## 6. Search
 
@@ -246,7 +213,7 @@ $$
 Q_{\mathrm{sel}}(s,a)=
 \begin{cases}
 Q(s,a), & N(s,a)>0,\\[4pt]
-\operatorname{clip}\left(
+\mathrm{clip}\left(
 Q(s)-r_{\mathrm{FPU}}\sqrt{\displaystyle\sum_{a':N(s,a')>0}P(s,a')},-1,1
 \right), & N(s,a)=0.
 \end{cases}
@@ -288,13 +255,13 @@ N_{\min}=
 \end{cases}
 $$
 
-A `movetime` deadline or UCI `stop` request may end search before $N_{\min}$ simulations. After $N_{\min}$ simulations have completed, dynamic budgeting uses the empirical root visit distribution
+A `movetime` deadline or UCI `stop` request may end search before $N_{\min}$ simulations. After $N_{\min}$ simulations have completed, a root with at least two legal actions uses the empirical visit distribution
 
 $$
 v_a=\frac{N(s,a)}{\displaystyle\sum_{b\in\mathcal A(x)}N(s,b)}.
 $$
 
-Let $a_1$ and $a_2$ be the two actions with the largest completed visit counts. Write $N_i=N(s,a_i)$ and $Q_i=Q(s,a_i)$. The normalized visit entropy $H_N$, visit closeness $U_N$ and $Q$ closeness $U_Q$ are
+Let $a_1$ and $a_2$ be the two actions with the largest completed visit counts, and write $N_i=N(s,a_i)$. Define $Q_i=Q(s,a_i)$ when $N_i>0$ and $Q_i=0$ when $N_i=0$. The normalized visit entropy $H_N$, visit closeness $U_N$ and $Q$ closeness $U_Q$ are
 
 $$
 H_N=-\frac{\sum_{a\in\mathcal A(x)}v_a\log v_a}
@@ -310,14 +277,17 @@ U_Q=1-\min\left(1,\frac{|Q_1-Q_2|}{0.5}\right).
 $$
 
 The combined uncertainty and resulting simulation target are
+
 $$
-u=\operatorname{clip}(0.5H_N+0.35U_N+0.15U_Q,0,1),
+u=\mathrm{clip}(0.5H_N+0.35U_N+0.15U_Q,0,1),
 $$
 
 $$
 N_{\mathrm{target}}=
 N_{\min}+\left\lceil u(N_{\mathrm{cap}}-N_{\min})\right\rceil.
 $$
+
+A root with one legal action uses $u=0$ and $N_{\mathrm{target}}=N_{\min}$.
 
 ### 6.4 Final Decision Components
 
@@ -343,16 +313,16 @@ $$
 D_I(a)=
 \begin{cases}
 1,&a=a_M,\\
-D_0(a),&a\in\mathcal A(x)\setminus\{a_M\}.
+D_0(a),&a\in\mathcal A(x)\setminus\lbrace a_M\rbrace.
 \end{cases}
 $$
 
-When $\mathcal M(x)$ is empty, $D_I(a)$ equals to $D_0(a)$ for every legal action.
+When $\mathcal M(x)$ is empty, $D_I(a)$ equals $D_0(a)$ for every legal action.
 
 Let $\lambda_R\in[0,1]$ be `--repetition-policy-penalty`, and let $V_R$ be the $V$ returned for the root by search. The set $\mathcal R_3(x)$ contains legal moves that either make a threefold-repetition claim available immediately or allow the opponent to do so with one reply. RPP computes
 
 $$
-d_R=\lambda_R\operatorname{clip}(V_R,0,1).
+d_R=\lambda_R\mathrm{clip}(V_R,0,1).
 $$
 
 RPP then produces the final decision score
@@ -367,31 +337,6 @@ $$
 
 The decision layer sorts legal moves by descending $D(a)$, then by descending $D_0(a)$ and finally by descending UCI notation. The first move in this order is selected.
 
-### 6.5 Search Command
-
-```bash
-build/gadus/search \
-	--model models/gadus/gadus.pth \
-	--fen "startpos" \
-	--device cuda \
-	--precision bf16 \
-	--search-type only-mcts \
-	--mcts-sims 1000 \
-	--mcts-min-sims 100 \
-	--mcts-batch-size 64 \
-	--movetime-ms 5000 \
-	--c-puct 0.5 \
-	--c-puct-base 19652 \
-	--c-puct-factor 1.0 \
-	--fpu-reduction 0.15 \
-	--virtual-loss 0.0 \
-	--repetition-policy-penalty 0.0 \
-	--instant-mate-first 0 \
-	--root-topn 8
-```
-
-`--fen` accepts either the literal value `startpos` or a FEN string. The value `startpos` selects the standard initial position.
-
 ## 7. Arena
 
 The Gadus arena executable loads both checkpoints once and advances several games concurrently. Positions evaluated by the same checkpoint are combined into inference batches. `--games` must be a positive even number because each sampled opening is played once with the candidate as White and once with the candidate as Black. `--games-in-flight` limits the number of active games.
@@ -404,21 +349,21 @@ score=\frac{N_W+\frac12N_D}{N_{\mathrm{games}}},
 net\_wins=N_W-N_L.
 $$
 
-Let $x_i\in\{0,\frac12,1\}$ be the candidate score in game $i$. The implementation uses the population variance
+Let $x_i\in\lbrace 0,\frac12,1\rbrace$ be the candidate score in game $i$. The population variance of these scores is
 
 $$
-\sigma^2=\frac1{N_{\mathrm{games}}}\sum_{i=1}^{N_{\mathrm{games}}}(x_i-score)^2
+\sigma^2=\frac1{N_{\mathrm{games}}}\sum_{i=1}^{N_{\mathrm{games}}}(x_i-score)^2.
 $$
 
-to report the clipped 95% normal-approximation interval
+The implementation reports the clipped 95% normal-approximation interval
 
 $$
-CI_{95\%}=\operatorname{clip}\left(
+CI_{95\%}=\mathrm{clip}\left(
 score\pm1.96\sqrt{\frac{\sigma^2}{N_{\mathrm{games}}}},0,1
 \right).
 $$
 
-For display, define $score_b=\operatorname{clip}(score,10^{-6},1-10^{-6})$. The reported Elo difference is
+For display, define $score_b=\mathrm{clip}(score,10^{-6},1-10^{-6})$. The reported Elo difference is
 
 $$
 \Delta Elo=400\log_{10}\left(\frac{score_b}{1-score_b}\right).
@@ -429,36 +374,6 @@ Let $M_{\mathrm{gate}}$ be the minimum net wins supplied by `--min-net-wins`. Th
 $$
 N_W-N_L\geq M_{\mathrm{gate}}.
 $$
-
-```bash
-build/gadus/arena \
-	--candidate models/gadus/candidate.pth \
-	--baseline models/gadus/champion.pth \
-	--device cuda \
-	--precision bf16 \
-	--games 400 \
-	--games-in-flight 32 \
-	--max-plies 240 \
-	--opening-book data/openings.gen.bin \
-	--book-plies 8 \
-	--max-book-positions 50000 \
-	--search-type closed \
-	--sims 0 \
-	--mcts-batch-size 64 \
-	--movetime-ms 0 \
-	--c-puct 0.5 \
-	--c-puct-base 19652 \
-	--c-puct-factor 1.0 \
-	--fpu-reduction 0.15 \
-	--virtual-loss 0.0 \
-	--repetition-policy-penalty 0.0 \
-	--instant-mate-first 0 \
-	--min-net-wins 4 \
-	--pgn-output data/gadus-arena.pgn \
-	--log-every 1
-```
-
-An empty `--opening-book` value starts every game from the standard initial position.
 
 ## 8. Folded Counterfactual Policy Iteration
 
@@ -476,7 +391,7 @@ The trainable candidate parameters are denoted by $\theta_{new}$, and the corres
 
 FCPI constructs targets from completed self-play trajectories and finite counterfactual trees. A completed trajectory assigns terminal return $G_t$ to each recorded position and MC advantage coefficient $A_{\mathrm{MC}}(s_t,a_t)$ to the move selected there. A counterfactual tree computes $Q_{\mathrm{CF}}(s,a)$ for legal moves and then derives $\pi^+(\cdot\mid s)$ and $\overline V_{\mathrm{CF}}(s)$.
 
-After aggregating these targets, FCPI minimizes total loss $L$ with respect to $\theta_{new}$. Automatic differentiation computes $\nabla_{\theta_{new}}L$, and AdamW updates the candidate parameters. A paired-game arena then compares the trained candidate with $C_r$ and promotes the candidate by atomic checkpoint replacement when it meets the acceptance threshold.
+After aggregating these targets, FCPI trains the candidate with the objective defined in Section 8.7. AdamW updates $\theta_{new}$ from the gradients of that objective. A paired-game arena then compares the trained candidate with $C_r$ and promotes the candidate by atomic checkpoint replacement when it meets the acceptance threshold.
 
 ### 8.2 Starting Positions and Behavior Policy
 
@@ -517,23 +432,23 @@ G_{T_{\mathrm{traj}}-1}=-z(x_{T_{\mathrm{traj}}}),
 G_t=-G_{t+1}\quad(0\leq t<T_{\mathrm{traj}}-1).
 $$
 
-Thus $G_t\in\{-1,0,1\}$ is the game outcome from the perspective of the player to move in $x_t$. Completed trajectories assign each recorded state weight
+Thus $G_t\in\lbrace -1,0,1\rbrace$ is the game outcome from the perspective of the player to move in $x_t$. Completed trajectories assign each recorded state weight
 
 $$
 w_{\mathrm{MC}}(s_t)=1.
 $$
 
-A truncated trajectory has no terminal outcome, so each of its recorded states receives $w_{\mathrm{MC}}(s_t)=0$.
+Each state in a truncated trajectory receives $w_{\mathrm{MC}}(s_t)=0$ because the trajectory supplies no terminal outcome.
 
 For a completed trajectory, the selected move receives MC advantage coefficient
 
 $$
 A_{\mathrm{MC}}(s_t,a_t)=
-\operatorname{clip}_{[-1,1]}
+\mathrm{clip}_{[-1,1]}
 \left(\frac{G_t-V_{old}(s_t)}{2}\right).
 $$
 
-The MC policy record assigns this coefficient to the selected move $a_t$ and assigns zero MC policy weight to every other legal move.
+The selected move $a_t$ is the sole action with MC policy weight one in this record, and its signed coefficient is $A_{\mathrm{MC}}(s_t,a_t)$.
 
 ### 8.4 Finite Counterfactual Trees
 
@@ -557,7 +472,7 @@ The expansion set always includes the move with highest source-policy probabilit
 
 $$
 k(a)=\log\left(
-\operatorname{clip}(P_{old}(a\mid s),10^{-12},1)
+\mathrm{clip}(P_{old}(a\mid s),10^{-12},1)
 \right)+g_a,
 \qquad
 g_a=-\log(-\log u_a),
@@ -595,7 +510,13 @@ $$
 
 The frontier contains the nonterminal nodes eligible for further expansion. FCPI repeatedly expands the highest-priority node until the tree has spent $B_{\mathrm{CF}}$ edge evaluations or the frontier is empty.
 
-Let $E(x)\subseteq\mathcal A(x)$ be the moves evaluated explicitly at node $x$. Backup proceeds from deeper nodes toward the root. For $s=\phi_G(x)$ and $x_a'=T(x,a)$, define
+Backup jointly computes edge values $Q_{\mathrm{CF}}$ and node values $\overline V_{\mathrm{CF}}$ from deeper nodes toward the root. A nonterminal frontier node $x'$ without evaluated descendants is initialized by the source model:
+
+$$
+\overline V_{\mathrm{CF}}(\phi_G(x'))=V_{old}(\phi_G(x')).
+$$
+
+Let $E(x)\subseteq\mathcal A(x)$ be the moves evaluated explicitly at node $x$. Once the backed-up values of its evaluated children are available, node $x$ uses $s=\phi_G(x)$ and $x_a'=T(x,a)$ to define
 
 $$
 Q_{\mathrm{CF}}(s,a)=
@@ -607,13 +528,7 @@ V_{old}(s),&a\in\mathcal A(x)\setminus E(x).
 \end{cases}
 $$
 
-An evaluated move that ends the game receives the exact terminal outcome from the parent's perspective. An evaluated nonterminal move receives the negated value backed up from its child. If a nonterminal child remains on the frontier without evaluated descendants, its backed-up value is initialized by the source model:
-
-$$
-\overline V_{\mathrm{CF}}(\phi_G(x'))=V_{old}(\phi_G(x')).
-$$
-
-The final branch of the definition assigns $Q_{\mathrm{CF}}(s,a)=V_{old}(s)$ to every unevaluated move.
+An evaluated move that ends the game receives the exact terminal outcome from the parent's perspective. An evaluated nonterminal move receives the negated value backed up from its child. The final branch of the definition assigns $Q_{\mathrm{CF}}(s,a)=V_{old}(s)$ to every unevaluated move. Section 8.5 defines the backed-up value of an expanded node from its completed set of edge values.
 
 ### 8.5 Counterfactual Policy and Value Targets
 
@@ -628,7 +543,7 @@ The clipped source-policy weight is defined by
 
 $$
 \widetilde p(a\mid s)=
-\operatorname{clip}(P_{old}(a\mid s),10^{-12},1).
+\mathrm{clip}(P_{old}(a\mid s),10^{-12},1).
 $$
 
 The implementation fixes the counterfactual-policy temperature at $T_{\mathrm{CF}}=1$. Thus the target distribution is
@@ -649,7 +564,7 @@ p_\varepsilon(a\mid s)=
 {\displaystyle\sum_{b\in\mathcal A(x)}\widetilde p(b\mid s)}.
 $$
 
-The same $\pi^+$ uniquely maximizes the following local objective with KL-regularization coefficient equal to 1:
+Among all probability distributions $\pi(\cdot\mid s)$ over $\mathcal A(x)$, the same $\pi^+$ uniquely maximizes the following local objective with KL-regularization coefficient equal to 1:
 
 $$
 \pi^+=\arg\max_\pi
@@ -665,7 +580,7 @@ $\overline V_{\mathrm{CF}}(s)$ is the expectation of $Q_{\mathrm{CF}}(s,a)$ unde
 
 $$
 \overline V_{\mathrm{CF}}(s)=
-\operatorname{clip}_{[-1,1]}
+\mathrm{clip}_{[-1,1]}
 \left(
 \sum_{a\in\mathcal A(x)}
 \pi^+(a\mid s)Q_{\mathrm{CF}}(s,a)
@@ -679,7 +594,7 @@ $$
 \overline V_{\mathrm{CF}}(s)-V_{old}(s).
 $$
 
-Because every unevaluated move satisfies $Q_{\mathrm{CF}}(s,a)=V_{old}(s)$, only explicitly evaluated moves contribute to this correction:
+Every unevaluated move satisfies $Q_{\mathrm{CF}}(s,a)=V_{old}(s)$, so the correction reduces to a sum over explicitly evaluated moves:
 
 $$
 \delta_{\mathrm{CF}}(s)=
@@ -694,7 +609,7 @@ $$
 \overline V_{\mathrm{CF}}(s)=V_{old}(s)+\delta_{\mathrm{CF}}(s).
 $$
 
-Suppose a tree evaluates $N_E$ edges in total, of which $n(x)=|E(x)|$ originate at expanded node $x$. FCPI assigns weights $w_P(x)$ and $w_T(x)$ to that node:
+Let $\mathcal T_{\mathrm{exp}}$ contain every expanded decision node in a tree, including its root. Suppose the tree evaluates $N_E$ edges in total, of which $n(x)=|E(x)|$ originate at node $x\in\mathcal T_{\mathrm{exp}}$. FCPI assigns weights $w_P(x)$ and $w_T(x)$ to that node:
 
 $$
 w_P(x)=w_T(x)=\frac{n(x)}{N_E},
@@ -702,7 +617,7 @@ w_P(x)=w_T(x)=\frac{n(x)}{N_E},
 N_E=\sum_{u\in\mathcal T_{\mathrm{exp}}}n(u).
 $$
 
-Here $\mathcal T_{\mathrm{exp}}$ contains every expanded decision node in the tree, including its root. Root and descendant edges both contribute to $N_E$, and the weights within each tree sum to one:
+Root and descendant edges both contribute to $N_E$, and the weights within each tree sum to one:
 
 $$
 \sum_{x\in\mathcal T_{\mathrm{exp}}}w_P(x)
@@ -711,44 +626,68 @@ $$
 
 ### 8.6 Encoded-State Aggregation
 
-Each expanded decision node produces one training record. Records at tree roots include the MC targets inherited from self-play. Records below the root contain only counterfactual targets. FCPI groups records with identical Gadus `PackedState` encodings across the iteration and verifies that every member of a group has the same legal-move list.
+Each expanded decision node produces one training record. Records at tree roots include the MC targets inherited from self-play, and records below the root contain counterfactual targets. FCPI groups records with identical Gadus `PackedState` encodings across the iteration and verifies that every member of a group has the same legal-move list.
 
-Let $\mathcal R(s)$ be the group associated with encoded position $s$, and let $\mathcal A_s$ be its legal-move set. Record $i\in\mathcal R(s)$ carries counterfactual policy weight $w_{P,i}$, MC value weight $w_{\mathrm{MC},i}$, counterfactual value weight $w_{T,i}$ and corresponding targets $\pi_i^+(\cdot\mid s)$, $G_i$ and $\overline V_{\mathrm{CF},i}(s)$.
+Let $\mathcal S_{\mathrm{agg}}$ be the set of encoded positions represented after grouping, let $\mathcal R(s)$ be the group associated with $s\in\mathcal S_{\mathrm{agg}}$ and let $\mathcal A_s$ be its legal-move set. Record $i\in\mathcal R(s)$ carries counterfactual policy weight $w_{P,i}$, MC value weight $w_{\mathrm{MC},i}$, counterfactual value weight $w_{T,i}$ and corresponding targets $\pi_i^+(\cdot\mid s)$, $G_i$ and $\overline V_{\mathrm{CF},i}(s)$.
 
-The aggregate quantities $W_P(s)$ and $\Pi^+(a\mid s)$ are
+The total counterfactual policy weight is
 
 $$
-W_P(s)=\sum_{i\in\mathcal R(s)}w_{P,i},
-\qquad
+W_P(s)=\sum_{i\in\mathcal R(s)}w_{P,i}.
+$$
+
+For $W_P(s)>0$, the aggregated counterfactual policy target is
+
+$$
 \Pi^+(a\mid s)=
 \frac{\sum_{i\in\mathcal R(s)}w_{P,i}\pi_i^+(a\mid s)}{W_P(s)}.
 $$
 
 $\Pi^+(\cdot\mid s)$ is the weighted mean of the counterfactual policy targets associated with encoded position $s$. FCPI renormalizes this distribution after aggregation to correct floating-point error in the probability sum.
 
-The aggregate quantities $W_{\mathrm{MC}}(s)$ and $\overline G(s)$ are
+The total MC value weight is
 
 $$
-W_{\mathrm{MC}}(s)=\sum_{i\in\mathcal R(s)}w_{\mathrm{MC},i},
-\qquad
+W_{\mathrm{MC}}(s)=\sum_{i\in\mathcal R(s)}w_{\mathrm{MC},i}.
+$$
+
+For $W_{\mathrm{MC}}(s)>0$, the aggregated MC value target is
+
+$$
 \overline G(s)=
 \frac{\sum_{i\in\mathcal R(s)}w_{\mathrm{MC},i}G_i}{W_{\mathrm{MC}}(s)}.
 $$
 
 $\overline G(s)$ is the weighted mean of the terminal-return targets associated with encoded position $s$.
 
-The aggregate quantities $W_T(s)$ and $\overline V_T(s)$ are
+The total counterfactual value weight is
 
 $$
-W_T(s)=\sum_{i\in\mathcal R(s)}w_{T,i},
-\qquad
+W_T(s)=\sum_{i\in\mathcal R(s)}w_{T,i}.
+$$
+
+For $W_T(s)>0$, the aggregated counterfactual value target is
+
+$$
 \overline V_T(s)=
 \frac{\sum_{i\in\mathcal R(s)}w_{T,i}\overline V_{\mathrm{CF},i}(s)}{W_T(s)}.
 $$
 
 $\overline V_T(s)$ is the weighted mean of the counterfactual value targets associated with encoded position $s$.
 
-All three aggregate weights are nonnegative. Each weighted mean is evaluated only when its denominator is positive. A zero denominator gives position $s$ zero contribution to the corresponding loss term.
+The support sets for the three aggregated targets are
+
+$$
+\mathcal S_P=\lbrace s\in\mathcal S_{\mathrm{agg}}:W_P(s)>0\rbrace,
+\qquad
+\mathcal S_{\mathrm{MC}}=\lbrace s\in\mathcal S_{\mathrm{agg}}:W_{\mathrm{MC}}(s)>0\rbrace,
+$$
+
+$$
+\mathcal S_T=\lbrace s\in\mathcal S_{\mathrm{agg}}:W_T(s)>0\rbrace.
+$$
+
+All three aggregate weights are nonnegative. Each target enters its corresponding loss on the support set where that target is defined.
 
 The three weighted means above aggregate targets defined for an entire encoded position. The MC policy data are action-specific because each trajectory selects one move at that position. Let $a_i$ and $A_{\mathrm{MC},i}$ denote the selected move and its MC advantage coefficient in record $i$. The indicator $\mathbf 1[a_i=a]$ selects records associated with move $a$. The aggregate signed coefficient and sample weight for pair $(s,a)$ are
 
@@ -782,15 +721,15 @@ $$
 {\sum_{b\in\mathcal A_s}\exp(\ell_{new}(s,i_G(b))/\widetilde T_b)}.
 $$
 
-Let $\mathcal S_{\mathrm{agg}}$ be the set of encoded positions remaining after aggregation. Weighted cross-entropy fits $P_{new}$ to $\Pi^+$:
+Weighted cross-entropy fits $P_{new}$ to $\Pi^+$ on $\mathcal S_P$:
 
 $$
 L_{P,\mathrm{CF}}=
 \frac{
-\sum_{s\in\mathcal S_{\mathrm{agg}}}W_P(s)L_{\mathrm{CE}}
+\sum_{s\in\mathcal S_P}W_P(s)L_{\mathrm{CE}}
 \left(P_{new}(\cdot\mid s),\Pi^+(\cdot\mid s)\right)
 }
-{\max\left(\sum_{s\in\mathcal S_{\mathrm{agg}}}W_P(s),10^{-8}\right)}.
+{\max\left(\sum_{s\in\mathcal S_P}W_P(s),10^{-8}\right)}.
 $$
 
 The terminal-return policy loss is the negative advantage-weighted log-likelihood
@@ -806,7 +745,7 @@ S_A(s,a)\log\mu_{new}(a\mid s)
 \right)}.
 $$
 
-For a single unmerged record, $S_A(s_t,a_t)=A_{\mathrm{MC}}(s_t,a_t)$ and $W_A(s_t,a_t)=1$. Gradient descent therefore raises the probability of a move with positive MC advantage and lowers the probability of a move with negative MC advantage. The two policy terms contribute additively:
+For a single unmerged record from a completed trajectory, $S_A(s_t,a_t)=A_{\mathrm{MC}}(s_t,a_t)$ and $W_A(s_t,a_t)=1$. Gradient descent therefore raises the probability of a move with positive MC advantage and lowers the probability of a move with negative MC advantage. The two policy terms contribute additively:
 
 $$
 \nabla_{\theta_{new}}
@@ -819,7 +758,7 @@ $$
 For scalar prediction error $e$, the terms involving $\overline G(s)$ and $\overline V_T(s)$ use the SmoothL1 penalty with threshold one:
 
 $$
-\operatorname{SL1}(e)=
+\mathrm{SL1}(e)=
 \begin{cases}
 \frac12e^2,&|e|<1,\\
 |e|-\frac12,&|e|\geq1.
@@ -831,14 +770,14 @@ $L_V$ combines the errors relative to $\overline G(s)$ and $\overline V_T(s)$ un
 $$
 L_V=
 \frac{
-\sum_{s\in\mathcal S_{\mathrm{agg}}}W_{\mathrm{MC}}(s)
-\operatorname{SL1}\left(V_{new}(s)-\overline G(s)\right)
-+\sum_{s\in\mathcal S_{\mathrm{agg}}}W_T(s)
-\operatorname{SL1}\left(V_{new}(s)-\overline V_T(s)\right)
+\sum_{s\in\mathcal S_{\mathrm{MC}}}W_{\mathrm{MC}}(s)
+\mathrm{SL1}\left(V_{new}(s)-\overline G(s)\right)
++\sum_{s\in\mathcal S_T}W_T(s)
+\mathrm{SL1}\left(V_{new}(s)-\overline V_T(s)\right)
 }
 {\max\left(
-\sum_{s\in\mathcal S_{\mathrm{agg}}}W_{\mathrm{MC}}(s)
-+\sum_{s\in\mathcal S_{\mathrm{agg}}}W_T(s),1
+\sum_{s\in\mathcal S_{\mathrm{MC}}}W_{\mathrm{MC}}(s)
++\sum_{s\in\mathcal S_T}W_T(s),1
 \right)}.
 $$
 
@@ -861,13 +800,13 @@ $$
 +Q_{\mathrm{CF}}(s,a)-Q_{\mathrm{CF}}(s,b).
 $$
 
-Suppose repeated local updates produce the fixed positive difference
+Assume repeated local updates preserve the fixed positive difference
 
 $$
 \Delta=Q_{\mathrm{CF}}(s,a)-Q_{\mathrm{CF}}(s,b)>0.
 $$
 
-Suppose each ideal fit becomes the reference policy for the next update. After $k$ such fits, the log odds of $a$ relative to $b$ have increased by $k\Delta$. Starting from policy $P_0$, the action order reverses when
+If each ideal fit becomes the reference policy for the next update, then after $k$ fits the log odds of $a$ relative to $b$ have increased by $k\Delta$. Starting from policy $P_0$, the action order reverses when
 
 $$
 k>
@@ -894,13 +833,11 @@ $$
 
 An accepted candidate atomically replaces the run's `current.pth`. A rejected candidate leaves that file unchanged, so the same current model generates the next iteration's targets.
 
-Every FCPI invocation creates a run identifier of the form `fcpi_YYYYMMDD_HHMMSS_id` and the following artifacts:
+Every FCPI invocation assigns a run identifier of the form `fcpi_YYYYMMDD_HHMMSS_id` and creates the following artifacts:
 
 ```text
 data/runs/<run-id>/
 	fcpi_iter_001.h5
-	info.log
-	pid
 	summary.json
 models/runs/<run-id>/
 	initial.pth
@@ -908,97 +845,25 @@ models/runs/<run-id>/
 	candidate_iter_001.pth
 ```
 
-The standard launcher runs FCPI in the background:
-
-```bash
-bash scripts/gadus_fcpi.sh
-```
-
-The launcher prints the run identifier, process identifier and log path. Follow the log with
-
-```bash
-tail -n 100 -f data/runs/<run-id>/info.log
-```
-
-Stop the run by reading its process identifier from the run directory:
-
-```bash
-kill "$(cat data/runs/<run-id>/pid)"
-```
-
-The launcher defaults to `PRECISION=bf16`, `ITERATIONS=10`, `GAMES_PER_ITER=6000`, `GAMES_IN_FLIGHT=512`, `INFERENCE_BATCH_SIZE=512`, `TARGET_RECORDS_PER_BATCH=512`, `BATCH_SIZE=1024`, `EPOCHS=30` and `TRAIN_MAX_STEPS=6000`. It draws starting positions from `OPENING_BOOK=data/openings.sam.bin` with `MAX_BOOK_POSITIONS=10000`. Environment variables override these defaults, for example:
-
-```bash
-PRECISION=fp32 BATCH_SIZE=512 bash scripts/gadus_fcpi.sh
-```
-
-After all FCPI iterations finish, the launcher runs a separate `closed` paired arena between the final `current.pth` and the run's `initial.pth`. This final comparison uses the `EVAL_GAMES`, `EVAL_GAMES_IN_FLIGHT`, `EVAL_MAX_PLIES` and evaluation-opening settings. The launcher writes the result to `summary.json` under `final_arena` and writes the games to `current_vs_initial.pgn`. The final comparison reports cumulative change and does not participate in per-iteration promotion.
-
-A direct invocation of `build/gadus/fcpi` ends after the configured FCPI iterations and omits the launcher's final current-versus-initial arena.
-
 ## 9. Opening Books
 
-FCPI sampling books contain reachable nonterminal states from arbitrary plies, covering both balanced and unbalanced positions. The following command traverses an existing Polyglot book and writes at least 10,000 unique states, including the standard initial position when it is reachable:
+FCPI sampling books contain reachable nonterminal states from arbitrary plies, covering both balanced and unbalanced positions. FCPI selects this position pool with `--opening-book` and limits the loaded pool with `--max-book-positions`.
 
-```powershell
-python scripts/opening_book.py --sampling-source data/openings.bin --output data/openings.sam.bin --min-fens 10000 --log-every 1000
-```
-
-`--sampling-source` may also identify a PGN file. In that mode, the script reads every legal main line and stores reachable states from arbitrary plies in the same Polyglot representation. FCPI can consume the resulting pool with `--opening-book data/openings.sam.bin --max-book-positions 10000`.
-
-Paired arena evaluation uses `openings.gen.bin`. Its positions are sampled at a fixed ply and filtered by a UCI evaluation bound. The launcher scripts generate 1,000 positions at ply eight with
-
-```bash
-bash scripts/run_opening.sh data/games.pgn 1000 data/openings.gen.bin
-```
-
-```powershell
-scripts\run_opening.bat data\games.pgn 1000 data\openings.gen.bin
-```
-
-The equivalent explicit command is
-
-```bash
-python scripts/opening_book.py \
-	--pgn data/games.pgn \
-	--uci models/stockfish/stockfish \
-	--output data/openings.gen.bin \
-	--max-abs-cp 80 \
-	--book-plies 8 \
-	--min-fens 1000 \
-	--uci-depth 10 \
-	--uci-threads 4 \
-	--uci-hash-mb 512 \
-	--log-every 1000
-```
-
-Each selected arena position is played once with each color assignment.
+Paired arena evaluation uses positions sampled at a fixed ply and filtered by a UCI evaluation bound. Each selected position is played once with each color assignment.
 
 ## 10. UCI Engine
 
-### 10.1 Direct Launch
-
-Launch the Windows UCI executable with:
-
-```powershell
-build\gadus\uci.exe `
-	--model models\gadus\gadus.pth `
-	--device cpu `
-	--search-type only-mcts `
-	--mcts-sims 100
-```
-
-The corresponding Linux executable is `build/gadus/uci`.
+### 10.1 Evaluation Output
 
 The engine reports MultiPV lines, side-to-move `score cp`, nodes, NPS, elapsed time and a one-move PV. For a visited MCTS root edge, the line evaluation $q_{line}$ is its root-perspective mean return $Q(s,a)$. For `closed` search or an unvisited MCTS root edge, $q_{line}=V_\theta(s)$. Let $c_s$ be `ScoreScale`. The displayed score is
 
 $$
-score\_cp=\operatorname{round}\left(
-c_s\operatorname{clip}(q_{line},-0.999,0.999)
+score\_cp=\mathrm{round}\left(
+c_s\mathrm{clip}(q_{line},-0.999,0.999)
 \right).
 $$
 
-### 10.2 UCI Options
+### 10.2 Options
 
 Gadus exposes the following UCI options.
 
@@ -1024,50 +889,6 @@ Gadus exposes the following UCI options.
 
 The engine publishes its direct policy ranking when search begins and publishes intermediate MCTS results at intervals of `ProgressIntervalMS`. Search limits and the UCI `stop` command determine the final result.
 
-A UCI client can configure the engine with standard commands such as
-
-```text
-setoption name SearchType value only-mcts
-setoption name MCTSSims value 1000
-setoption name MCTSBatchSize value 64
-setoption name CPuct value 0.5
-setoption name RepetitionPolicyPenalty value 1.0
-setoption name InstantMateFirst value true
-```
-
-### 10.3 Engine Packaging
-
-Package a Windows checkpoint and its Gadus UCI runtime with:
-
-```powershell
-scripts\package_engine.bat gadus models\gadus\candidate3.pth
-```
-
-Package the same checkpoint on Linux with:
-
-```bash
-bash scripts/package_engine.sh gadus models/gadus/candidate3.pth
-```
-
-The Windows package has the following layout:
-
-```text
-models/gadus/
-	gadus.exe
-	gadus.pth
-	LibTorch DLLs
-```
-
-Register `models/gadus/gadus.exe` in a Windows UCI client. The Linux package contains a `gadus` launcher, a `gadus.bin` executable, `gadus.pth` and a private `lib/` directory. Register the launcher in a Linux UCI client. Repackaging Gadus updates the checkpoint, executable and runtime libraries in place.
-
-## 11. Inspection and Tests
-
-Inspect a Gadus checkpoint with
-
-```bash
-python scripts/check.py --model models/gadus/gadus.pth
-```
-
-The inspection script loads the checkpoint without modifying it and reports its architecture, heads, channels, blocks, action space, parameter count, tensor types, memory size, finite-value status, file size and SHA-256 digest.
+## 11. Implementation Tests
 
 The build process runs the Gadus CTest executable before publishing binaries. The test suite covers `gadus_18_planes`, ordinary and special action encoding, terminal-state detection, policy and value output shapes, finite numerical results, backward propagation, checkpoint round trips, `closed` search and batched MCTS.
