@@ -1,0 +1,96 @@
+# Gadidae Graphics
+
+Gadidae provides a native graphical client for engines that implement the Universal Chess Interface (UCI). The client uses GLFW, OpenGL 3.3, GLAD, Dear ImGui and FreeType, while the UCI boundary keeps its interface independent of any particular engine architecture.
+
+## 1. Installation and Build
+
+On Windows, install the graphics dependencies and build the client with
+
+```powershell
+api\setup.bat
+scripts\build.bat
+```
+
+On Linux, enable the graphics targets explicitly with
+
+```bash
+GADIDAE_BUILD_GRAPHICS=1 bash api/setup.sh
+GADIDAE_BUILD_GRAPHICS=1 bash scripts/build.sh
+```
+
+The build produces `build/graphics/Gadidae.exe` on Windows and `build/graphics/Gadidae` on Linux. Interactive use over Secure Shell (SSH) requires X11 forwarding, a remote desktop or another display service.
+
+## 2. Engine Interface
+
+Importing an engine starts its process and performs a standard UCI handshake. The client reads every `option name ...` declaration returned by the engine and generates a matching control. UCI options configure the running engine after the handshake, whereas `Launch arguments` supplies arguments when the operating system starts the engine process.
+
+The client keeps each imported engine process alive for the lifetime of its session. A position change sends `stop` to the current search, discards subsequent output associated with the previous position and submits the new position to the same process. The engine determines how quickly an active search responds to `stop`.
+
+## 3. Simulator
+
+Simulator provides interactive position analysis. `Run > Open` starts live analysis, and `Run > Close` stops it. The following command opens Simulator with a Gadus engine and preconfigures its analysis controls:
+
+```powershell
+build\graphics\Gadidae.exe `
+	--mode simulator `
+	--uci "models\gadus\gadus.exe" `
+	--device cpu `
+	--movetime-ms 3000 `
+	--node-limit 0 `
+	--multipv 8 `
+	--font-size 20 `
+	--theme dark
+```
+
+Simulator accepts any executable that implements the UCI protocol. The `--uci` argument therefore may refer to Gadus, Melano, Stockfish or another UCI engine.
+
+## 4. Stadium
+
+Stadium manages multiple independent games. `Tools > Matches` creates games, selects the game shown in the active view and closes games, while games outside the active view continue in the background. Each seat requires a participant name. A Human seat accepts moves from the board. An engine seat requires a UCI executable and stores its own UCI option values and launch arguments.
+
+Match settings define the initial clock, increment, display delay, maximum ply count and starting position in Forsyth-Edwards Notation (FEN). An initial clock of zero disables clock timing. `Run > Start`, `Run > Pause` and `Run > Stop` control the active game. Closing Gadidae terminates every UCI subprocess owned by every open match.
+
+The following command opens Stadium with a Gadus-versus-Stockfish game:
+
+```powershell
+build\graphics\Gadidae.exe `
+	--mode stadium `
+	--white-uci "models\gadus\gadus.exe" `
+	--white-name "Gadus" `
+	--black-uci "models\stockfish\stockfish.exe" `
+	--black-name "Stockfish"
+```
+
+Replacing the White executable and name with `models\melano\melano.exe` and `Melano` creates the corresponding Melano game.
+
+## 5. Appearance
+
+Appearance settings include dark and light application themes, base font size, bounded font scaling, board-color presets, custom colors, coordinate labels and embedded piece styles. Applying a setting writes `gui.json` beside the Gadidae executable, and subsequent launches restore that configuration. Command-line overrides include `--font-size <px>`, `--theme dark`, `--theme light` and `--piece-style <name>`.
+
+## 6. Piece Import
+
+`scripts/import_pieces.py` converts one Scalable Vector Graphics (SVG) set into pre-triangulated indexed meshes stored in `src/graphics/pieces.gpack`. The input directory must contain `wK.svg`, `wQ.svg`, `wR.svg`, `wB.svg`, `wN.svg`, `wP.svg`, `bK.svg`, `bQ.svg`, `bR.svg`, `bB.svg`, `bN.svg` and `bP.svg`. A stable style name begins with a lowercase letter and contains lowercase letters, digits or hyphens.
+
+Import a style and rebuild the client on Windows with
+
+```powershell
+python -m pip install -r scripts\requirements.txt
+python scripts\import_pieces.py `
+	--input data\pieces\my-style `
+	--name my-style
+scripts\build.bat
+```
+
+Import and rebuild on Linux with
+
+```bash
+python -m pip install -r scripts/requirements.txt
+python scripts/import_pieces.py \
+	--input data/pieces/my-style \
+	--name my-style
+GADIDAE_BUILD_GRAPHICS=1 bash scripts/build.sh
+```
+
+A new style name appends an embedded style, while reimporting an existing name atomically replaces that style. The `--curve-step` argument controls the curve-sampling distance and defaults to `1.5`. Smaller values produce smoother and larger meshes, while larger values reduce package size and import cost.
+
+Every imported third-party style requires an independent declaration in `THIRD_PARTY.md`. The declaration records the author, permanent source URL, license name and version, license-text URL, modifications and every source used by a combined style.
