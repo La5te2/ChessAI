@@ -1,4 +1,4 @@
-// Implements batched, paired Gadus arena games and result-only promotion statistics.
+// Implements batched, paired Gadus arena games and a result-only acceptance gate.
 
 #include "gadus/arena.hpp"
 #include <algorithm>

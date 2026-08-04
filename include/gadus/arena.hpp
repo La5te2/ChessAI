@@ -1,6 +1,6 @@
 #pragma once
 
-// Paired, batched Gadus-vs-Gadus evaluation used by promotion gates.
+// Paired, batched Gadus-vs-Gadus evaluation with a result-only acceptance gate.
 
 #include <cstdint>
 #include <filesystem>

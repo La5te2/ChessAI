@@ -1,4 +1,4 @@
-// Implements batched, paired Melano arena games and result-only promotion statistics.
+// Implements batched, paired Melano arena games and a result-only acceptance gate.
 
 #include "melano/arena.hpp"
 #include <algorithm>

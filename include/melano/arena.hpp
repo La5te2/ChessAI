@@ -1,6 +1,6 @@
 #pragma once
 
-// Paired, batched Melano-vs-Melano evaluation used by promotion gates.
+// Paired, batched Melano-vs-Melano evaluation with a result-only acceptance gate.
 
 #include <cstdint>
 #include <filesystem>
