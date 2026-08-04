@@ -90,7 +90,7 @@ $$
 
 For $j=0$, the recurrence computes $h_1$ from $h_0$. Repeating the recurrence through block $B-1$ produces the trunk output $h_B$. Every $3\times3$ convolution uses one-square padding and preserves the $8\times8$ spatial dimensions, so each tensor $h_j$ lies in $\mathbb R^{C\times8\times8}$.
 
-Both output heads receive $h_B$. The policy head applies a bias-free $1\times1$ convolution from $C$ channels to 32 channels, followed by BatchNorm, ReLU, flattening and a linear map from 2048 features to 4672 logits. The value head has an independent $1\times1$ convolution from $C$ channels to 32 channels, followed by BatchNorm, ReLU, flattening, a 2048-to-256 linear layer, ReLU, a scalar output layer and a hyperbolic tangent.
+$h_B$ is used as the common input to both output heads. The policy head applies a bias-free $1\times1$ convolution from $C$ channels to 32 channels, followed by BatchNorm, ReLU, flattening and a linear map from 2048 features to 4672 logits. The value head has an independent $1\times1$ convolution from $C$ channels to 32 channels, followed by BatchNorm, ReLU, flattening, a 2048-to-256 linear layer, ReLU, a scalar output layer and a hyperbolic tangent.
 
 Writing $f_\theta$ for the complete network, its forward pass is
 

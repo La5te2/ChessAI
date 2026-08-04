@@ -73,7 +73,7 @@ Ordinary moves and queen promotions are indexed by source and destination square
 
 ## 3. Network
 
-### 3.1 Geometry Attention Encoder
+### 3.1 Geometry-Attention Encoder
 
 Let $C$ be the hidden width selected by `--channels`. Each geometry-attention block contains pre-norm multi-head self-attention and a pre-norm feed-forward network, both with residual connections. Attention uses 32 ordered geometric relation classes and a dynamic relation bias conditioned on the global token. The number of heads $n_h$ is the largest member of $\lbrace 8,4,2,1\rbrace$ that divides $C$, giving head dimension $d_h=C/n_h$. The feed-forward sublayer maps $C\rightarrow4C\rightarrow C$ with a GELU activation.
 
@@ -91,17 +91,25 @@ $$
 
 Here $q^{(m)}_i$, $k^{(m)}_j$ and $v^{(m)}_j$ are the attention query, key and value projections of $\mathrm{LN}(\widetilde h)$. Head $m$ returns $\sum_j\alpha^{(m)}_{ij}v^{(m)}_j$. The block concatenates the head outputs, applies an output projection, adds the attention residual and then applies the pre-norm feed-forward sublayer with a second residual. Lowercase $v^{(m)}_j$ denotes an attention value vector. Section 3.2 defines uppercase $V_\theta(s)$ as the scalar position evaluation.
 
-`--blocks` sets the number of geometry-attention blocks.
+Let $H_\theta(s)$ denote the 65-token sequence constructed from state $s$ in Section 2, and let $\mathcal B_{\theta,j}$ denote geometry-attention block $j$. The number of blocks $B$ is supplied by `--blocks`, and their sequential composition defines the exact-state encoder
+
+$$
+E_\theta(s)=
+\left(\mathcal B_{\theta,B-1}\circ\cdots\circ
+\mathcal B_{\theta,0}\right)\left(H_\theta(s)\right).
+$$
 
 ### 3.2 Policy, Value and Advantage Heads
 
-For an exact-state input $s$, write the encoded latent sequence as
+The state embedding and geometry-attention blocks form the backbone shared by the Policy, Value and Advantage heads. For an exact-state input $s$, write the backbone output as
 
 $$
 z=E_\theta(s)=(z_0,z_1,\ldots,z_{64}),
 $$
 
-where $z_0$ is the global token and $z_1,\ldots,z_{64}$ are the square tokens. Denote the Policy head's learned LayerNorm by $\mathrm{LN}_P$. Its source and destination projections have trainable parameters $W_{\mathrm{from}},W_{\mathrm{to}}\in\mathbb R^{C\times C}$ and $b_{\mathrm{from}},b_{\mathrm{to}}\in\mathbb R^C$. For $1\leq i\leq64$, define
+where $z_0$ is the global token and $z_1,\ldots,z_{64}$ are the square tokens. The Policy and Advantage heads read the square tokens, while the Value head reads the global token. Each head has its own trainable readout parameters.
+
+Denote the Policy head's learned LayerNorm by $\mathrm{LN}_P$. Its source and destination projections have trainable parameters $W_{\mathrm{from}},W_{\mathrm{to}}\in\mathbb R^{C\times C}$ and $b_{\mathrm{from}},b_{\mathrm{to}}\in\mathbb R^C$. For $1\leq i\leq64$, define
 
 $$
 r_i=\mathrm{LN}_P(z_i),
