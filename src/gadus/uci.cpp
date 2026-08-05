@@ -454,7 +454,6 @@ EngineOptions options_from_args(int argc, char **argv) {
 	options.search.mcts_sims = args.get_int("mcts-sims", options.search.mcts_sims);
 	options.search.mcts_min_sims = args.get_int("mcts-min-sims", options.search.mcts_min_sims);
 	options.search.mcts_batch_size = args.get_int("mcts-batch-size", options.search.mcts_batch_size);
-	options.search.movetime_ms = args.get_double("movetime-ms", options.search.movetime_ms);
 	options.search.c_puct = args.get_double("c-puct", options.search.c_puct);
 	options.search.c_puct_base = args.get_double("c-puct-base", options.search.c_puct_base);
 	options.search.c_puct_factor = args.get_double("c-puct-factor", options.search.c_puct_factor);

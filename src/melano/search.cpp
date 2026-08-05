@@ -45,7 +45,10 @@ int main(int argc, char **argv) {
 
 		auto model = melano::load_checkpoint(model_path, device);
 		melano::Searcher searcher(model, device, options);
-		const std::string fen = args.get("fen", std::string(chess::constants::STARTPOS));
+		const std::string fen_argument =
+			args.get("fen", std::string(chess::constants::STARTPOS));
+		const std::string fen =
+			fen_argument == "startpos" ? std::string(chess::constants::STARTPOS) : fen_argument;
 		chess::Board board(fen);
 		const auto result = searcher.search(board);
 

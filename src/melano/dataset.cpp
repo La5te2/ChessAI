@@ -775,6 +775,9 @@ void preprocess_pgn(const PreprocessOptions &options) {
 
 // Optimize policy, value, dueling action value, latent transition, and successor value.
 void train_supervised(const TrainOptions &options) {
+	if (options.channels <= 0 || options.blocks <= 0) {
+		throw std::invalid_argument("channels and blocks must be positive");
+	}
 	torch::manual_seed(static_cast<std::int64_t>(options.seed));
 	const auto device = resolve_device(options.device);
 	validate_compute_precision(options.precision, device);

@@ -337,7 +337,7 @@ $$
 \end{cases}
 $$
 
-The metric `grad_norm_before_clip` reports $\lVert\mathbf g_\theta\rVert_2$ before clipping. A nonfinite norm raises an error and terminates training before the optimizer step.
+When `--grad-clip` is positive, `grad_norm_before_clip` reports $\lVert\mathbf g_\theta\rVert_2$ before clipping, and a nonfinite norm terminates training before the optimizer step. A nonpositive `--grad-clip` disables gradient-norm calculation and clipping, so the reported metric is zero.
 
 Checkpoints serialize the online model used for inference. Training reconstructs the EMA target encoder from the online model and updates it after each optimizer step.
 
