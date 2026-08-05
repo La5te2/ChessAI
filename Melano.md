@@ -170,7 +170,7 @@ y_{b,u}=\widetilde h_{b,u}+
 W_{o,b}\mathrm{Concat}_{h=1}^{H}(o_{b,h,u})+b_{o,b}.
 $$
 
-The second residual uses a pre-normalized feed-forward network:
+After attention has exchanged information among the tokens, a pre-normalized feed-forward network transforms each token independently and forms the second residual update:
 
 $$
 h_{b+1}=y_b+
@@ -178,7 +178,7 @@ W_{f,b,2}\mathrm{GELU}
 \left(W_{f,b,1}\mathrm{LN}_{b,2}(y_b)+b_{f,b,1}\right)+b_{f,b,2}.
 $$
 
-The feed-forward dimensions are $C\rightarrow4C\rightarrow C$. Applying all $B$ blocks defines the shared representation
+The feed-forward network expands each token from $C$ to $4C$ features and projects it back to $C$. Applying all $B$ geometry-attention blocks defines the shared representation
 
 $$
 E_\theta(s)=h_B(s)\in\mathbb R^{65\times C}.
