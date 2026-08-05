@@ -377,7 +377,7 @@ $$
 
 ## 8. FCPI
 
-### 8.1 Source, Candidate and Training Targets
+### 8.1 Iteration Framework
 
 Let $C_r$ be the current model at the start of FCPI iteration $r$, with parameters $\theta_{old}$. FCPI freezes $\theta_{old}$ while constructing the training set. For encoded position $s$, the source model returns $P_{old}(\cdot\mid s)$ and $V_{old}(s)$.
 
@@ -393,7 +393,7 @@ FCPI constructs targets from completed self-play trajectories and finite counter
 
 After aggregating these targets, FCPI trains the candidate with the objective defined in Section 8.7. AdamW updates $\theta_{new}$ from the gradients of that objective. A paired-game arena then compares the trained candidate with $C_r$ and promotes the candidate by atomic checkpoint replacement when it meets the acceptance threshold.
 
-### 8.2 Starting Positions and Behavior Policy
+### 8.2 Self-Play Trajectory Generation
 
 When `--opening-book` names a sampling book, FCPI draws `--games-per-iter` distinct nonterminal positions without replacement from a pool of at most `--max-book-positions` FENs. The pool may include positions from any ply, including the standard initial position. With an empty book path, every game begins from the standard initial position. Iteration $r$ shuffles the pool with seed `--seed + r`.
 
@@ -413,7 +413,7 @@ $$
 
 Values $T_b<1$ concentrate probability on moves favored by the source policy, while values $T_b>1$ flatten the distribution.
 
-FCPI tracks cumulative move counts for each Gadus `PackedState` throughout an iteration. Suppose encoded position $s$ is encountered for the $n$th time, and let $N_{n-1}(s,a)$ count how often move $a$ was chosen during the preceding $n-1$ encounters. The behavior distribution assigns desired cumulative count $n\mu_{old}(a\mid s)$ to move $a$. FCPI chooses the move with the largest deficit between desired and observed counts:
+FCPI tracks cumulative move counts for each Gadus `PackedState` throughout an iteration. Suppose encoded position $s$ is encountered for the $n$-th time, and let $N_{n-1}(s,a)$ count how often move $a$ was chosen during the preceding $n-1$ encounters. The behavior distribution assigns desired cumulative count $n\mu_{old}(a\mid s)$ to move $a$. FCPI chooses the move with the largest deficit between desired and observed counts:
 
 $$
 a_n=\arg\max_{a\in\mathcal A(x)}
@@ -422,7 +422,7 @@ $$
 
 The legal-move array determines the tie-break order. Before playing $a_t$, FCPI records the FEN of $x_t$, encoded position $s_t$, $V_{old}(s_t)$, legal action indices, $P_{old}(\cdot\mid s_t)$ and selected move $a_t$. The trajectory ends at a terminal state or after `--max-plies` recorded plies.
 
-### 8.3 Terminal Monte Carlo Targets
+### 8.3 Monte Carlo Target Construction
 
 Consider a completed trajectory containing pre-move states $x_0,\ldots,x_{T_{\mathrm{traj}}-1}$. Its final move reaches terminal state $x_{T_{\mathrm{traj}}}$. Starting from terminal outcome $z(x_{T_{\mathrm{traj}}})$, FCPI reverses perspective at each ply:
 
@@ -450,7 +450,7 @@ $$
 
 The selected move $a_t$ is the sole action with MC policy weight one in this record, and its signed coefficient is $A_{\mathrm{MC}}(s_t,a_t)$.
 
-### 8.4 Finite Counterfactual Trees
+### 8.4 Finite Counterfactual Tree Search
 
 Before constructing counterfactual trees, FCPI deduplicates each trajectory by Gadus `PackedState` and keeps the first occurrence of each encoded position. Occurrences with the same `PackedState` produce the same network input, so this step prevents that input from generating multiple trees and receiving repeated weight within one trajectory. Each retained occurrence supplies the FEN that initializes the root of a separate tree, regardless of whether the trajectory ended naturally or reached the ply limit. The FEN restores the board, side to move, castling rights, en passant state and move counters. It does not contain positions visited earlier in the trajectory, so the reconstructed root begins with an empty repetition history. The tree records every move played after that root and applies the chess termination rules to the resulting descendants. It can therefore only detect a threefold repetition when all three occurrences of the repeated position lie on the path from the root to the current node.
 
@@ -491,7 +491,7 @@ V_{old}(\phi_G(x)),&x\in\mathcal X_O.
 \end{cases}
 $$
 
-The root has reach probability one. If edge $(x,a)$ leads to $x'=T(x,a)$, its reach probability is
+The reach probability of the root is $1$. If edge $(x,a)$ leads to child state $x'=T(x,a)$, the child's reach probability is
 
 $$
 p_{\mathrm{reach}}(x')=
@@ -530,7 +530,7 @@ $$
 
 An evaluated move that ends the game receives the exact terminal outcome from the parent's perspective. An evaluated nonterminal move receives the negated value backed up from its child. The final branch of the definition assigns $Q_{\mathrm{CF}}(s,a)=V_{old}(s)$ to every unevaluated move. Section 8.5 defines the backed-up value of an expanded node from its completed set of edge values.
 
-### 8.5 Counterfactual Policy and Value Targets
+### 8.5 Policy-Value Targets
 
 At an expanded node, the $P_{old}$-weighted mean of $Q_{\mathrm{CF}}$ is
 
@@ -603,7 +603,7 @@ $$
 \left(Q_{\mathrm{CF}}(s,a)-V_{old}(s)\right).
 $$
 
-Substituting $\delta_{\mathrm{CF}}(s)$ gives
+Substituting $\delta_{\mathrm{CF}}(s)$ gives:
 
 $$
 \overline V_{\mathrm{CF}}(s)=V_{old}(s)+\delta_{\mathrm{CF}}(s).
@@ -624,7 +624,7 @@ $$
 =\sum_{x\in\mathcal T_{\mathrm{exp}}}w_T(x)=1.
 $$
 
-### 8.6 Encoded-State Aggregation
+### 8.6 Aggregation and Weighting
 
 Each expanded decision node produces one training record. Records at tree roots include the MC targets inherited from self-play, and records below the root contain counterfactual targets. FCPI groups records with identical Gadus `PackedState` encodings across the iteration and verifies that every member of a group has the same legal-move list.
 
@@ -703,7 +703,7 @@ $$
 
 $S_A(s,a)$ is the weighted sum of MC advantage coefficients for selected move $a$ at encoded position $s$. $W_A(s,a)$ is the corresponding sample weight. The HDF5 datasets `mc_policy_advantage_sums` and `mc_policy_weights` store these two quantities.
 
-### 8.7 Candidate Loss
+### 8.7 Minibatch Training Objective
 
 Let $\ell_{new}(s,i_G(a))$ be the candidate logit for legal move $a$. The resulting legal-move policy is
 
@@ -792,7 +792,7 @@ $$
 
 Automatic differentiation computes $\nabla_{\theta_{new}}L^{(\mathcal B)}$, and AdamW updates the policy head, value head and shared ResNet trunk. Every minibatch supplies its own weight denominators, so minibatches with different total weights are normalized independently.
 
-### 8.8 Local Policy Update Property
+### 8.8 Theoretical Analysis of Iterative Policy Shift
 
 Let the clipping floor $10^{-12}$ tend to zero, and suppose the candidate fits $\pi^+$ exactly. For two actions $a$ and $b$ at the same state,
 
@@ -818,7 +818,7 @@ $$
 
 This statement applies to one fixed state, one fixed action pair and a constant $\Delta$.
 
-### 8.9 Optimization, Artifacts and Promotion
+### 8.9 Training Implementation and Target Storage
 
 Each iteration initializes the candidate from that iteration's `current.pth` and creates a new AdamW optimizer with weight decay $10^{-4}$. The training process initializes its random generator from `--seed` and uses that generator to shuffle records before every epoch. A positive `--train-max-steps` limits the number of optimizer steps, while a zero or negative value allows `--epochs` to determine the training length.
 
@@ -827,6 +827,8 @@ The model remains in `eval()` mode during FCPI training, which keeps BatchNorm r
 Each iteration writes an HDF5 target file containing `policy_targets`, `policy_weights`, `mc_policy_advantage_sums`, `mc_policy_weights`, `mc_value_targets`, `mc_value_weights`, `tree_value_targets` and `tree_value_weights`. The file is a persistent record of the aggregated targets. Candidate training consumes the same aggregated records from memory.
 
 For reporting, the metrics `value_mc` and `value_tree` normalize each value-loss component by its own weight. Backpropagation uses the minibatch loss $L_V^{(\mathcal B)}$ defined above.
+
+### 8.10 Acceptance and Promotion
 
 The iteration arena compares the candidate with the `current.pth` that generated its targets. If the candidate records $N_W$ wins, $N_D$ draws and $N_L$ losses, promotion occurs when
 
