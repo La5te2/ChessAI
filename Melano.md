@@ -75,9 +75,9 @@ Ordinary moves and queen promotions are indexed by source and destination square
 
 ### 3.1 Geometry-Attention Encoder
 
-Let $C$ be the hidden width selected by `--channels`. Each geometry-attention block contains pre-norm multi-head self-attention and a pre-norm feed-forward network, both with residual connections. Attention uses 32 ordered geometric relation classes and a dynamic relation bias conditioned on the global token. The number of heads $n_h$ is the largest member of $\lbrace 8,4,2,1\rbrace$ that divides $C$, giving head dimension $d_h=C/n_h$. The feed-forward sublayer maps $C\rightarrow4C\rightarrow C$ with a GELU activation.
+Let $C$ be the hidden width selected by `--channels`. Each geometry-attention block contains pre-norm multi-head self-attention and a pre-norm feed-forward network, both with residual connections. Attention uses a 32-row ordered-relation table and a dynamic relation bias conditioned on the global token. The number of heads $n_h$ is the largest member of $\lbrace 8,4,2,1\rbrace$ that divides $C$, giving head dimension $d_h=C/n_h$. The feed-forward sublayer maps $C\rightarrow4C\rightarrow C$ with a GELU activation.
 
-For input token $h_i$ and learned positional vector $\zeta_i$, write $\widetilde h_i=h_i+\zeta_i$. Relation index $\kappa_{ij}\in\lbrace 0,\ldots,31\rbrace$ encodes the geometry of ordered token pair $(i,j)$. Class 0 is reserved for pairs involving the global token. Relations between square tokens distinguish identity, common rank or file, diagonals, knight moves, adjacency and distance.
+For input token $h_i$ and learned positional vector $\zeta_i$, write $\widetilde h_i=h_i+\zeta_i$. Relation index $\kappa_{ij}\in\lbrace 0,\ldots,31\rbrace$ encodes the geometry of ordered token pair $(i,j)$. Class 0 applies to pairs involving the global token. Square-token pairs use classes for identity, common-rank distance, common-file distance, diagonal distance, knight moves and residual distance buckets. The current classifier reaches 29 relation indices. Rows 24 through 26 remain allocated in the relation table to preserve the checkpoint layout but receive no token pairs.
 
 For head $m$, let $b^{(m)}_{\kappa_{ij}}$ be the learned static bias for relation $\kappa_{ij}$. A two-layer MLP applied after LayerNorm to global token $\widetilde h_0$ produces position-dependent bias $d^{(m)}_{\kappa_{ij}}(\widetilde h_0)$. The attention weights are
 
@@ -605,7 +605,7 @@ Paired arena evaluation uses positions sampled at a fixed ply and filtered by a 
 
 ### 9.1 Evaluation Output
 
-The engine reports MultiPV lines, side-to-move `score cp`, nodes, NPS, elapsed time and a one-move PV. For a visited MCTS root edge, the line evaluation $q_{line}$ is $Q_{\mathrm{edge}}(s,a)$. For `closed` search or an unvisited MCTS root edge, $q_{line}=V_\theta(s)$. Let $c_s$ be `ScoreScale`. The displayed score is
+The engine reports MultiPV lines, side-to-move `score cp`, nodes, NPS, elapsed time and a one-move PV. Let $V_{root}$ denote the root evaluation returned by search. In `closed` mode, $V_{root}=V_\theta(s)$. After MCTS completes at least one simulation, $V_{root}$ is the mean return backed up to the root. A visited MCTS root edge reports $q_{line}=Q_{\mathrm{edge}}(s,a)$, while an unvisited root edge reports $q_{line}=V_{root}$. Let $c_s$ be `ScoreScale`. The displayed score is
 
 $$
 score\_cp=\mathrm{round}\left(
@@ -623,11 +623,7 @@ Melano exposes the following UCI options.
 - `MCTSSims` sets the MCTS simulation cap and defaults to `100`. A UCI command `go nodes <n>` uses `<n>` as the current cap.
 - `MCTSMinSims` sets the nominal minimum simulation count before dynamic budgeting and defaults to `0`. A zero value activates the formula derived from the cap and batch size. A time limit or UCI `stop` command may end search before this count is reached.
 - `MCTSBatchSize` sets the neural leaf batch size and defaults to `32`.
-- `MoveTimeMS` sets the fixed thinking time used when `go` supplies neither `movetime` nor a clock for the side to move. Its default is `0`.
 - `MoveOverheadMS` reserves communication and move-submission time from a clock allocation. Its default is `50`.
-- `MinMoveTimeMS` and `MaxMoveTimeMS` bound clock-based thinking time and default to `50` and `10000`.
-- `TimeDivisor` allocates a fraction of remaining time through division and defaults to `30.0`.
-- `IncrementFraction` allocates a fraction of the increment and defaults to `0.75`.
 - `CPuct`, `CPuctBase` and `CPuctFactor` set the PUCT exploration schedule and default to `0.5`, `19652` and `1.0`.
 - `FPUReduction` sets the FPU reduction and defaults to `0.15`.
 - `VirtualLoss` sets the repeated-path penalty within one batched selection and defaults to `0.0`.
@@ -637,8 +633,10 @@ Melano exposes the following UCI options.
 - `MultiPV` sets the number of reported analysis lines and defaults to `5`.
 - `ScoreScale` sets $c_s$ for converting the engine's dimensionless evaluation to the displayed centipawn scale and defaults to `1000`.
 
+The `go movetime` command supplies a fixed time budget directly. When `go` supplies the active side's remaining time and increment, the engine subtracts `MoveOverheadMS` from the allocation $t_{remain}/30+0.75t_{inc}$, bounds the result between 50 and 10000 milliseconds and then limits it to the usable remaining time. A `go` command without `movetime` or clock fields imposes no time limit.
+
 The engine publishes its direct policy ranking when search begins and publishes intermediate MCTS results at intervals of `ProgressIntervalMS`. Search limits and the UCI `stop` command determine the final result.
 
 ## 10. Implementation Tests
 
-The build process runs the Melano CTest executable before publishing binaries. The test suite covers `melano_square_tokens`, ordinary move and promotion encoding, terminal-state detection, policy, value and advantage output shapes, the advantage range, action-conditioned latent successors, anchored latent MCTS with $K=2$, finite numerical results, backward propagation and checkpoint round trips.
+The build process runs the Melano CTest executable before publishing binaries. The test suite covers `melano_square_tokens`, the geometry-relation layout, ordinary move and promotion encoding, terminal-state detection, policy, value and advantage output shapes, the advantage range, action-conditioned latent successors, anchored latent MCTS with $K=2$, finite numerical results, backward propagation and checkpoint round trips.

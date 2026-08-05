@@ -119,7 +119,7 @@ values: float32, (N,)
 arch_type=gadus
 state_encoding=gadus_18_planes
 move_encoding=alphazero_64x73
-target_schema=policy_value
+target_schema=pv_supervised
 has_cmt=0|1
 ```
 
@@ -452,7 +452,7 @@ The selected move $a_t$ is the sole action with MC policy weight one in this rec
 
 ### 8.4 Finite Counterfactual Trees
 
-Before constructing counterfactual trees, FCPI deduplicates each trajectory by Gadus `PackedState` and keeps the first occurrence of each encoded position. Every retained game state becomes the root of a separate tree, regardless of whether its trajectory ended naturally or reached the ply limit.
+Before constructing counterfactual trees, FCPI deduplicates each trajectory by Gadus `PackedState` and keeps the first occurrence of each encoded position. Occurrences with the same `PackedState` produce the same network input, so this step prevents that input from generating multiple trees and receiving repeated weight within one trajectory. Each retained occurrence supplies the FEN that initializes the root of a separate tree, regardless of whether the trajectory ended naturally or reached the ply limit. The FEN restores the board, side to move, castling rights, en passant state and move counters. It does not contain positions visited earlier in the trajectory, so the reconstructed root begins with an empty repetition history. The tree records every move played after that root and applies the chess termination rules to the resulting descendants. It can therefore only detect a threefold repetition when all three occurrences of the repeated position lie on the path from the root to the current node.
 
 Let $B_{\mathrm{CF}}$ denote `--counterfactual-budget`. This budget limits the number of edges evaluated below the root of each tree. An edge evaluation plays one legal move and assigns the successor either its exact terminal outcome or $V_{old}$ from the frozen source model.
 
@@ -481,7 +481,7 @@ $$
 
 FCPI selects the highest $k(a)$ values until the expansion set reaches width $w(x)$. The Gumbel generator uses seed `--seed + 3000017`.
 
-Every tree node stores a complete game state. Let $\mathcal X_T$ contain the terminal states and $\mathcal X_O$ the nonterminal states with legal moves. The leaf evaluation is exact on $\mathcal X_T$ and uses the frozen source model on $\mathcal X_O$:
+Each node in a counterfactual tree stores one environment state. For a given tree, let $\mathcal X_T$ be the set of terminal states stored in its nodes and let $\mathcal X_O$ be the set of stored nonterminal states that have legal moves. The leaf-evaluation function assigns the rule outcome to a state in $\mathcal X_T$ and the frozen source-model evaluation to a state in $\mathcal X_O$:
 
 $$
 v_{\mathrm{leaf}}(x)=
@@ -713,7 +713,7 @@ P_{new}(a\mid s)=
 {\sum_{b\in\mathcal A_s}\exp\ell_{new}(s,i_G(b))}.
 $$
 
-The distribution $\mu_{new}(a\mid s)$ used by $L_{P,\mathrm{MC}}$ applies the same behavior temperature as self-play:
+The distribution $\mu_{new}(a\mid s)$ used by $L_{P,\mathrm{MC}}^{(\mathcal B)}$ applies the same behavior temperature as self-play:
 
 $$
 \mu_{new}(a\mid s)=
@@ -721,27 +721,27 @@ $$
 {\sum_{b\in\mathcal A_s}\exp(\ell_{new}(s,i_G(b))/\widetilde T_b)}.
 $$
 
-Weighted cross-entropy fits $P_{new}$ to $\Pi^+$ on $\mathcal S_P$:
+At one optimizer step, let $\mathcal B\subseteq\mathcal S_{\mathrm{agg}}$ be the current minibatch. The counterfactual Policy loss normalizes its weights within $\mathcal B$:
 
 $$
-L_{P,\mathrm{CF}}=
+L_{P,\mathrm{CF}}^{(\mathcal B)}=
 \frac{
-\sum_{s\in\mathcal S_P}W_P(s)L_{\mathrm{CE}}
+\sum_{s\in\mathcal B}W_P(s)L_{\mathrm{CE}}
 \left(P_{new}(\cdot\mid s),\Pi^+(\cdot\mid s)\right)
 }
-{\max\left(\sum_{s\in\mathcal S_P}W_P(s),10^{-8}\right)}.
+{\max\left(\sum_{s\in\mathcal B}W_P(s),10^{-8}\right)}.
 $$
 
-The terminal-return policy loss is the negative advantage-weighted log-likelihood
+The MC Policy loss uses the same minibatch and normalizes by the corresponding action weights:
 
 $$
-L_{P,\mathrm{MC}}=
+L_{P,\mathrm{MC}}^{(\mathcal B)}=
 -\frac{
-\sum_{s\in\mathcal S_{\mathrm{agg}}}\sum_{a\in\mathcal A_s}
+\sum_{s\in\mathcal B}\sum_{a\in\mathcal A_s}
 S_A(s,a)\log\mu_{new}(a\mid s)
 }
 {\max\left(
-\sum_{s\in\mathcal S_{\mathrm{agg}}}\sum_{a\in\mathcal A_s}W_A(s,a),1
+\sum_{s\in\mathcal B}\sum_{a\in\mathcal A_s}W_A(s,a),1
 \right)}.
 $$
 
@@ -749,10 +749,10 @@ For a single unmerged record from a completed trajectory, $S_A(s_t,a_t)=A_{\math
 
 $$
 \nabla_{\theta_{new}}
-\left(L_{P,\mathrm{CF}}+L_{P,\mathrm{MC}}\right)
+\left(L_{P,\mathrm{CF}}^{(\mathcal B)}+L_{P,\mathrm{MC}}^{(\mathcal B)}\right)
 =
-\nabla_{\theta_{new}}L_{P,\mathrm{CF}}
-+\nabla_{\theta_{new}}L_{P,\mathrm{MC}}.
+\nabla_{\theta_{new}}L_{P,\mathrm{CF}}^{(\mathcal B)}
++\nabla_{\theta_{new}}L_{P,\mathrm{MC}}^{(\mathcal B)}.
 $$
 
 For scalar prediction error $e$, the terms involving $\overline G(s)$ and $\overline V_T(s)$ use the SmoothL1 penalty with threshold one:
@@ -765,29 +765,32 @@ $$
 \end{cases}
 $$
 
-$L_V$ combines the errors relative to $\overline G(s)$ and $\overline V_T(s)$ under one weighted mean:
+The Value loss combines the two weighted error sums within the same minibatch:
 
 $$
-L_V=
+L_V^{(\mathcal B)}=
 \frac{
-\sum_{s\in\mathcal S_{\mathrm{MC}}}W_{\mathrm{MC}}(s)
+\sum_{s\in\mathcal B}W_{\mathrm{MC}}(s)
 \mathrm{SL1}\left(V_{new}(s)-\overline G(s)\right)
-+\sum_{s\in\mathcal S_T}W_T(s)
++\sum_{s\in\mathcal B}W_T(s)
 \mathrm{SL1}\left(V_{new}(s)-\overline V_T(s)\right)
 }
 {\max\left(
-\sum_{s\in\mathcal S_{\mathrm{MC}}}W_{\mathrm{MC}}(s)
-+\sum_{s\in\mathcal S_T}W_T(s),1
+\sum_{s\in\mathcal B}W_{\mathrm{MC}}(s)
++\sum_{s\in\mathcal B}W_T(s),1
 \right)}.
 $$
 
-The complete FCPI objective is the unweighted sum of the three loss components:
+The objective evaluated for minibatch $\mathcal B$ is the unweighted sum of these three components:
 
 $$
-L=L_{P,\mathrm{CF}}+L_{P,\mathrm{MC}}+L_V.
+L^{(\mathcal B)}=
+L_{P,\mathrm{CF}}^{(\mathcal B)}+
+L_{P,\mathrm{MC}}^{(\mathcal B)}+
+L_V^{(\mathcal B)}.
 $$
 
-Automatic differentiation computes $\nabla_{\theta_{new}}L$, and AdamW updates the policy head, value head and shared ResNet trunk.
+Automatic differentiation computes $\nabla_{\theta_{new}}L^{(\mathcal B)}$, and AdamW updates the policy head, value head and shared ResNet trunk. Every minibatch supplies its own weight denominators, so minibatches with different total weights are normalized independently.
 
 ### 8.8 Local Policy Update Property
 
@@ -823,7 +826,7 @@ The model remains in `eval()` mode during FCPI training, which keeps BatchNorm r
 
 Each iteration writes an HDF5 target file containing `policy_targets`, `policy_weights`, `mc_policy_advantage_sums`, `mc_policy_weights`, `mc_value_targets`, `mc_value_weights`, `tree_value_targets` and `tree_value_weights`. The file is a persistent record of the aggregated targets. Candidate training consumes the same aggregated records from memory.
 
-For reporting, the metrics `value_mc` and `value_tree` normalize each value-loss component by its own weight. Backpropagation uses the joint loss $L_V$ defined above.
+For reporting, the metrics `value_mc` and `value_tree` normalize each value-loss component by its own weight. Backpropagation uses the minibatch loss $L_V^{(\mathcal B)}$ defined above.
 
 The iteration arena compares the candidate with the `current.pth` that generated its targets. If the candidate records $N_W$ wins, $N_D$ draws and $N_L$ losses, promotion occurs when
 
@@ -855,7 +858,7 @@ Paired arena evaluation uses positions sampled at a fixed ply and filtered by a 
 
 ### 10.1 Evaluation Output
 
-The engine reports MultiPV lines, side-to-move `score cp`, nodes, NPS, elapsed time and a one-move PV. For a visited MCTS root edge, the line evaluation $q_{line}$ is its root-perspective mean return $Q(s,a)$. For `closed` search or an unvisited MCTS root edge, $q_{line}=V_\theta(s)$. Let $c_s$ be `ScoreScale`. The displayed score is
+The engine reports MultiPV lines, side-to-move `score cp`, nodes, NPS, elapsed time and a one-move PV. Let $V_{root}$ denote the root evaluation returned by search. In `closed` mode, $V_{root}=V_\theta(s)$. After MCTS completes at least one simulation, $V_{root}$ is the mean return backed up to the root. A visited MCTS root edge reports $q_{line}=Q(s,a)$, while an unvisited root edge reports $q_{line}=V_{root}$. Let $c_s$ be `ScoreScale`. The displayed score is
 
 $$
 score\_cp=\mathrm{round}\left(
@@ -873,11 +876,7 @@ Gadus exposes the following UCI options.
 - `MCTSSims` sets the MCTS simulation cap and defaults to `100`. A UCI command `go nodes <n>` uses `<n>` as the current cap.
 - `MCTSMinSims` sets the nominal minimum simulation count before dynamic budgeting and defaults to `0`. A zero value activates the formula derived from the cap and batch size. A time limit or UCI `stop` command may end search before this count is reached.
 - `MCTSBatchSize` sets the neural leaf batch size and defaults to `32`.
-- `MoveTimeMS` sets the fixed thinking time used when `go` supplies neither `movetime` nor a clock for the side to move. Its default is `0`.
 - `MoveOverheadMS` reserves communication and move-submission time from a clock allocation. Its default is `50`.
-- `MinMoveTimeMS` and `MaxMoveTimeMS` bound clock-based thinking time and default to `50` and `10000`.
-- `TimeDivisor` allocates a fraction of remaining time through division and defaults to `30.0`.
-- `IncrementFraction` allocates a fraction of the increment and defaults to `0.75`.
 - `CPuct`, `CPuctBase` and `CPuctFactor` set the PUCT exploration schedule and default to `0.5`, `19652` and `1.0`.
 - `FPUReduction` sets the FPU reduction and defaults to `0.15`.
 - `VirtualLoss` sets the repeated-path penalty within one batched selection and defaults to `0.0`.
@@ -886,6 +885,8 @@ Gadus exposes the following UCI options.
 - `ProgressIntervalMS` sets the interval between intermediate UCI `info` reports and defaults to `750`. A zero interval suppresses intermediate reports.
 - `MultiPV` sets the number of reported analysis lines and defaults to `5`.
 - `ScoreScale` sets $c_s$ for converting the engine's dimensionless evaluation to the displayed centipawn scale and defaults to `1000`.
+
+The `go movetime` command supplies a fixed time budget directly. When `go` supplies the active side's remaining time and increment, the engine subtracts `MoveOverheadMS` from the allocation $t_{remain}/30+0.75t_{inc}$, bounds the result between 50 and 10000 milliseconds and then limits it to the usable remaining time. A `go` command without `movetime` or clock fields imposes no time limit.
 
 The engine publishes its direct policy ranking when search begins and publishes intermediate MCTS results at intervals of `ProgressIntervalMS`. Search limits and the UCI `stop` command determine the final result.
 

@@ -20,15 +20,16 @@
 
 namespace {
 
+inline constexpr int kMinimumMoveTimeMs = 50;
+inline constexpr int kMaximumMoveTimeMs = 10000;
+inline constexpr double kTimeDivisor = 30.0;
+inline constexpr double kIncrementFraction = 0.75;
+
 struct EngineOptions {
 	std::filesystem::path model_path;
 	std::string device = "auto";
 	gadus::SearchOptions search;
 	int move_overhead_ms = 50;
-	int min_movetime_ms = 50;
-	int max_movetime_ms = 10000;
-	double time_divisor = 30.0;
-	double increment_fraction = 0.75;
 	int progress_interval_ms = 750;
 	int multipv = 5;
 	int score_scale = 1000;
@@ -194,18 +195,8 @@ class UciEngine {
 			  std::to_string(options_.search.mcts_min_sims) + " min 0 max 1000000");
 		print("option name MCTSBatchSize type spin default " +
 			  std::to_string(options_.search.mcts_batch_size) + " min 1 max 4096");
-		print("option name MoveTimeMS type spin default " +
-			  std::to_string(static_cast<int>(options_.search.movetime_ms)) +
-			  " min 0 max 3600000");
 		print("option name MoveOverheadMS type spin default " +
 			  std::to_string(options_.move_overhead_ms) + " min 0 max 60000");
-		print("option name MinMoveTimeMS type spin default " +
-			  std::to_string(options_.min_movetime_ms) + " min 0 max 3600000");
-		print("option name MaxMoveTimeMS type spin default " +
-			  std::to_string(options_.max_movetime_ms) + " min 0 max 3600000");
-		print("option name TimeDivisor type string default " + std::to_string(options_.time_divisor));
-		print("option name IncrementFraction type string default " +
-			  std::to_string(options_.increment_fraction));
 		print("option name CPuct type string default " + std::to_string(options_.search.c_puct));
 		print("option name CPuctBase type string default " +
 			  std::to_string(options_.search.c_puct_base));
@@ -268,18 +259,8 @@ class UciEngine {
 			options_.search.mcts_min_sims = std::max(0, parse_int(value, options_.search.mcts_min_sims));
 		} else if (key == "mctsbatchsize") {
 			options_.search.mcts_batch_size = std::max(1, parse_int(value, options_.search.mcts_batch_size));
-		} else if (key == "movetimems") {
-			options_.search.movetime_ms = std::max(0, parse_int(value, static_cast<int>(options_.search.movetime_ms)));
 		} else if (key == "moveoverheadms") {
 			options_.move_overhead_ms = std::max(0, parse_int(value, options_.move_overhead_ms));
-		} else if (key == "minmovetimems") {
-			options_.min_movetime_ms = std::max(0, parse_int(value, options_.min_movetime_ms));
-		} else if (key == "maxmovetimems") {
-			options_.max_movetime_ms = std::max(0, parse_int(value, options_.max_movetime_ms));
-		} else if (key == "timedivisor") {
-			options_.time_divisor = std::max(1.0, parse_double(value, options_.time_divisor));
-		} else if (key == "incrementfraction") {
-			options_.increment_fraction = std::max(0.0, parse_double(value, options_.increment_fraction));
 		} else if (key == "cpuct") {
 			options_.search.c_puct = std::max(0.0, parse_double(value, options_.search.c_puct));
 		} else if (key == "cpuctbase") {
@@ -358,7 +339,7 @@ class UciEngine {
 	// Derive a bounded per-move budget from movetime or the active side's clock and increment.
 	int movetime_for(const std::unordered_map<std::string, std::string> &go) const {
 		if (const auto found = go.find("movetime"); found != go.end()) {
-			return std::max(0, parse_int(found->second, static_cast<int>(options_.search.movetime_ms)));
+			return std::max(0, parse_int(found->second, 0));
 		}
 		const bool white = board_.sideToMove() == chess::Color::WHITE;
 		const auto time_key = white ? "wtime" : "btime";
@@ -368,18 +349,14 @@ class UciEngine {
 			const int increment = go.contains(increment_key)
 								  ? std::max(0, parse_int(go.at(increment_key), 0))
 								  : 0;
-			double budget = remaining / options_.time_divisor +
-							increment * options_.increment_fraction - options_.move_overhead_ms;
-			if (options_.max_movetime_ms > 0) {
-				budget = std::min(budget, static_cast<double>(options_.max_movetime_ms));
-			}
-			if (options_.min_movetime_ms > 0) {
-				budget = std::max(budget, static_cast<double>(options_.min_movetime_ms));
-			}
+			double budget = remaining / kTimeDivisor + increment * kIncrementFraction -
+							options_.move_overhead_ms;
+			budget = std::clamp(budget, static_cast<double>(kMinimumMoveTimeMs),
+							static_cast<double>(kMaximumMoveTimeMs));
 			budget = std::min(budget, static_cast<double>(std::max(1, remaining - options_.move_overhead_ms)));
 			return std::max(0, static_cast<int>(budget));
 		}
-		return std::max(0, static_cast<int>(options_.search.movetime_ms));
+		return 0;
 	}
 
 	// Map bounded neural value to a monotonic centipawn-like UCI display score.
@@ -491,10 +468,6 @@ EngineOptions options_from_args(int argc, char **argv) {
 	options.progress_interval_ms =
 		args.get_int("progress-interval-ms", options.progress_interval_ms);
 	options.move_overhead_ms = args.get_int("move-overhead-ms", options.move_overhead_ms);
-	options.min_movetime_ms = args.get_int("min-movetime-ms", options.min_movetime_ms);
-	options.max_movetime_ms = args.get_int("max-movetime-ms", options.max_movetime_ms);
-	options.time_divisor = args.get_double("time-divisor", options.time_divisor);
-	options.increment_fraction = args.get_double("increment-fraction", options.increment_fraction);
 	options.multipv = args.get_int("multipv", options.multipv);
 	options.score_scale = args.get_int("score-scale", options.score_scale);
 	return options;

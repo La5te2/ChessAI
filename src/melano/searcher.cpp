@@ -85,7 +85,7 @@ bool deadline_reached(const std::optional<Clock::time_point> &deadline) {
 
 // Remove temporary reservations made while assembling one neural evaluation batch.
 void clear_virtual(const std::vector<Node *> &path) {
-	for (std::size_t index = 1; index < path.size(); ++index) {
+	for (std::size_t index = 0; index < path.size(); ++index) {
 		path[index]->virtual_visits = std::max(0, path[index]->virtual_visits - 1);
 	}
 }
@@ -371,6 +371,7 @@ struct Searcher::Impl {
 		selected.board = state.board;
 		selected.leaf = state.root.get();
 		selected.path.push_back(selected.leaf);
+		selected.leaf->virtual_visits += 1;
 		while (!selected.leaf->children.empty()) {
 			selected.leaf = select_child(selected.leaf);
 			selected.leaf->virtual_visits += 1;

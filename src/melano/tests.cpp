@@ -1,6 +1,8 @@
 // Focused Melano smoke tests for codecs, P/V/A gradients, checkpoints, and search.
 
+#include <array>
 #include <cmath>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -65,6 +67,25 @@ int main() {
 		require(packed[64] == 1, "side-to-move token mismatch");
 		require(packed[65] == 15, "castling token mismatch");
 		require(packed[66] == 0, "en-passant token mismatch");
+
+		const auto relation_ids = melano::build_geometry_relation_ids().contiguous();
+		const auto relation_access = relation_ids.accessor<std::int64_t, 2>();
+		std::array<bool, melano::kGeometryRelations> seen_relations{};
+		for (std::int64_t source = 0; source < relation_ids.size(0); ++source) {
+			for (std::int64_t target = 0; target < relation_ids.size(1); ++target) {
+				const auto relation = relation_access[source][target];
+				require(relation >= 0 && relation < melano::kGeometryRelations,
+						"geometry relation id is out of range");
+				seen_relations[static_cast<std::size_t>(relation)] = true;
+			}
+		}
+		int active_relations = 0;
+		for (const bool active : seen_relations) {
+			active_relations += active ? 1 : 0;
+		}
+		require(active_relations == 29, "geometry relation layout changed");
+		require(!seen_relations[24] && !seen_relations[25] && !seen_relations[26],
+				"reserved geometry relation id became reachable");
 
 		require_move_codec(board);
 		chess::Board promotion("8/P7/8/8/8/8/8/k6K w - - 0 1");
@@ -265,7 +286,7 @@ int main() {
 		require(torch::allclose(reference_successor, loaded_successor),
 				"checkpoint changed latent transition output");
 
-		// Closed search ranks legal actions with policy and Melano's advantage prior.
+		// Closed search ranks legal actions with Policy before optional decision components.
 		melano::SearchOptions closed_options;
 		closed_options.type = melano::SearchType::Closed;
 		closed_options.mcts_sims = 0;

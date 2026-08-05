@@ -78,11 +78,13 @@ ctest --test-dir "${WORK_DIR}" --output-on-failure
 
 rm -rf -- "${PUBLISH_DIR}/gadus" "${PUBLISH_DIR}/melano" "${PUBLISH_DIR}/graphics"
 mkdir -p "${PUBLISH_DIR}/gadus" "${PUBLISH_DIR}/melano"
-for architecture in gadus melano; do
-	for executable in preprocess train search arena fcpi uci; do
-		test -x "${WORK_DIR}/${architecture}/${executable}"
-		cp "${WORK_DIR}/${architecture}/${executable}" "${PUBLISH_DIR}/${architecture}/"
-	done
+for executable in preprocess train search arena fcpi uci; do
+	test -x "${WORK_DIR}/gadus/${executable}"
+	cp "${WORK_DIR}/gadus/${executable}" "${PUBLISH_DIR}/gadus/"
+done
+for executable in preprocess train search arena uci; do
+	test -x "${WORK_DIR}/melano/${executable}"
+	cp "${WORK_DIR}/melano/${executable}" "${PUBLISH_DIR}/melano/"
 done
 if [[ "${BUILD_GRAPHICS}" == "ON" ]]; then
 	mkdir -p "${PUBLISH_DIR}/graphics"

@@ -41,9 +41,9 @@ int square_geometry_relation(int source, int target) {
 		value = 14 + adr;
 	} else if ((adr == 1 && adc == 2) || (adr == 2 && adc == 1)) {
 		value = 22;
-	} else if (std::max(adr, adc) == 1) {
-		value = 23;
 	} else {
+		// IDs 24-26 remain unused to preserve the established 32-row checkpoint layout.
+		// Adjacent squares already belong to a rank, file, or diagonal relation.
 		value = 24 + std::min(6, adr + adc - 2);
 	}
 	return value + 1;
