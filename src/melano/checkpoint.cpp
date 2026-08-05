@@ -17,6 +17,8 @@ namespace melano {
 
 namespace {
 
+constexpr std::int64_t kMelanoCheckpointType = 2;
+
 class Sha256 {
 	public:
 	// Stream bytes into 512-bit SHA-256 blocks without loading a whole checkpoint in memory.
@@ -184,7 +186,7 @@ void save_checkpoint_atomic(const std::filesystem::path &path, const Model &mode
 	torch::serialize::OutputArchive model_archive;
 	torch::serialize::OutputArchive arch_archive;
 	model->save(model_archive);
-	arch_archive.write("type_id", scalar(2), true);
+	arch_archive.write("type_id", scalar(kMelanoCheckpointType), true);
 	arch_archive.write("channels", scalar(arch.channels), true);
 	arch_archive.write("blocks", scalar(arch.blocks), true);
 	arch_archive.write("action_size", scalar(kActionSize), true);
@@ -211,7 +213,7 @@ Model load_checkpoint(const std::filesystem::path &path, const torch::Device &de
 	torch::serialize::InputArchive arch_archive;
 	archive.read("model", model_archive);
 	archive.read("arch", arch_archive);
-	if (read_scalar(arch_archive, "type_id") != 2) {
+	if (read_scalar(arch_archive, "type_id") != kMelanoCheckpointType) {
 		throw std::runtime_error("checkpoint is not a Melano model: " + path.string());
 	}
 	ArchitectureInfo loaded;
@@ -252,17 +254,6 @@ std::string file_sha256(const std::filesystem::path &path) {
 		output << std::setw(2) << static_cast<int>(byte);
 	}
 	return output.str();
-}
-
-// Stage a full copy beside its destination, then publish it with replace_file.
-void atomic_copy(const std::filesystem::path &source, const std::filesystem::path &target) {
-	if (!target.parent_path().empty()) {
-		std::filesystem::create_directories(target.parent_path());
-	}
-	const auto temporary = target.string() + ".tmp";
-	std::filesystem::copy_file(source, temporary,
-							   std::filesystem::copy_options::overwrite_existing);
-	replace_file(temporary, target);
 }
 
 } // namespace melano

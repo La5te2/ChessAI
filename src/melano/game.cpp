@@ -220,7 +220,7 @@ torch::Tensor encode_boards(const std::vector<chess::Board> &boards, bool pinned
 						 pinned_memory);
 }
 
-// Pack live positions once, then use the compact device transfer used by FCPI inference.
+// Pack live positions once, then transfer the batch directly to the inference device.
 torch::Tensor encode_boards_device(const std::vector<chess::Board> &boards,
 								   const torch::Device &device) {
 	std::vector<std::uint8_t> packed(boards.size() * kStateFeatures);

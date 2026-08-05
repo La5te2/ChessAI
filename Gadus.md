@@ -2,9 +2,7 @@
 
 Gadus is a residual policy-value network for chess with an AlphaZero-style action space.
 
-## 1. Notation and Abbreviations
-
-> Throughout this document, $V$, $Q$ and terminal outcomes use the perspective of the side to move. A definition states its perspective explicitly when it uses a different one.
+## 1. Notations
 
 - $\mathcal X$ is the set of complete game states. A state $x\in\mathcal X$ contains the board, side to move, castling rights, en passant state, halfmove clock and repetition history.
 - $\mathcal A(x)$ is the set of legal actions in $x$. An action is written as $a\in\mathcal A(x)$, and $T(x,a)$ is the deterministic successor state produced by the chess rules.
@@ -18,34 +16,6 @@ Gadus is a residual policy-value network for chess with an AlphaZero-style actio
 - $L_{\mathrm{CE}}(p,q)=-\sum_iq_i\log p_i$ is the cross-entropy from target distribution $q$ to predicted distribution $p$. $\mathrm{MSE}(u,v)$ is the mean squared error between corresponding elements.
 - $D_{\mathrm{KL}}(p\,\|\,q)=\sum_ip_i\log(p_i/q_i)$ is the Kullback-Leibler divergence from distribution $p$ to distribution $q$.
 - Subscripts `old` and `new` identify the frozen source model and the trainable candidate within one FCPI iteration. A superscript `+` identifies a policy target produced by local policy improvement.
-
-The following abbreviations are used throughout this document.
-
-- **PGN**: Portable Game Notation.
-- **FEN**: Forsyth-Edwards Notation.
-- **UCI**: Universal Chess Interface.
-- **HDF5**: Hierarchical Data Format 5.
-- **ResNet**: residual network.
-- **MLP**: multilayer perceptron.
-- **MCTS**: Monte Carlo Tree Search.
-- **PUCT**: Predictor plus Upper Confidence bounds applied to Trees.
-- **FPU**: First Play Urgency.
-- **MC**: Monte Carlo. In the FCPI sections, MC denotes a terminal return propagated along one completed trajectory.
-- **FCPI**: Folded Counterfactual Policy Iteration.
-- **KL**: Kullback-Leibler divergence.
-- **CE**: cross-entropy.
-- **MSE**: mean squared error.
-- **IMF**: Instant Mate First.
-- **RPP**: Repetition Policy Penalty.
-- **PV**: principal variation. `MultiPV` denotes multiple reported principal variations.
-- **NPS**: nodes per second.
-- **CPU**: central processing unit.
-- **GPU**: graphics processing unit.
-- **CUDA**: NVIDIA's GPU computing platform.
-- **FP32**: IEEE 754 single-precision floating point.
-- **BF16**: bfloat16 floating point.
-- **CI**: confidence interval.
-- **JSON**: JavaScript Object Notation.
 
 ## 2. State and Action Encoding
 
@@ -186,7 +156,7 @@ arch  #stores the Gadus identifier and the dimensions required to reconstruct th
 
 ### 6.1 Search Modes
 
-Search mode `closed` derives its initial move ranking directly from the model policy. Search mode `only-mcts` evaluates leaf nodes in neural batches and derives its initial ranking from the resulting MCTS root distribution. Both modes then apply the enabled IMF and RPP decision components.
+Search mode `closed` derives its initial move ranking directly from the model policy. Search mode `only-mcts` evaluates leaf nodes in neural batches and derives its initial ranking from the resulting MCTS root distribution. Both modes then apply the enabled IMF(Instant Mate First) and RPP(Repetition Policy Penalty) decision components.
 
 Within `only-mcts` mode, expanding node $s$ creates one outgoing edge $(s,a)$ for each legal action $a$ and stores policy probability $P(s,a)$ as that edge's prior. Each prior remains fixed throughout the search. The completed visit counts of an edge and its parent node are denoted by $N(s,a)$ and $N(s)=\sum_aN(s,a)$. During batched selection, virtual visits reserve edges for concurrent paths and reduce repeated selection of the same edge. Their corresponding counts are $N_v(s,a)$ and $N_v(s)=\sum_aN_v(s,a)$. Selection combines completed and virtual visits into the augmented counts:
 
@@ -255,7 +225,7 @@ N_{\min}=
 \end{cases}
 $$
 
-A `movetime` deadline or UCI `stop` request may end search before $N_{\min}$ simulations. After $N_{\min}$ simulations have completed, a root with at least two legal actions uses the empirical visit distribution
+A UCI `stop` request may end search before $N_{\min}$ simulations. After $N_{\min}$ simulations have completed, a root with at least two legal actions uses the empirical visit distribution
 
 $$
 v_a=\frac{N(s,a)}{\displaystyle\sum_{b\in\mathcal A(x)}N(s,b)}.
@@ -291,7 +261,7 @@ A root with one legal action uses $u=0$ and $N_{\mathrm{target}}=N_{\min}$.
 
 ### 6.4 Final Decision Components
 
-The optional IMF and RPP rules operate on the final ranking rather than on the search tree. Before either rule is applied, the ranking score is
+The optional IMF(Instant Mate First) and RPP(Repetition Policy Penalty) rules operate on the final ranking rather than on the search tree. Before either rule is applied, the ranking score is
 
 $$
 D_0(a)=
@@ -378,6 +348,8 @@ $$
 ## 8. FCPI
 
 ### 8.1 Iteration Framework
+
+FCPI stands for Folded Counterfactual Policy Iteration.
 
 Let $C_r$ be the current model at the start of FCPI iteration $r$, with parameters $\theta_{old}$. FCPI freezes $\theta_{old}$ while constructing the training set. For encoded position $s$, the source model returns $P_{old}(\cdot\mid s)$ and $V_{old}(s)$.
 

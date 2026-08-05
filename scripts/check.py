@@ -69,7 +69,7 @@ def inspect_model(path: Path) -> dict[str, object]:
     try:
         archive = torch.jit.load(str(path), map_location="cpu")
     except Exception as error:
-        raise ValueError("file is not a readable current LibTorch checkpoint") from error
+        raise ValueError("file is not a readable Gadidae LibTorch checkpoint") from error
 
     children = dict(archive.named_children())
     if set(children) != {"model", "arch"}:
@@ -110,7 +110,7 @@ def inspect_model(path: Path) -> dict[str, object]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Display basic information about a current Gadidae LibTorch checkpoint."
+        description="Display basic information about a Gadidae LibTorch checkpoint."
     )
     parser.add_argument("--model", required=True, type=Path)
     return parser.parse_args()

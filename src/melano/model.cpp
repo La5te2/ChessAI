@@ -9,6 +9,8 @@
 
 namespace melano {
 
+namespace {
+
 // Select a practical multi-head factor without requiring channels to use one fixed width.
 int attention_heads_for_channels(int channels) {
 	for (const int heads : {8, 4, 2}) {
@@ -18,8 +20,6 @@ int attention_heads_for_channels(int channels) {
 	}
 	return 1;
 }
-
-namespace {
 
 // Reject invalid architecture descriptors instead of silently changing model dimensions.
 int require_positive(int value, const char *name) {
@@ -191,34 +191,24 @@ torch::Tensor ValueHeadImpl::forward(torch::Tensor tokens) {
 }
 
 // Stack geometry-attention blocks and attach the policy and value heads.
-ModelImpl::ModelImpl(int channels, int blocks)
-	: channels_(require_positive(channels, "channels")),
-	  blocks_(require_positive(blocks, "blocks")) {
-	state_embedding = register_module("state_embedding", StateEmbedding(channels_));
+ModelImpl::ModelImpl(int channels, int blocks) {
+	channels = require_positive(channels, "channels");
+	blocks = require_positive(blocks, "blocks");
+	state_embedding = register_module("state_embedding", StateEmbedding(channels));
 	trunk = register_module("trunk", torch::nn::Sequential());
-	for (int index = 0; index < blocks_; ++index) {
-		trunk->push_back(GeometryAttentionBlock(channels_));
+	for (int index = 0; index < blocks; ++index) {
+		trunk->push_back(GeometryAttentionBlock(channels));
 	}
-	policy_head = register_module("policy_head", ActionHead(channels_));
-	value_head = register_module("value_head", ValueHead(channels_));
-}
-
-// Encode one exact state with the embedding and shared geometry transformer.
-torch::Tensor ModelImpl::encode(torch::Tensor state) {
-	return trunk->forward(state_embedding->forward(state));
+	policy_head = register_module("policy_head", ActionHead(channels));
+	value_head = register_module("value_head", ValueHead(channels));
 }
 
 // Produce policy logits and V(s) from the shared exact-state representation.
 std::tuple<torch::Tensor, torch::Tensor> ModelImpl::forward(torch::Tensor state) {
-	auto tokens = encode(state);
+	auto tokens = trunk->forward(state_embedding->forward(state));
 	auto squares = tokens.index({torch::indexing::Slice(), torch::indexing::Slice(1, torch::indexing::None)});
 	return {policy_head->forward(squares), value_head->forward(tokens)};
 }
-
-// Expose the checkpoint-defining embedding width.
-int ModelImpl::channels() const noexcept { return channels_; }
-// Expose the checkpoint-defining attention depth.
-int ModelImpl::blocks() const noexcept { return blocks_; }
 
 // Sum tensor element counts rather than serialized bytes or optimizer state.
 std::int64_t parameter_count(const Model &model) {

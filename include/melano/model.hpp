@@ -12,8 +12,6 @@ namespace melano {
 inline constexpr int kTokenCount = kBoardSquares + 1;
 inline constexpr int kGeometryRelations = 29;
 
-/// Chooses the largest supported attention-head count that evenly divides channels.
-int attention_heads_for_channels(int channels);
 /// Builds static relation ids for every global/square token pair.
 torch::Tensor build_geometry_relation_ids();
 
@@ -81,23 +79,13 @@ TORCH_MODULE(ValueHead);
 struct ModelImpl : torch::nn::Module {
 	/// Builds the token embedding, geometry-attention trunk, and policy/value heads.
 	ModelImpl(int channels = 128, int blocks = 10);
-	/// Encodes an exact board state into the shared geometry-aware token representation.
-	torch::Tensor encode(torch::Tensor state);
 	/// Returns policy logits and side-to-move V(s) for an exact board state.
 	std::tuple<torch::Tensor, torch::Tensor> forward(torch::Tensor state);
-	/// Returns the transformer embedding width stored in the checkpoint descriptor.
-	int channels() const noexcept;
-	/// Returns the number of geometry-attention blocks stored in the descriptor.
-	int blocks() const noexcept;
 
 	StateEmbedding state_embedding{nullptr};
 	torch::nn::Sequential trunk{nullptr};
 	ActionHead policy_head{nullptr};
 	ValueHead value_head{nullptr};
-
-	private:
-	int channels_;
-	int blocks_;
 };
 TORCH_MODULE(Model);
 

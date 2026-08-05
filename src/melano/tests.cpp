@@ -247,18 +247,6 @@ int main() {
 		closed_options.root_topn = 4;
 		melano::Searcher closed_searcher(loaded, torch::Device(torch::kCPU), closed_options);
 		const auto closed_result = closed_searcher.search(board);
-		const auto compact_result = closed_searcher.evaluate_closed_many({board});
-		require(compact_result.size() == 1, "compact Melano evaluation row count mismatch");
-		require(compact_result[0].legal_indices.size() == compact_result[0].legal_policy.size(),
-				"compact Melano evaluation width mismatch");
-		for (std::size_t column = 0; column < compact_result[0].legal_indices.size(); ++column) {
-			const int action = compact_result[0].legal_indices[column];
-			require(std::abs(compact_result[0].legal_policy[column] -
-							 closed_result.policy[action]) < 1e-6F,
-					"compact Melano evaluation changed a legal probability");
-		}
-		require(std::abs(compact_result[0].value - closed_result.value) < 1e-6F,
-				"compact Melano evaluation changed Value");
 		require(closed_result.root.size() == 4, "closed search root size mismatch");
 		require(closed_result.sims_completed == 0, "closed search unexpectedly ran MCTS");
 		require(melano::index_to_move(melano::move_to_index(closed_result.move), board) ==

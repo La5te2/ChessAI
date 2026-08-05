@@ -1,10 +1,6 @@
 // Implements the small dependency-free argument grammar shared by Melano tools.
 
 #include "melano/args.hpp"
-#include <chrono>
-#include <iomanip>
-#include <random>
-#include <sstream>
 #include <stdexcept>
 
 namespace melano {
@@ -102,29 +98,6 @@ double Args::get_double(const std::string &name, double fallback) const {
 bool Args::get_bool(const std::string &name, bool fallback) const {
 	const auto value = optional(name);
 	return value ? parse_bool_text(*value) : fallback;
-}
-
-// Format local time without punctuation that is awkward in file names.
-std::string timestamp() {
-	const auto now = std::chrono::system_clock::now();
-	const auto time = std::chrono::system_clock::to_time_t(now);
-	std::tm local{};
-#ifdef _WIN32
-	localtime_s(&local, &time);
-#else
-	localtime_r(&time, &local);
-#endif
-	std::ostringstream output;
-	output << std::put_time(&local, "%Y%m%d_%H%M%S");
-	return output.str();
-}
-
-// Combine readable time with process-local randomness to avoid run-directory collisions.
-std::string create_run_id(const std::string &prefix) {
-	std::random_device device;
-	std::mt19937 generator(device());
-	std::uniform_int_distribution<int> suffix(1000, 9999);
-	return prefix + "_" + timestamp() + "_" + std::to_string(suffix(generator));
 }
 
 } // namespace melano

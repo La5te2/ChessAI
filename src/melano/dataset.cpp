@@ -1,4 +1,4 @@
-// Implements Melano PGN parsing, schema-checked HDF5 I/O, and fresh P/V/A training.
+// Implements Melano PGN parsing, schema-checked HDF5 I/O, and Policy/Value training.
 
 #include "melano/dataset.hpp"
 #include <hdf5.h>

@@ -22,6 +22,12 @@ struct Evaluation {
 	std::vector<float> values;
 };
 
+struct CompactEvaluation {
+	std::vector<int> legal_indices;
+	std::vector<float> legal_policy;
+	float value = 0.0F;
+};
+
 struct Node {
 	// Create an edge/node pair with its Policy prior and incoming legal move.
 	explicit Node(float initial_prior = 0.0F, chess::Move incoming = chess::Move::NO_MOVE)
@@ -54,9 +60,6 @@ struct TreeState {
 	int dynamic_target = 0;
 	int expanded_nodes = 0;
 	int nn_batches = 0;
-	double total_leaf_depth = 0.0;
-	int leaf_samples = 0;
-	int max_leaf_depth = 0;
 };
 
 // Keep bounded value arithmetic inside the model's [-1, 1] convention.
@@ -115,8 +118,8 @@ struct Searcher::Impl {
 		model->eval();
 	}
 
-	// Evaluate a frozen batch and keep legal actions compact on both sides of the device boundary.
-	std::vector<ClosedEvaluation> evaluate_closed(const std::vector<chess::Board> &boards) {
+	// Evaluate a batch and keep legal actions compact on both sides of the device boundary.
+	std::vector<CompactEvaluation> evaluate_compact(const std::vector<chess::Board> &boards) {
 		if (boards.empty()) {
 			return {};
 		}
@@ -177,7 +180,7 @@ struct Searcher::Impl {
 						  .to(torch::kCPU)
 						  .contiguous();
 
-		std::vector<ClosedEvaluation> output(boards.size());
+		std::vector<CompactEvaluation> output(boards.size());
 		auto probability_rows = probabilities.accessor<float, 2>();
 		auto value_rows = values.accessor<float, 1>();
 		for (std::size_t row = 0; row < boards.size(); ++row) {
@@ -195,7 +198,7 @@ struct Searcher::Impl {
 
 	// Densify only for MCTS and user-facing search, whose node logic indexes the full action space.
 	Evaluation evaluate(const std::vector<chess::Board> &boards) {
-		auto compact = evaluate_closed(boards);
+		auto compact = evaluate_compact(boards);
 		Evaluation output;
 		output.policies.resize(compact.size(), std::vector<float>(kActionSize, 0.0F));
 		output.values.resize(compact.size());
@@ -301,10 +304,6 @@ struct Searcher::Impl {
 				break;
 			}
 		}
-		const int depth = static_cast<int>(selected.path.size()) - 1;
-		state.total_leaf_depth += depth;
-		state.leaf_samples += 1;
-		state.max_leaf_depth = std::max(state.max_leaf_depth, depth);
 		return selected;
 	}
 
@@ -651,12 +650,6 @@ SearchResult Searcher::search(const chess::Board &board,
 // Search a batch without progress callbacks, as used by arena.
 std::vector<SearchResult> Searcher::search_many(const std::vector<chess::Board> &boards) {
 	return impl_->search_many(boards);
-}
-
-// Return compact legal-action Policy and Value outputs for batched inspection.
-std::vector<ClosedEvaluation>
-Searcher::evaluate_closed_many(const std::vector<chess::Board> &boards) {
-	return impl_->evaluate_closed(boards);
 }
 
 // Convert the command-line search mode to the strongly typed enum.

@@ -6,7 +6,7 @@
 #include "melano/checkpoint.hpp"
 #include "melano/search.hpp"
 
-// Parse a FEN/search configuration, load one checkpoint, and print P/V/A root diagnostics.
+// Parse a FEN/search configuration, load one checkpoint, and print Policy/Value diagnostics.
 int main(int argc, char **argv) {
 	try {
 		melano::Args args(argc, argv);
