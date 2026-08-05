@@ -341,7 +341,7 @@ When `--grad-clip` is positive, `grad_norm_before_clip` reports $\lVert\mathbf g
 
 Checkpoints serialize the online model used for inference. Training reconstructs the EMA target encoder from the online model and updates it after each optimizer step.
 
-Each training invocation initializes a new Melano model. `--channels` and `--blocks` determine its width and depth. Checkpoints are written atomically by renaming a completed temporary file. Each checkpoint contains top-level keys `model` and `arch`. The `arch` entry records the architecture identifier, channel count, block count and action-space size.
+Each training invocation initializes a new Melano model. `--channels` and `--blocks` determine its width and depth. A positive `--max-steps` limits the number of optimizer steps, while a zero or negative value allows `--epochs` to determine the training length. Checkpoints are written atomically by renaming a completed temporary file. Each checkpoint contains top-level keys `model` and `arch`. The `arch` entry records the architecture identifier, channel count, block count and action-space size.
 
 `--precision` accepts `fp32` or `bf16` and defaults to `fp32`. CUDA forward computation uses BF16 in `bf16` mode. The policy softmax, all loss calculations, metric accumulation and checkpoint parameters use FP32. CUDA training batches use pinned host memory.
 

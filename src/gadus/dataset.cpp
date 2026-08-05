@@ -692,7 +692,7 @@ void train_supervised(const TrainOptions &options) {
 					std::cout << "checkpoint saved: path=" << options.output.string()
 							  << " global_step=" << global_step << std::endl;
 				}
-				if (options.max_steps >= 0 && global_step >= options.max_steps) {
+				if (options.max_steps > 0 && global_step >= options.max_steps) {
 					stop = true;
 					break;
 				}

@@ -799,10 +799,9 @@ void train_supervised(const TrainOptions &options) {
 									 options.batch_size);
 	const auto epoch_step_limit =
 		std::max<std::int64_t>(1, static_cast<std::int64_t>(options.epochs) * steps_per_epoch);
-	const auto planned_steps =
-		options.max_steps >= 0 ? std::max<std::int64_t>(
-									 1, std::min(options.max_steps, epoch_step_limit))
-							 : epoch_step_limit;
+	const auto planned_steps = options.max_steps > 0
+							   ? std::min(options.max_steps, epoch_step_limit)
+							   : epoch_step_limit;
 	const auto warmup_steps = std::min<std::int64_t>(
 		planned_steps, std::min<std::int64_t>(
 						   2000, std::max<std::int64_t>(100, planned_steps / 100)));
@@ -976,7 +975,7 @@ void train_supervised(const TrainOptions &options) {
 					std::cout << "checkpoint saved: path=" << options.output.string()
 							  << " global_step=" << global_step << std::endl;
 				}
-				if (options.max_steps >= 0 && global_step >= options.max_steps) {
+				if (options.max_steps > 0 && global_step >= options.max_steps) {
 					stop = true;
 					break;
 				}

@@ -171,7 +171,7 @@ L_{\mathrm{sup}}=
 L_{P,\mathrm{sup}}+w_VL_{V,\mathrm{sup}}.
 $$
 
-Each training invocation initializes a new Gadus model. `--channels` and `--blocks` determine its width and depth. `--max-steps` limits the number of optimizer steps, and `--save-every` sets the interval between atomic checkpoint writes. `--seed` controls parameter initialization and dataset shuffling.
+Each training invocation initializes a new Gadus model. `--channels` and `--blocks` determine its width and depth. A positive `--max-steps` limits the number of optimizer steps, while a zero or negative value allows `--epochs` to determine the training length. `--save-every` sets the interval between atomic checkpoint writes. `--seed` controls parameter initialization and dataset shuffling.
 
 `--precision` accepts `fp32` or `bf16` and defaults to `fp32`. CUDA forward computation uses BF16 in `bf16` mode. The Policy softmax, loss calculations, metric accumulation and checkpoint parameters remain in FP32. CUDA training batches use pinned host memory.
 
@@ -375,9 +375,9 @@ $$
 N_W-N_L\geq M_{\mathrm{gate}}.
 $$
 
-## 8. Folded Counterfactual Policy Iteration
+## 8. FCPI
 
-### 8.1 Source Model, Candidate and Training Targets
+### 8.1 Source, Candidate and Training Targets
 
 Let $C_r$ be the current model at the start of FCPI iteration $r$, with parameters $\theta_{old}$. FCPI freezes $\theta_{old}$ while constructing the training set. For encoded position $s$, the source model returns $P_{old}(\cdot\mid s)$ and $V_{old}(s)$.
 
@@ -820,7 +820,7 @@ This statement applies to one fixed state, one fixed action pair and a constant 
 
 ### 8.9 Optimization, Artifacts and Promotion
 
-Each iteration initializes the candidate from that iteration's `current.pth` and creates a new AdamW optimizer with weight decay $10^{-4}$. The training process initializes its random generator from `--seed` and uses that generator to shuffle records before every epoch. Training stops at the first limit reached by `--epochs` or `--train-max-steps`.
+Each iteration initializes the candidate from that iteration's `current.pth` and creates a new AdamW optimizer with weight decay $10^{-4}$. The training process initializes its random generator from `--seed` and uses that generator to shuffle records before every epoch. A positive `--train-max-steps` limits the number of optimizer steps, while a zero or negative value allows `--epochs` to determine the training length.
 
 The model remains in `eval()` mode during FCPI training, which keeps BatchNorm running statistics fixed while preserving parameter gradients. Global gradient-norm clipping uses threshold one. CUDA forward computation uses BF16 when `--precision bf16` is selected. The policy logits, $V$ outputs, loss calculations and checkpoint parameters use FP32.
 

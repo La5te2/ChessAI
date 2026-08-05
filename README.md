@@ -91,12 +91,14 @@ A graphics-enabled build also produces `build/graphics/Gadidae`. Windows executa
 
 The `build/.build-work/` directory stores the CMake and Ninja state used for incremental builds. Subsequent builds reuse compatible object files from this directory. Every build runs CTest before publishing the executables. A compilation or test failure leaves diagnostic files under `build/.build-work/`. CTest failures also produce `build/.build-work/Testing/Temporary/LastTest.log`.
 
-Each command entry point provides its current argument list through `--help`:
+The `preprocess`, `train`, `search`, `arena` and Gadus `fcpi` entry points provide their current argument lists through `--help`:
 
 ```bash
 build/gadus/search --help
 build/melano/train --help
 ```
+
+The Gadus and Melano UCI executables publish their configurable engine options in response to the UCI `uci` command rather than through `--help`.
 
 ## Commands
 
