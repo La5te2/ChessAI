@@ -1,17 +1,16 @@
 #pragma once
 
-// Melano geometry-aware transformer with policy, value, and non-positive advantage heads.
+// Melano geometry-aware transformer with a shared exact-state encoder and policy/value heads.
 
 #include <cstdint>
+#include <tuple>
 #include <torch/nn.h>
 #include "melano/game.hpp"
 
 namespace melano {
 
 inline constexpr int kTokenCount = kBoardSquares + 1;
-inline constexpr int kGeometryRelations = 32;
-/// Prevents cosine-latent objectives from creating singular gradients near a zero vector.
-inline constexpr double kLatentNormEpsilon = 1e-4;
+inline constexpr int kGeometryRelations = 29;
 
 /// Chooses the largest supported attention-head count that evenly divides channels.
 int attention_heads_for_channels(int channels);
@@ -79,48 +78,13 @@ struct ValueHeadImpl : torch::nn::Module {
 };
 TORCH_MODULE(ValueHead);
 
-struct AdvantageHeadImpl : torch::nn::Module {
-	/// Builds the action-shaped head used to predict non-positive A(s,a).
-	explicit AdvantageHeadImpl(int channels);
-	/// Produces A(s,a) in [-2, 0] as -2*tanh(raw)^2.
-	torch::Tensor forward(torch::Tensor square_tokens);
-
-	ActionHead action_head{nullptr};
-};
-TORCH_MODULE(AdvantageHead);
-
-struct ModelOutput {
-	torch::Tensor policy;
-	torch::Tensor value;
-	torch::Tensor advantages;
-};
-
-struct LatentDynamicsImpl : torch::nn::Module {
-	/// Builds an action-conditioned residual transition over Melano's 65 latent tokens.
-	explicit LatentDynamicsImpl(int channels);
-	/// Predicts the successor latent z' from z and one encoded legal action.
-	torch::Tensor forward(torch::Tensor tokens, torch::Tensor actions);
-
-	int channels;
-	torch::nn::Embedding action_embedding{nullptr};
-	torch::nn::Linear action_projection{nullptr};
-	torch::nn::Linear update_gate{nullptr};
-	GeometryAttentionBlock transition{nullptr};
-	torch::nn::LayerNorm output_norm{nullptr};
-};
-TORCH_MODULE(LatentDynamics);
-
 struct ModelImpl : torch::nn::Module {
-	/// Builds the token embedding, geometry-attention trunk, and P/V/A heads.
+	/// Builds the token embedding, geometry-attention trunk, and policy/value heads.
 	ModelImpl(int channels = 128, int blocks = 10);
-	/// Encodes exact board state into the shared geometry-aware latent representation.
+	/// Encodes an exact board state into the shared geometry-aware token representation.
 	torch::Tensor encode(torch::Tensor state);
-	/// Applies P/V/A heads to an already encoded latent representation.
-	ModelOutput predict(torch::Tensor tokens);
-	/// Predicts the latent successor of an encoded action without decoding a board.
-	torch::Tensor transition(torch::Tensor tokens, torch::Tensor actions);
-	/// Returns policy logits, side-to-move V(s), and action advantages A(s,a).
-	ModelOutput forward(torch::Tensor state);
+	/// Returns policy logits and side-to-move V(s) for an exact board state.
+	std::tuple<torch::Tensor, torch::Tensor> forward(torch::Tensor state);
 	/// Returns the transformer embedding width stored in the checkpoint descriptor.
 	int channels() const noexcept;
 	/// Returns the number of geometry-attention blocks stored in the descriptor.
@@ -130,8 +94,6 @@ struct ModelImpl : torch::nn::Module {
 	torch::nn::Sequential trunk{nullptr};
 	ActionHead policy_head{nullptr};
 	ValueHead value_head{nullptr};
-	AdvantageHead advantage_head{nullptr};
-	LatentDynamics dynamics{nullptr};
 
 	private:
 	int channels_;
@@ -141,9 +103,5 @@ TORCH_MODULE(Model);
 
 /// Counts all trainable and non-trainable model parameter elements.
 std::int64_t parameter_count(const Model &model);
-/// Copies the exact-state encoder into a frozen training-only target model.
-void initialize_target_encoder(Model target, const Model &online);
-/// Moves the frozen target encoder toward the online encoder with exponential averaging.
-void update_target_encoder(Model target, const Model &online, double decay);
 
 } // namespace melano

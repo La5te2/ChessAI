@@ -20,7 +20,7 @@ inline constexpr int kActionSize = kBoardSquares * kBoardSquares +
 inline constexpr const char *kArchType = "melano";
 inline constexpr const char *kStateEncoding = "melano_square_tokens";
 inline constexpr const char *kMoveEncoding = "sd_64x64_underpromo9";
-inline constexpr const char *kTargetSchema = "pva_latent_dynamics";
+inline constexpr const char *kTargetSchema = "melano_policy_value";
 
 using PackedState = std::array<std::uint8_t, kStateFeatures>;
 

@@ -1,6 +1,6 @@
 #pragma once
 
-// Melano PGN-to-HDF5 preprocessing and one-shot supervised P/V/A training.
+// Melano PGN-to-HDF5 preprocessing and one-shot supervised policy/value training.
 
 #include <cstdint>
 #include <filesystem>
@@ -14,12 +14,8 @@ namespace melano {
 
 struct SupervisedBatch {
 	torch::Tensor states;
-	torch::Tensor next_states;
 	torch::Tensor moves;
 	torch::Tensor values;
-	torch::Tensor next_values;
-	torch::Tensor advantage_moves;
-	torch::Tensor advantage_values;
 };
 
 struct DatasetInfo {
@@ -49,10 +45,10 @@ class SupervisedH5 {
 
 	/// Returns immutable schema and row-count metadata.
 	const DatasetInfo &info() const noexcept;
-	/// Reads arbitrary rows and decodes state, move, value, and advantage tensors.
+	/// Reads arbitrary rows and decodes state, move, and value tensors.
 	SupervisedBatch read(const std::vector<std::int64_t> &indices,
 						 bool pinned_memory = false) const;
-	/// Reads one contiguous range while preserving alignment across every Melano target.
+	/// Reads one contiguous range while preserving state, move, and value alignment.
 	SupervisedBatch read_contiguous(std::int64_t begin, std::int64_t count,
 									bool pinned_memory = false) const;
 
@@ -71,7 +67,7 @@ struct PreprocessOptions {
 	int log_every = 10000;
 };
 
-/// Parses PGN games and writes Melano-specific policy, value, and advantage targets.
+/// Parses PGN games and writes Melano-specific state, policy, and value targets.
 void preprocess_pgn(const PreprocessOptions &options);
 
 struct TrainOptions {
@@ -85,10 +81,6 @@ struct TrainOptions {
 	double learning_rate = 1e-3;
 	double weight_decay = 1e-4;
 	double value_weight = 0.25;
-	double dueling_q_weight = 0.5;
-	double dynamics_weight = 0.25;
-	double imagined_value_weight = 0.25;
-	double target_decay = 0.995;
 	double grad_clip = 1.0;
 	int save_every = 5000;
 	int log_every = 100;

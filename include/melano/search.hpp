@@ -1,6 +1,6 @@
 #pragma once
 
-// Melano direct-policy and K=2 anchored latent PUCT search API.
+// Melano direct-policy and exact-state batched PUCT search API.
 
 #include <cstdint>
 #include <functional>
@@ -38,8 +38,6 @@ struct RootMove {
 	float decision_score = 0.0F;
 	float prior = 0.0F;
 	float q = 0.0F;
-	float advantage = 0.0F;
-	float q_prior = 0.0F;
 	int visits = 0;
 	bool repetition_penalized = false;
 	bool instant_mate = false;
@@ -48,15 +46,12 @@ struct RootMove {
 struct SearchResult {
 	chess::Move move;
 	std::vector<float> policy;
-	std::vector<float> advantages;
 	std::vector<float> decision_scores;
 	float value = 0.0F;
 	int sims_completed = 0;
 	int dynamic_target = 0;
 	int expanded_nodes = 0;
 	int nn_batches = 0;
-	int exact_evaluations = 0;
-	int latent_evaluations = 0;
 	double uncertainty = 0.0;
 	double elapsed_ms = 0.0;
 	std::vector<RootMove> root;
@@ -65,9 +60,7 @@ struct SearchResult {
 // Frozen closed-policy output in legal-action form for high-throughput data generation.
 struct ClosedEvaluation {
 	std::vector<int> legal_indices;
-	std::vector<chess::Move> moves;
 	std::vector<float> legal_policy;
-	std::vector<float> legal_advantages;
 	float value = 0.0F;
 };
 
@@ -84,7 +77,7 @@ class Searcher {
 						const SearchCancelCallback &cancel = {});
 	/// Searches independent positions together so leaf evaluations share neural batches.
 	std::vector<SearchResult> search_many(const std::vector<chess::Board> &boards);
-	/// Evaluates closed Policy/Value/Advantage without constructing search trees.
+	/// Evaluates closed Policy/Value without constructing search trees.
 	std::vector<ClosedEvaluation>
 	evaluate_closed_many(const std::vector<chess::Board> &boards);
 

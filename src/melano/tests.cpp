@@ -1,4 +1,4 @@
-// Focused Melano smoke tests for codecs, P/V/A gradients, checkpoints, and search.
+// Focused Melano smoke tests for codecs, Policy/Value gradients, checkpoints, and search.
 
 #include <array>
 #include <cmath>
@@ -83,9 +83,8 @@ int main() {
 		for (const bool active : seen_relations) {
 			active_relations += active ? 1 : 0;
 		}
-		require(active_relations == 29, "geometry relation layout changed");
-		require(!seen_relations[24] && !seen_relations[25] && !seen_relations[26],
-				"reserved geometry relation id became reachable");
+		require(active_relations == melano::kGeometryRelations,
+				"geometry relation layout contains an unreachable id");
 
 		require_move_codec(board);
 		chess::Board promotion("8/P7/8/8/8/8/8/k6K w - - 0 1");
@@ -167,7 +166,7 @@ int main() {
 		require(melano::game_termination(repetition) == "threefold repetition",
 				"threefold-repetition termination mismatch");
 
-		// A first annotated move has no previous score but does have an exact successor value.
+		// A move comment supervises the state reached immediately before the next move.
 		const auto pgn = std::filesystem::temp_directory_path() / "melanotest.pgn";
 		const auto h5 = std::filesystem::temp_directory_path() / "melanotest.h5";
 		{
@@ -195,96 +194,51 @@ int main() {
 			const auto e4 = chess::uci::uciToMove(after_e4, "e2e4");
 			after_e4.makeMove(e4);
 			const auto expected_after_e4 = melano::encode_boards({after_e4}).index({0});
-			require(torch::equal(supervised_batch.next_states.index({0}), expected_after_e4),
-					"HDF5 successor state differs from live state codec");
+			require(torch::equal(supervised_batch.states.index({1}), expected_after_e4),
+					"HDF5 second state differs from live state codec");
 			require(supervised_batch.moves.index({0}).item<std::int64_t>() ==
 						melano::move_to_index(e4),
 					"HDF5 policy target differs from live move codec");
-			const float expected_successor = -static_cast<float>(std::tanh(0.60 / 3.0));
+			const float expected_after_e4_value = -static_cast<float>(std::tanh(0.60 / 3.0));
 			require(std::abs(supervised_batch.values.index({0}).item<float>()) < 1e-6F,
-					"first unanchored value must remain neutral");
-			require(std::abs(supervised_batch.next_values.index({0}).item<float>() -
-							 expected_successor) < 1e-6F,
-					"first annotated successor value was lost");
+					"first value without a preceding comment must remain neutral");
+			require(std::abs(supervised_batch.values.index({1}).item<float>() -
+							 expected_after_e4_value) < 1e-6F,
+					"annotated second-state value was lost");
 		}
 		std::filesystem::remove(pgn);
 		std::filesystem::remove(h5);
 
-		auto ema_online = melano::Model(8, 1);
-		auto ema_target = melano::Model(8, 1);
-		melano::initialize_target_encoder(ema_target, ema_online);
-		const auto ema_state = melano::encode_boards({board});
-		require(torch::allclose(ema_online->encode(ema_state), ema_target->encode(ema_state)),
-				"target encoder initialization mismatch");
-		for (const auto &parameter : ema_target->parameters()) {
-			require(!parameter.requires_grad(), "target encoder parameter still requires gradients");
-		}
-		auto online_embedding = ema_online->state_embedding->parameters().front();
-		auto target_embedding = ema_target->state_embedding->parameters().front();
-		auto target_before = target_embedding.clone();
-		{
-			torch::NoGradGuard no_grad;
-			online_embedding.add_(2.0);
-		}
-		melano::update_target_encoder(ema_target, ema_online, 0.75);
-		require(torch::allclose(target_embedding, target_before + 0.5),
-				"target encoder EMA update mismatch");
-
 		auto model = melano::Model(8, 1);
 		auto states = melano::encode_boards({board, board});
-		auto tokens = model->encode(states);
-		auto output = model->predict(tokens);
-		require(output.policy.sizes() == torch::IntArrayRef({2, melano::kActionSize}),
+		auto [policy, value] = model->forward(states);
+		require(policy.sizes() == torch::IntArrayRef({2, melano::kActionSize}),
 				"policy shape mismatch");
-		require(output.value.sizes() == torch::IntArrayRef({2, 1}), "value shape mismatch");
-		require(output.advantages.sizes() == torch::IntArrayRef({2, melano::kActionSize}),
-				"advantage shape mismatch");
-		require(torch::isfinite(output.policy).all().item<bool>(),
+		require(value.sizes() == torch::IntArrayRef({2, 1}), "value shape mismatch");
+		require(torch::isfinite(policy).all().item<bool>(),
 				"policy contains a non-finite value");
-		require(torch::isfinite(output.value).all().item<bool>(),
+		require(torch::isfinite(value).all().item<bool>(),
 				"value contains a non-finite value");
-		require(torch::isfinite(output.advantages).all().item<bool>(),
-				"advantage contains a non-finite value");
-		require(output.value.abs().max().item<float>() <= 1.000001F, "value range mismatch");
-		require(output.advantages.max().item<float>() <= 1e-6F &&
-				output.advantages.min().item<float>() >= -2.000001F,
-				"advantage range mismatch");
-		auto actions = torch::tensor(
-			{melano::move_to_index(chess::uci::uciToMove(board, "e2e4")),
-			 melano::move_to_index(chess::uci::uciToMove(board, "g1f3"))},
-			torch::kInt64);
-		auto successor = model->transition(tokens, actions);
-		require(successor.sizes() == torch::IntArrayRef({2, melano::kTokenCount, 8}),
-				"latent successor shape mismatch");
-		auto imagined = model->predict(successor);
-		(output.policy.mean() + output.value.mean() + output.advantages.mean() +
-		 successor.mean() + imagined.value.mean())
-			.backward();
+		require(value.abs().max().item<float>() <= 1.000001F, "value range mismatch");
+		(policy.mean() + value.mean()).backward();
 		require_finite_gradients(model);
 
 		const auto checkpoint = std::filesystem::temp_directory_path() / "melanotest.pth";
 		model->eval();
-		auto reference = model->forward(melano::encode_boards({board}));
-		auto reference_latent = model->encode(melano::encode_boards({board}));
-		auto reference_successor = model->transition(reference_latent, actions.index({0}).reshape({1}));
+		auto [reference_policy, reference_value] =
+			model->forward(melano::encode_boards({board}));
 		melano::save_checkpoint_atomic(checkpoint, model, {8, 1});
 		melano::ArchitectureInfo info;
 		auto loaded = melano::load_checkpoint(checkpoint, torch::Device(torch::kCPU), &info);
 		require(info.channels == 8 && info.blocks == 1, "checkpoint architecture mismatch");
 		loaded->eval();
-		auto loaded_output = loaded->forward(melano::encode_boards({board}));
-		require(loaded_output.policy.size(1) == melano::kActionSize,
+		auto [loaded_policy, loaded_value] = loaded->forward(melano::encode_boards({board}));
+		require(loaded_policy.size(1) == melano::kActionSize,
 				"loaded model output mismatch");
-		require(torch::allclose(reference.policy, loaded_output.policy),
+		require(torch::allclose(reference_policy, loaded_policy),
 				"checkpoint changed policy output");
-		require(torch::allclose(reference.value, loaded_output.value),
+		require(torch::allclose(reference_value, loaded_value),
 				"checkpoint changed value output");
-		require(torch::allclose(reference.advantages, loaded_output.advantages),
-				"checkpoint changed advantage output");
-		auto loaded_latent = loaded->encode(melano::encode_boards({board}));
-		auto loaded_successor = loaded->transition(loaded_latent, actions.index({0}).reshape({1}));
-		require(torch::allclose(reference_successor, loaded_successor),
-				"checkpoint changed latent transition output");
 
 		// Closed search ranks legal actions with Policy before optional decision components.
 		melano::SearchOptions closed_options;
@@ -295,21 +249,13 @@ int main() {
 		const auto closed_result = closed_searcher.search(board);
 		const auto compact_result = closed_searcher.evaluate_closed_many({board});
 		require(compact_result.size() == 1, "compact Melano evaluation row count mismatch");
-		require(compact_result[0].legal_indices.size() == compact_result[0].legal_policy.size() &&
-				compact_result[0].legal_indices.size() ==
-					compact_result[0].legal_advantages.size() &&
-				compact_result[0].legal_indices.size() == compact_result[0].moves.size(),
+		require(compact_result[0].legal_indices.size() == compact_result[0].legal_policy.size(),
 				"compact Melano evaluation width mismatch");
 		for (std::size_t column = 0; column < compact_result[0].legal_indices.size(); ++column) {
 			const int action = compact_result[0].legal_indices[column];
-			require(melano::move_to_index(compact_result[0].moves[column]) == action,
-					"compact Melano evaluation changed legal move alignment");
 			require(std::abs(compact_result[0].legal_policy[column] -
 							 closed_result.policy[action]) < 1e-6F,
 					"compact Melano evaluation changed a legal probability");
-			require(std::abs(compact_result[0].legal_advantages[column] -
-							 closed_result.advantages[action]) < 1e-6F,
-					"compact Melano evaluation changed a legal Advantage");
 		}
 		require(std::abs(compact_result[0].value - closed_result.value) < 1e-6F,
 				"compact Melano evaluation changed Value");
@@ -329,10 +275,7 @@ int main() {
 		const auto mcts_result = mcts_searcher.search(board);
 		require(mcts_result.sims_completed == 4, "MCTS simulation budget mismatch");
 		require(mcts_result.expanded_nodes > 0, "MCTS did not expand a node");
-		require(mcts_result.exact_evaluations >= 1,
-				"K=2 MCTS did not retain an exact latent anchor");
-		require(mcts_result.latent_evaluations > 0,
-				"K=2 MCTS did not evaluate odd-depth latent successors");
+		require(mcts_result.nn_batches > 1, "MCTS did not evaluate exact-state leaves");
 		std::filesystem::remove(checkpoint);
 
 		std::cout << "melanotests passed" << std::endl;

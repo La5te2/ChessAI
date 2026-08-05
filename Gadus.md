@@ -703,7 +703,7 @@ $$
 
 $S_A(s,a)$ is the weighted sum of MC advantage coefficients for selected move $a$ at encoded position $s$. $W_A(s,a)$ is the corresponding sample weight. The HDF5 datasets `mc_policy_advantage_sums` and `mc_policy_weights` store these two quantities.
 
-### 8.7 Joint Policy-Value Objective
+### 8.7 Joint Training Objective
 
 Let $\ell_{new}(s,i_G(a))$ be the candidate logit for legal move $a$. The resulting legal-move policy is
 

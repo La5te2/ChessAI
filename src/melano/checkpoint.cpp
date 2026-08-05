@@ -217,6 +217,10 @@ Model load_checkpoint(const std::filesystem::path &path, const torch::Device &de
 	ArchitectureInfo loaded;
 	loaded.channels = static_cast<int>(read_scalar(arch_archive, "channels"));
 	loaded.blocks = static_cast<int>(read_scalar(arch_archive, "blocks"));
+	if (loaded.channels <= 0 || loaded.blocks <= 0) {
+		throw std::runtime_error("checkpoint has invalid Melano architecture dimensions: " +
+								 path.string());
+	}
 	if (read_scalar(arch_archive, "action_size") != kActionSize) {
 		throw std::runtime_error("checkpoint action size does not match Melano: " + path.string());
 	}

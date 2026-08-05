@@ -106,7 +106,7 @@ std::int64_t read_int_attribute(hid_t object, const char *name) {
 
 class H5Writer {
 	public:
-	// Create a fresh Melano file with aligned state, policy, value, and advantage rows.
+	// Create a fresh Melano file with aligned state, policy, and value rows.
 	explicit H5Writer(const PreprocessOptions &options) : options_(options) {
 		if (!options.output.parent_path().empty()) {
 			std::filesystem::create_directories(options.output.parent_path());
@@ -128,23 +128,11 @@ class H5Writer {
 		states_ = create_dataset(
 			"states", {0, kStateFeatures}, {H5S_UNLIMITED, kStateFeatures},
 			{static_cast<hsize_t>(std::max(1, options.chunk_size)), kStateFeatures}, H5T_STD_U8LE);
-		next_states_ = create_dataset(
-			"next_states", {0, kStateFeatures}, {H5S_UNLIMITED, kStateFeatures},
-			{static_cast<hsize_t>(std::max(1, options.chunk_size)), kStateFeatures}, H5T_STD_U8LE);
 		moves_ =
 			create_dataset("moves", {0}, {H5S_UNLIMITED},
 						   {static_cast<hsize_t>(std::max(1, options.chunk_size))}, H5T_STD_U16LE);
 		values_ =
 			create_dataset("values", {0}, {H5S_UNLIMITED},
-						   {static_cast<hsize_t>(std::max(1, options.chunk_size))}, H5T_IEEE_F32LE);
-		next_values_ =
-			create_dataset("next_values", {0}, {H5S_UNLIMITED},
-						   {static_cast<hsize_t>(std::max(1, options.chunk_size))}, H5T_IEEE_F32LE);
-		advantage_moves_ =
-			create_dataset("adv_moves", {0}, {H5S_UNLIMITED},
-						   {static_cast<hsize_t>(std::max(1, options.chunk_size))}, H5T_STD_U16LE);
-		advantage_values_ =
-			create_dataset("adv_values", {0}, {H5S_UNLIMITED},
 						   {static_cast<hsize_t>(std::max(1, options.chunk_size))}, H5T_IEEE_F32LE);
 	}
 
@@ -152,56 +140,33 @@ class H5Writer {
 	~H5Writer() {
 		if (states_ >= 0)
 			H5Dclose(states_);
-		if (next_states_ >= 0)
-			H5Dclose(next_states_);
 		if (moves_ >= 0)
 			H5Dclose(moves_);
 		if (values_ >= 0)
 			H5Dclose(values_);
-		if (next_values_ >= 0)
-			H5Dclose(next_values_);
-		if (advantage_moves_ >= 0)
-			H5Dclose(advantage_moves_);
-		if (advantage_values_ >= 0)
-			H5Dclose(advantage_values_);
 		if (file_ >= 0)
 			H5Fclose(file_);
 	}
 
-	// Append one aligned block of P/V/A supervision and encoded token states.
+	// Append one aligned block of encoded states, policy actions, and values.
 	void append(const std::vector<PackedState> &states,
-				const std::vector<PackedState> &next_states,
 				const std::vector<std::uint16_t> &moves,
-				const std::vector<float> &values,
-				const std::vector<float> &next_values,
-				const std::vector<std::uint16_t> &advantage_moves,
-				const std::vector<float> &advantage_values) {
+				const std::vector<float> &values) {
 		if (states.empty())
 			return;
-		if (states.size() != next_states.size() || states.size() != moves.size() ||
-			states.size() != values.size() || states.size() != next_values.size() ||
-			states.size() != advantage_moves.size() || states.size() != advantage_values.size()) {
+		if (states.size() != moves.size() || states.size() != values.size()) {
 			throw std::runtime_error("preprocess buffers have mismatched lengths");
 		}
 		const hsize_t count = states.size();
 		const hsize_t old = size_;
 		const hsize_t next = old + count;
 		extend(states_, {next, kStateFeatures});
-		extend(next_states_, {next, kStateFeatures});
 		extend(moves_, {next});
 		extend(values_, {next});
-		extend(next_values_, {next});
-		extend(advantage_moves_, {next});
-		extend(advantage_values_, {next});
 
 		write_slice(states_, H5T_NATIVE_UINT8, states.data(), {old, 0}, {count, kStateFeatures});
-		write_slice(next_states_, H5T_NATIVE_UINT8, next_states.data(), {old, 0},
-					{count, kStateFeatures});
 		write_slice(moves_, H5T_NATIVE_UINT16, moves.data(), {old}, {count});
 		write_slice(values_, H5T_NATIVE_FLOAT, values.data(), {old}, {count});
-		write_slice(next_values_, H5T_NATIVE_FLOAT, next_values.data(), {old}, {count});
-		write_slice(advantage_moves_, H5T_NATIVE_UINT16, advantage_moves.data(), {old}, {count});
-		write_slice(advantage_values_, H5T_NATIVE_FLOAT, advantage_values.data(), {old}, {count});
 		size_ = next;
 	}
 
@@ -263,12 +228,8 @@ class H5Writer {
 	PreprocessOptions options_;
 	hid_t file_ = -1;
 	hid_t states_ = -1;
-	hid_t next_states_ = -1;
 	hid_t moves_ = -1;
 	hid_t values_ = -1;
-	hid_t next_values_ = -1;
-	hid_t advantage_moves_ = -1;
-	hid_t advantage_values_ = -1;
 	hsize_t size_ = 0;
 };
 
@@ -317,12 +278,8 @@ class PreprocessVisitor : public chess::pgn::Visitor {
 		previous_comment_.clear();
 		game_has_eval_ = false;
 		game_states_.clear();
-		game_next_states_.clear();
 		game_moves_.clear();
 		game_values_.clear();
-		game_next_values_.clear();
-		game_advantage_moves_.clear();
-		game_advantage_values_.clear();
 	}
 
 	// Capture Result and optional non-starting FEN headers before move parsing.
@@ -336,35 +293,20 @@ class PreprocessVisitor : public chess::pgn::Visitor {
 	// Satisfy the visitor interface; no setup is needed after headers.
 	void startMoves() override {}
 
-	// Encode s and derive A(s,a)=clamp(V_after_same_perspective-V(s), -2, 0).
+	// Encode the pre-move state and attach its policy action and side-to-move value target.
 	void move(std::string_view san, std::string_view comment) override {
 		try {
 			const auto move = chess::uci::parseSan(board_, san);
 			const auto move_index = static_cast<std::uint16_t>(move_to_index(move));
-			chess::Board next_board = board_;
-			next_board.makeMove(move);
 			game_states_.push_back(encode_state(board_));
-			game_next_states_.push_back(encode_state(next_board));
 			game_moves_.push_back(move_index);
-			game_advantage_moves_.push_back(move_index);
-			const float before = options_.has_comments
+			const float value = options_.has_comments
 				? comment_value(previous_comment_, board_.sideToMove())
 				: result_value(result_, board_.sideToMove());
-			game_values_.push_back(before);
-			const float next_value = options_.has_comments
-				? comment_value(std::string(comment), next_board.sideToMove())
-				: result_value(result_, next_board.sideToMove());
-			game_next_values_.push_back(next_value);
-			float advantage = 0.0F;
-			if (options_.has_comments && comment_score_white(previous_comment_).has_value() &&
-				comment_score_white(std::string(comment)).has_value()) {
-				const float after = comment_value(std::string(comment), board_.sideToMove());
-				advantage = std::clamp(after - before, -2.0F, 0.0F);
-			}
-			game_advantage_values_.push_back(advantage);
+			game_values_.push_back(value);
 			if (comment_score_white(std::string(comment)).has_value())
 				game_has_eval_ = true;
-			board_ = std::move(next_board);
+			board_.makeMove(move);
 			previous_comment_ = std::string(comment);
 		} catch (const std::exception &) {
 			++skipped_moves_;
@@ -377,8 +319,7 @@ class PreprocessVisitor : public chess::pgn::Visitor {
 			++skipped_games_;
 			return;
 		}
-		writer_.append(game_states_, game_next_states_, game_moves_, game_values_, game_next_values_,
-					   game_advantage_moves_, game_advantage_values_);
+		writer_.append(game_states_, game_moves_, game_values_);
 		++games_;
 		if (options_.log_every > 0 && games_ % options_.log_every == 0) {
 			std::cout << "preprocess progress: games=" << games_ << " positions=" << writer_.size()
@@ -402,12 +343,8 @@ class PreprocessVisitor : public chess::pgn::Visitor {
 	std::string previous_comment_;
 	bool game_has_eval_ = false;
 	std::vector<PackedState> game_states_;
-	std::vector<PackedState> game_next_states_;
 	std::vector<std::uint16_t> game_moves_;
 	std::vector<float> game_values_;
-	std::vector<float> game_next_values_;
-	std::vector<std::uint16_t> game_advantage_moves_;
-	std::vector<float> game_advantage_values_;
 	std::int64_t games_ = 0;
 	std::int64_t skipped_moves_ = 0;
 	std::int64_t skipped_games_ = 0;
@@ -428,22 +365,6 @@ void select_rows(hid_t space, const std::vector<std::int64_t> &indices, int rank
 			require_h5(H5Sselect_hyperslab(space, H5S_SELECT_OR, start, nullptr, count, nullptr),
 					   "select scalar rows");
 		}
-	}
-}
-
-// Validate one rank-two state dataset against the architecture's fixed token encoding.
-void require_state_shape(hid_t dataset, const char *name, std::int64_t expected_rows) {
-	const hid_t space = require_id(H5Dget_space(dataset), std::string("get ") + name + " shape");
-	hsize_t dimensions[2]{};
-	if (H5Sget_simple_extent_ndims(space) != 2) {
-		H5Sclose(space);
-		throw std::runtime_error(std::string(name) + " must have rank 2");
-	}
-	H5Sget_simple_extent_dims(space, dimensions, nullptr);
-	H5Sclose(space);
-	if (dimensions[1] != kStateFeatures ||
-		(expected_rows >= 0 && dimensions[0] != static_cast<hsize_t>(expected_rows))) {
-		throw std::runtime_error(std::string(name) + " must have shape [N,67]");
 	}
 }
 
@@ -479,14 +400,8 @@ struct SupervisedH5::Impl {
 			throw std::runtime_error("HDF5 schema does not match the Melano architecture");
 		}
 		states = require_id(H5Dopen2(file, "states", H5P_DEFAULT), "open states");
-		next_states =
-			require_id(H5Dopen2(file, "next_states", H5P_DEFAULT), "open next_states");
 		moves = require_id(H5Dopen2(file, "moves", H5P_DEFAULT), "open moves");
 		values = require_id(H5Dopen2(file, "values", H5P_DEFAULT), "open values");
-		next_values =
-			require_id(H5Dopen2(file, "next_values", H5P_DEFAULT), "open next_values");
-		advantage_moves = require_id(H5Dopen2(file, "adv_moves", H5P_DEFAULT), "open adv_moves");
-		advantage_values = require_id(H5Dopen2(file, "adv_values", H5P_DEFAULT), "open adv_values");
 		const hid_t space = require_id(H5Dget_space(states), "get states shape");
 		hsize_t dimensions[2]{};
 		if (H5Sget_simple_extent_ndims(space) != 2) {
@@ -514,42 +429,26 @@ struct SupervisedH5::Impl {
 			info.chunk_rows = info.length;
 		}
 		H5Pclose(properties);
-		require_state_shape(next_states, "next_states", info.length);
 		require_scalar_shape(moves, "moves", info.length);
 		require_scalar_shape(values, "values", info.length);
-		require_scalar_shape(next_values, "next_values", info.length);
-		require_scalar_shape(advantage_moves, "adv_moves", info.length);
-		require_scalar_shape(advantage_values, "adv_values", info.length);
 	}
 
 	// Close every opened dataset before closing the HDF5 file.
 	~Impl() {
 		if (states >= 0)
 			H5Dclose(states);
-		if (next_states >= 0)
-			H5Dclose(next_states);
 		if (moves >= 0)
 			H5Dclose(moves);
 		if (values >= 0)
 			H5Dclose(values);
-		if (next_values >= 0)
-			H5Dclose(next_values);
-		if (advantage_moves >= 0)
-			H5Dclose(advantage_moves);
-		if (advantage_values >= 0)
-			H5Dclose(advantage_values);
 		if (file >= 0)
 			H5Fclose(file);
 	}
 
 	hid_t file = -1;
 	hid_t states = -1;
-	hid_t next_states = -1;
 	hid_t moves = -1;
 	hid_t values = -1;
-	hid_t next_values = -1;
-	hid_t advantage_moves = -1;
-	hid_t advantage_values = -1;
 	DatasetInfo info;
 };
 
@@ -572,7 +471,7 @@ SupervisedH5 &SupervisedH5::operator=(SupervisedH5 &&other) noexcept {
 // Expose validated immutable metadata without another HDF5 call.
 const DatasetInfo &SupervisedH5::info() const noexcept { return impl_->info; }
 
-// Read sorted HDF5 rows into owned, optionally pinned state and target tensors.
+// Read sorted HDF5 rows into owned, optionally pinned state, move, and value tensors.
 SupervisedBatch SupervisedH5::read(const std::vector<std::int64_t> &requested,
 								  bool pinned_memory) const {
 	if (requested.empty())
@@ -585,9 +484,7 @@ SupervisedBatch SupervisedH5::read(const std::vector<std::int64_t> &requested,
 	}
 	const hsize_t batch = indices.size();
 	std::vector<std::uint8_t> packed(batch * kStateFeatures);
-	std::vector<std::uint8_t> packed_next(batch * kStateFeatures);
 	std::vector<std::uint16_t> moves(batch);
-	std::vector<std::uint16_t> advantage_moves(batch);
 	auto index_options =
 		torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
 	auto float_options =
@@ -598,11 +495,6 @@ SupervisedBatch SupervisedH5::read(const std::vector<std::int64_t> &requested,
 	}
 	auto move_tensor = torch::empty({static_cast<std::int64_t>(batch)}, index_options);
 	auto value_tensor = torch::empty({static_cast<std::int64_t>(batch)}, float_options);
-	auto next_value_tensor = torch::empty({static_cast<std::int64_t>(batch)}, float_options);
-	auto advantage_move_tensor =
-		torch::empty({static_cast<std::int64_t>(batch)}, index_options);
-	auto advantage_value_tensor =
-		torch::empty({static_cast<std::int64_t>(batch)}, float_options);
 
 	const hid_t state_space = require_id(H5Dget_space(impl_->states), "get states selection");
 	select_rows(state_space, indices, 2);
@@ -613,27 +505,11 @@ SupervisedBatch SupervisedH5::read(const std::vector<std::int64_t> &requested,
 			   "read state rows");
 	H5Sclose(state_memory);
 	H5Sclose(state_space);
-	const hid_t next_state_space =
-		require_id(H5Dget_space(impl_->next_states), "get next_states selection");
-	select_rows(next_state_space, indices, 2);
-	const hid_t next_state_memory =
-		require_id(H5Screate_simple(2, state_dims, nullptr), "next_state memory");
-	require_h5(H5Dread(impl_->next_states, H5T_NATIVE_UINT8, next_state_memory,
-					  next_state_space, H5P_DEFAULT, packed_next.data()),
-			   "read next_state rows");
-	H5Sclose(next_state_memory);
-	H5Sclose(next_state_space);
 
 	for (const auto &[dataset, type, destination] : {
 			 std::tuple<hid_t, hid_t, void *>{impl_->moves, H5T_NATIVE_UINT16, moves.data()},
 			 std::tuple<hid_t, hid_t, void *>{impl_->values, H5T_NATIVE_FLOAT,
 												value_tensor.data_ptr<float>()},
-			 std::tuple<hid_t, hid_t, void *>{impl_->next_values, H5T_NATIVE_FLOAT,
-												next_value_tensor.data_ptr<float>()},
-			 std::tuple<hid_t, hid_t, void *>{impl_->advantage_moves, H5T_NATIVE_UINT16,
-												advantage_moves.data()},
-			 std::tuple<hid_t, hid_t, void *>{impl_->advantage_values, H5T_NATIVE_FLOAT,
-												advantage_value_tensor.data_ptr<float>()},
 		 }) {
 		const hid_t space = require_id(H5Dget_space(dataset), "get scalar selection");
 		select_rows(space, indices, 1);
@@ -645,33 +521,25 @@ SupervisedBatch SupervisedH5::read(const std::vector<std::int64_t> &requested,
 		H5Sclose(space);
 	}
 	auto *move_destination = move_tensor.data_ptr<std::int64_t>();
-	auto *advantage_move_destination = advantage_move_tensor.data_ptr<std::int64_t>();
 	for (std::size_t index = 0; index < moves.size(); ++index) {
 		move_destination[index] = moves[index];
-		advantage_move_destination[index] = advantage_moves[index];
 	}
 
 	return {
 		decode_states(packed.data(), static_cast<std::int64_t>(batch), pinned_memory),
-		decode_states(packed_next.data(), static_cast<std::int64_t>(batch), pinned_memory),
 		std::move(move_tensor),
 		std::move(value_tensor),
-		std::move(next_value_tensor),
-		std::move(advantage_move_tensor),
-		std::move(advantage_value_tensor),
 	};
 }
 
-// Read one physical HDF5 range and keep all state, successor, and action targets row-aligned.
+// Read one physical HDF5 range while preserving state, move, and value alignment.
 SupervisedBatch SupervisedH5::read_contiguous(std::int64_t begin, std::int64_t count,
 											  bool pinned_memory) const {
 	if (begin < 0 || count <= 0 || begin > impl_->info.length - count)
 		throw std::out_of_range("contiguous HDF5 row range");
 	const hsize_t batch = static_cast<hsize_t>(count);
 	std::vector<std::uint8_t> packed(batch * kStateFeatures);
-	std::vector<std::uint8_t> packed_next(batch * kStateFeatures);
 	std::vector<std::uint16_t> moves(batch);
-	std::vector<std::uint16_t> advantage_moves(batch);
 	auto index_options = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
 	auto float_options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
 	if (pinned_memory) {
@@ -680,39 +548,25 @@ SupervisedBatch SupervisedH5::read_contiguous(std::int64_t begin, std::int64_t c
 	}
 	auto move_tensor = torch::empty({count}, index_options);
 	auto value_tensor = torch::empty({count}, float_options);
-	auto next_value_tensor = torch::empty({count}, float_options);
-	auto advantage_move_tensor = torch::empty({count}, index_options);
-	auto advantage_value_tensor = torch::empty({count}, float_options);
 
-	for (const auto &[dataset, destination, label] : {
-			 std::tuple<hid_t, void *, const char *>{impl_->states, packed.data(), "states"},
-			 std::tuple<hid_t, void *, const char *>{impl_->next_states, packed_next.data(),
-													 "next_states"},
-		 }) {
-		const hid_t space = require_id(H5Dget_space(dataset), "get state range");
-		const hsize_t start[] = {static_cast<hsize_t>(begin), 0};
-		const hsize_t dimensions[] = {batch, kStateFeatures};
-		require_h5(H5Sselect_hyperslab(space, H5S_SELECT_SET, start, nullptr, dimensions,
-									   nullptr),
-				   std::string("select ") + label + " range");
-		const hid_t memory =
-			require_id(H5Screate_simple(2, dimensions, nullptr), "create state range memory");
-		require_h5(H5Dread(dataset, H5T_NATIVE_UINT8, memory, space, H5P_DEFAULT, destination),
-				   std::string("read ") + label + " range");
-		H5Sclose(memory);
-		H5Sclose(space);
-	}
+	const hid_t state_space = require_id(H5Dget_space(impl_->states), "get state range");
+	const hsize_t state_start[] = {static_cast<hsize_t>(begin), 0};
+	const hsize_t state_count[] = {batch, kStateFeatures};
+	require_h5(H5Sselect_hyperslab(state_space, H5S_SELECT_SET, state_start, nullptr,
+								   state_count, nullptr),
+			   "select state range");
+	const hid_t state_memory =
+		require_id(H5Screate_simple(2, state_count, nullptr), "create state range memory");
+	require_h5(H5Dread(impl_->states, H5T_NATIVE_UINT8, state_memory, state_space, H5P_DEFAULT,
+					  packed.data()),
+			   "read state range");
+	H5Sclose(state_memory);
+	H5Sclose(state_space);
 
 	for (const auto &[dataset, type, destination] : {
 			 std::tuple<hid_t, hid_t, void *>{impl_->moves, H5T_NATIVE_UINT16, moves.data()},
 			 std::tuple<hid_t, hid_t, void *>{impl_->values, H5T_NATIVE_FLOAT,
-											  value_tensor.data_ptr<float>()},
-			 std::tuple<hid_t, hid_t, void *>{impl_->next_values, H5T_NATIVE_FLOAT,
-											  next_value_tensor.data_ptr<float>()},
-			 std::tuple<hid_t, hid_t, void *>{impl_->advantage_moves, H5T_NATIVE_UINT16,
-											  advantage_moves.data()},
-			 std::tuple<hid_t, hid_t, void *>{impl_->advantage_values, H5T_NATIVE_FLOAT,
-											  advantage_value_tensor.data_ptr<float>()},
+												  value_tensor.data_ptr<float>()},
 		 }) {
 		const hid_t space = require_id(H5Dget_space(dataset), "get scalar range");
 		const hsize_t start[] = {static_cast<hsize_t>(begin)};
@@ -728,20 +582,14 @@ SupervisedBatch SupervisedH5::read_contiguous(std::int64_t begin, std::int64_t c
 		H5Sclose(space);
 	}
 	auto *move_destination = move_tensor.data_ptr<std::int64_t>();
-	auto *advantage_move_destination = advantage_move_tensor.data_ptr<std::int64_t>();
 	for (std::size_t index = 0; index < moves.size(); ++index) {
 		move_destination[index] = moves[index];
-		advantage_move_destination[index] = advantage_moves[index];
 	}
 
 	return {
 		decode_states(packed.data(), count, pinned_memory),
-		decode_states(packed_next.data(), count, pinned_memory),
 		std::move(move_tensor),
 		std::move(value_tensor),
-		std::move(next_value_tensor),
-		std::move(advantage_move_tensor),
-		std::move(advantage_value_tensor),
 	};
 }
 
@@ -773,10 +621,13 @@ void preprocess_pgn(const PreprocessOptions &options) {
 			  << " output=" << options.output.string() << std::endl;
 }
 
-// Optimize policy, value, dueling action value, latent transition, and successor value.
+// Optimize the exact-state Policy and Value outputs from supervised targets.
 void train_supervised(const TrainOptions &options) {
 	if (options.channels <= 0 || options.blocks <= 0) {
 		throw std::invalid_argument("channels and blocks must be positive");
+	}
+	if (options.batch_size <= 0 || options.epochs < 0) {
+		throw std::invalid_argument("batch-size must be positive and epochs must be nonnegative");
 	}
 	torch::manual_seed(static_cast<std::int64_t>(options.seed));
 	const auto device = resolve_device(options.device);
@@ -785,12 +636,6 @@ void train_supervised(const TrainOptions &options) {
 	auto model = Model(options.channels, options.blocks);
 	model->to(device);
 	model->train();
-	auto target_model = Model(options.channels, options.blocks);
-	target_model->to(device);
-	initialize_target_encoder(target_model, model);
-	if (!(options.target_decay >= 0.0 && options.target_decay < 1.0)) {
-		throw std::invalid_argument("target-decay must be in [0, 1)");
-	}
 	torch::optim::AdamW optimizer(
 		model->parameters(),
 		torch::optim::AdamWOptions(options.learning_rate).weight_decay(options.weight_decay));
@@ -814,7 +659,6 @@ void train_supervised(const TrainOptions &options) {
 			  << " device=" << device.str() << " epochs=" << options.epochs
 			  << " batch_size=" << options.batch_size << " max_steps=" << options.max_steps
 			  << " precision=" << compute_precision_name(options.precision)
-			  << " target_decay=" << options.target_decay
 			  << " grad_clip=" << options.grad_clip
 			  << " lr_peak=" << options.learning_rate
 			  << " lr_warmup_steps=" << warmup_steps
@@ -833,7 +677,7 @@ void train_supervised(const TrainOptions &options) {
 		}
 		std::shuffle(chunk_starts.begin(), chunk_starts.end(), rng);
 		auto metric_totals =
-			torch::zeros({5}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+			torch::zeros({2}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
 		std::int64_t batches = 0;
 		auto launch_read = [&](std::size_t chunk_index) {
 			const auto begin = chunk_starts[chunk_index];
@@ -859,82 +703,31 @@ void train_supervised(const TrainOptions &options) {
 								 torch::TensorOptions().dtype(torch::kInt64))
 					.clone();
 			chunk.states = chunk.states.index_select(0, permutation);
-			chunk.next_states = chunk.next_states.index_select(0, permutation);
 			chunk.moves = chunk.moves.index_select(0, permutation);
 			chunk.values = chunk.values.index_select(0, permutation);
-			chunk.next_values = chunk.next_values.index_select(0, permutation);
-			chunk.advantage_moves = chunk.advantage_moves.index_select(0, permutation);
-			chunk.advantage_values = chunk.advantage_values.index_select(0, permutation);
 
 			for (std::int64_t begin = 0; begin < chunk_rows; begin += options.batch_size) {
 				const auto count =
 					std::min<std::int64_t>(options.batch_size, chunk_rows - begin);
 				auto states = chunk.states.narrow(0, begin, count).to(device, true);
-				auto next_states = chunk.next_states.narrow(0, begin, count).to(device, true);
 				auto moves = chunk.moves.narrow(0, begin, count).to(device, true);
 				auto values = chunk.values.narrow(0, begin, count).to(device, true);
-				auto next_values = chunk.next_values.narrow(0, begin, count).to(device, true);
-				auto advantage_moves =
-					chunk.advantage_moves.narrow(0, begin, count).to(device, true);
-				auto advantage_values =
-					chunk.advantage_values.narrow(0, begin, count).to(device, true);
 				const double learning_rate =
 					scheduled_learning_rate(options.learning_rate, global_step + 1, warmup_steps);
 				set_learning_rate(optimizer, learning_rate);
 				optimizer.zero_grad();
 
-				torch::Tensor tokens;
-				torch::Tensor predicted_next;
-				torch::Tensor target_next;
-				ModelOutput output;
-				ModelOutput imagined;
+				torch::Tensor policy;
+				torch::Tensor predicted_value;
 				{
 					AutocastGuard autocast(options.precision, device);
-					tokens = model->encode(states);
-					output = model->predict(tokens);
-					predicted_next = model->transition(tokens, moves);
-					{
-						torch::NoGradGuard no_grad;
-						target_next = target_model->encode(next_states).detach();
-					}
-					imagined = model->predict(predicted_next);
+					std::tie(policy, predicted_value) = model->forward(states);
 				}
 				auto policy_loss = torch::nn::functional::cross_entropy(
-					output.policy.to(torch::kFloat32), moves);
-				auto predicted_value = output.value.squeeze(1).to(torch::kFloat32);
-				auto value_loss = torch::mse_loss(predicted_value, values);
-				auto selected_advantage = output.advantages.to(torch::kFloat32)
-											  .gather(1, advantage_moves.unsqueeze(1))
-											  .squeeze(1);
-				auto dueling_q_loss =
-					torch::zeros({}, states.options().dtype(torch::kFloat32));
-				if (data.info().has_comments) {
-					auto predicted_q =
-						torch::clamp(predicted_value + selected_advantage, -1.0, 1.0);
-					auto target_q =
-						torch::clamp(values + advantage_values, -1.0, 1.0);
-					dueling_q_loss = torch::mse_loss(predicted_q, target_q);
-				}
-				// Cosine consistency avoids making latent scale itself a learning target.
-				auto predicted_next_fp32 = predicted_next.to(torch::kFloat32);
-				auto target_next_fp32 = target_next.to(torch::kFloat32);
-				auto predicted_unit = predicted_next_fp32 /
-					predicted_next_fp32.square()
-						.sum(-1, true)
-						.sqrt()
-						.clamp_min(kLatentNormEpsilon);
-				auto target_unit = target_next_fp32 /
-					target_next_fp32.square()
-						.sum(-1, true)
-						.sqrt()
-						.clamp_min(kLatentNormEpsilon);
-				auto dynamics_loss = 1.0 - (predicted_unit * target_unit).sum(-1).mean();
-				auto imagined_value_loss =
-					torch::mse_loss(imagined.value.squeeze(1).to(torch::kFloat32), next_values);
-				auto loss = policy_loss + options.value_weight * value_loss +
-					options.dueling_q_weight * dueling_q_loss +
-					options.dynamics_weight * dynamics_loss +
-					options.imagined_value_weight * imagined_value_loss;
+					policy.to(torch::kFloat32), moves);
+				auto value_loss = torch::mse_loss(
+					predicted_value.squeeze(1).to(torch::kFloat32), values);
+				auto loss = policy_loss + options.value_weight * value_loss;
 				loss.backward();
 				double gradient_norm = 0.0;
 				if (options.grad_clip > 0.0) {
@@ -942,19 +735,14 @@ void train_supervised(const TrainOptions &options) {
 						model->parameters(), options.grad_clip, 2.0, true);
 				}
 				optimizer.step();
-				update_target_encoder(target_model, model, options.target_decay);
 
 				++global_step;
 				++batches;
-				metric_totals.add_(torch::stack(
-					{policy_loss.detach(), value_loss.detach(), dueling_q_loss.detach(),
-					 dynamics_loss.detach(), imagined_value_loss.detach()}));
+				metric_totals.add_(torch::stack({policy_loss.detach(), value_loss.detach()}));
 				if (options.log_every > 0 &&
 					(global_step == 1 || global_step % options.log_every == 0)) {
 					auto metrics =
-						torch::stack({policy_loss.detach(), value_loss.detach(),
-									  dueling_q_loss.detach(), dynamics_loss.detach(),
-									  imagined_value_loss.detach(), loss.detach()})
+						torch::stack({policy_loss.detach(), value_loss.detach(), loss.detach()})
 							.to(torch::kCPU)
 							.contiguous();
 					auto metric_values = metrics.accessor<float, 1>();
@@ -962,10 +750,7 @@ void train_supervised(const TrainOptions &options) {
 							  << " global_step=" << global_step
 							  << " policy=" << metric_values[0]
 							  << " value=" << metric_values[1]
-							  << " dueling_q=" << metric_values[2]
-							  << " dynamics=" << metric_values[3]
-							  << " imagined_value=" << metric_values[4]
-							  << " loss=" << metric_values[5]
+							  << " loss=" << metric_values[2]
 							  << " grad_norm_before_clip=" << gradient_norm
 							  << " lr=" << learning_rate << std::endl;
 				}
@@ -987,10 +772,6 @@ void train_supervised(const TrainOptions &options) {
 		std::cout << "epoch=" << epoch << ", steps=" << global_step
 				  << ", policy=" << epoch_values[0] / std::max<std::int64_t>(1, batches)
 				  << ", value=" << epoch_values[1] / std::max<std::int64_t>(1, batches)
-				  << ", dueling_q=" << epoch_values[2] / std::max<std::int64_t>(1, batches)
-				  << ", dynamics=" << epoch_values[3] / std::max<std::int64_t>(1, batches)
-				  << ", imagined_value=" << epoch_values[4] /
-												 std::max<std::int64_t>(1, batches)
 				  << std::endl;
 	}
 	std::cout << "training finished: " << options.output.string() << std::endl;

@@ -62,8 +62,6 @@ int main(int argc, char **argv) {
 		std::cout << "uncertainty: " << result.uncertainty << '\n';
 		std::cout << "expanded_nodes: " << result.expanded_nodes << '\n';
 		std::cout << "nn_batches: " << result.nn_batches << '\n';
-		std::cout << "exact_evaluations: " << result.exact_evaluations << '\n';
-		std::cout << "latent_evaluations: " << result.latent_evaluations << '\n';
 		std::cout << "elapsed_ms: " << result.elapsed_ms << '\n';
 		std::cout << "root:\n";
 		for (std::size_t index = 0; index < result.root.size(); ++index) {
@@ -71,8 +69,7 @@ int main(int argc, char **argv) {
 			std::cout << index + 1 << ". " << melano::move_san(board, row.move) << ' '
 					  << melano::move_uci(row.move) << " p=" << row.probability
 					  << " decision=" << row.decision_score << " prior=" << row.prior
-					  << " visits=" << row.visits << " q=" << row.q
-					  << " adv=" << row.advantage << " q_prior=" << row.q_prior;
+					  << " visits=" << row.visits << " q=" << row.q;
 			if (row.instant_mate) {
 				std::cout << " imf";
 			}

@@ -1,9 +1,10 @@
-// Implements Melano's geometry-aware token network and P/V/A heads.
+// Implements Melano's geometry-aware token network and Policy/Value heads.
 
 #include "melano/model.hpp"
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace melano {
@@ -19,6 +20,14 @@ int attention_heads_for_channels(int channels) {
 }
 
 namespace {
+
+// Reject invalid architecture descriptors instead of silently changing model dimensions.
+int require_positive(int value, const char *name) {
+	if (value <= 0) {
+		throw std::invalid_argument(std::string(name) + " must be positive");
+	}
+	return value;
+}
 
 // Classify an ordered square pair by chessboard geometry for attention bias lookup.
 int square_geometry_relation(int source, int target) {
@@ -42,9 +51,8 @@ int square_geometry_relation(int source, int target) {
 	} else if ((adr == 1 && adc == 2) || (adr == 2 && adc == 1)) {
 		value = 22;
 	} else {
-		// IDs 24-26 remain unused to preserve the established 32-row checkpoint layout.
-		// Adjacent squares already belong to a rank, file, or diagonal relation.
-		value = 24 + std::min(6, adr + adc - 2);
+		// Five residual classes group the remaining ordered pairs by Manhattan distance.
+		value = 23 + std::min(4, adr + adc - 4);
 	}
 	return value + 1;
 }
@@ -182,55 +190,10 @@ torch::Tensor ValueHeadImpl::forward(torch::Tensor tokens) {
 	return value->forward(norm->forward(tokens.index({torch::indexing::Slice(), 0})));
 }
 
-// Reuse the action-shaped projection while initializing the final mappings near zero.
-AdvantageHeadImpl::AdvantageHeadImpl(int channels) {
-	action_head = register_module("action_head", ActionHead(channels));
-	torch::nn::init::normal_(action_head->to_proj->weight, 0.0, 0.01);
-	torch::nn::init::zeros_(action_head->to_proj->bias);
-	torch::nn::init::normal_(action_head->underpromotion->weight, 0.0, 0.01);
-	torch::nn::init::zeros_(action_head->underpromotion->bias);
-}
-
-// Enforce the project invariant A(s,a) <= 0 with -2*tanh(raw)^2.
-torch::Tensor AdvantageHeadImpl::forward(torch::Tensor square_tokens) {
-	auto raw = torch::tanh(action_head->forward(square_tokens));
-	return -2.0 * raw.square();
-}
-
-// Condition one geometry-attention transition on the selected action id.
-LatentDynamicsImpl::LatentDynamicsImpl(int channel_count) : channels(channel_count) {
-	action_embedding =
-		register_module("action_embedding", torch::nn::Embedding(kActionSize, channels));
-	action_projection =
-		register_module("action_projection", torch::nn::Linear(channels, channels));
-	update_gate = register_module("update_gate", torch::nn::Linear(channels, channels));
-	transition = register_module("transition", GeometryAttentionBlock(channels));
-	output_norm =
-		register_module("output_norm", torch::nn::LayerNorm(torch::nn::LayerNormOptions({channels})));
-	// Begin with a conservative residual update while still allowing immediate gradients.
-	torch::nn::init::zeros_(update_gate->weight);
-	torch::nn::init::constant_(update_gate->bias, -2.0);
-}
-
-// Apply z'=LN(z+sigmoid(g(a))*(T(z+c(a))-z)) as an action-conditioned latent world step.
-torch::Tensor LatentDynamicsImpl::forward(torch::Tensor tokens, torch::Tensor actions) {
-	if (tokens.dim() != 3 || tokens.size(1) != kTokenCount || tokens.size(2) != channels) {
-		throw std::runtime_error("invalid Melano latent-dynamics token shape");
-	}
-	actions = actions.to(torch::kInt64).reshape({-1});
-	if (actions.size(0) != tokens.size(0)) {
-		throw std::runtime_error("latent-dynamics action batch does not match token batch");
-	}
-	auto action = action_embedding->forward(actions);
-	auto conditioned = tokens + action_projection->forward(action).unsqueeze(1);
-	auto proposed = transition->forward(conditioned);
-	auto gate = torch::sigmoid(update_gate->forward(action)).unsqueeze(1);
-	return output_norm->forward(tokens + gate * (proposed - tokens));
-}
-
-// Stack geometry-attention blocks and attach independent policy, value, and advantage heads.
+// Stack geometry-attention blocks and attach the policy and value heads.
 ModelImpl::ModelImpl(int channels, int blocks)
-	: channels_(channels), blocks_(std::max(1, blocks)) {
+	: channels_(require_positive(channels, "channels")),
+	  blocks_(require_positive(blocks, "blocks")) {
 	state_embedding = register_module("state_embedding", StateEmbedding(channels_));
 	trunk = register_module("trunk", torch::nn::Sequential());
 	for (int index = 0; index < blocks_; ++index) {
@@ -238,8 +201,6 @@ ModelImpl::ModelImpl(int channels, int blocks)
 	}
 	policy_head = register_module("policy_head", ActionHead(channels_));
 	value_head = register_module("value_head", ValueHead(channels_));
-	advantage_head = register_module("advantage_head", AdvantageHead(channels_));
-	dynamics = register_module("dynamics", LatentDynamics(channels_));
 }
 
 // Encode one exact state with the embedding and shared geometry transformer.
@@ -247,20 +208,12 @@ torch::Tensor ModelImpl::encode(torch::Tensor state) {
 	return trunk->forward(state_embedding->forward(state));
 }
 
-// Produce all three heads from one contextual token representation.
-ModelOutput ModelImpl::predict(torch::Tensor tokens) {
+// Produce policy logits and V(s) from the shared exact-state representation.
+std::tuple<torch::Tensor, torch::Tensor> ModelImpl::forward(torch::Tensor state) {
+	auto tokens = encode(state);
 	auto squares = tokens.index({torch::indexing::Slice(), torch::indexing::Slice(1, torch::indexing::None)});
-	return {policy_head->forward(squares), value_head->forward(tokens),
-			advantage_head->forward(squares)};
+	return {policy_head->forward(squares), value_head->forward(tokens)};
 }
-
-// Delegate one imagined action step to the registered latent transition model.
-torch::Tensor ModelImpl::transition(torch::Tensor tokens, torch::Tensor actions) {
-	return dynamics->forward(tokens, actions);
-}
-
-// Preserve the public exact-state inference contract while exposing staged internals for training.
-ModelOutput ModelImpl::forward(torch::Tensor state) { return predict(encode(state)); }
 
 // Expose the checkpoint-defining embedding width.
 int ModelImpl::channels() const noexcept { return channels_; }
@@ -274,65 +227,6 @@ std::int64_t parameter_count(const Model &model) {
 		count += parameter.numel();
 	}
 	return count;
-}
-
-namespace {
-
-// Return encoder tensors in registration order so online and target models stay aligned.
-std::vector<torch::Tensor> encoder_parameters(const Model &model) {
-	auto parameters = model->state_embedding->parameters();
-	auto trunk_parameters = model->trunk->parameters();
-	parameters.insert(parameters.end(), trunk_parameters.begin(), trunk_parameters.end());
-	return parameters;
-}
-
-// Relation ids and square indices are immutable, but copying them keeps the target exact.
-std::vector<torch::Tensor> encoder_buffers(const Model &model) {
-	auto buffers = model->state_embedding->buffers();
-	auto trunk_buffers = model->trunk->buffers();
-	buffers.insert(buffers.end(), trunk_buffers.begin(), trunk_buffers.end());
-	return buffers;
-}
-
-} // namespace
-
-// Start the slowly moving target from the exact online encoder and exclude it from autograd.
-void initialize_target_encoder(Model target, const Model &online) {
-	auto target_parameters = encoder_parameters(target);
-	const auto online_parameters = encoder_parameters(online);
-	auto target_buffers = encoder_buffers(target);
-	const auto online_buffers = encoder_buffers(online);
-	if (target_parameters.size() != online_parameters.size() ||
-		target_buffers.size() != online_buffers.size()) {
-		throw std::runtime_error("Melano target encoder does not match the online encoder");
-	}
-	torch::NoGradGuard no_grad;
-	for (std::size_t index = 0; index < target_parameters.size(); ++index) {
-		target_parameters[index].copy_(online_parameters[index]);
-	}
-	for (std::size_t index = 0; index < target_buffers.size(); ++index) {
-		target_buffers[index].copy_(online_buffers[index]);
-	}
-	for (auto &parameter : target->parameters()) {
-		parameter.set_requires_grad(false);
-	}
-	target->eval();
-}
-
-// EMA prevents one unstable online update from redefining both sides of latent consistency.
-void update_target_encoder(Model target, const Model &online, double decay) {
-	if (!(decay >= 0.0 && decay < 1.0)) {
-		throw std::invalid_argument("Melano target decay must be in [0, 1)");
-	}
-	auto target_parameters = encoder_parameters(target);
-	const auto online_parameters = encoder_parameters(online);
-	if (target_parameters.size() != online_parameters.size()) {
-		throw std::runtime_error("Melano target encoder parameter count changed");
-	}
-	torch::NoGradGuard no_grad;
-	for (std::size_t index = 0; index < target_parameters.size(); ++index) {
-		target_parameters[index].mul_(decay).add_(online_parameters[index], 1.0 - decay);
-	}
 }
 
 } // namespace melano

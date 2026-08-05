@@ -1,4 +1,4 @@
-// Implements Melano K=2 anchored latent PUCT; search.cpp is its CLI front end.
+// Implements Melano exact-state batched PUCT; search.cpp is its CLI front end.
 
 #include "melano/search.hpp"
 #include <algorithm>
@@ -7,6 +7,7 @@
 #include <limits>
 #include <memory>
 #include <stdexcept>
+#include <tuple>
 #include <unordered_set>
 #include <utility>
 
@@ -19,29 +20,21 @@ using Clock = std::chrono::steady_clock;
 struct Evaluation {
 	std::vector<std::vector<float>> policies;
 	std::vector<float> values;
-	std::vector<std::vector<float>> advantages;
-	std::vector<torch::Tensor> latents;
 };
 
 struct Node {
-	// Create an edge/node pair carrying P, A, and the derived Q prior V(s)+A(s,a).
-	explicit Node(float initial_prior = 0.0F, chess::Move incoming = chess::Move::NO_MOVE,
-				  float initial_advantage = 0.0F, float initial_q_prior = 0.0F)
-		: prior(initial_prior), move(incoming), advantage(initial_advantage),
-		  q_prior(initial_q_prior) {}
+	// Create an edge/node pair with its Policy prior and incoming legal move.
+	explicit Node(float initial_prior = 0.0F, chess::Move incoming = chess::Move::NO_MOVE)
+		: prior(initial_prior), move(incoming) {}
 
 	// Return the empirical value from this node's side-to-move perspective.
 	float q() const { return visits > 0 ? value_sum / static_cast<float>(visits) : 0.0F; }
 
 	float prior = 0.0F;
 	chess::Move move;
-	float advantage = 0.0F;
-	float q_prior = 0.0F;
 	int visits = 0;
 	float value_sum = 0.0F;
 	int virtual_visits = 0;
-	// K=2 anchors retain exact E(s) only at even tree depths.
-	torch::Tensor anchor_latent;
 	std::vector<std::unique_ptr<Node>> children;
 };
 
@@ -50,27 +43,23 @@ struct SelectedLeaf {
 	Node *leaf = nullptr;
 	chess::Board board;
 	std::vector<Node *> path;
-	int depth = 0;
 };
 
 struct TreeState {
 	chess::Board board;
 	std::unique_ptr<Node> root = std::make_unique<Node>();
 	std::vector<float> network_policy;
-	std::vector<float> network_advantages;
 	float network_value = 0.0F;
 	int sims_completed = 0;
 	int dynamic_target = 0;
 	int expanded_nodes = 0;
 	int nn_batches = 0;
-	int exact_evaluations = 0;
-	int latent_evaluations = 0;
 	double total_leaf_depth = 0.0;
 	int leaf_samples = 0;
 	int max_leaf_depth = 0;
 };
 
-// Keep V, A-derived Q, and backed-up values inside the model's [-1, 1] convention.
+// Keep bounded value arithmetic inside the model's [-1, 1] convention.
 float clamp_unit(float value) { return std::clamp(value, -1.0F, 1.0F); }
 
 // Convert steady-clock elapsed time to seconds for deadlines and reporting.
@@ -126,15 +115,15 @@ struct Searcher::Impl {
 		model->eval();
 	}
 
-	// Gather only legal P/A entries before crossing the device boundary.
-	std::vector<ClosedEvaluation> collect_closed(ModelOutput prediction,
-											  const std::vector<chess::Board> &boards) {
+	// Evaluate a frozen batch and keep legal actions compact on both sides of the device boundary.
+	std::vector<ClosedEvaluation> evaluate_closed(const std::vector<chess::Board> &boards) {
+		if (boards.empty()) {
+			return {};
+		}
 		std::vector<std::vector<int>> legal_actions(boards.size());
-		std::vector<std::vector<chess::Move>> legal_move_rows(boards.size());
 		std::size_t legal_width = 1;
 		for (std::size_t row = 0; row < boards.size(); ++row) {
-			legal_move_rows[row] = legal_moves(boards[row]);
-			for (const auto &move : legal_move_rows[row]) {
+			for (const auto &move : legal_moves(boards[row])) {
 				legal_actions[row].push_back(move_to_index(move));
 			}
 			legal_width = std::max(legal_width, legal_actions[row].size());
@@ -167,138 +156,68 @@ struct Searcher::Impl {
 						 [static_cast<std::int64_t>(column)] = true;
 			}
 		}
+
+		torch::InferenceMode guard;
+		auto states = encode_boards_device(boards, device);
 		auto device_indices = legal_indices.to(device, true);
 		auto device_mask = legal_mask.to(device, true);
-		auto compact_logits = prediction.policy.to(torch::kFloat32).gather(1, device_indices);
+		torch::Tensor logits;
+		torch::Tensor raw_values;
+		{
+			AutocastGuard autocast(options.precision, device);
+			std::tie(logits, raw_values) = model->forward(states);
+		}
+		auto compact_logits = logits.to(torch::kFloat32).gather(1, device_indices);
 		compact_logits = compact_logits.masked_fill(
 			~device_mask, -std::numeric_limits<float>::infinity());
 		auto probabilities =
 			torch::softmax(compact_logits, 1).to(torch::kCPU).contiguous();
-		auto values = prediction.value.reshape({-1})
+		auto values = raw_values.reshape({-1})
 						  .to(torch::kFloat32)
 						  .to(torch::kCPU)
 						  .contiguous();
-		auto advantages = prediction.advantages.to(torch::kFloat32)
-							  .gather(1, device_indices)
-							  .to(torch::kCPU)
-							  .contiguous();
-		const auto rows = static_cast<std::size_t>(values.size(0));
 
-		std::vector<ClosedEvaluation> output(rows);
+		std::vector<ClosedEvaluation> output(boards.size());
 		auto probability_rows = probabilities.accessor<float, 2>();
 		auto value_rows = values.accessor<float, 1>();
-		auto advantage_rows = advantages.accessor<float, 2>();
-		for (std::size_t row = 0; row < rows; ++row) {
+		for (std::size_t row = 0; row < boards.size(); ++row) {
 			output[row].legal_indices = std::move(legal_actions[row]);
-			output[row].moves = std::move(legal_move_rows[row]);
 			output[row].legal_policy.resize(output[row].legal_indices.size());
-			output[row].legal_advantages.resize(output[row].legal_indices.size());
-			output[row].value = value_rows[static_cast<std::int64_t>(row)];
 			for (std::size_t column = 0; column < output[row].legal_indices.size(); ++column) {
 				output[row].legal_policy[column] =
 					probability_rows[static_cast<std::int64_t>(row)]
 									[static_cast<std::int64_t>(column)];
-				output[row].legal_advantages[column] =
-					advantage_rows[static_cast<std::int64_t>(row)]
-								  [static_cast<std::int64_t>(column)];
 			}
+			output[row].value = value_rows[static_cast<std::int64_t>(row)];
 		}
 		return output;
 	}
 
-	// Rebuild dense arrays only for MCTS, which indexes action values throughout its tree.
-	Evaluation densify(std::vector<ClosedEvaluation> compact,
-					   const torch::Tensor &latents = {}) {
+	// Densify only for MCTS and user-facing search, whose node logic indexes the full action space.
+	Evaluation evaluate(const std::vector<chess::Board> &boards) {
+		auto compact = evaluate_closed(boards);
 		Evaluation output;
 		output.policies.resize(compact.size(), std::vector<float>(kActionSize, 0.0F));
 		output.values.resize(compact.size());
-		output.advantages.resize(compact.size(), std::vector<float>(kActionSize, 0.0F));
-		if (latents.defined()) {
-			output.latents.reserve(compact.size());
-		}
 		for (std::size_t row = 0; row < compact.size(); ++row) {
 			for (std::size_t column = 0; column < compact[row].legal_indices.size(); ++column) {
 				const int action = compact[row].legal_indices[column];
 				output.policies[row][action] = compact[row].legal_policy[column];
-				output.advantages[row][action] = compact[row].legal_advantages[column];
 			}
 			output.values[row] = compact[row].value;
-			if (latents.defined()) {
-				output.latents.push_back(
-					latents.index({static_cast<std::int64_t>(row)}).contiguous());
-			}
 		}
 		return output;
 	}
 
-	// Encode exact boards and retain their geometry-aware latents as K=2 anchors.
-	Evaluation evaluate_exact(const std::vector<chess::Board> &boards) {
-		if (boards.empty()) {
-			return {};
-		}
-		torch::InferenceMode guard;
-		auto states = encode_boards_device(boards, device);
-		torch::Tensor latents;
-		ModelOutput prediction;
-		{
-			AutocastGuard autocast(options.precision, device);
-			latents = model->encode(states);
-			prediction = model->predict(latents);
-		}
-		return densify(collect_closed(std::move(prediction), boards), latents);
-	}
-
-	// Evaluate exact P/V/A for FCPI without retaining latent anchors or dense action arrays.
-	std::vector<ClosedEvaluation> evaluate_closed(const std::vector<chess::Board> &boards) {
-		if (boards.empty()) {
-			return {};
-		}
-		torch::InferenceMode guard;
-		auto states = encode_boards_device(boards, device);
-		ModelOutput prediction;
-		{
-			AutocastGuard autocast(options.precision, device);
-			prediction = model->forward(states);
-		}
-		return collect_closed(std::move(prediction), boards);
-	}
-
-	// Predict odd-depth leaves from their exact even-depth parent anchors.
-	Evaluation evaluate_latent(const std::vector<torch::Tensor> &parents,
-							   const std::vector<std::int64_t> &actions,
-							   const std::vector<chess::Board> &boards) {
-		if (parents.empty()) {
-			return {};
-		}
-		if (parents.size() != actions.size()) {
-			throw std::runtime_error("Melano latent evaluation batch is misaligned");
-		}
-		torch::InferenceMode guard;
-		auto parent_batch = torch::stack(parents);
-		auto action_batch =
-			torch::tensor(actions, torch::TensorOptions().dtype(torch::kInt64).device(device));
-		ModelOutput prediction;
-		{
-			AutocastGuard autocast(options.precision, device);
-			auto successors = model->transition(parent_batch, action_batch);
-			prediction = model->predict(successors);
-		}
-		return densify(collect_closed(std::move(prediction), boards));
-	}
-
-	// Expand legal edges and derive each current-player Q prior as clamp(V(s)+A(s,a)).
-	void expand(Node *node, const chess::Board &board, const std::vector<float> &policy,
-				const std::vector<float> &advantages, float parent_value) {
+	// Create one child per legal action using the masked, normalized network Policy.
+	void expand(Node *node, const chess::Board &board, const std::vector<float> &policy) {
 		if (!node->children.empty()) {
 			return;
 		}
 		const auto legal_policy = normalize_legal_policy(policy, board);
 		for (const auto &move : legal_moves(board)) {
-			const int action = move_to_index(move);
-			const float advantage = advantages[action];
-			const float q_prior = clamp_unit(parent_value + advantage);
 			node->children.push_back(
-				std::make_unique<Node>(legal_policy[action], move, advantage, q_prior));
+				std::make_unique<Node>(legal_policy[move_to_index(move)], move));
 		}
 	}
 
@@ -313,15 +232,16 @@ struct Searcher::Impl {
 		return mass;
 	}
 
-	// Blend one A-derived pseudo-visit with empirical child returns, both in parent perspective.
+	// Estimate an unvisited edge as parent Q minus uncertainty proportional to explored prior mass.
+	float fpu(const Node *parent) const {
+		const float parent_q = parent->visits > 0 ? parent->q() : 0.0F;
+		return clamp_unit(parent_q - static_cast<float>(std::max(0.0, options.fpu_reduction)) *
+										 std::sqrt(visited_policy_mass(parent)));
+	}
+
+	// Return the edge value in the parent side-to-move perspective.
 	float edge_value(const Node *parent, const Node *child) const {
-		if (child->visits > 0) {
-			return clamp_unit((static_cast<float>(child->visits) * -child->q() + child->q_prior) /
-							  static_cast<float>(child->visits + 1));
-		}
-		return clamp_unit(child->q_prior -
-			static_cast<float>(std::max(0.0, options.fpu_reduction)) *
-				std::sqrt(visited_policy_mass(parent)));
+		return child->visits > 0 ? -child->q() : fpu(parent);
 	}
 
 	// Increase exploration logarithmically with parent visits: c_init + factor*log((N+base+1)/base).
@@ -333,7 +253,7 @@ struct Searcher::Impl {
 		return std::max(0.0, options.c_puct + growth);
 	}
 
-	// Score an edge with PUCT using its pseudo-visit-adjusted exploitation value.
+	// Score an edge with PUCT: Q + c_puct*P*sqrt(N_parent)/(1+N_child) - virtual loss.
 	double selection_score(const Node *parent, const Node *child) const {
 		const double exploitation = edge_value(parent, child);
 		const int child_visits = child->visits + child->virtual_visits;
@@ -343,7 +263,7 @@ struct Searcher::Impl {
 		return exploitation + exploration - options.virtual_loss * child->virtual_visits;
 	}
 
-	// Break equal PUCT scores by policy prior, then by Melano's edge value.
+	// Break equal PUCT scores by Policy prior, then by the edge value in the parent perspective.
 	Node *select_child(Node *parent) const {
 		if (parent->children.empty()) {
 			return nullptr;
@@ -382,7 +302,6 @@ struct Searcher::Impl {
 			}
 		}
 		const int depth = static_cast<int>(selected.path.size()) - 1;
-		selected.depth = depth;
 		state.total_leaf_depth += depth;
 		state.leaf_samples += 1;
 		state.max_leaf_depth = std::max(state.max_leaf_depth, depth);
@@ -513,21 +432,18 @@ struct Searcher::Impl {
 		}
 	}
 
-	// Assemble final ranking plus P/V/A and pseudo-visit diagnostics for one tree.
+	// Assemble the final ranked move list and diagnostics from one completed tree.
 	SearchResult make_result(TreeState &state, Clock::time_point start) const {
 		SearchResult result;
 		result.policy = options.type == SearchType::Closed || options.mcts_sims <= 0
 							? normalize_legal_policy(state.network_policy, state.board)
 							: root_policy(state);
-		result.advantages = state.network_advantages;
 		result.decision_scores = result.policy;
 		result.value = state.root->visits > 0 ? state.root->q() : state.network_value;
 		result.sims_completed = state.sims_completed;
 		result.dynamic_target = options.type == SearchType::Closed ? 0 : state.dynamic_target;
 		result.expanded_nodes = state.expanded_nodes;
 		result.nn_batches = state.nn_batches;
-		result.exact_evaluations = state.exact_evaluations;
-		result.latent_evaluations = state.latent_evaluations;
 		result.uncertainty =
 			options.type == SearchType::Closed ? 0.0 : uncertainty(state.root.get());
 		result.elapsed_ms = seconds_since(start) * 1000.0;
@@ -571,8 +487,6 @@ struct Searcher::Impl {
 					root_move.prior = child->prior;
 					root_move.visits = child->visits;
 					root_move.q = edge_value(state.root.get(), child.get());
-					root_move.advantage = child->advantage;
-					root_move.q_prior = child->q_prior;
 					break;
 				}
 			}
@@ -608,18 +522,14 @@ struct Searcher::Impl {
 			state.board = board;
 			states.push_back(std::move(state));
 		}
-		const auto roots = evaluate_exact(boards);
+		const auto roots = evaluate(boards);
 		const int minimum = minimum_simulations();
 		for (std::size_t index = 0; index < states.size(); ++index) {
 			states[index].network_policy = roots.policies[index];
-			states[index].network_advantages = roots.advantages[index];
 			states[index].network_value = roots.values[index];
 			states[index].nn_batches = 1;
-			states[index].exact_evaluations = 1;
 			states[index].dynamic_target = minimum;
-			states[index].root->anchor_latent = roots.latents[index];
-			expand(states[index].root.get(), states[index].board, roots.policies[index],
-				   roots.advantages[index], roots.values[index]);
+			expand(states[index].root.get(), states[index].board, roots.policies[index]);
 			states[index].expanded_nodes = 1;
 		}
 		auto next_progress = start;
@@ -672,88 +582,28 @@ struct Searcher::Impl {
 
 				for (std::size_t begin = 0; begin < selected.size(); begin += batch_size) {
 					const auto end = std::min(selected.size(), begin + batch_size);
-					std::vector<std::size_t> exact_rows;
-					std::vector<std::size_t> latent_rows;
+					std::vector<chess::Board> leaf_boards;
 					for (std::size_t index = begin; index < end; ++index) {
-						if (selected[index].depth % 2 == 0) {
-							exact_rows.push_back(index);
-						} else {
-							latent_rows.push_back(index);
-						}
+						leaf_boards.push_back(selected[index].board);
 					}
-
-					auto apply_evaluation = [&](std::size_t index, const Evaluation &evaluation,
-												std::size_t row, bool exact) {
+					const auto evaluation = evaluate(leaf_boards);
+					std::unordered_set<std::size_t> evaluated_states;
+					for (std::size_t index = begin; index < end; ++index) {
 						auto &leaf = selected[index];
 						auto &state = states[leaf.state_index];
-						if (exact) {
-							leaf.leaf->anchor_latent = evaluation.latents[row];
-							state.exact_evaluations += 1;
-						} else {
-							state.latent_evaluations += 1;
-						}
+						const std::size_t row = index - begin;
 						if (leaf.leaf->children.empty()) {
-							expand(leaf.leaf, leaf.board, evaluation.policies[row],
-								   evaluation.advantages[row], evaluation.values[row]);
+							expand(leaf.leaf, leaf.board, evaluation.policies[row]);
 							state.expanded_nodes += 1;
 						}
 						clear_virtual(leaf.path);
 						backpropagate(leaf.path, evaluation.values[row]);
 						state.sims_completed += 1;
+						evaluated_states.insert(leaf.state_index);
 						progressed = true;
-					};
-
-					if (!exact_rows.empty()) {
-						std::vector<chess::Board> leaf_boards;
-						leaf_boards.reserve(exact_rows.size());
-						for (const auto index : exact_rows) {
-							leaf_boards.push_back(selected[index].board);
-						}
-						const auto evaluation = evaluate_exact(leaf_boards);
-						std::unordered_set<std::size_t> evaluated_states;
-						for (std::size_t row = 0; row < exact_rows.size(); ++row) {
-							const auto index = exact_rows[row];
-							apply_evaluation(index, evaluation, row, true);
-							evaluated_states.insert(selected[index].state_index);
-						}
-						for (const auto state_index : evaluated_states) {
-							states[state_index].nn_batches += 1;
-						}
 					}
-
-					if (!latent_rows.empty()) {
-						std::vector<torch::Tensor> parent_latents;
-						std::vector<std::int64_t> actions;
-						std::vector<chess::Board> leaf_boards;
-						parent_latents.reserve(latent_rows.size());
-						actions.reserve(latent_rows.size());
-						leaf_boards.reserve(latent_rows.size());
-						for (const auto index : latent_rows) {
-							const auto &leaf = selected[index];
-							if (leaf.path.size() < 2) {
-								throw std::runtime_error(
-									"odd-depth Melano leaf has no parent anchor");
-							}
-							const auto *parent = leaf.path[leaf.path.size() - 2];
-							if (!parent->anchor_latent.defined()) {
-								throw std::runtime_error(
-									"odd-depth Melano leaf is missing its K=2 parent anchor");
-							}
-							parent_latents.push_back(parent->anchor_latent);
-							actions.push_back(move_to_index(leaf.leaf->move));
-							leaf_boards.push_back(leaf.board);
-						}
-						const auto evaluation =
-							evaluate_latent(parent_latents, actions, leaf_boards);
-						std::unordered_set<std::size_t> evaluated_states;
-						for (std::size_t row = 0; row < latent_rows.size(); ++row) {
-							const auto index = latent_rows[row];
-							apply_evaluation(index, evaluation, row, false);
-							evaluated_states.insert(selected[index].state_index);
-						}
-						for (const auto state_index : evaluated_states) {
-							states[state_index].nn_batches += 1;
-						}
+					for (const auto state_index : evaluated_states) {
+						states[state_index].nn_batches += 1;
 					}
 				}
 
@@ -798,12 +648,12 @@ SearchResult Searcher::search(const chess::Board &board,
 	return impl_->search_many({board}, progress, progress_interval_ms, cancel)[0];
 }
 
-// Search a batch without progress callbacks, as used by arena and FCPI.
+// Search a batch without progress callbacks, as used by arena.
 std::vector<SearchResult> Searcher::search_many(const std::vector<chess::Board> &boards) {
 	return impl_->search_many(boards);
 }
 
-// Return the compact frozen-model contract used by FCPI generation.
+// Return compact legal-action Policy and Value outputs for batched inspection.
 std::vector<ClosedEvaluation>
 Searcher::evaluate_closed_many(const std::vector<chess::Board> &boards) {
 	return impl_->evaluate_closed(boards);

@@ -13,7 +13,7 @@ except ImportError as error:
 
 ARCHITECTURES = {
     1: ("gadus", "policy, value"),
-    2: ("melano", "policy, value, advantage"),
+    2: ("melano", "policy, value"),
 }
 REQUIRED_ARCH_FIELDS = ("type_id", "channels", "blocks", "action_size")
 
