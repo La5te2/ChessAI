@@ -2,7 +2,32 @@ cmake_minimum_required(VERSION 3.22)
 
 project(GadidaeCpp LANGUAGES C CXX)
 
+option(GADIDAE_BUILD_GADUS "Build the Gadus architecture" ON)
+option(GADIDAE_BUILD_MELANO "Build the Melano architecture" ON)
+option(GADIDAE_BUILD_ELEGINUS "Build the Eleginus architecture" ON)
+option(GADIDAE_BUILD_ELEGINUS_TRAINING "Build Eleginus LibTorch training tools" ON)
 option(GADIDAE_BUILD_GRAPHICS "Build the GLFW/OpenGL desktop application" ON)
+
+if(NOT GADIDAE_BUILD_GADUS AND NOT GADIDAE_BUILD_MELANO AND
+	NOT GADIDAE_BUILD_ELEGINUS AND NOT GADIDAE_BUILD_GRAPHICS)
+	message(FATAL_ERROR "At least one Gadidae architecture must be enabled")
+endif()
+
+set(GADIDAE_NEEDS_TORCH OFF)
+if(GADIDAE_BUILD_GADUS OR GADIDAE_BUILD_MELANO OR
+	(GADIDAE_BUILD_ELEGINUS AND GADIDAE_BUILD_ELEGINUS_TRAINING))
+	set(GADIDAE_NEEDS_TORCH ON)
+endif()
+set(GADIDAE_NEEDS_HDF5 OFF)
+if(GADIDAE_BUILD_GADUS OR GADIDAE_BUILD_MELANO OR
+	(GADIDAE_BUILD_ELEGINUS AND GADIDAE_BUILD_ELEGINUS_TRAINING))
+	set(GADIDAE_NEEDS_HDF5 ON)
+endif()
+set(GADIDAE_NEEDS_ZLIB OFF)
+if(GADIDAE_BUILD_GADUS OR GADIDAE_BUILD_MELANO OR GADIDAE_BUILD_GRAPHICS OR
+	(GADIDAE_BUILD_ELEGINUS AND GADIDAE_BUILD_ELEGINUS_TRAINING))
+	set(GADIDAE_NEEDS_ZLIB ON)
+endif()
 
 if(MSVC AND CMAKE_GENERATOR MATCHES "Ninja")
 	set(CMAKE_CL_SHOWINCLUDES_PREFIX "注意: 包含文件:  ")
@@ -33,11 +58,17 @@ function(gadidaelockvalue name output)
 	set(${output} "${value}" PARENT_SCOPE)
 endfunction()
 
-gadidaelockvalue(TORCH_VERSION GADIDAE_TORCH_VERSION)
-gadidaelockvalue(HDF5_VERSION GADIDAE_HDF5_VERSION)
-gadidaelockvalue(ZLIB_VERSION GADIDAE_ZLIB_VERSION)
+if(GADIDAE_NEEDS_TORCH)
+	gadidaelockvalue(TORCH_VERSION GADIDAE_TORCH_VERSION)
+endif()
+if(GADIDAE_NEEDS_HDF5)
+	gadidaelockvalue(HDF5_VERSION GADIDAE_HDF5_VERSION)
+endif()
+if(GADIDAE_NEEDS_ZLIB)
+	gadidaelockvalue(ZLIB_VERSION GADIDAE_ZLIB_VERSION)
+endif()
 
-if(EXISTS "${GADIDAE_TORCH_DIR}/share/cmake/Torch")
+if(GADIDAE_NEEDS_TORCH AND EXISTS "${GADIDAE_TORCH_DIR}/share/cmake/Torch")
 	unset(TORCH_LIBRARY CACHE)
 	unset(c10_LIBRARY CACHE)
 	unset(kineto_LIBRARY CACHE)
@@ -47,21 +78,27 @@ if(EXISTS "${GADIDAE_TORCH_DIR}/share/cmake/Torch")
 	set(Caffe2_DIR "${GADIDAE_TORCH_DIR}/share/cmake/Caffe2" CACHE PATH "Caffe2 CMake package" FORCE)
 	list(PREPEND CMAKE_PREFIX_PATH "${GADIDAE_TORCH_DIR}")
 endif()
-if(EXISTS "${GADIDAE_HDF5_DIR}")
+if(GADIDAE_NEEDS_HDF5 AND EXISTS "${GADIDAE_HDF5_DIR}")
 	list(PREPEND CMAKE_PREFIX_PATH "${GADIDAE_HDF5_DIR}")
 	set(HDF5_ROOT "${GADIDAE_HDF5_DIR}")
 endif()
-if(EXISTS "${GADIDAE_ZLIB_DIR}")
+if(GADIDAE_NEEDS_ZLIB AND EXISTS "${GADIDAE_ZLIB_DIR}")
 	list(PREPEND CMAKE_PREFIX_PATH "${GADIDAE_ZLIB_DIR}")
 	set(ZLIB_ROOT "${GADIDAE_ZLIB_DIR}")
 endif()
 
-find_package(Torch ${GADIDAE_TORCH_VERSION} EXACT REQUIRED)
-find_package(HDF5 ${GADIDAE_HDF5_VERSION} EXACT REQUIRED COMPONENTS C)
-find_package(ZLIB ${GADIDAE_ZLIB_VERSION} EXACT REQUIRED)
+if(GADIDAE_NEEDS_TORCH)
+	find_package(Torch ${GADIDAE_TORCH_VERSION} EXACT REQUIRED)
+endif()
+if(GADIDAE_NEEDS_HDF5)
+	find_package(HDF5 ${GADIDAE_HDF5_VERSION} EXACT REQUIRED COMPONENTS C)
+endif()
+if(GADIDAE_NEEDS_ZLIB)
+	find_package(ZLIB ${GADIDAE_ZLIB_VERSION} EXACT REQUIRED)
+endif()
 find_package(Threads REQUIRED)
 
-if(MSVC)
+if(MSVC AND GADIDAE_NEEDS_ZLIB)
 	find_library(
 		GADIDAE_ZLIB_STATIC
 		NAMES zlibstatic
@@ -70,6 +107,35 @@ if(MSVC)
 		REQUIRED
 	)
 endif()
+
+enable_testing()
+
+if(MSVC AND GADIDAE_NEEDS_TORCH)
+	file(GLOB TORCH_DLLS "${GADIDAE_TORCH_DIR}/lib/*.dll")
+	if(NOT TORCH_DLLS)
+		message(FATAL_ERROR "No LibTorch runtime DLLs found in ${GADIDAE_TORCH_DIR}/lib")
+	endif()
+	add_custom_target(torchruntime ALL COMMENT "Copying LibTorch runtime")
+	foreach(architecture IN ITEMS gadus melano)
+		string(TOUPPER "${architecture}" architecture_upper)
+		if(GADIDAE_BUILD_${architecture_upper})
+			add_custom_command(TARGET torchruntime POST_BUILD
+				COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/${architecture}"
+				COMMAND ${CMAKE_COMMAND} -E copy_if_different
+					${TORCH_DLLS} "${CMAKE_BINARY_DIR}/${architecture}"
+			)
+		endif()
+	endforeach()
+	if(GADIDAE_BUILD_ELEGINUS AND GADIDAE_BUILD_ELEGINUS_TRAINING)
+		add_custom_command(TARGET torchruntime POST_BUILD
+			COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/eleginus"
+			COMMAND ${CMAKE_COMMAND} -E copy_if_different
+				${TORCH_DLLS} "${CMAKE_BINARY_DIR}/eleginus"
+		)
+	endif()
+endif()
+
+if(GADIDAE_BUILD_GADUS)
 
 add_library(gadus
 	src/gadus/checkpoint.cpp
@@ -129,25 +195,6 @@ function(gadusexecutable name source)
 	endif()
 endfunction()
 
-if(MSVC)
-	file(GLOB TORCH_DLLS "${GADIDAE_TORCH_DIR}/lib/*.dll")
-	if(TORCH_DLLS)
-		add_custom_target(torchruntime ALL
-			COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/gadus"
-			COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/melano"
-			COMMAND ${CMAKE_COMMAND} -E copy_if_different
-				${TORCH_DLLS}
-				"${CMAKE_BINARY_DIR}/gadus"
-			COMMAND ${CMAKE_COMMAND} -E copy_if_different
-				${TORCH_DLLS}
-				"${CMAKE_BINARY_DIR}/melano"
-			COMMENT "Copying LibTorch runtime"
-		)
-	else()
-		message(FATAL_ERROR "No LibTorch runtime DLLs found in ${GADIDAE_TORCH_DIR}/lib")
-	endif()
-endif()
-
 gadusexecutable(preprocess src/gadus/preprocess.cpp)
 gadusexecutable(train src/gadus/train.cpp)
 gadusexecutable(search src/gadus/search.cpp)
@@ -155,7 +202,6 @@ gadusexecutable(arena src/gadus/arena.cpp)
 gadusexecutable(fcpi src/gadus/fcpi.cpp)
 gadusexecutable(uci src/gadus/uci.cpp)
 
-enable_testing()
 add_executable(gadustests src/gadus/tests.cpp)
 set_target_properties(gadustests PROPERTIES
 	RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/gadus"
@@ -168,6 +214,10 @@ if(MSVC)
 	add_dependencies(gadustests torchruntime)
 endif()
 add_test(NAME gadustests COMMAND gadustests)
+
+endif()
+
+if(GADIDAE_BUILD_MELANO)
 
 add_library(melano
 	src/melano/checkpoint.cpp
@@ -236,6 +286,101 @@ if(MSVC)
 	add_dependencies(melanotests torchruntime)
 endif()
 add_test(NAME melanotests COMMAND melanotests)
+
+endif()
+
+if(GADIDAE_BUILD_ELEGINUS)
+	add_library(eleginus_runtime STATIC
+		src/eleginus/game.cpp
+		src/eleginus/nnue.cpp
+		src/eleginus/runtime.cpp
+		src/eleginus/search.cpp
+	)
+	set_target_properties(eleginus_runtime PROPERTIES
+		ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/eleginus"
+		LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/eleginus"
+		PDB_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/eleginus"
+	)
+	target_include_directories(eleginus_runtime PUBLIC "${CMAKE_SOURCE_DIR}/include")
+	target_include_directories(eleginus_runtime SYSTEM PUBLIC "${GADIDAE_API_DIR}/chess")
+	target_precompile_headers(eleginus_runtime PRIVATE <chess.hpp>)
+	if(MSVC)
+		target_compile_options(eleginus_runtime PRIVATE /MP /W4 /permissive- /utf-8)
+	else()
+		target_compile_options(eleginus_runtime PRIVATE -Wall -Wextra -Wpedantic)
+	endif()
+
+	function(eleginusruntimeexecutable name source)
+		set(target "eleginus${name}")
+		add_executable(${target} ${source})
+		set_target_properties(${target} PROPERTIES
+			OUTPUT_NAME "${name}"
+			RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/eleginus"
+			ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/eleginus"
+			LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/eleginus"
+			PDB_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/eleginus"
+		)
+		target_link_libraries(${target} PRIVATE eleginus_runtime)
+	endfunction()
+
+	eleginusruntimeexecutable(search src/eleginus/searcher.cpp)
+	eleginusruntimeexecutable(uci src/eleginus/uci.cpp)
+
+	if(GADIDAE_BUILD_ELEGINUS_TRAINING)
+		add_library(eleginus_training STATIC
+			src/eleginus/args.cpp
+			src/eleginus/checkpoint.cpp
+			src/eleginus/dataset.cpp
+			src/eleginus/model.cpp
+		)
+		set_target_properties(eleginus_training PROPERTIES
+			ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/eleginus"
+			LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/eleginus"
+			PDB_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/eleginus"
+		)
+		target_include_directories(eleginus_training PUBLIC "${CMAKE_SOURCE_DIR}/include")
+		target_include_directories(eleginus_training SYSTEM PUBLIC
+			"${GADIDAE_API_DIR}/chess"
+			${HDF5_INCLUDE_DIRS}
+		)
+		target_precompile_headers(eleginus_training PRIVATE <chess.hpp>)
+		if(MSVC)
+			target_link_libraries(eleginus_training PUBLIC eleginus_runtime ${TORCH_LIBRARIES}
+				${HDF5_LIBRARIES} "${GADIDAE_ZLIB_STATIC}" Threads::Threads Shlwapi)
+		else()
+			target_link_libraries(eleginus_training PUBLIC eleginus_runtime ${TORCH_LIBRARIES}
+				${HDF5_LIBRARIES} ZLIB::ZLIB Threads::Threads)
+		endif()
+		target_compile_definitions(eleginus_training PRIVATE H5_USE_110_API)
+		if(MSVC)
+			target_compile_options(eleginus_training PRIVATE /MP /W4 /permissive- /utf-8)
+		else()
+			target_compile_options(eleginus_training PRIVATE -Wall -Wextra -Wpedantic)
+		endif()
+
+		function(eleginustrainingexecutable name source)
+			set(target "eleginus${name}")
+			add_executable(${target} ${source})
+			set_target_properties(${target} PROPERTIES
+				OUTPUT_NAME "${name}"
+				RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/eleginus"
+				ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/eleginus"
+				LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/eleginus"
+				PDB_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/eleginus"
+			)
+			target_link_libraries(${target} PRIVATE eleginus_training)
+			if(MSVC)
+				add_dependencies(${target} torchruntime)
+			endif()
+		endfunction()
+
+		eleginustrainingexecutable(preprocess src/eleginus/preprocess.cpp)
+		eleginustrainingexecutable(train src/eleginus/train.cpp)
+		eleginustrainingexecutable(embed src/eleginus/embed.cpp)
+		eleginustrainingexecutable(tests src/eleginus/tests.cpp)
+		add_test(NAME eleginustests COMMAND eleginustests)
+	endif()
+endif()
 
 if(GADIDAE_BUILD_GRAPHICS)
 # The native GUI owns no model implementation. It talks to Gadus, Melano, and

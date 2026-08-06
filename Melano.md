@@ -20,7 +20,7 @@ Melano is a geometry-aware Transformer chess architecture with Policy and Value 
 
 ### 2.1 State Encoding
 
-The state codec `melano_states` maps $x$ to 67 unsigned integers:
+The rules engine represents the complete state $x$, including move counters and repetition history. The state codec `melano_states` maps $x$ to a 67-integer network input by retaining its board occupancy, side to move, castling rights and en-passant file:
 
 $$
 s=(p_0,\ldots,p_{63},t,c,e).
@@ -39,8 +39,6 @@ t=
 $$
 
 The castling token $c\in\{0,\ldots,15\}$ is a four-bit mask. Its bits, from least to most significant, represent White kingside, White queenside, Black kingside and Black queenside castling rights. The en-passant token is 0 when no en-passant square exists and equals $1+f_{\mathrm{ep}}$ otherwise, where $f_{\mathrm{ep}}\in\{0,\ldots,7\}$ is the en-passant file.
-
-The rules engine retains move counters and repetition history in $x$. The network input $s$ contains the board occupancy, side to move, castling rights and en-passant file described above.
 
 ### 2.2 Action Encoding
 

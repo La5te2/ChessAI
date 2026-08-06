@@ -57,6 +57,21 @@ Build on Windows with:
 
 The Windows build script locates Visual Studio through `vswhere`, initializes an x64 compiler environment and invokes CMake with the Ninja generator.
 
+Each component can be enabled independently with `GADIDAE_BUILD_GADUS`,
+`GADIDAE_BUILD_MELANO`, `GADIDAE_BUILD_ELEGINUS`, and `GADIDAE_BUILD_GRAPHICS`. Values `0` and `1`
+disable and enable a component. Eleginus additionally provides
+`GADIDAE_BUILD_ELEGINUS_TRAINING`; setting it to `0` builds only its statically linked, Torch-free
+`search` and `uci` programs. For example, an Eleginus inference-only Windows build is:
+
+```powershell
+$env:GADIDAE_BUILD_GADUS = "0"
+$env:GADIDAE_BUILD_MELANO = "0"
+$env:GADIDAE_BUILD_ELEGINUS = "1"
+$env:GADIDAE_BUILD_ELEGINUS_TRAINING = "0"
+$env:GADIDAE_BUILD_GRAPHICS = "0"
+.\scripts\build.bat
+```
+
 Build on Linux with:
 
 ```bash
@@ -69,6 +84,9 @@ A command-line-only Linux server can install and build with graphics disabled:
 GADIDAE_BUILD_GRAPHICS=0 bash api/setup.sh
 GADIDAE_BUILD_GRAPHICS=0 bash scripts/build.sh
 ```
+
+The same switches select any subset on Linux. Disabled components are not rebuilt, published, or
+removed from `build/`.
 
 The build scripts use CMake and Ninja to produce the following command-line executables:
 
@@ -85,20 +103,31 @@ build/melano/train
 build/melano/search
 build/melano/arena
 build/melano/uci
+
+build/eleginus/preprocess
+build/eleginus/train
+build/eleginus/embed
+build/eleginus/search
+build/eleginus/uci
+build/eleginus/tests
 ```
+
+The Eleginus `preprocess`, `train`, `embed` and `tests` programs are omitted when
+`GADIDAE_BUILD_ELEGINUS_TRAINING=0`; `search` and `uci` remain available and do not depend on
+LibTorch at runtime.
 
 A graphics-enabled build also produces `build/graphics/Gadidae`. Windows executables use the `.exe` suffix. [Graphics.md](Graphics.md) describes the graphical client, its operating modes and its piece-import pipeline.
 
 The `build/.build-work/` directory stores the CMake and Ninja state used for incremental builds. Subsequent builds reuse compatible object files from this directory. Every build runs CTest before publishing the executables. A compilation or test failure leaves diagnostic files under `build/.build-work/`. CTest failures also produce `build/.build-work/Testing/Temporary/LastTest.log`.
 
-The `preprocess`, `train`, `search`, `arena` and Gadus `fcpi` entry points provide their current argument lists through `--help`:
+The `preprocess`, `train`, `embed`, `search`, `arena` and Gadus `fcpi` entry points provide their current argument lists through `--help`:
 
 ```bash
 build/gadus/search --help
 build/melano/train --help
 ```
 
-The Gadus and Melano UCI executables publish their configurable engine options in response to the UCI `uci` command rather than through `--help`.
+The Gadus, Melano and Eleginus UCI executables publish their configurable engine options in response to the UCI `uci` command rather than through `--help`.
 
 ## Commands
 
@@ -232,7 +261,7 @@ Preprocess an annotated PGN into the Melano HDF5 schema with:
 
 ```bash
 build/melano/preprocess \
-	--input data/games.cmt.pgn \
+	--input data/ccrl.pgn \
 	--output data/games.melano.h5 \
 	--has-cmt 1 \
 	--chunk-size 4096 \
@@ -250,7 +279,7 @@ build/melano/train \
 	--data data/games.melano.h5 \
 	--out models/melano/melano.pth \
 	--channels 128 \
-	--blocks 12 \
+	--blocks 20 \
 	--epochs 3 \
 	--batch-size 256 \
 	--max-steps 500000 \
@@ -350,6 +379,99 @@ setoption name RepetitionPolicyPenalty value 1.0
 setoption name InstantMateFirst value true
 ```
 
+### Eleginus
+
+Preprocess a PGN into the architecture-locked Eleginus Value schema with:
+
+```bash
+build/eleginus/preprocess \
+	--input data/games.cmt.pgn \
+	--output data/games.eleginus.h5 \
+	--has-cmt 1 \
+	--compression-level 4
+```
+
+The HDF5 file uses the same `states`, `moves` and `values` dataset names as Gadus and Melano, but
+its root metadata identifies `arch_type=eleginus` together with Eleginus-specific state, move and
+target encodings. Every reader rejects a dataset produced for either of the other architectures.
+With `--has-cmt 1`, numerical pawn evaluations in PGN comments become side-to-move targets in `[0,1]`;
+with `--has-cmt 0`, completed game results supply targets in `{0, 0.5, 1}`.
+
+Train a new Eleginus Value network with:
+
+```bash
+build/eleginus/train \
+	--data data/games.eleginus.h5 \
+	--out models/eleginus/eleginus.pth \
+	--epochs 10 \
+	--batch-size 512 \
+	--lr 0.001 \
+	--device cuda \
+	--seed 2026
+```
+
+This command trains the sole Eleginus Value network. Supplying `--model existing.pth` initializes
+the training run from those parameters, while omitting it initializes a new Value model. Each run
+constructs a new AdamW optimizer. Eleginus currently defines no self-learning procedure.
+
+The `.pth` checkpoint is the only standalone Eleginus weight file. Like the other architecture
+checkpoints, its top level contains `model` and `arch`; the latter identifies Eleginus with
+`type_id=3` and records every fixed network dimension. Inspect it with:
+
+```bash
+python scripts/check.py --model models/eleginus/eleginus.pth
+```
+
+Search and UCI are built first as weightless, Torch-free executable templates. Embed the checkpoint
+into a copy of the standalone search template and analyze one position:
+
+```bash
+build/eleginus/embed \
+	--model models/eleginus/eleginus.pth \
+	--input build/eleginus/search \
+	--output models/eleginus/eleginus-search
+
+models/eleginus/eleginus-search \
+	--fen startpos \
+	--expansions 32
+```
+
+`--fen` accepts `startpos` or one quoted six-field FEN. The embedded search program uses the
+statically linked float32 NNUE evaluator and therefore has no model path, device argument or
+LibTorch runtime dependency.
+
+Create and launch the Eleginus UCI engine on Windows with:
+
+```powershell
+build\eleginus\embed.exe `
+	--model models\eleginus\eleginus.pth `
+	--input build\eleginus\uci.exe `
+	--output models\eleginus\eleginus.exe
+
+models\eleginus\eleginus.exe --expansions 32
+```
+
+The corresponding Linux command is:
+
+```bash
+build/eleginus/embed \
+	--model models/eleginus/eleginus.pth \
+	--input build/eleginus/uci \
+	--output models/eleginus/eleginus
+
+models/eleginus/eleginus --expansions 32
+```
+
+The UCI process reads the embedded representation from its own executable at startup. A client can
+change the subsequent search budget without reloading the model:
+
+```text
+setoption name BFMExpansions value 128
+```
+
+The final Eleginus UCI and standalone search executables require neither an external weight file nor
+`torch.dll` or `c10.dll`. The `train` and `embed` tools remain training-side LibTorch programs.
+
 ## Scripts
 
 The `scripts/` directory contains repository-level launchers and data-preparation tools. The architecture documents specify the models and algorithms implemented by the compiled executables. The following sections describe the scripts shared across those executables.
@@ -445,8 +567,8 @@ Running `build/gadus/fcpi` directly executes FCPI and its per-iteration promotio
 `scripts/package_engine.bat` and `scripts/package_engine.sh` package a Gadus or Melano checkpoint with the corresponding UCI executable and runtime libraries. The first argument selects the architecture, and the second supplies the source checkpoint.
 
 ```powershell
-scripts\package_engine.bat gadus models\gadus\candidate.pth
-scripts\package_engine.bat melano models\melano\candidate.pth
+scripts\package_engine.bat gadus models\gadus\gadus.pth
+scripts\package_engine.bat melano models\melano\melano.pth
 ```
 
 ```bash
@@ -458,11 +580,12 @@ On Windows, each package is written to `models/<architecture>/` as `<architectur
 
 ### Checkpoint Inspection
 
-`scripts/check.py` performs a read-only inspection of a Gadus or Melano checkpoint. The report includes its architecture, heads, channels, blocks, action-space size, parameter counts, tensor data types, tensor memory, devices, finite-value status, file size and SHA-256 digest.
+`scripts/check.py` performs a read-only inspection of a Gadus, Melano or Eleginus checkpoint. The report includes its architecture, heads, architecture dimensions, action-space size, parameter counts, tensor data types, tensor memory, devices, finite-value status, file size and SHA-256 digest.
 
 ```bash
 python scripts/check.py --model models/gadus/gadus.pth
 python scripts/check.py --model models/melano/melano.pth
+python scripts/check.py --model models/eleginus/eleginus.pth
 ```
 
 ### Piece Import

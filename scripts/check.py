@@ -12,10 +12,31 @@ except ImportError as error:
 
 
 ARCHITECTURES = {
-    1: ("gadus", "policy, value"),
-    2: ("melano", "policy, value"),
+    1: {
+        "name": "gadus",
+        "heads": "policy, value",
+        "fields": ("type_id", "channels", "blocks", "action_size"),
+    },
+    2: {
+        "name": "melano",
+        "heads": "policy, value",
+        "fields": ("type_id", "channels", "blocks", "action_size"),
+    },
+    3: {
+        "name": "eleginus",
+        "heads": "value",
+        "fields": (
+            "type_id",
+            "feature_count",
+            "feature_slots",
+            "accumulator",
+            "hidden",
+            "bottleneck",
+            "action_size",
+        ),
+        "model_children": ("encoder", "hidden", "bottleneck", "output"),
+    },
 }
-REQUIRED_ARCH_FIELDS = ("type_id", "channels", "blocks", "action_size")
 
 
 def sha256(path: Path) -> str:
@@ -26,27 +47,37 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def scalar_fields(module) -> dict[str, int]:
+def scalar_fields(module) -> tuple[dict[str, int], dict[str, object]]:
     parameters = dict(module.named_parameters())
     if parameters:
         raise ValueError(
             "checkpoint arch metadata must be registered as buffers, not parameters"
         )
     fields = dict(module.named_buffers())
-    missing = [name for name in REQUIRED_ARCH_FIELDS if name not in fields]
+    if "type_id" not in fields:
+        raise ValueError("checkpoint arch is missing fields: type_id")
+    type_tensor = fields["type_id"]
+    if type_tensor.numel() != 1:
+        raise ValueError("checkpoint arch field is not scalar: type_id")
+    type_id = int(type_tensor.detach().cpu().item())
+    specification = ARCHITECTURES.get(type_id)
+    if specification is None:
+        raise ValueError(f"checkpoint has unknown architecture type_id: {type_id}")
+    required_fields = specification["fields"]
+    missing = [name for name in required_fields if name not in fields]
     if missing:
         raise ValueError(f"checkpoint arch is missing fields: {', '.join(missing)}")
-    unexpected = sorted(set(fields) - set(REQUIRED_ARCH_FIELDS))
+    unexpected = sorted(set(fields) - set(required_fields))
     if unexpected:
         raise ValueError(f"checkpoint arch has unexpected fields: {', '.join(unexpected)}")
 
     values = {}
-    for name in REQUIRED_ARCH_FIELDS:
+    for name in required_fields:
         tensor = fields[name]
         if tensor.numel() != 1:
             raise ValueError(f"checkpoint arch field is not scalar: {name}")
         values[name] = int(tensor.detach().cpu().item())
-    return values
+    return values, specification
 
 
 def tensor_bytes(tensors) -> int:
@@ -76,11 +107,15 @@ def inspect_model(path: Path) -> dict[str, object]:
         names = ", ".join(sorted(children)) or "<empty>"
         raise ValueError(f"checkpoint top level must contain only model and arch; found: {names}")
 
-    arch = scalar_fields(children["arch"])
-    architecture, heads = ARCHITECTURES.get(
-        arch["type_id"], (f"unknown(type_id={arch['type_id']})", "unknown")
-    )
+    arch, specification = scalar_fields(children["arch"])
     model = children["model"]
+    model_children = tuple(name for name, _ in model.named_children())
+    expected_children = specification.get("model_children")
+    if expected_children is not None and set(model_children) != set(expected_children):
+        names = ", ".join(model_children) or "<empty>"
+        raise ValueError(
+            f"{specification['name']} model has unexpected children: {names}"
+        )
     parameters = list(model.parameters())
     buffers = list(model.buffers())
     tensors = parameters + buffers
@@ -88,11 +123,10 @@ def inspect_model(path: Path) -> dict[str, object]:
     devices = sorted({str(tensor.device) for tensor in tensors})
 
     return {
-        "architecture": architecture,
-        "heads": heads,
-        "channels": arch["channels"],
-        "blocks": arch["blocks"],
-        "action_size": arch["action_size"],
+        "architecture": specification["name"],
+        "heads": specification["heads"],
+        "arch": arch,
+        "model_children": ", ".join(model_children) or "none",
         "parameters": sum(tensor.numel() for tensor in parameters),
         "trainable_parameters": sum(
             tensor.numel() for tensor in parameters if tensor.requires_grad
@@ -128,9 +162,9 @@ def main() -> None:
     print(f"sha256: {sha256(path)}")
     print(f"architecture: {info['architecture']}")
     print(f"heads: {info['heads']}")
-    print(f"channels: {info['channels']}")
-    print(f"blocks: {info['blocks']}")
-    print(f"action_size: {info['action_size']}")
+    for name, value in info["arch"].items():
+        print(f"arch.{name}: {value}")
+    print(f"model_children: {info['model_children']}")
     print(f"parameters: {info['parameters']}")
     print(f"trainable_parameters: {info['trainable_parameters']}")
     print(f"parameter_tensors: {info['parameter_tensors']}")

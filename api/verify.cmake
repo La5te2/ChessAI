@@ -6,6 +6,11 @@ endif()
 if(NOT DEFINED TORCH_DIR)
 	set(TORCH_DIR "${API_DIR}/libtorch")
 endif()
+foreach(component IN ITEMS TORCH HDF5 ZLIB JSON GUI)
+	if(NOT DEFINED VERIFY_${component})
+		set(VERIFY_${component} ON)
+	endif()
+endforeach()
 
 function(lock_value name output)
 	file(STRINGS "${API_DIR}/versions.env" lines REGEX "^${name}=")
@@ -79,77 +84,85 @@ lock_value(JSON_VERSION locked_json_version)
 lock_value(NINJA_VERSION locked_ninja_version)
 lock_value(CHESS_SHA256 locked_chess_sha256)
 
-set(torch_version_file "${TORCH_DIR}/build-version")
-if(NOT EXISTS "${torch_version_file}")
-	message(FATAL_ERROR "LibTorch build-version is missing: ${torch_version_file}")
-endif()
-file(STRINGS "${torch_version_file}" torch_build LIMIT_COUNT 1)
-string(STRIP "${torch_build}" torch_build)
-if(NOT torch_build MATCHES "^([^+]+)\\+(.+)$")
-	message(FATAL_ERROR "Unrecognized LibTorch build-version: ${torch_build}")
-endif()
-set(actual_torch_version "${CMAKE_MATCH_1}")
-set(actual_torch_variant "${CMAKE_MATCH_2}")
-if(NOT actual_torch_version STREQUAL locked_torch_version)
-	message(FATAL_ERROR
-		"LibTorch version mismatch: expected ${locked_torch_version}, found ${actual_torch_version}")
-endif()
-string(REPLACE "," ";" allowed_torch_variants "${locked_torch_variants}")
-list(FIND allowed_torch_variants "${actual_torch_variant}" variant_index)
-if(variant_index EQUAL -1)
-	message(FATAL_ERROR
-		"Unsupported LibTorch variant ${actual_torch_variant}; allowed: ${locked_torch_variants}")
-endif()
-if(DEFINED EXPECTED_TORCH_VARIANT AND
-	NOT actual_torch_variant STREQUAL EXPECTED_TORCH_VARIANT)
-	message(FATAL_ERROR
-		"LibTorch variant mismatch: expected ${EXPECTED_TORCH_VARIANT}, found ${actual_torch_variant}")
+if(VERIFY_TORCH)
+	set(torch_version_file "${TORCH_DIR}/build-version")
+	if(NOT EXISTS "${torch_version_file}")
+		message(FATAL_ERROR "LibTorch build-version is missing: ${torch_version_file}")
+	endif()
+	file(STRINGS "${torch_version_file}" torch_build LIMIT_COUNT 1)
+	string(STRIP "${torch_build}" torch_build)
+	if(NOT torch_build MATCHES "^([^+]+)\\+(.+)$")
+		message(FATAL_ERROR "Unrecognized LibTorch build-version: ${torch_build}")
+	endif()
+	set(actual_torch_version "${CMAKE_MATCH_1}")
+	set(actual_torch_variant "${CMAKE_MATCH_2}")
+	if(NOT actual_torch_version STREQUAL locked_torch_version)
+		message(FATAL_ERROR
+			"LibTorch version mismatch: expected ${locked_torch_version}, found ${actual_torch_version}")
+	endif()
+	string(REPLACE "," ";" allowed_torch_variants "${locked_torch_variants}")
+	list(FIND allowed_torch_variants "${actual_torch_variant}" variant_index)
+	if(variant_index EQUAL -1)
+		message(FATAL_ERROR
+			"Unsupported LibTorch variant ${actual_torch_variant}; allowed: ${locked_torch_variants}")
+	endif()
+	if(DEFINED EXPECTED_TORCH_VARIANT AND
+		NOT actual_torch_variant STREQUAL EXPECTED_TORCH_VARIANT)
+		message(FATAL_ERROR
+			"LibTorch variant mismatch: expected ${EXPECTED_TORCH_VARIANT}, found ${actual_torch_variant}")
+	endif()
+
+	if(NOT WIN32 AND NOT actual_torch_variant STREQUAL "cpu")
+		python_package_version(
+			"${API_DIR}/nvidia" nvidia_cusparselt_cu12 "${locked_cusparselt_version}")
+		python_package_version(
+			"${API_DIR}/nvidia" nvidia_nccl_cu12 "${locked_nccl_version}")
+		python_package_version(
+			"${API_DIR}/nvidia" nvidia_nvshmem_cu12 "${locked_nvshmem_version}")
+		foreach(runtime IN ITEMS
+				"cusparselt|libcusparseLt.so.0|${locked_cusparselt_version}"
+				"nccl|libnccl.so.2|${locked_nccl_version}"
+				"nvshmem|libnvshmem_host.so.3|${locked_nvshmem_version}"
+		)
+			string(REPLACE "|" ";" fields "${runtime}")
+			list(GET fields 0 component)
+			list(GET fields 1 library)
+			list(GET fields 2 version)
+			set(component_library "${API_DIR}/nvidia/nvidia/${component}/lib/${library}")
+			if(NOT EXISTS "${component_library}")
+				message(FATAL_ERROR
+					"NVIDIA ${component} ${version} runtime is missing: ${component_library}")
+			endif()
+			set(torch_runtime_link "${TORCH_DIR}/lib/${library}")
+			if(NOT EXISTS "${torch_runtime_link}")
+				message(FATAL_ERROR
+					"LibTorch runtime link is missing: ${torch_runtime_link}")
+			endif()
+		endforeach()
+	endif()
 endif()
 
-if(NOT WIN32 AND NOT actual_torch_variant STREQUAL "cpu")
-	python_package_version(
-		"${API_DIR}/nvidia" nvidia_cusparselt_cu12 "${locked_cusparselt_version}")
-	python_package_version(
-		"${API_DIR}/nvidia" nvidia_nccl_cu12 "${locked_nccl_version}")
-	python_package_version(
-		"${API_DIR}/nvidia" nvidia_nvshmem_cu12 "${locked_nvshmem_version}")
-	foreach(runtime IN ITEMS
-		"cusparselt|libcusparseLt.so.0|${locked_cusparselt_version}"
-		"nccl|libnccl.so.2|${locked_nccl_version}"
-		"nvshmem|libnvshmem_host.so.3|${locked_nvshmem_version}"
-	)
-		string(REPLACE "|" ";" fields "${runtime}")
-		list(GET fields 0 component)
-		list(GET fields 1 library)
-		list(GET fields 2 version)
-		set(component_library "${API_DIR}/nvidia/nvidia/${component}/lib/${library}")
-		if(NOT EXISTS "${component_library}")
-			message(FATAL_ERROR
-				"NVIDIA ${component} ${version} runtime is missing: ${component_library}")
-		endif()
-		set(torch_runtime_link "${TORCH_DIR}/lib/${library}")
-		if(NOT EXISTS "${torch_runtime_link}")
-			message(FATAL_ERROR
-				"LibTorch runtime link is missing: ${torch_runtime_link}")
-		endif()
-	endforeach()
+if(VERIFY_HDF5)
+	quoted_define("${API_DIR}/hdf5/include/H5pubconf.h" H5_VERSION "${locked_hdf5_version}")
+endif()
+if(VERIFY_ZLIB)
+	quoted_define("${API_DIR}/zlib/include/zlib.h" ZLIB_VERSION "${locked_zlib_version}")
 endif()
 
-quoted_define("${API_DIR}/hdf5/include/H5pubconf.h" H5_VERSION "${locked_hdf5_version}")
-quoted_define("${API_DIR}/zlib/include/zlib.h" ZLIB_VERSION "${locked_zlib_version}")
-
-string(REPLACE "." ";" json_parts "${locked_json_version}")
-list(LENGTH json_parts json_part_count)
-if(NOT json_part_count EQUAL 3)
-	message(FATAL_ERROR "Invalid JSON_VERSION in dependency lock: ${locked_json_version}")
+if(VERIFY_JSON)
+	string(REPLACE "." ";" json_parts "${locked_json_version}")
+	list(LENGTH json_parts json_part_count)
+	if(NOT json_part_count EQUAL 3)
+		message(FATAL_ERROR "Invalid JSON_VERSION in dependency lock: ${locked_json_version}")
+	endif()
+	list(GET json_parts 0 json_major)
+	list(GET json_parts 1 json_minor)
+	list(GET json_parts 2 json_patch)
+	set(json_header "${API_DIR}/nlohmann/include/nlohmann/json.hpp")
+	integer_define("${json_header}" NLOHMANN_JSON_VERSION_MAJOR "${json_major}")
+	integer_define("${json_header}" NLOHMANN_JSON_VERSION_MINOR "${json_minor}")
+	integer_define("${json_header}" NLOHMANN_JSON_VERSION_PATCH "${json_patch}")
 endif()
-list(GET json_parts 0 json_major)
-list(GET json_parts 1 json_minor)
-list(GET json_parts 2 json_patch)
-set(json_header "${API_DIR}/nlohmann/include/nlohmann/json.hpp")
-integer_define("${json_header}" NLOHMANN_JSON_VERSION_MAJOR "${json_major}")
-integer_define("${json_header}" NLOHMANN_JSON_VERSION_MINOR "${json_minor}")
-integer_define("${json_header}" NLOHMANN_JSON_VERSION_PATCH "${json_patch}")
 
 set(chess_header "${API_DIR}/chess/chess.hpp")
 if(NOT EXISTS "${chess_header}")
@@ -161,9 +174,6 @@ if(NOT actual_chess_sha256 STREQUAL locked_chess_sha256)
 		"chess-library checksum mismatch: expected ${locked_chess_sha256}, found ${actual_chess_sha256}")
 endif()
 
-if(NOT DEFINED VERIFY_GUI)
-	set(VERIFY_GUI ON)
-endif()
 if(VERIFY_GUI)
 	foreach(gui_dependency
 			glfw/CMakeLists.txt
@@ -200,7 +210,4 @@ if(NOT actual_ninja_version STREQUAL locked_ninja_version)
 		"Ninja version mismatch: expected ${locked_ninja_version}, found ${actual_ninja_version}")
 endif()
 
-message(STATUS
-	"Dependencies verified: LibTorch ${torch_build}, HDF5 ${locked_hdf5_version}, "
-	"zlib ${locked_zlib_version}, nlohmann-json ${locked_json_version}, "
-	"Ninja ${locked_ninja_version}")
+message(STATUS "Selected Gadidae dependencies verified; Ninja ${locked_ninja_version}")
