@@ -22,7 +22,7 @@ The build produces `build/graphics/Gadidae.exe` on Windows and `build/graphics/G
 
 ## 2. Engine Interface
 
-Importing an engine starts a temporary process and performs a standard UCI handshake. The client reads every `option name ...` declaration returned by the engine, generates a matching control and then closes the temporary process. UCI options configure a working engine after its handshake, whereas `Launch arguments` supplies arguments when the operating system starts an engine process.
+Importing an engine starts a temporary process and performs a standard UCI handshake. The client reads every `option name ...` declaration returned by the engine, generates a matching control and then closes the temporary process. The imported configuration enters a reusable registry stored in `gui.json`. Importing the same executable path updates its existing entry. UCI options configure a working engine after its handshake, whereas `Launch arguments` supplies arguments when the operating system starts an engine process.
 
 Simulator starts a working engine when analysis opens, and Stadium starts the configured working engines when a match begins. Each working process remains alive for its analysis or match session. A position change sends `stop` to the active search, discards subsequent output associated with the previous position and submits the new position to the same process. The UCI `position` command reconstructs the game from its initial FEN and the complete move sequence up to the position being displayed, preserving the rule history required for repetition detection. The engine determines how quickly an active search responds to `stop`.
 
@@ -44,9 +44,11 @@ build\graphics\Gadidae.exe `
 
 Simulator accepts any executable that implements the UCI protocol. The `--uci` argument therefore may refer to Gadus, Melano, Stockfish or another UCI engine.
 
+`File` imports engines and PGN files and saves the current PGN. `Board` sets the starting FEN, resets the position, undoes a Simulator move and flips the board. The board-state panel provides commands that copy the current FEN or PGN to the clipboard. The slider below the board selects a read-only historical position without changing the live game.
+
 ## 4. Stadium
 
-Stadium manages multiple independent games. `Tools > Matches` creates games, selects the game shown in the active view and closes games. Games outside the active view continue in the background. Each seat requires a participant name. A Human seat accepts moves from the board. An engine seat requires a UCI executable and stores its own UCI option values and launch arguments.
+Stadium manages multiple independent games. `Tools > Matches` creates games, selects the game shown in the active view and closes games. Games outside the active view continue in the background, including while Simulator is visible. Each seat requires a participant name. A Human seat accepts moves from the board. An engine seat requires a UCI executable and stores its own UCI option values and launch arguments.
 
 Match settings define the initial clock, increment, display delay, maximum ply count and starting position in Forsyth-Edwards Notation (FEN). An initial clock of zero disables clock timing. `Run > Start`, `Run > Pause` and `Run > Stop` control the active game. Closing Gadidae terminates every UCI subprocess owned by every open match.
 

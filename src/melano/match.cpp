@@ -282,7 +282,6 @@ nlohmann::json evaluate_models(const ArenaOptions &options) {
 		{"precision", compute_precision_name(options.search.precision)},
 		{"sims_soft_cap", options.search.mcts_sims},
 		{"mcts_batch_size", options.search.mcts_batch_size},
-		{"movetime_ms", options.search.movetime_ms},
 		{"paired_openings", true},
 		{"unique_start_positions", (options.games + 1) / 2},
 		{"result_ok", accepted},

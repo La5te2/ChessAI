@@ -26,7 +26,7 @@ $$
 s=(p_0,\ldots,p_{63},t,c,e).
 $$
 
-Squares are numbered from `a1` as 0 to `h8` as 63. For each square $q$, the token $p_q$ belongs to $\{0,\ldots,12\}$. Token 0 represents an empty square. White pawn, knight, bishop, rook, queen and king use tokens 1 through 6, while the corresponding Black pieces use tokens 7 through 12.
+Squares are indexed from 0 at `a1` to 63 at `h8`. For each square $q$, the token $p_q$ belongs to $\{0,\ldots,12\}$. Token 0 represents an empty square. White pawn, knight, bishop, rook, queen and king use tokens 1 through 6, while the corresponding Black pieces use tokens 7 through 12.
 
 The side token is
 
@@ -357,7 +357,7 @@ Thus the schedule uses linear warmup followed by inverse-square-root decay. The 
 
 Precision `fp32` evaluates the forward pass and both losses in float32. Precision `bf16` requires CUDA and applies BF16 autocast to the forward pass, while Policy logits, Value predictions and losses are converted to float32 before loss evaluation.
 
-Every positive multiple of `--save-every` writes a checkpoint. Training also writes one after each processed epoch pass, including the final partial pass stopped by a positive `--max-steps`. The top-level archive contains `model` and `arch`. The architecture archive stores type identifier 2, $C$, $B$ and action size 4672 as integer tensors. Saving first writes a sibling `.tmp` file and then atomically replaces the destination. Loading validates every architecture field before constructing the model and restoring its parameters.
+Training writes a checkpoint at every positive optimizer step divisible by `--save-every`. It also writes one after each processed epoch pass, including the final partial pass stopped by a positive `--max-steps`. The top-level archive contains `model` and `arch`. The architecture archive stores type identifier 2, $C$, $B$ and action size 4672 as integer tensors. Saving first writes a sibling `.tmp` file and then atomically replaces the destination. Loading validates every architecture field before constructing the model and restoring its parameters.
 
 ## 6. Search
 
@@ -443,7 +443,7 @@ N_{\min}=
 \end{cases}
 $$
 
-A wall-clock deadline or a cancellation request may end search before $N_{\min}$. After at least $N_{\min}$ simulations, a root with at least two legal actions uses the completed-visit distribution
+When UCI supplies a wall-clock limit or sends `stop`, search may terminate with fewer than $N_{\min}$ completed simulations. After $N_{\min}$ simulations have completed, a root with at least two legal actions uses the completed-visit distribution
 
 $$
 v_a=\frac{N(s,a)}{\displaystyle\sum_{b\in\mathcal A(x)}N(s,b)}.

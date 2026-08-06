@@ -15,7 +15,7 @@ int main(int argc, char **argv) {
 				<< "  --games <n> --games-in-flight <n> --max-plies <n>\n"
 				<< "  --opening-book <path|empty> --book-plies <n> --max-book-positions <n>\n"
 				<< "  --search-type <closed|only-mcts> --sims <n> --mcts-min-sims <n>\n"
-				<< "  --mcts-batch-size <n> --movetime-ms <ms> --c-puct <x> --c-puct-base <x>\n"
+				<< "  --mcts-batch-size <n> --c-puct <x> --c-puct-base <x>\n"
 				<< "  --c-puct-factor <x> --fpu-reduction <x> --virtual-loss <x>\n"
 				<< "  --repetition-policy-penalty <x> --instant-mate-first <0|1>\n"
 				<< "  --min-net-wins <n> --pgn-output <path> --seed <n> --log-every <games>\n";
@@ -43,7 +43,6 @@ int main(int argc, char **argv) {
 		search.mcts_sims = args.get_int("sims", search.mcts_sims);
 		search.mcts_min_sims = args.get_int("mcts-min-sims", search.mcts_min_sims);
 		search.mcts_batch_size = args.get_int("mcts-batch-size", search.mcts_batch_size);
-		search.movetime_ms = args.get_double("movetime-ms", search.movetime_ms);
 		search.c_puct = args.get_double("c-puct", search.c_puct);
 		search.c_puct_base = args.get_double("c-puct-base", search.c_puct_base);
 		search.c_puct_factor = args.get_double("c-puct-factor", search.c_puct_factor);

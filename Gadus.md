@@ -19,9 +19,13 @@ Gadus is a residual policy-value network for chess with an AlphaZero-style actio
 
 ## 2. State and Action Encoding
 
-The `gadus_18_planes` state encoding contains 12 piece planes, one side-to-move plane, four castling-right planes and one en passant file plane. Bit-packing each rank into one byte gives an HDF5 state size of $18\times8$ bytes.
+The `gadus_18_planes` state encoding uses planes 0 through 5 for White pawn, knight, bishop, rook, queen and king, followed by the corresponding six Black piece planes. Plane 12 is filled with ones when White is to move and zeros when Black is to move. Planes 13 through 16 represent White kingside, White queenside, Black kingside and Black queenside castling rights. Plane 17 marks the en passant file on every rank when an en passant square exists.
 
-The `alphazero_64x73` action encoding assigns 73 action planes to each source square. The planes contain 56 sliding moves in eight directions, eight knight moves and nine underpromotion moves. The action-space size is
+Squares use the order `a1` through `h8`. Within each plane, rank 1 is stored before rank 2 and so forth. Each rank occupies one byte whose most significant bit represents file `a` and whose least significant bit represents file `h`. This packing gives an HDF5 state size of $18\times8$ bytes.
+
+The `alphazero_64x73` action encoding assigns 73 action planes to each source square. Its action index is $73q+p$, where $q\in\{0,\ldots,63\}$ is the source square and $p\in\{0,\ldots,72\}$ is the action plane. Planes 0 through 55 encode distances 1 through 7 in the ordered rank-file directions $(-1,-1)$, $(-1,0)$, $(-1,1)$, $(0,-1)$, $(0,1)$, $(1,-1)$, $(1,0)$ and $(1,1)$. Planes 56 through 63 encode knight offsets $(-2,-1)$, $(-2,1)$, $(-1,-2)$, $(-1,2)$, $(1,-2)$, $(1,2)$, $(2,-1)$ and $(2,1)$.
+
+Planes 64 through 72 encode underpromotions. They first order the destination-file offset as $-1$, $0$ and $1$, then order the promoted piece as knight, bishop and rook. Queen promotions use the corresponding one-square sliding plane. Castling uses the king destination square `g1`, `c1`, `g8` or `c8`, even when the chess-library move representation points to the rook square. The action-space size is
 
 $$
 |\mathcal I_G|=64\times(56+8+9)=4672.
@@ -156,7 +160,7 @@ arch  #stores the Gadus identifier and the dimensions required to reconstruct th
 
 ### 6.1 Search Modes
 
-Search mode `closed` derives its initial move ranking directly from the model policy. Search mode `only-mcts` evaluates leaf nodes in neural batches and derives its initial ranking from the resulting MCTS root distribution. Both modes then apply the enabled IMF(Instant Mate First) and RPP(Repetition Policy Penalty) decision components.
+Search mode `closed` derives its initial move ranking directly from the model policy. Search mode `only-mcts` evaluates leaf nodes in neural batches and derives its initial ranking from the resulting MCTS root distribution. Both modes then apply the enabled IMF (Instant Mate First) and RPP (Repetition Policy Penalty) decision components.
 
 Within `only-mcts` mode, expanding node $s$ creates one outgoing edge $(s,a)$ for each legal action $a$ and stores policy probability $P(s,a)$ as that edge's prior. Each prior remains fixed throughout the search. The completed visit counts of an edge and its parent node are denoted by $N(s,a)$ and $N(s)=\sum_aN(s,a)$. During batched selection, virtual visits reserve edges for concurrent paths and reduce repeated selection of the same edge. Their corresponding counts are $N_v(s,a)$ and $N_v(s)=\sum_aN_v(s,a)$. Selection combines completed and virtual visits into the augmented counts:
 
@@ -175,7 +179,7 @@ c_{\mathrm{puct}}(\widetilde N)=
 \max\left(0,c_0+f\log\left(\frac{\widetilde N+b+1}{b}\right)\right).
 $$
 
-An evaluated leaf supplies the scalar value $V_{\mathrm{leaf}}$. MCTS backs up this value along the selected path and reverses its sign at every ply. Each completed backup increments $N(s,a)$ and updates the mean return $Q(s,a)$ from the perspective of the player at the parent node $s$.
+A terminal leaf supplies the exact rule outcome $z(x)$, while a nonterminal leaf supplies the network evaluation $V_\theta(\phi_G(x))$. Denote either result by $V_{\mathrm{leaf}}$. MCTS backs up this value along the selected path and reverses its sign at every ply. Each completed backup increments $N(s,a)$ and updates the mean return $Q(s,a)$ from the perspective of the player at the parent node $s$.
 
 The selection estimate $Q_{\mathrm{sel}}(s,a)$ equals $Q(s,a)$ when $N(s,a)>0$. For an unvisited edge, $Q(s)$ denotes the mean return backed up to node $s$ from the perspective of the player to move at that node. First Play Urgency combines $Q(s)$ with the explored prior mass. With $r_{\mathrm{FPU}}=\max(0,\texttt{--fpu-reduction})$, the two cases are
 
@@ -225,7 +229,7 @@ N_{\min}=
 \end{cases}
 $$
 
-A UCI `stop` request may end search before $N_{\min}$ simulations. After $N_{\min}$ simulations have completed, a root with at least two legal actions uses the empirical visit distribution
+When UCI supplies a wall-clock limit or sends `stop`, search may terminate with fewer than $N_{\min}$ completed simulations. After $N_{\min}$ simulations have completed, a root with at least two legal actions uses the empirical visit distribution
 
 $$
 v_a=\frac{N(s,a)}{\displaystyle\sum_{b\in\mathcal A(x)}N(s,b)}.
@@ -261,7 +265,7 @@ A root with one legal action uses $u=0$ and $N_{\mathrm{target}}=N_{\min}$.
 
 ### 6.4 Final Decision Components
 
-The optional IMF(Instant Mate First) and RPP(Repetition Policy Penalty) rules operate on the final ranking rather than on the search tree. Before either rule is applied, the ranking score is
+The optional IMF (Instant Mate First) and RPP (Repetition Policy Penalty) rules operate on the final ranking rather than on the search tree. Before either rule is applied, the ranking score is
 
 $$
 D_0(a)=
@@ -363,7 +367,7 @@ The trainable candidate parameters are denoted by $\theta_{new}$, and the corres
 
 FCPI constructs targets from completed self-play trajectories and finite counterfactual trees. A completed trajectory assigns terminal return $G_t$ to each recorded position and MC advantage coefficient $A_{\mathrm{MC}}(s_t,a_t)$ to the move selected there. A counterfactual tree computes $Q_{\mathrm{CF}}(s,a)$ for legal moves and then derives $\pi^+(\cdot\mid s)$ and $\overline V_{\mathrm{CF}}(s)$.
 
-After aggregating these targets, FCPI trains the candidate with the objective defined in Section 8.7. AdamW updates $\theta_{new}$ from the gradients of that objective. A paired-game arena then compares the trained candidate with $C_r$ and promotes the candidate by atomic checkpoint replacement when it meets the acceptance threshold.
+After aggregating these targets, FCPI trains the candidate with the objective defined in Section 8.7. AdamW updates $\theta_{new}$ from the gradients of that objective. A paired-game arena then compares the trained candidate with $C_r$ and returns the acceptance result. FCPI atomically replaces `current.pth` when that result meets the promotion threshold.
 
 ### 8.2 Self-Play Trajectory Generation
 

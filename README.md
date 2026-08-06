@@ -18,7 +18,7 @@ The Windows and Linux dependency installers place LibTorch, HDF5, zlib, nlohmann
 
 The installers select the LibTorch CUDA `cu126` package when `nvidia-smi` reports a GPU compute capability. They select the CPU package in other environments. Set `GADIDAE_TORCH_VARIANT=cpu` or `GADIDAE_TORCH_VARIANT=cu126` to select a package explicitly. Set `GADIDAE_TORCH_DIR` to use an existing LibTorch installation.
 
-After installing the dependencies, `api/setup.bat` and `api/setup.sh` verify each installed package. The build scripts repeat this verification before configuring CMake. LibTorch, HDF5, zlib and chess-library must match the versions and checksums recorded in `api/versions.env`. After verification succeeds, the installer removes downloaded archives, extracted sources and temporary dependency build directories.
+After installing the dependencies, `api/setup.bat` and `api/setup.sh` verify each installed package. The build scripts repeat this verification before configuring CMake. LibTorch, HDF5, zlib, nlohmann-json and Ninja must match the versions recorded in `api/versions.env`. Chess-library must match its recorded SHA-256 checksum. After verification succeeds, the installer removes downloaded archives, extracted sources and temporary dependency build directories.
 
 Windows uses the MSVC-compatible LibTorch ABI. Install Microsoft C++ Build Tools and a Windows SDK, then run:
 
@@ -152,7 +152,6 @@ build/gadus/search \
 	--mcts-sims 1000 \
 	--mcts-min-sims 100 \
 	--mcts-batch-size 64 \
-	--movetime-ms 5000 \
 	--c-puct 0.5 \
 	--c-puct-base 19652 \
 	--c-puct-factor 1.0 \
@@ -182,7 +181,6 @@ build/gadus/arena \
 	--search-type closed \
 	--sims 0 \
 	--mcts-batch-size 64 \
-	--movetime-ms 0 \
 	--c-puct 0.5 \
 	--c-puct-base 19652 \
 	--c-puct-factor 1.0 \
@@ -277,7 +275,6 @@ build/melano/search \
 	--mcts-sims 1000 \
 	--mcts-min-sims 250 \
 	--mcts-batch-size 64 \
-	--movetime-ms 5000 \
 	--c-puct 0.5 \
 	--c-puct-base 19652 \
 	--c-puct-factor 1.0 \
@@ -308,7 +305,6 @@ build/melano/arena \
 	--sims 64 \
 	--mcts-min-sims 32 \
 	--mcts-batch-size 32 \
-	--movetime-ms 0 \
 	--c-puct 0.5 \
 	--c-puct-base 19652 \
 	--c-puct-factor 1.0 \
@@ -388,7 +384,7 @@ python scripts/opening_book.py \
 	--log-every 1000
 ```
 
-An arena book contains positions from one fixed ply whose absolute UCI evaluation lies within a selected bound. The shell and batch launchers generate 1,000 positions at ply eight with a default bound of 80 centipawns:
+An arena book contains positions from one fixed ply whose absolute UCI evaluation lies within a selected bound. The following launcher invocations request 1,000 positions at ply eight with the default bound of 80 centipawns:
 
 ```bash
 bash scripts/run_opening.sh data/games.pgn 1000 data/openings.gen.bin
@@ -429,7 +425,7 @@ tail -n 100 -f data/runs/<run-id>/info.log
 kill "$(cat data/runs/<run-id>/pid)"
 ```
 
-The launcher's production defaults are `bf16` precision, 10 iterations, 6,000 self-play games per iteration, 512 games in flight, 512 positions per inference batch, 512 target records per batch, 30 training epochs, a batch size of 1,024 and at most 6,000 training steps per iteration. Self-play uses at most 10,000 positions from `data/openings.sam.bin`. Arena evaluation uses at most 1,000 positions from `data/openings.gen.bin`.
+The launcher's production defaults are `bf16` precision, 10 iterations, 6,000 self-play games per iteration, 512 games in flight, 512 positions per inference batch, 512 target records per batch, 30 training epochs, a batch size of 1,024 and at most 6,000 training steps per iteration. Self-play uses at most 10,000 positions from `data/openings.sam.bin`. Arena evaluation uses at most 1,000 positions from `data/openings.gen.bin`, applies an RPP coefficient of `1.0` and enables IMF.
 
 Environment variables provide per-run overrides for individual launcher settings:
 

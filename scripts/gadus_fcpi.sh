@@ -40,7 +40,6 @@ EVAL_MAX_BOOK_POSITIONS="${EVAL_MAX_BOOK_POSITIONS:-1000}"
 EVAL_SEARCH_TYPE="${EVAL_SEARCH_TYPE:-closed}"
 EVAL_SIMS="${EVAL_SIMS:-0}"
 EVAL_MCTS_BATCH_SIZE="${EVAL_MCTS_BATCH_SIZE:-512}"
-EVAL_MOVETIME_MS="${EVAL_MOVETIME_MS:-0}"
 EVAL_REPETITION_POLICY_PENALTY="${EVAL_REPETITION_POLICY_PENALTY:-1.0}"
 EVAL_INSTANT_MATE_FIRST="${EVAL_INSTANT_MATE_FIRST:-1}"
 EVAL_MIN_NET_WINS="${EVAL_MIN_NET_WINS:-4}"
@@ -120,7 +119,6 @@ COMMAND=(
 	--eval-search-type "${EVAL_SEARCH_TYPE}"
 	--eval-sims "${EVAL_SIMS}"
 	--eval-mcts-batch-size "${EVAL_MCTS_BATCH_SIZE}"
-	--eval-movetime-ms "${EVAL_MOVETIME_MS}"
 	--eval-repetition-policy-penalty "${EVAL_REPETITION_POLICY_PENALTY}"
 	--eval-instant-mate-first "${EVAL_INSTANT_MATE_FIRST}"
 	--eval-min-net-wins "${EVAL_MIN_NET_WINS}"
@@ -183,7 +181,6 @@ run_pipeline() {
 		--search-type closed \
 		--sims 0 \
 		--mcts-batch-size "${EVAL_MCTS_BATCH_SIZE}" \
-		--movetime-ms 0 \
 		--repetition-policy-penalty "${EVAL_REPETITION_POLICY_PENALTY}" \
 		--instant-mate-first "${EVAL_INSTANT_MATE_FIRST}" \
 		--min-net-wins 0 \

@@ -15,8 +15,7 @@ int main(int argc, char **argv) {
 				<< "Usage: search --model <melano.pth> [--fen <fen>] [options]\n"
 				<< "  --device <auto|cpu|cuda> --precision <fp32|bf16>\n"
 				<< "  --search-type <closed|only-mcts>\n"
-				<< "  --mcts-sims <n> --mcts-min-sims <n> --mcts-batch-size <n> --movetime-ms "
-				   "<ms>\n"
+				<< "  --mcts-sims <n> --mcts-min-sims <n> --mcts-batch-size <n>\n"
 				<< "  --c-puct <x> --c-puct-base <x> --c-puct-factor <x> --fpu-reduction <x>\n"
 				<< "  --virtual-loss <x> --repetition-policy-penalty <x>\n"
 				<< "  --instant-mate-first <0|1> --root-topn <n>\n";
@@ -31,7 +30,6 @@ int main(int argc, char **argv) {
 		options.mcts_sims = args.get_int("mcts-sims", options.mcts_sims);
 		options.mcts_min_sims = args.get_int("mcts-min-sims", options.mcts_min_sims);
 		options.mcts_batch_size = args.get_int("mcts-batch-size", options.mcts_batch_size);
-		options.movetime_ms = args.get_double("movetime-ms", options.movetime_ms);
 		options.c_puct = args.get_double("c-puct", options.c_puct);
 		options.c_puct_base = args.get_double("c-puct-base", options.c_puct_base);
 		options.c_puct_factor = args.get_double("c-puct-factor", options.c_puct_factor);
