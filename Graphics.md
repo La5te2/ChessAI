@@ -24,7 +24,7 @@ The build produces `build/graphics/Gadidae.exe` on Windows and `build/graphics/G
 
 Importing an engine starts a temporary process and performs a standard UCI handshake. The client reads every `option name ...` declaration returned by the engine, generates a matching control and then closes the temporary process. UCI options configure a working engine after its handshake, whereas `Launch arguments` supplies arguments when the operating system starts an engine process.
 
-Simulator starts a working engine when analysis opens, and Stadium starts the configured working engines when a match begins. Each working process remains alive for its analysis or match session. A position change sends `stop` to the active search, discards subsequent output associated with the previous position and submits the new position to the same process. The engine determines how quickly an active search responds to `stop`.
+Simulator starts a working engine when analysis opens, and Stadium starts the configured working engines when a match begins. Each working process remains alive for its analysis or match session. A position change sends `stop` to the active search, discards subsequent output associated with the previous position and submits the new position to the same process. The UCI `position` command reconstructs the game from its initial FEN and the complete move sequence up to the position being displayed, preserving the rule history required for repetition detection. The engine determines how quickly an active search responds to `stop`.
 
 ## 3. Simulator
 

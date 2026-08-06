@@ -106,7 +106,7 @@ private:
 	std::optional<std::size_t> viewed_ply_;
 	std::optional<std::string> error_;
 	std::string start_fen_ = "startpos";
-	std::string root_fen_;
+	std::string root_position_;
 	std::string status_ = "Ready";
 	std::string result_override_;
 	std::string termination_override_;

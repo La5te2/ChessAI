@@ -164,6 +164,18 @@ GameState GameState::position_at(std::size_t ply) const {
 	return position;
 }
 
+std::string GameState::uci_position() const {
+	std::ostringstream position;
+	position << "fen " << start_fen_;
+	if(!moves_.empty()) {
+		position << " moves";
+		for(const auto &move : moves_) {
+			position << ' ' << chess::uci::moveToUci(move);
+		}
+	}
+	return position.str();
+}
+
 std::string GameState::movetext(const std::string &result_override) const {
 	std::ostringstream text;
 	for(std::size_t index = 0; index < san_.size(); ++index) {

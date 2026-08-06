@@ -459,7 +459,7 @@ void UciEngine::close() {
 	}
 }
 
-std::uint64_t UciEngine::analyse(const std::string &fen, bool infinite) {
+std::uint64_t UciEngine::analyse(const std::string &position, bool infinite) {
 	if(!ready()) {
 		throw std::runtime_error("UCI engine is not ready");
 	}
@@ -468,7 +468,7 @@ std::uint64_t UciEngine::analyse(const std::string &fen, bool infinite) {
 	bool start_now = false;
 	{
 		std::lock_guard lock(mutex_);
-		request = {++generation_, fen, infinite};
+		request = {++generation_, position, infinite};
 		snapshot_ = {};
 		snapshot_.generation = request.generation;
 		snapshot_.searching = true;
@@ -497,7 +497,7 @@ void UciEngine::send_analysis(const AnalysisRequest &request) {
 	if(!process_) {
 		throw std::runtime_error("UCI process is not running");
 	}
-	process_->write_line("position fen " + request.fen);
+	process_->write_line("position " + request.position);
 	if(request.infinite) {
 		process_->write_line("go infinite");
 	} else {

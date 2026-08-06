@@ -18,7 +18,7 @@ inline constexpr int kUnderpromotionPlanes = 9;
 inline constexpr int kActionSize = kBoardSquares * kBoardSquares +
 								   kBoardSquares * kUnderpromotionPlanes;
 inline constexpr const char *kArchType = "melano";
-inline constexpr const char *kStateEncoding = "melano_square_tokens";
+inline constexpr const char *kStateEncoding = "melano_states";
 inline constexpr const char *kMoveEncoding = "sd_64x64_underpromo9";
 inline constexpr const char *kTargetSchema = "melano_policy_value";
 

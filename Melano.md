@@ -20,7 +20,7 @@ Melano is a geometry-aware Transformer chess architecture with Policy and Value 
 
 ### 2.1 State Encoding
 
-The state codec `melano_square_tokens` maps $x$ to 67 unsigned integers:
+The state codec `melano_states` maps $x$ to 67 unsigned integers:
 
 $$
 s=(p_0,\ldots,p_{63},t,c,e).
@@ -272,7 +272,7 @@ Preprocessing creates a new HDF5 file and writes the following identifying attri
 
 ```text
 arch_type=melano
-state_encoding=melano_square_tokens
+state_encoding=melano_states
 move_encoding=sd_64x64_underpromo9
 target_schema=melano_policy_value
 value_perspective=side_to_move

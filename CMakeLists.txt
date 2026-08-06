@@ -240,6 +240,19 @@ add_test(NAME melanotests COMMAND melanotests)
 if(GADIDAE_BUILD_GRAPHICS)
 # The native GUI owns no model implementation. It talks to Gadus, Melano, and
 # third-party engines through UCI and therefore links only graphics dependencies.
+add_executable(graphicstests
+	src/graphics/tests.cpp
+	src/graphics/game.cpp
+)
+target_include_directories(graphicstests PRIVATE "${CMAKE_SOURCE_DIR}/include")
+target_include_directories(graphicstests SYSTEM PRIVATE "${GADIDAE_API_DIR}/chess")
+if(MSVC)
+	target_compile_options(graphicstests PRIVATE /W4 /permissive- /utf-8)
+else()
+	target_compile_options(graphicstests PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+add_test(NAME graphicstests COMMAND graphicstests)
+
 set(GADIDAE_PIECE_ARCHIVE "${CMAKE_SOURCE_DIR}/src/graphics/pieces.gpack")
 if(NOT EXISTS "${GADIDAE_PIECE_ARCHIVE}")
 	message(FATAL_ERROR "Missing compressed piece archive: ${GADIDAE_PIECE_ARCHIVE}")

@@ -331,8 +331,8 @@ void StadiumSession::update() {
 				status_ = "Waiting for Human";
 				return;
 			}
-			root_fen_ = game_.board().getFen();
-			generation_ = active_engine().analyse(root_fen_, false);
+			root_position_ = game_.uci_position();
+			generation_ = active_engine().analyse(root_position_, false);
 			display_ = active_engine().snapshot();
 			status_ = "Running";
 			return;

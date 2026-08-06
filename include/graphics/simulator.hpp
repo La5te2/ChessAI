@@ -62,7 +62,7 @@ private:
 	EngineConfig config_;
 	std::string start_fen_ = "startpos";
 	std::optional<std::size_t> viewed_ply_;
-	std::string analysis_fen_;
+	std::string analysis_position_;
 	AnalysisSnapshot display_;
 	Clock::time_point last_display_{};
 	bool analysis_open_ = true;

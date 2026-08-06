@@ -42,7 +42,7 @@ void SimulatorWorkspace::update_analysis() {
 	if(!analysis_open_ || config_.path.empty()) {
 		return;
 	}
-	const std::string fen = visible_game().board().getFen();
+	const std::string position = visible_game().uci_position();
 	try {
 		if(!engine_.ready()) {
 			const auto startup = engine_.snapshot();
@@ -58,9 +58,9 @@ void SimulatorWorkspace::update_analysis() {
 		}
 		config_.discovered_options = engine_.option_definitions();
 		config_.button_commands.clear();
-		if(analysis_fen_ != fen) {
-			engine_.analyse(fen, true);
-			analysis_fen_ = fen;
+		if(analysis_position_ != position) {
+			engine_.analyse(position, true);
+			analysis_position_ = position;
 			last_display_ = Clock::time_point{};
 		}
 		const auto now = Clock::now();
@@ -81,7 +81,7 @@ void SimulatorWorkspace::update_analysis() {
 
 void SimulatorWorkspace::invalidate_analysis() {
 	engine_.stop_search();
-	analysis_fen_.clear();
+	analysis_position_.clear();
 	display_ = {};
 	last_display_ = Clock::time_point{};
 }

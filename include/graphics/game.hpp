@@ -42,6 +42,8 @@ public:
 	std::size_t plies() const;
 	std::optional<chess::Move> last_move() const;
 	GameState position_at(std::size_t ply) const;
+	/// Formats the initial FEN and complete move history as UCI position arguments.
+	std::string uci_position() const;
 
 	/// Formats movetext or a complete PGN document.
 	std::string movetext(const std::string &result_override = "") const;

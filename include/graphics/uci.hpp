@@ -89,8 +89,8 @@ public:
 	/// Stops the current search and terminates the child process.
 	void close();
 
-	/// Starts an asynchronous search for a complete FEN position.
-	std::uint64_t analyse(const std::string &fen, bool infinite = false);
+	/// Starts an asynchronous search from UCI position arguments including move history.
+	std::uint64_t analyse(const std::string &position, bool infinite = false);
 
 	/// Requests termination of the current search while keeping the engine alive.
 	void stop_search();
@@ -117,7 +117,7 @@ private:
 	class Process;
 	struct AnalysisRequest {
 		std::uint64_t generation = 0;
-		std::string fen;
+		std::string position;
 		bool infinite = false;
 	};
 
