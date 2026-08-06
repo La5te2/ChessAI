@@ -3,6 +3,7 @@
 __pycache__/
 *.token
 .env
+/.vscode/
 /api/*
 /build/*
 !/api/patch.cmake
