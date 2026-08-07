@@ -850,6 +850,8 @@ Gadus exposes the following UCI options.
 
 - `ModelPath` selects a Gadus checkpoint. A packaged engine defaults to `gadus.pth` in the executable directory.
 - `Device` selects `auto`, `cpu` or `cuda`.
+- `Threads` sets the number of LibTorch CPU computation threads and defaults to `2`. This option does not affect CUDA inference.
+- `EvalCacheMB` sets the approximate memory ceiling for compact Policy/Value evaluations retained across `go` commands and defaults to `256`. A zero value disables cross-search retention. Each search still deduplicates repeated network inputs within that search. The cache contains no MCTS nodes, visits or action-value statistics. `ucinewgame`, `ModelPath` changes and `Device` changes discard its contents automatically.
 - `SearchType` selects direct policy ranking with `closed` or Gadus MCTS with `only-mcts`. Both modes apply the enabled final decision components.
 - `MCTSSims` sets the MCTS simulation cap and defaults to `100`. A UCI command `go nodes <n>` uses `<n>` as the current cap.
 - `MCTSMinSims` sets the nominal minimum simulation count before dynamic budgeting and defaults to `0`. A zero value activates the formula derived from the cap and batch size. A time limit or UCI `stop` command may end search before this count is reached.

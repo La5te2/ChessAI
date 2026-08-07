@@ -27,7 +27,7 @@ int main(int argc, char **argv) {
 				<< "  --eval-instant-mate-first <bool>\n"
 				<< "  --eval-min-net-wins <n> --device <auto|cpu|cuda> --seed <n> --log-every "
 				   "<n>\n"
-				<< "  --precision <fp32|bf16>\n";
+				<< "  --precision <fp32|bf16> --threads <n|0=auto>\n";
 			return 0;
 		}
 		gadus::FcpiOptions options;
@@ -35,6 +35,7 @@ int main(int argc, char **argv) {
 		options.device = args.get("device", options.device);
 		options.precision =
 			gadus::parse_compute_precision(args.get("precision", "fp32"));
+		options.cpu_threads = std::max(0, args.get_int("threads", options.cpu_threads));
 		options.iterations = args.get_int("iterations", options.iterations);
 		options.games_per_iter = args.get_int("games-per-iter", options.games_per_iter);
 		options.games_in_flight = args.get_int("games-in-flight", options.games_in_flight);
@@ -79,6 +80,7 @@ int main(int argc, char **argv) {
 		search.instant_mate_first =
 			args.get_bool("eval-instant-mate-first", search.instant_mate_first);
 		search.precision = options.precision;
+		search.cpu_threads = options.cpu_threads;
 
 		gadus::run_fcpi(options);
 		return 0;

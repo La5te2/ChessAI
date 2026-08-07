@@ -372,6 +372,7 @@ std::vector<Position> collect_selfplay(Model model, const torch::Device &device,
 	SearchOptions closed;
 	closed.type = SearchType::Closed;
 	closed.precision = options.precision;
+	closed.cpu_threads = options.cpu_threads;
 	closed.mcts_sims = 0;
 	closed.mcts_batch_size = options.inference_batch_size;
 	Searcher evaluator(model, device, closed);
@@ -645,6 +646,7 @@ void construct_targets(std::vector<Position> &records, Model model, const torch:
 	SearchOptions closed;
 	closed.type = SearchType::Closed;
 	closed.precision = options.precision;
+	closed.cpu_threads = options.cpu_threads;
 	closed.mcts_sims = 0;
 	closed.mcts_batch_size = options.inference_batch_size;
 	Searcher evaluator(model, device, closed);
@@ -1071,9 +1073,11 @@ nlohmann::json write_fcpi_h5(const std::filesystem::path &path, std::vector<Posi
 
 // Fine-tune Policy on planned targets and Value against Monte Carlo and detached tree targets.
 nlohmann::json train_candidate(const std::filesystem::path &source,
-							   const std::filesystem::path &candidate, Model model,
-							   const torch::Device &device, std::vector<Position> &records,
-							   const FcpiOptions &options) {
+								   const std::filesystem::path &candidate,
+								   const torch::Device &device, std::vector<Position> &records,
+								   const FcpiOptions &options) {
+	ArchitectureInfo source_arch;
+	auto model = load_checkpoint(source, device, &source_arch);
 	model->to(device);
 	// FCPI targets are generated from the frozen model in inference mode. Keep
 	// BatchNorm on those same running statistics while autograd updates parameters;
@@ -1242,8 +1246,6 @@ nlohmann::json train_candidate(const std::filesystem::path &source,
 			break;
 		}
 	}
-	ArchitectureInfo source_arch;
-	load_checkpoint(source, torch::Device(torch::kCPU), &source_arch);
 	save_checkpoint_atomic(candidate, model, {source_arch.channels, source_arch.blocks});
 	const double divisor = static_cast<double>(std::max<std::int64_t>(1, steps));
 	auto final_metrics = metric_totals.to(torch::kCPU).contiguous();
@@ -1342,7 +1344,7 @@ void run_fcpi(const FcpiOptions &options) {
 				 : 0.0},
 		};
 		const auto candidate = model_dir / ("candidate_iter_" + zero_pad(iteration, 3) + ".pth");
-		auto train_summary = train_candidate(current, candidate, model, device, records, options);
+		auto train_summary = train_candidate(current, candidate, device, records, options);
 		auto arena_options = options.arena;
 		arena_options.candidate = candidate;
 		arena_options.baseline = current;

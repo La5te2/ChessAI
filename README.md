@@ -230,6 +230,7 @@ Launch the Gadus UCI engine on Windows with:
 build\gadus\uci.exe `
 	--model models\gadus\gadus.pth `
 	--device cpu `
+	--threads 2 `
 	--search-type only-mcts `
 	--mcts-sims 100
 ```
@@ -240,6 +241,7 @@ The corresponding Linux command is:
 build/gadus/uci \
 	--model models/gadus/gadus.pth \
 	--device cpu \
+	--threads 2 \
 	--search-type only-mcts \
 	--mcts-sims 100
 ```
@@ -247,6 +249,8 @@ build/gadus/uci \
 A UCI client can configure a running Gadus engine with commands such as:
 
 ```text
+setoption name Threads value 2
+setoption name EvalCacheMB value 256
 setoption name SearchType value only-mcts
 setoption name MCTSSims value 1000
 setoption name MCTSBatchSize value 64

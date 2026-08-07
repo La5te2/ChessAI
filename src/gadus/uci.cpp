@@ -6,6 +6,7 @@
 #include <cmath>
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <sstream>
@@ -137,6 +138,9 @@ class UciEngine {
 				} else if (command == "ucinewgame") {
 					stop_and_join();
 					board_ = chess::Board();
+					if (searcher_) {
+						searcher_->clear_evaluation_cache();
+					}
 				} else if (command == "position") {
 					stop_and_join();
 					set_position(line);
@@ -187,6 +191,10 @@ class UciEngine {
 		print("id author La5te2");
 		print("option name ModelPath type string default " + options_.model_path.string());
 		print("option name Device type string default " + options_.device);
+		print("option name Threads type spin default " +
+			  std::to_string(options_.search.cpu_threads) + " min 1 max 256");
+		print("option name EvalCacheMB type spin default " +
+			  std::to_string(options_.search.evaluation_cache_mb) + " min 0 max 65536");
 		print("option name SearchType type combo default " +
 			  gadus::search_type_name(options_.search.type) + " var closed var only-mcts");
 		print("option name MCTSSims type spin default " + std::to_string(options_.search.mcts_sims) +
@@ -224,11 +232,13 @@ class UciEngine {
 		if (options_.model_path.empty()) {
 			throw std::runtime_error("ModelPath is empty");
 		}
-		if (model_ && loaded_model_path_ == options_.model_path && loaded_device_ == options_.device) {
+		if (model_ && searcher_ && loaded_model_path_ == options_.model_path &&
+			loaded_device_ == options_.device) {
 			return;
 		}
 		device_ = gadus::resolve_device(options_.device);
 		model_ = gadus::load_checkpoint(options_.model_path, device_);
+		searcher_ = std::make_shared<gadus::Searcher>(model_, device_, options_.search);
 		loaded_model_path_ = options_.model_path;
 		loaded_device_ = options_.device;
 	}
@@ -248,9 +258,17 @@ class UciEngine {
 		if (key == "modelpath") {
 			options_.model_path = value;
 			model_ = nullptr;
+			searcher_.reset();
 		} else if (key == "device") {
 			options_.device = value;
 			model_ = nullptr;
+			searcher_.reset();
+		} else if (key == "threads") {
+			options_.search.cpu_threads =
+				std::clamp(parse_int(value, options_.search.cpu_threads), 1, 256);
+		} else if (key == "evalcachemb") {
+			options_.search.evaluation_cache_mb =
+				std::clamp(parse_int(value, options_.search.evaluation_cache_mb), 0, 65536);
 		} else if (key == "searchtype") {
 			options_.search.type = gadus::parse_search_type(value);
 		} else if (key == "mctssims") {
@@ -285,6 +303,9 @@ class UciEngine {
 			options_.score_scale = std::clamp(parse_int(value, options_.score_scale), 1, 100000);
 		} else {
 			print("info string unknown option: " + name);
+		}
+		if (searcher_) {
+			searcher_->set_options(options_.search);
 		}
 	}
 
@@ -377,8 +398,8 @@ class UciEngine {
 			print("info depth " + std::to_string(depth) + " seldepth " + std::to_string(depth) +
 				  " multipv " + std::to_string(index + 1) + " score cp " +
 				  std::to_string(score_cp(value)) + " nodes " + std::to_string(nodes) + " nps " +
-				  std::to_string(nps) + " time " + std::to_string(elapsed) +
-				  " hashfull 0 tbhits 0 pv " + gadus::move_uci(row.move));
+				  std::to_string(nps) + " time " + std::to_string(elapsed) + " pv " +
+				  gadus::move_uci(row.move));
 		}
 	}
 
@@ -398,15 +419,13 @@ class UciEngine {
 		}
 		search_options.root_topn = std::max(options_.multipv, search_options.root_topn);
 		const auto board = board_;
-		const auto model = model_;
-		const auto device = device_;
+		searcher_->set_options(search_options);
+		const auto searcher = searcher_;
 		const int progress_interval_ms = options_.progress_interval_ms;
 		stop_requested_ = false;
-		search_thread_ = std::thread([this, board, model, device, search_options,
-									  progress_interval_ms] {
+		search_thread_ = std::thread([this, board, searcher, progress_interval_ms] {
 			try {
-				gadus::Searcher searcher(model, device, search_options);
-				const auto result = searcher.search(
+				const auto result = searcher->search(
 					board, [this](const gadus::SearchResult &partial) { emit_info(partial); },
 					progress_interval_ms, [this] { return stop_requested_.load(); });
 				emit_info(result);
@@ -430,6 +449,7 @@ class UciEngine {
 	chess::Board board_;
 	torch::Device device_{torch::kCPU};
 	gadus::Model model_{nullptr};
+	std::shared_ptr<gadus::Searcher> searcher_;
 	std::filesystem::path loaded_model_path_;
 	std::string loaded_device_;
 	std::thread search_thread_;
@@ -450,6 +470,9 @@ EngineOptions options_from_args(int argc, char **argv) {
 		}
 	}
 	options.device = args.get("device", options.device);
+	options.search.cpu_threads = std::clamp(args.get_int("threads", 2), 1, 256);
+	options.search.evaluation_cache_mb =
+		std::clamp(args.get_int("eval-cache-mb", 256), 0, 65536);
 	options.search.type = gadus::parse_search_type(args.get("search-type", "only-mcts"));
 	options.search.mcts_sims = args.get_int("mcts-sims", options.search.mcts_sims);
 	options.search.mcts_min_sims = args.get_int("mcts-min-sims", options.search.mcts_min_sims);

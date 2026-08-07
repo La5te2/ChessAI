@@ -5,11 +5,14 @@
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <list>
 #include <memory>
 #include <stdexcept>
 #include <tuple>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <torch/utils.h>
 
 namespace gadus {
 
@@ -17,9 +20,113 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
-struct Evaluation {
-	std::vector<std::vector<float>> policies;
-	std::vector<float> values;
+struct EvaluationRow {
+	std::vector<chess::Move> legal_moves;
+	std::vector<int> legal_indices;
+	std::vector<float> legal_policy;
+	float value = 0.0F;
+	bool reused = false;
+};
+
+struct PackedStateHash {
+	std::size_t operator()(const PackedState &state) const noexcept {
+		std::size_t hash = sizeof(std::size_t) == 8 ? 1469598103934665603ULL : 2166136261U;
+		const std::size_t prime = sizeof(std::size_t) == 8 ? 1099511628211ULL : 16777619U;
+		for (const auto byte : state) {
+			hash ^= byte;
+			hash *= prime;
+		}
+		return hash;
+	}
+};
+
+class EvaluationCache {
+	struct Entry {
+		EvaluationRow evaluation;
+		std::list<PackedState>::iterator recency;
+		std::size_t bytes = 0;
+	};
+
+	using Entries = std::unordered_map<PackedState, Entry, PackedStateHash>;
+
+	public:
+	/// Creates a cache with an approximate byte ceiling; the maximum size disables eviction.
+	explicit EvaluationCache(
+		std::size_t capacity_bytes = std::numeric_limits<std::size_t>::max())
+		: capacity_bytes_(capacity_bytes) {}
+
+	/// Copies a cached network result and marks the entry as recently used.
+	bool get(const PackedState &state, EvaluationRow &output) {
+		const auto found = entries_.find(state);
+		if (found == entries_.end()) {
+			return false;
+		}
+		recency_.splice(recency_.end(), recency_, found->second.recency);
+		output = found->second.evaluation;
+		return true;
+	}
+
+	/// Inserts or replaces one compact Policy/Value row and evicts least-recently-used entries.
+	void put(const PackedState &state, const EvaluationRow &evaluation) {
+		if (capacity_bytes_ == 0) {
+			return;
+		}
+		const std::size_t bytes = entry_bytes(evaluation);
+		if (bytes > capacity_bytes_) {
+			return;
+		}
+		if (const auto found = entries_.find(state); found != entries_.end()) {
+			used_bytes_ -= found->second.bytes;
+			recency_.erase(found->second.recency);
+			entries_.erase(found);
+		}
+		while (!recency_.empty() && used_bytes_ + bytes > capacity_bytes_) {
+			const auto oldest = entries_.find(recency_.front());
+			if (oldest != entries_.end()) {
+				used_bytes_ -= oldest->second.bytes;
+				entries_.erase(oldest);
+			}
+			recency_.pop_front();
+		}
+		recency_.push_back(state);
+		auto iterator = std::prev(recency_.end());
+		entries_.emplace(state, Entry{evaluation, iterator, bytes});
+		used_bytes_ += bytes;
+	}
+
+	/// Changes the byte ceiling and evicts old entries until the cache fits.
+	void set_capacity(std::size_t capacity_bytes) {
+		capacity_bytes_ = capacity_bytes;
+		while (!recency_.empty() && used_bytes_ > capacity_bytes_) {
+			const auto oldest = entries_.find(recency_.front());
+			if (oldest != entries_.end()) {
+				used_bytes_ -= oldest->second.bytes;
+				entries_.erase(oldest);
+			}
+			recency_.pop_front();
+		}
+	}
+
+	/// Clears all retained rows without changing the configured byte ceiling.
+	void clear() {
+		entries_.clear();
+		recency_.clear();
+		used_bytes_ = 0;
+	}
+
+	private:
+	// Include vector storage and conservative container overhead in the memory budget.
+	static std::size_t entry_bytes(const EvaluationRow &evaluation) {
+		return sizeof(PackedState) * 2 + sizeof(Entry) + 64 +
+			   evaluation.legal_moves.capacity() * sizeof(chess::Move) +
+			   evaluation.legal_indices.capacity() * sizeof(int) +
+			   evaluation.legal_policy.capacity() * sizeof(float);
+	}
+
+	std::size_t capacity_bytes_;
+	std::size_t used_bytes_ = 0;
+	std::list<PackedState> recency_;
+	Entries entries_;
 };
 
 struct Node {
@@ -35,7 +142,7 @@ struct Node {
 	int visits = 0;
 	float value_sum = 0.0F;
 	int virtual_visits = 0;
-	std::vector<std::unique_ptr<Node>> children;
+	std::vector<Node> children;
 };
 
 struct SelectedLeaf {
@@ -48,12 +155,14 @@ struct SelectedLeaf {
 struct TreeState {
 	chess::Board board;
 	std::unique_ptr<Node> root = std::make_unique<Node>();
-	std::vector<float> network_policy;
+	EvaluationRow network;
 	float network_value = 0.0F;
 	int sims_completed = 0;
 	int dynamic_target = 0;
 	int expanded_nodes = 0;
 	int nn_batches = 0;
+	int nn_evaluations = 0;
+	int evaluation_reuses = 0;
 	double total_leaf_depth = 0.0;
 	int leaf_samples = 0;
 	int max_leaf_depth = 0;
@@ -109,24 +218,81 @@ struct Searcher::Impl {
 		if (!model) {
 			throw std::invalid_argument("Gadus search requires a model");
 		}
-		validate_compute_precision(options.precision, device);
-		options.virtual_loss = std::max(0.0, options.virtual_loss);
+		set_options(source_options);
 		model->to(device);
 		model->eval();
+		model->fuse_for_inference();
+		auto parameters = model->parameters();
+		for (auto &parameter : parameters) {
+			if (parameter.dim() == 4) {
+				parameter.set_data(
+					parameter.contiguous(torch::MemoryFormat::ChannelsLast));
+			}
+		}
 	}
 
-	// Evaluate a frozen batch and keep legal actions compact on both sides of the device boundary.
-	std::vector<ClosedEvaluation> evaluate_closed(const std::vector<chess::Board> &boards) {
+	// Apply mutable search controls without rebuilding the model or discarding compatible cache rows.
+	void set_options(SearchOptions source_options) {
+		validate_compute_precision(source_options.precision, device);
+		source_options.virtual_loss = std::max(0.0, source_options.virtual_loss);
+		source_options.evaluation_cache_mb =
+			std::clamp(source_options.evaluation_cache_mb, 0, 65536);
+		if (device.is_cpu() && source_options.cpu_threads > 0) {
+			torch::set_num_threads(source_options.cpu_threads);
+		}
+		active_cpu_threads = device.is_cpu() ? torch::get_num_threads() : 0;
+		persistent_evaluation_cache.set_capacity(
+			static_cast<std::size_t>(source_options.evaluation_cache_mb) * 1024 * 1024);
+		options = source_options;
+	}
+
+	// Evaluate a frozen batch and retain legal moves so tree expansion does not generate them again.
+	std::vector<EvaluationRow> evaluate_rows(const std::vector<chess::Board> &boards,
+											 EvaluationCache *cache = nullptr) {
 		if (boards.empty()) {
 			return {};
 		}
-		std::vector<std::vector<int>> legal_actions(boards.size());
-		std::size_t legal_width = 1;
+		std::vector<EvaluationRow> output(boards.size());
+		std::vector<PackedState> pending_states;
+		std::vector<EvaluationRow> pending;
+		std::vector<std::size_t> row_to_pending(boards.size());
+		std::vector<bool> row_cached(boards.size(), false);
+		std::vector<bool> row_reused(boards.size(), false);
+		std::unordered_map<PackedState, std::size_t, PackedStateHash> pending_lookup;
+		pending_states.reserve(boards.size());
+		pending.reserve(boards.size());
+		pending_lookup.reserve(boards.size() * 2);
 		for (std::size_t row = 0; row < boards.size(); ++row) {
-			for (const auto &move : legal_moves(boards[row])) {
-				legal_actions[row].push_back(move_to_index(move));
+			const auto state = encode_state(boards[row]);
+			if (cache != nullptr) {
+				if (cache->get(state, output[row])) {
+					output[row].reused = true;
+					row_cached[row] = true;
+					continue;
+				}
 			}
-			legal_width = std::max(legal_width, legal_actions[row].size());
+			const auto [found, inserted] =
+				pending_lookup.emplace(state, pending.size());
+			row_to_pending[row] = found->second;
+			if (!inserted) {
+				row_reused[row] = true;
+				continue;
+			}
+			pending_states.push_back(state);
+			pending.emplace_back();
+			pending.back().legal_moves = legal_moves(boards[row]);
+			pending.back().legal_indices.reserve(pending.back().legal_moves.size());
+			for (const auto &move : pending.back().legal_moves) {
+				pending.back().legal_indices.push_back(move_to_index(move));
+			}
+		}
+		if (pending.empty()) {
+			return output;
+		}
+
+		std::size_t legal_width = 1;
+		for (const auto &evaluation : pending) {
+			legal_width = std::max(legal_width, evaluation.legal_indices.size());
 		}
 
 		const bool pin_memory = device.is_cuda();
@@ -139,36 +305,39 @@ struct Searcher::Impl {
 			mask_options = mask_options.pinned_memory(true);
 		}
 		auto legal_indices =
-			torch::zeros({static_cast<std::int64_t>(boards.size()),
+			torch::zeros({static_cast<std::int64_t>(pending.size()),
 						  static_cast<std::int64_t>(legal_width)},
 						 index_options);
 		auto legal_mask =
-			torch::zeros({static_cast<std::int64_t>(boards.size()),
+			torch::zeros({static_cast<std::int64_t>(pending.size()),
 						  static_cast<std::int64_t>(legal_width)},
 						 mask_options);
 		auto index_rows = legal_indices.accessor<std::int64_t, 2>();
 		auto mask_rows = legal_mask.accessor<bool, 2>();
-		for (std::size_t row = 0; row < legal_actions.size(); ++row) {
-			for (std::size_t column = 0; column < legal_actions[row].size(); ++column) {
+		for (std::size_t row = 0; row < pending.size(); ++row) {
+			for (std::size_t column = 0; column < pending[row].legal_indices.size(); ++column) {
 				index_rows[static_cast<std::int64_t>(row)]
 						  [static_cast<std::int64_t>(column)] =
-					legal_actions[row][column];
+					pending[row].legal_indices[column];
 				mask_rows[static_cast<std::int64_t>(row)]
 						 [static_cast<std::int64_t>(column)] = true;
 			}
 		}
 
 		torch::InferenceMode guard;
-		auto states = encode_boards_device(boards, device);
+		auto states = decode_states_device(
+			reinterpret_cast<const std::uint8_t *>(pending_states.data()),
+			static_cast<std::int64_t>(pending_states.size()), device);
+		states = states.contiguous(torch::MemoryFormat::ChannelsLast);
 		auto device_indices = legal_indices.to(device, true);
 		auto device_mask = legal_mask.to(device, true);
 		torch::Tensor logits;
 		torch::Tensor raw_values;
 		{
 			AutocastGuard autocast(options.precision, device);
-			std::tie(logits, raw_values) = model->forward(states);
+			std::tie(logits, raw_values) = model->forward_legal(states, device_indices);
 		}
-		auto compact_logits = logits.to(torch::kFloat32).gather(1, device_indices);
+		auto compact_logits = logits.to(torch::kFloat32);
 		compact_logits = compact_logits.masked_fill(
 			~device_mask, -std::numeric_limits<float>::infinity());
 		auto probabilities =
@@ -178,47 +347,87 @@ struct Searcher::Impl {
 						  .to(torch::kCPU)
 						  .contiguous();
 
-		std::vector<ClosedEvaluation> output(boards.size());
 		auto probability_rows = probabilities.accessor<float, 2>();
 		auto value_rows = values.accessor<float, 1>();
-		for (std::size_t row = 0; row < boards.size(); ++row) {
-			output[row].legal_indices = std::move(legal_actions[row]);
-			output[row].legal_policy.resize(output[row].legal_indices.size());
-			for (std::size_t column = 0; column < output[row].legal_indices.size(); ++column) {
-				output[row].legal_policy[column] =
+		for (std::size_t row = 0; row < pending.size(); ++row) {
+			pending[row].legal_policy.resize(pending[row].legal_indices.size());
+			for (std::size_t column = 0; column < pending[row].legal_indices.size(); ++column) {
+				pending[row].legal_policy[column] =
 					probability_rows[static_cast<std::int64_t>(row)]
 									[static_cast<std::int64_t>(column)];
 			}
-			output[row].value = value_rows[static_cast<std::int64_t>(row)];
-		}
-		return output;
-	}
-
-	// Densify only for MCTS and user-facing search, whose node logic indexes the full action space.
-	Evaluation evaluate(const std::vector<chess::Board> &boards) {
-		auto compact = evaluate_closed(boards);
-		Evaluation output;
-		output.policies.resize(compact.size(), std::vector<float>(kActionSize, 0.0F));
-		output.values.resize(compact.size());
-		for (std::size_t row = 0; row < compact.size(); ++row) {
-			for (std::size_t column = 0; column < compact[row].legal_indices.size(); ++column) {
-				output.policies[row][compact[row].legal_indices[column]] =
-					compact[row].legal_policy[column];
+			pending[row].value = value_rows[static_cast<std::int64_t>(row)];
+			if (cache != nullptr) {
+				auto cached = pending[row];
+				cached.reused = false;
+				cache->put(pending_states[row], cached);
 			}
-			output.values[row] = compact[row].value;
+		}
+		for (std::size_t row = 0; row < output.size(); ++row) {
+			if (!row_cached[row]) {
+				output[row] = pending[row_to_pending[row]];
+				output[row].reused = row_reused[row];
+			}
 		}
 		return output;
 	}
 
-	// Create one child per legal action using the masked, normalized network policy.
-	void expand(Node *node, const chess::Board &board, const std::vector<float> &policy) {
+	// Remove move objects from the public frozen-model result used by FCPI generation.
+	std::vector<ClosedEvaluation> evaluate_closed(const std::vector<chess::Board> &boards) {
+		auto rows = evaluate_rows(boards);
+		std::vector<ClosedEvaluation> output(rows.size());
+		for (std::size_t row = 0; row < rows.size(); ++row) {
+			output[row].legal_indices = std::move(rows[row].legal_indices);
+			output[row].legal_policy = std::move(rows[row].legal_policy);
+			output[row].value = rows[row].value;
+		}
+		return output;
+	}
+
+	// Normalize an already masked legal policy without allocating the 4672-action vector.
+	std::vector<float> normalize_compact_policy(const EvaluationRow &evaluation) const {
+		std::vector<float> normalized(evaluation.legal_policy.size(), 0.0F);
+		if (normalized.empty()) {
+			return normalized;
+		}
+		double total = 0.0;
+		for (std::size_t index = 0; index < normalized.size(); ++index) {
+			normalized[index] = std::max(0.0F, evaluation.legal_policy[index]);
+			total += normalized[index];
+		}
+		if (total <= 0.0) {
+			std::fill(normalized.begin(), normalized.end(),
+					  1.0F / static_cast<float>(normalized.size()));
+		} else {
+			for (auto &value : normalized) {
+				value = static_cast<float>(value / total);
+			}
+		}
+		return normalized;
+	}
+
+	// Materialize a public dense policy only when a final or progress result requires it.
+	std::vector<float> dense_policy(const EvaluationRow &evaluation) const {
+		std::vector<float> dense(kActionSize, 0.0F);
+		const auto normalized = normalize_compact_policy(evaluation);
+		for (std::size_t index = 0; index < evaluation.legal_indices.size(); ++index) {
+			dense[evaluation.legal_indices[index]] = normalized[index];
+		}
+		return dense;
+	}
+
+	// Create one child per legal action directly from the compact network evaluation.
+	void expand(Node *node, const EvaluationRow &evaluation) {
 		if (!node->children.empty()) {
 			return;
 		}
-		const auto legal_policy = normalize_legal_policy(policy, board);
-		for (const auto &move : legal_moves(board)) {
-			node->children.push_back(
-				std::make_unique<Node>(legal_policy[move_to_index(move)], move));
+		if (evaluation.legal_moves.size() != evaluation.legal_policy.size()) {
+			throw std::runtime_error("legal move and policy widths differ");
+		}
+		const auto normalized = normalize_compact_policy(evaluation);
+		node->children.reserve(evaluation.legal_moves.size());
+		for (std::size_t index = 0; index < evaluation.legal_moves.size(); ++index) {
+			node->children.emplace_back(normalized[index], evaluation.legal_moves[index]);
 		}
 	}
 
@@ -226,8 +435,8 @@ struct Searcher::Impl {
 	float visited_policy_mass(const Node *parent) const {
 		float mass = 0.0F;
 		for (const auto &child : parent->children) {
-			if (child->visits > 0) {
-				mass += std::max(0.0F, child->prior);
+			if (child.visits > 0) {
+				mass += std::max(0.0F, child.prior);
 			}
 		}
 		return mass;
@@ -269,20 +478,20 @@ struct Searcher::Impl {
 		if (parent->children.empty()) {
 			return nullptr;
 		}
-		return std::max_element(parent->children.begin(), parent->children.end(),
-								[&](const auto &left, const auto &right) {
-									const double left_score = selection_score(parent, left.get());
-									const double right_score = selection_score(parent, right.get());
+		auto selected = std::max_element(parent->children.begin(), parent->children.end(),
+									 [&] (const Node &left, const Node &right) {
+									const double left_score = selection_score(parent, &left);
+									const double right_score = selection_score(parent, &right);
 									if (left_score != right_score) {
 										return left_score < right_score;
 									}
-									if (left->prior != right->prior) {
-										return left->prior < right->prior;
+									if (left.prior != right.prior) {
+										return left.prior < right.prior;
 									}
-									return edge_value(parent, left.get()) <
-										   edge_value(parent, right.get());
-								})
-			->get();
+									return edge_value(parent, &left) <
+										   edge_value(parent, &right);
+								});
+		return &*selected;
 	}
 
 	// Descend to an unexpanded or terminal node while reserving the path for batching.
@@ -291,6 +500,7 @@ struct Searcher::Impl {
 		selected.state_index = state_index;
 		selected.board = state.board;
 		selected.leaf = state.root.get();
+		selected.path.reserve(16);
 		selected.path.push_back(selected.leaf);
 		selected.leaf->virtual_visits += 1;
 		while (!selected.leaf->children.empty()) {
@@ -298,9 +508,6 @@ struct Searcher::Impl {
 			selected.leaf->virtual_visits += 1;
 			selected.board.makeMove(selected.leaf->move);
 			selected.path.push_back(selected.leaf);
-			if (game_is_over(selected.board)) {
-				break;
-			}
 		}
 		const int depth = static_cast<int>(selected.path.size()) - 1;
 		state.total_leaf_depth += depth;
@@ -316,16 +523,16 @@ struct Searcher::Impl {
 		}
 		double total = 0.0;
 		for (const auto &child : root->children) {
-			total += child->visits;
+			total += child.visits;
 		}
 		if (total <= 0.0) {
 			for (const auto &child : root->children) {
-				total += std::max(0.0F, child->prior);
+				total += std::max(0.0F, child.prior);
 			}
 		}
 		double entropy = 0.0;
 		for (const auto &child : root->children) {
-			const double weight = root->visits > 0 ? child->visits : std::max(0.0F, child->prior);
+			const double weight = root->visits > 0 ? child.visits : std::max(0.0F, child.prior);
 			const double probability = weight / std::max(1e-12, total);
 			if (probability > 0.0) {
 				entropy -= probability * std::log(probability);
@@ -336,7 +543,7 @@ struct Searcher::Impl {
 		std::vector<const Node *> ordered;
 		ordered.reserve(root->children.size());
 		for (const auto &child : root->children) {
-			ordered.push_back(child.get());
+			ordered.push_back(&child);
 		}
 		std::sort(ordered.begin(), ordered.end(), [](const Node *left, const Node *right) {
 			return std::pair(left->visits, left->prior) > std::pair(right->visits, right->prior);
@@ -375,7 +582,7 @@ struct Searcher::Impl {
 	std::vector<float> root_policy(const TreeState &state) const {
 		std::vector<float> policy(kActionSize, 0.0F);
 		for (const auto &child : state.root->children) {
-			policy[move_to_index(child->move)] = child->visits + child->prior;
+			policy[move_to_index(child.move)] = child.visits + child.prior;
 		}
 		return normalize_legal_policy(policy, state.board);
 	}
@@ -437,7 +644,7 @@ struct Searcher::Impl {
 	SearchResult make_result(TreeState &state, Clock::time_point start) const {
 		SearchResult result;
 		result.policy = options.type == SearchType::Closed || options.mcts_sims <= 0
-							? normalize_legal_policy(state.network_policy, state.board)
+							? dense_policy(state.network)
 							: root_policy(state);
 		result.decision_scores = result.policy;
 		result.value = state.root->visits > 0 ? state.root->q() : state.network_value;
@@ -445,6 +652,9 @@ struct Searcher::Impl {
 		result.dynamic_target = options.type == SearchType::Closed ? 0 : state.dynamic_target;
 		result.expanded_nodes = state.expanded_nodes;
 		result.nn_batches = state.nn_batches;
+		result.nn_evaluations = state.nn_evaluations;
+		result.evaluation_reuses = state.evaluation_reuses;
+		result.cpu_threads = active_cpu_threads;
 		result.uncertainty =
 			options.type == SearchType::Closed ? 0.0 : uncertainty(state.root.get());
 		result.elapsed_ms = seconds_since(start) * 1000.0;
@@ -484,10 +694,10 @@ struct Searcher::Impl {
 			root_move.repetition_penalized = repetitions.contains(action);
 			root_move.instant_mate = mates.contains(action);
 			for (const auto &child : state.root->children) {
-				if (child->move == move) {
-					root_move.prior = child->prior;
-					root_move.visits = child->visits;
-					root_move.q = edge_value(state.root.get(), child.get());
+				if (child.move == move) {
+					root_move.prior = child.prior;
+					root_move.visits = child.visits;
+					root_move.q = edge_value(state.root.get(), &child);
 					break;
 				}
 			}
@@ -523,14 +733,20 @@ struct Searcher::Impl {
 			state.board = board;
 			states.push_back(std::move(state));
 		}
-		const auto roots = evaluate(boards);
+		EvaluationCache local_evaluation_cache;
+		auto *evaluation_cache = options.evaluation_cache_mb > 0
+								 ? &persistent_evaluation_cache
+								 : &local_evaluation_cache;
+		auto roots = evaluate_rows(boards, evaluation_cache);
 		const int minimum = minimum_simulations();
 		for (std::size_t index = 0; index < states.size(); ++index) {
-			states[index].network_policy = roots.policies[index];
-			states[index].network_value = roots.values[index];
-			states[index].nn_batches = 1;
+			states[index].network_value = roots[index].value;
+			states[index].nn_batches = roots[index].reused ? 0 : 1;
+			states[index].nn_evaluations = roots[index].reused ? 0 : 1;
+			states[index].evaluation_reuses = roots[index].reused ? 1 : 0;
 			states[index].dynamic_target = minimum;
-			expand(states[index].root.get(), states[index].board, roots.policies[index]);
+			expand(states[index].root.get(), roots[index]);
+			states[index].network = std::move(roots[index]);
 			states[index].expanded_nodes = 1;
 		}
 		auto next_progress = start;
@@ -546,6 +762,7 @@ struct Searcher::Impl {
 				bool active = false;
 				bool progressed = false;
 				std::vector<SelectedLeaf> selected;
+				selected.reserve(states.size() * static_cast<std::size_t>(batch_size));
 				for (std::size_t state_index = 0; state_index < states.size(); ++state_index) {
 					auto &state = states[state_index];
 					if (state.sims_completed >= options.mcts_sims ||
@@ -557,6 +774,7 @@ struct Searcher::Impl {
 						std::min({batch_size, options.mcts_sims - state.sims_completed,
 								  state.dynamic_target - state.sims_completed});
 					std::unordered_set<Node *> selected_nodes;
+					selected_nodes.reserve(static_cast<std::size_t>(wanted) * 2);
 					for (int attempt = 0, accepted = 0;
 						 accepted < wanted && attempt < std::max(wanted * 5, wanted + 8);
 						 ++attempt) {
@@ -584,23 +802,30 @@ struct Searcher::Impl {
 				for (std::size_t begin = 0; begin < selected.size(); begin += batch_size) {
 					const auto end = std::min(selected.size(), begin + batch_size);
 					std::vector<chess::Board> leaf_boards;
+					leaf_boards.reserve(end - begin);
 					for (std::size_t index = begin; index < end; ++index) {
-						leaf_boards.push_back(selected[index].board);
+						leaf_boards.push_back(std::move(selected[index].board));
 					}
-					const auto evaluation = evaluate(leaf_boards);
+					auto evaluation = evaluate_rows(leaf_boards, evaluation_cache);
 					std::unordered_set<std::size_t> evaluated_states;
+					evaluated_states.reserve(end - begin);
 					for (std::size_t index = begin; index < end; ++index) {
 						auto &leaf = selected[index];
 						auto &state = states[leaf.state_index];
 						const std::size_t row = index - begin;
 						if (leaf.leaf->children.empty()) {
-							expand(leaf.leaf, leaf.board, evaluation.policies[row]);
+							expand(leaf.leaf, evaluation[row]);
 							state.expanded_nodes += 1;
 						}
+						if (evaluation[row].reused) {
+							state.evaluation_reuses += 1;
+						} else {
+							state.nn_evaluations += 1;
+							evaluated_states.insert(leaf.state_index);
+						}
 						clear_virtual(leaf.path);
-						backpropagate(leaf.path, evaluation.values[row]);
+						backpropagate(leaf.path, evaluation[row].value);
 						state.sims_completed += 1;
-						evaluated_states.insert(leaf.state_index);
 						progressed = true;
 					}
 					for (const auto state_index : evaluated_states) {
@@ -636,6 +861,8 @@ struct Searcher::Impl {
 	Model model;
 	torch::Device device;
 	SearchOptions options;
+	EvaluationCache persistent_evaluation_cache{0};
+	int active_cpu_threads = 0;
 };
 
 // Construct the public value-type wrapper around the shared implementation.
@@ -659,6 +886,12 @@ std::vector<ClosedEvaluation>
 Searcher::evaluate_closed_many(const std::vector<chess::Board> &boards) {
 	return impl_->evaluate_closed(boards);
 }
+
+// Update search controls while preserving network evaluations that remain model-compatible.
+void Searcher::set_options(SearchOptions options) { impl_->set_options(options); }
+
+// Clear the cross-search network cache without changing its configured capacity.
+void Searcher::clear_evaluation_cache() { impl_->persistent_evaluation_cache.clear(); }
 
 // Convert the command-line search mode to the strongly typed enum.
 SearchType parse_search_type(const std::string &value) {

@@ -11,7 +11,7 @@ int main(int argc, char **argv) {
 		if (args.has("help")) {
 			std::cout
 				<< "Usage: arena --candidate <model> --baseline <model> [options]\n"
-				<< "  --device <auto|cpu|cuda> --precision <fp32|bf16>\n"
+				<< "  --device <auto|cpu|cuda> --precision <fp32|bf16> --threads <n|0=auto>\n"
 				<< "  --games <n> --games-in-flight <n> --max-plies <n>\n"
 				<< "  --opening-book <path|empty> --book-plies <n> --max-book-positions <n>\n"
 				<< "  --search-type <closed|only-mcts> --sims <n> --mcts-min-sims <n>\n"
@@ -39,6 +39,7 @@ int main(int argc, char **argv) {
 		auto &search = options.search;
 		search.precision =
 			gadus::parse_compute_precision(args.get("precision", "fp32"));
+		search.cpu_threads = std::max(0, args.get_int("threads", search.cpu_threads));
 		search.type = gadus::parse_search_type(args.get("search-type", "only-mcts"));
 		search.mcts_sims = args.get_int("sims", search.mcts_sims);
 		search.mcts_min_sims = args.get_int("mcts-min-sims", search.mcts_min_sims);

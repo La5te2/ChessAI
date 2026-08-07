@@ -13,7 +13,7 @@ int main(int argc, char **argv) {
 		if (args.has("help")) {
 			std::cout
 				<< "Usage: search --model <gadus.pth> [--fen <fen>] [options]\n"
-				<< "  --device <auto|cpu|cuda> --precision <fp32|bf16>\n"
+				<< "  --device <auto|cpu|cuda> --precision <fp32|bf16> --threads <n|0=auto>\n"
 				<< "  --search-type <closed|only-mcts>\n"
 				<< "  --mcts-sims <n> --mcts-min-sims <n> --mcts-batch-size <n>\n"
 				<< "  --c-puct <x> --c-puct-base <x> --c-puct-factor <x> --fpu-reduction <x>\n"
@@ -26,6 +26,7 @@ int main(int argc, char **argv) {
 		gadus::SearchOptions options;
 		options.precision =
 			gadus::parse_compute_precision(args.get("precision", "fp32"));
+		options.cpu_threads = std::max(0, args.get_int("threads", options.cpu_threads));
 		options.type = gadus::parse_search_type(args.get("search-type", "only-mcts"));
 		options.mcts_sims = args.get_int("mcts-sims", options.mcts_sims);
 		options.mcts_min_sims = args.get_int("mcts-min-sims", options.mcts_min_sims);
@@ -60,6 +61,9 @@ int main(int argc, char **argv) {
 		std::cout << "uncertainty: " << result.uncertainty << '\n';
 		std::cout << "expanded_nodes: " << result.expanded_nodes << '\n';
 		std::cout << "nn_batches: " << result.nn_batches << '\n';
+		std::cout << "nn_evaluations: " << result.nn_evaluations << '\n';
+		std::cout << "evaluation_reuses: " << result.evaluation_reuses << '\n';
+		std::cout << "cpu_threads: " << result.cpu_threads << '\n';
 		std::cout << "elapsed_ms: " << result.elapsed_ms << '\n';
 		std::cout << "root:\n";
 		for (std::size_t index = 0; index < result.root.size(); ++index) {

@@ -133,6 +133,22 @@ int main() {
 		const auto checkpoint = std::filesystem::temp_directory_path() / "gadustest.pth";
 		model->eval();
 		auto reference = model->forward(gadus::encode_boards({board}));
+		const auto start_moves = gadus::legal_moves(board);
+		auto legal_indices = torch::empty(
+			{1, static_cast<std::int64_t>(start_moves.size())},
+			torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+		auto legal_row = legal_indices.accessor<std::int64_t, 2>();
+		for (std::size_t index = 0; index < start_moves.size(); ++index) {
+			legal_row[0][static_cast<std::int64_t>(index)] =
+				gadus::move_to_index(start_moves[index]);
+		}
+		auto legal_output =
+			model->forward_legal(gadus::encode_boards({board}), legal_indices);
+		require(torch::allclose(legal_output.first, reference.first.gather(1, legal_indices),
+								1e-5, 1e-6),
+				"legal-action forward changed a requested policy logit");
+		require(torch::allclose(legal_output.second, reference.second),
+				"legal-action forward changed Value");
 		gadus::save_checkpoint_atomic(checkpoint, model, {8, 1});
 		gadus::ArchitectureInfo info;
 		auto loaded = gadus::load_checkpoint(checkpoint, torch::Device(torch::kCPU), &info);
@@ -144,6 +160,12 @@ int main() {
 				"checkpoint changed policy output");
 		require(torch::allclose(reference.second, loaded_output.second),
 				"checkpoint changed value output");
+		loaded->fuse_for_inference();
+		auto fused_output = loaded->forward(gadus::encode_boards({board}));
+		require(torch::allclose(loaded_output.first, fused_output.first, 1e-4, 1e-5),
+				"Conv-BN fusion changed policy output");
+		require(torch::allclose(loaded_output.second, fused_output.second, 1e-5, 1e-6),
+				"Conv-BN fusion changed value output");
 
 		// Closed search ranks legal policy actions without constructing an MCTS tree.
 		gadus::SearchOptions closed_options;
@@ -178,6 +200,28 @@ int main() {
 			require(std::abs(closed_result.policy[action] - expected_policy[action]) < 1e-5F,
 					"compact legal-policy transfer changed closed search probabilities");
 		}
+
+		// A persistent evaluation cache reuses only Policy/Value; every call still builds a new tree.
+		auto cached_options = closed_options;
+		cached_options.evaluation_cache_mb = 1;
+		gadus::Searcher cached_searcher(loaded, torch::Device(torch::kCPU), cached_options);
+		const auto first_cached = cached_searcher.search(board);
+		const auto second_cached = cached_searcher.search(board);
+		require(first_cached.nn_evaluations == 1 && first_cached.evaluation_reuses == 0,
+				"first persistent-cache search did not evaluate its root");
+		require(second_cached.nn_evaluations == 0 && second_cached.evaluation_reuses == 1,
+				"second persistent-cache search did not reuse its root evaluation");
+		require(second_cached.sims_completed == 0 && second_cached.expanded_nodes == 1,
+				"persistent evaluation cache retained search-tree statistics");
+		require(torch::allclose(torch::tensor(first_cached.policy),
+							torch::tensor(second_cached.policy), 1e-6, 1e-7),
+				"persistent evaluation cache changed Policy");
+		require(std::abs(first_cached.value - second_cached.value) < 1e-7F,
+				"persistent evaluation cache changed Value");
+		cached_searcher.clear_evaluation_cache();
+		const auto after_clear = cached_searcher.search(board);
+		require(after_clear.nn_evaluations == 1 && after_clear.evaluation_reuses == 0,
+				"clearing the persistent evaluation cache did not force reevaluation");
 
 		// Four simulations exercise selection, batched expansion, and value backup.
 		gadus::SearchOptions mcts_options = closed_options;

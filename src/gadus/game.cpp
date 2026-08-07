@@ -251,21 +251,31 @@ PackedState encode_state(const chess::Board &board) {
 // Expand packed rank bits to the floating-point NCHW tensor consumed by convolutions.
 torch::Tensor decode_states(const std::uint8_t *packed, std::int64_t count,
 							bool pinned_memory) {
+	static const auto byte_planes = [] {
+		std::array<std::array<float, 8>, 256> table{};
+		for (std::size_t byte = 0; byte < table.size(); ++byte) {
+			for (int file = 0; file < 8; ++file) {
+				table[byte][file] = static_cast<float>((byte >> (7 - file)) & 1U);
+			}
+		}
+		return table;
+	}();
 	auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
 	if (pinned_memory) {
 		options = options.pinned_memory(true);
 	}
-	auto output = torch::zeros({count, kStatePlanes, 8, 8}, options);
-	auto accessor = output.accessor<float, 4>();
+	auto output = torch::empty({count, kStatePlanes, 8, 8}, options);
+	auto *destination = output.data_ptr<float>();
 	for (std::int64_t item = 0; item < count; ++item) {
 		const auto *state = packed + item * kStatePlanes * 8;
 		for (int plane = 0; plane < kStatePlanes; ++plane) {
 			for (int rank = 0; rank < 8; ++rank) {
 				const auto byte = state[plane * 8 + rank];
-				for (int file = 0; file < 8; ++file) {
-					accessor[item][plane][rank][file] =
-						static_cast<float>((byte >> (7 - file)) & 1U);
-				}
+				const auto offset =
+					(static_cast<std::size_t>(item) * kStatePlanes * 8 * 8) +
+					(static_cast<std::size_t>(plane) * 8 * 8) +
+					(static_cast<std::size_t>(rank) * 8);
+				std::memcpy(destination + offset, byte_planes[byte].data(), 8 * sizeof(float));
 			}
 		}
 	}

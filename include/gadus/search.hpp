@@ -18,6 +18,8 @@ enum class SearchType { Closed, OnlyMcts };
 struct SearchOptions {
 	SearchType type = SearchType::OnlyMcts;
 	ComputePrecision precision = ComputePrecision::Fp32;
+	int cpu_threads = 0;
+	int evaluation_cache_mb = 0;
 	int mcts_sims = 100;
 	int mcts_min_sims = 0;
 	int mcts_batch_size = 32;
@@ -52,6 +54,9 @@ struct SearchResult {
 	int dynamic_target = 0;
 	int expanded_nodes = 0;
 	int nn_batches = 0;
+	int nn_evaluations = 0;
+	int evaluation_reuses = 0;
+	int cpu_threads = 0;
 	double uncertainty = 0.0;
 	double elapsed_ms = 0.0;
 	std::vector<RootMove> root;
@@ -80,6 +85,10 @@ class Searcher {
 	/// Evaluates closed Policy/Value without constructing search trees or dense action vectors.
 	std::vector<ClosedEvaluation>
 	evaluate_closed_many(const std::vector<chess::Board> &boards);
+	/// Applies a new search configuration while retaining compatible cached network evaluations.
+	void set_options(SearchOptions options);
+	/// Removes every network evaluation retained across previous search calls.
+	void clear_evaluation_cache();
 
 	private:
 	struct Impl;
