@@ -16,13 +16,13 @@ best-first minimax (BFM) search.
 - $\mathcal I_E=\{0,\ldots,4671\}$ is the fixed action-index set, and $i_E(a)$ is the index of a
   legal action.
 - $\theta_V$ denotes the trainable parameters of the Value network.
-- $R_t\in[0,1]$ is the supervision target for the state $x_t$ recorded before ply $t$.
+- $R_t\in[0,1]$ is the training target for the state $x_t$ recorded before ply $t$.
 - $V(x)\in[0,1]$ is the Value network prediction computed from $\phi_E(x)$.
 
 Neural targets and terminal scores deliberately share the same range and perspective, so search can
-replace a leaf prediction directly with an exact rule outcome. The selected supervision source then
-determines the statistical meaning of Value: result supervision estimates expected game score, while
-annotation supervision estimates a transformed numerical annotation.
+replace a leaf prediction directly with an exact rule outcome. The source of the training targets
+determines the statistical meaning of Value. A model fitted to game-result targets estimates expected
+game score. A model fitted to comment-derived targets estimates the transformed numerical evaluation.
 
 ## 2. State and Action Encoding
 
@@ -51,7 +51,7 @@ q(7-r,f),&c=\mathrm B.
 \end{cases}
 $$
 
-Under this map, Black's perspective uses a vertical reflection that preserves files. Eleginus then
+The map represents Black's perspective by a vertical reflection that preserves files. Eleginus then
 combines the oriented square with perspective-relative ownership. Piece types are ordered as pawn,
 knight, bishop, rook, queen and king, and the perspective-relative category of piece $p$ is
 
@@ -230,8 +230,8 @@ Its two bottlenecks thereby express global interactions through a compact shared
 
 ### 3.3 Initialization
 
-The padding row is initialized to zero, and every active embedding row uses an independent
-$\mathcal N(0,1)$ initialization. The first two affine layers use fan-in initialization,
+The padding row is initialized to zero, and every active embedding row is initialized independently from
+$\mathcal N(0,1)$. The first two affine layers use fan-in initialization,
 
 $$
 W_{ij},b_i\sim
@@ -294,21 +294,21 @@ $$
 
 A PGN `FEN` header supplies $x_0$ when present; otherwise, $x_0$ is the standard initial state.
 
-Each preprocessing run selects exactly one target source for the entire dataset. Result mode derives
-every target from the completed game result, while annotation mode derives targets from comments
-and neutral defaults. For a game ending at terminal state $x_T$, result supervision uses
+Each preprocessing run selects one of two target sources for the entire dataset: completed game results
+or numerical PGN comments. If game results are selected, a game ending at terminal state $x_T$ defines
+the target at ply $t$ by
 
 $$
 R_t=g(x_T,c_{x_t})
 \in\left\{0,\frac12,1\right\}.
 $$
 
-The target is complemented when the side to move changes from one color to the other. Result mode
-retains games whose PGN result is `1-0`, `0-1` or `1/2-1/2`.
+The target is complemented when the side to move changes from one color to the other. Games with PGN
+result `1-0`, `0-1` or `1/2-1/2` are admitted when game results provide the targets.
 
-In annotation mode, a comment attached to move $a_{t-1}$ describes the resulting state $x_t$. The
-first standalone decimal, with an optional sign, is interpreted as a pawn evaluation $s_t$ from
-White's perspective. It is converted to the side-to-move perspective by
+If numerical comments are selected, a comment attached to move $a_{t-1}$ describes the resulting state
+$x_t$. The first standalone decimal, with an optional sign, is interpreted as a pawn evaluation $s_t$
+from White's perspective. It is converted to the side-to-move perspective by
 
 $$
 \widehat s_t=
@@ -327,9 +327,9 @@ $$
 The initial state has no preceding move comment and therefore receives the neutral target $1/2$.
 For $t>0$, the target for $x_t$ comes from the comment attached to $a_{t-1}$ when that comment
 contains a numerical evaluation; otherwise, $x_t$ also receives $1/2$. A numerical comment attached
-to the final move has no later pre-move state to label. Annotation mode admits a game when at least
-one of its move comments contains a numerical evaluation, so unannotated gaps in an admitted game
-contribute neutral targets and draw the fitted conditional mean toward $1/2$.
+to the final move has no later pre-move state to label. When comments provide the targets, preprocessing
+admits a game if at least one of its move comments contains a numerical evaluation. Unannotated gaps
+in an admitted game contribute neutral targets and draw the fitted conditional mean toward $1/2$.
 
 ### 4.2 HDF5 Schema
 
@@ -404,9 +404,10 @@ CPU and CUDA evaluate the same float32 objective. Their backend-specific reducti
 the exact sequence of floating-point operations and may therefore produce different final parameter
 bits.
 
-Training writes the final parameters after all selected epochs or optimizer steps have completed.
-The value `0` for `--max-steps` leaves the number of optimizer steps unrestricted, so `--epochs`
-then determines when training ends.
+Let $E$ be the epoch count and let $K_{\max}\in\mathbb N\cup\{\infty\}$ be the
+optimizer-step cap. Training writes the final parameters after completing
+$\min(K_{\max},E\lceil N/B\rceil)$ updates, where $N$ is the dataset size and $B$ is the minibatch
+size.
 
 ## 6. Search
 
@@ -429,10 +430,10 @@ Before any children have been generated, the backed value is initialized as
 $\overline v(x)=v_0(x)$. This initialization uses Value for an ongoing frontier leaf and the exact
 game result for a terminal node; consequently, a terminal root returns its exact score immediately.
 
-With result supervision, neural and terminal values have the same expected-score interpretation.
-With annotation supervision, search mixes transformed annotation targets at ongoing leaves with
-exact game scores at terminal leaves. Their common range makes minimax arithmetic well-defined,
-while their relative calibration follows the annotation distribution and target transformation.
+When the model is trained on game-result targets, neural and terminal values share the same expected-score
+interpretation. With comment-derived targets, ongoing leaves carry transformed comment evaluations and
+terminal leaves carry exact game scores. Their common range makes minimax arithmetic well-defined. Their
+relative calibration follows the distribution and transformation of the comment evaluations.
 
 The tree preserves one node per path. Two paths reaching equivalent board positions therefore
 remain separate nodes and retain their own repetition and move-count histories.
@@ -467,8 +468,9 @@ for nodes with equal priorities.
 
 ### 6.3 Expansion and Minimax Backup
 
-A positive search budget first expands the root and thereby creates the initial frontier. Each later
-expansion selects the frontier node with maximal priority and performs the same sequence:
+When the expansion budget is positive, search first expands the root and thereby creates the initial
+frontier. Each later expansion selects the frontier node with maximal priority and performs the same
+sequence:
 
 1. The rules engine enumerates every legal action from the selected state.
 2. Each successor receives an incrementally updated Value accumulator.
@@ -567,33 +569,3 @@ startup before constructing `CpuValue`.
 The embedded evaluator uses the scalar equations in Section 3.5 and has no LibTorch runtime
 dependency. Its native payload requires a little-endian target with IEEE 754 binary32 floats. The
 embedding operation writes through a temporary file and requires distinct template and output paths.
-
-## 8. UCI Interface
-
-The embedded Universal Chess Interface (UCI) executable identifies the engine as `Eleginus` and the
-author as `Gadidae`, then loads its Value parameters from its own file. It exposes one engine option,
-`BFMExpansions`, with default value 32 and advertised range 1 through 1,000,000. Each `go` command
-performs one synchronous search with the current expansion budget and the fixed depth and priority
-coefficients from Section 6.5. The expansion budget is determined by `BFMExpansions`; UCI time,
-depth and node fields do not change it.
-
-For a completed search with root value $\overline v(x)$, the value written to the UCI centipawn
-field is
-
-$$
-\mathrm{cp}(x)=
-\mathrm{round}\left(2000\left(\overline v(x)-\frac12\right)\right).
-$$
-
-This score uses the root side-to-move perspective. The `depth` field reports the number of expanded
-parents, the `nodes` field reports the number of generated and evaluated children and the one-move
-principal variation contains the selected root move. The subsequent `bestmove` field reports the
-same move.
-
-## 9. Verification
-
-The Eleginus test executable checks action-codec round trips for ordinary moves, castling and
-promotions. It also compares full and incremental accumulators, compares LibTorch and scalar CPU
-Value outputs, verifies checkpoint and embedded-runtime round trips, checks HDF5 perspective order
-and validates the expansion budget and terminal score used by search. These checks run through CTest
-as `eleginustests` when the training-side Eleginus targets are enabled.

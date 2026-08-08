@@ -1,9 +1,10 @@
-// Focused tests for codecs, sparse features, incremental Value inference, BFM, and checkpoints.
+// CTest entrypoint for Eleginus invariants. It covers move codecs, sparse features, full and
+// incremental accumulators, agreement between LibTorch and scalar evaluation, checkpoint and
+// embedded-runtime round trips, HDF5 perspective order, expansion budgeting, terminal scoring and BFM search.
 
 #include "eleginus/checkpoint.hpp"
 #include "eleginus/dataset.hpp"
 #include "eleginus/search.hpp"
-
 #include <cmath>
 #include <filesystem>
 #include <fstream>

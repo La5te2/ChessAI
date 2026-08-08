@@ -1,4 +1,6 @@
-// Focused Gadus smoke tests for codecs, gradients, checkpoint round-trips, and search.
+// CTest entrypoint for Gadus invariants. It covers state and move codecs, terminal rules,
+// Policy and Value shapes and gradients, checkpoint round trips, direct Policy search, batched MCTS,
+// legal-row projection, inference fusion and cross-search evaluation reuse with fresh tree statistics.
 
 #include <filesystem>
 #include <algorithm>

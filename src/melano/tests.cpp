@@ -1,4 +1,6 @@
-// Focused Melano smoke tests for codecs, Policy/Value gradients, checkpoints, and search.
+// CTest entrypoint for Melano invariants. It covers precision parsing, state and move codecs,
+// geometry relations, terminal rules, annotated-PGN preprocessing, HDF5 schema validation,
+// Policy and Value shapes and gradients, checkpoint round trips, direct Policy search and batched PUCT.
 
 #include <array>
 #include <cmath>

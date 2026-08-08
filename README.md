@@ -2,6 +2,8 @@
 
 Gadidae is a family of experimental chess engines.
 
+This README and [Graphics.md](Graphics.md) explain installation, commands and user-facing interfaces. [Gadus.md](Gadus.md), [Melano.md](Melano.md) and [Eleginus.md](Eleginus.md) specify the corresponding architectures, training methods and search algorithms.
+
 ## Dependencies
 
 ### Python
@@ -118,7 +120,7 @@ LibTorch at runtime.
 
 A graphics-enabled build also produces `build/graphics/Gadidae`. Windows executables use the `.exe` suffix. [Graphics.md](Graphics.md) describes the graphical client, its operating modes and its piece-import pipeline.
 
-The `build/.build-work/` directory stores the CMake and Ninja state used for incremental builds. Subsequent builds reuse compatible object files from this directory. Every build runs CTest before publishing the executables. A compilation or test failure leaves diagnostic files under `build/.build-work/`. CTest failures also produce `build/.build-work/Testing/Temporary/LastTest.log`.
+The `build/.build-work/` directory stores the CMake and Ninja state used for incremental builds. Subsequent builds reuse compatible object files from this directory. A failed build leaves its diagnostic files in this directory.
 
 The `preprocess`, `train`, `embed`, `search`, `arena` and Gadus `fcpi` entry points provide their current argument lists through `--help`:
 
@@ -146,7 +148,7 @@ build/gadus/preprocess \
 	--max-games 1000000
 ```
 
-`--max-games` limits the number of PGN games read. `--chunk-size` controls HDF5 dataset extension units. `--compression-level` selects the deflate level. `--log-every` controls progress reporting by game count.
+`--has-cmt 1` derives Value targets from numerical PGN comments, while `--has-cmt 0` derives them from final game results. `--max-games` limits the number of PGN games read. `--chunk-size` controls HDF5 dataset extension units. `--compression-level` selects the deflate level. `--log-every` controls progress reporting by game count.
 
 Train a new Gadus model with:
 
@@ -168,6 +170,8 @@ build/gadus/train \
 	--log-every 50 \
 	--seed 2026
 ```
+
+For supervised training, a positive `--max-steps` value caps optimizer updates. Setting it to `0` leaves the update count under the control of `--epochs`. `--save-every` controls periodic atomic checkpoint writes.
 
 Analyze one position with Gadus search using:
 
@@ -231,6 +235,7 @@ build\gadus\uci.exe `
 	--model models\gadus\gadus.pth `
 	--device cpu `
 	--threads 2 `
+	--eval-cache-mb 256 `
 	--search-type only-mcts `
 	--mcts-sims 100
 ```
@@ -242,22 +247,12 @@ build/gadus/uci \
 	--model models/gadus/gadus.pth \
 	--device cpu \
 	--threads 2 \
+	--eval-cache-mb 256 \
 	--search-type only-mcts \
 	--mcts-sims 100
 ```
 
-A UCI client can configure a running Gadus engine with commands such as:
-
-```text
-setoption name Threads value 2
-setoption name EvalCacheMB value 256
-setoption name SearchType value only-mcts
-setoption name MCTSSims value 1000
-setoption name MCTSBatchSize value 64
-setoption name CPuct value 0.5
-setoption name RepetitionPolicyPenalty value 1.0
-setoption name InstantMateFirst value true
-```
+The [UCI](#uci) section describes runtime options, output fields and time management.
 
 ### Melano
 
@@ -274,7 +269,7 @@ build/melano/preprocess \
 	--max-games 1000000
 ```
 
-`--max-games` limits the number of PGN games read. `--chunk-size` controls HDF5 dataset extension units. `--compression-level` selects the deflate level. `--log-every` controls progress reporting by game count.
+`--has-cmt 1` derives Value targets from numerical PGN comments, while `--has-cmt 0` derives them from final game results. `--max-games` limits the number of PGN games read. `--chunk-size` controls HDF5 dataset extension units. `--compression-level` selects the deflate level. `--log-every` controls progress reporting by game count.
 
 Train a new Melano model with:
 
@@ -295,6 +290,8 @@ build/melano/train \
 	--precision bf16 \
 	--log-every 50
 ```
+
+For supervised training, a positive `--max-steps` value caps optimizer updates. Setting it to `0` leaves the update count under the control of `--epochs`. `--save-every` controls periodic atomic checkpoint writes.
 
 Analyze one position with Melano search using:
 
@@ -372,16 +369,7 @@ build/melano/uci \
 	--mcts-sims 1000
 ```
 
-A UCI client can configure a running Melano engine with commands such as:
-
-```text
-setoption name SearchType value only-mcts
-setoption name MCTSSims value 1000
-setoption name MCTSBatchSize value 64
-setoption name CPuct value 0.5
-setoption name RepetitionPolicyPenalty value 1.0
-setoption name InstantMateFirst value true
-```
+The [UCI](#uci) section describes runtime options, output fields and time management.
 
 ### Eleginus
 
@@ -413,6 +401,8 @@ build/eleginus/train \
 	--device cuda \
 	--seed 2026
 ```
+
+Eleginus uses the same `--max-steps` convention: a positive value caps optimizer updates, while `0` lets `--epochs` determine the training length.
 
 This command trains the sole Eleginus Value network. Supplying `--model existing.pth` initializes
 the training run from those parameters, while omitting it initializes a new Value model. Each run
@@ -466,41 +456,101 @@ build/eleginus/embed \
 models/eleginus/eleginus --expansions 32
 ```
 
-The UCI process reads the embedded representation from its own executable at startup. A client can
-change the subsequent search budget without reloading the model:
+The final Eleginus UCI and standalone search executables require neither an external weight file nor
+`torch.dll` or `c10.dll`. The `train` and `embed` tools remain training-side LibTorch programs.
+
+## UCI
+
+### Gadus and Melano
+
+The Gadus and Melano UCI executables load their checkpoints when `isready` or `go` first requires neural evaluation. An explicit `--model` argument selects the checkpoint. Without that argument, Gadus reads `gadus.pth` and Melano reads `melano.pth` beside the executable. Each process retains the loaded model across positions and evaluates it in FP32. Changing `ModelPath` or `Device` reloads the model before the next search.
+
+Search runs on a worker thread so the protocol loop can process `stop`. A `position`, `setoption` or `ucinewgame` command first stops and joins an active search before changing engine state. Closing the UCI process also joins the worker.
+
+Both engines report MultiPV rows containing `score cp`, nodes, NPS, elapsed time and a one-move principal variation. In `closed` mode, the reported root evaluation is the network Value $V_\theta(s)$. After at least one MCTS simulation, it is the mean return backed up to the root. A visited root edge reports its backed-up $Q(s,a)$, while an unvisited edge reports the root evaluation. For `ScoreScale` value $c_s$, the displayed value is
+
+$$
+\text{score cp}=\mathrm{round}\left(
+c_s\,\mathrm{clip}(q_{\mathrm{line}},-0.999,0.999)
+\right).
+$$
+
+The score is expressed from the root side-to-move perspective. The `nodes` field reports completed simulations and represents the initial neural evaluation as one node when no simulation has completed. For reported node count $n$, both `depth` and `seldepth` equal
+
+$$
+\max\left(1,\left\lfloor\log_2\max(1,n)\right\rfloor+1\right).
+$$
+
+These depth fields summarize search effort rather than maximum tree depth. NPS is $1000n/t$, where $t$ is elapsed time in milliseconds with a denominator of at least one millisecond. The engines emit the initial root result, periodic MCTS updates and one final result before `bestmove`. `ProgressIntervalMS=0` suppresses periodic updates.
+
+`go movetime <ms>` supplies the wall-clock budget directly. When `go` instead supplies the active side's remaining time $t_{\mathrm{remain}}$ and increment $t_{\mathrm{inc}}$, the engine computes
+
+$$
+t_0=\frac{t_{\mathrm{remain}}}{30}+0.75t_{\mathrm{inc}}-t_{\mathrm{overhead}}.
+$$
+
+It clamps $t_0$ to 50 through 10000 milliseconds and then limits the allocation to $\max(1,t_{\mathrm{remain}}-t_{\mathrm{overhead}})$. A `go` command without `movetime` or the active clock supplies no wall-clock deadline. `go nodes <n>` overrides the current MCTS simulation cap, and `stop` requests early termination.
+
+Gadus and Melano expose these shared options:
+
+- `ModelPath` selects the checkpoint.
+- `Device` selects `auto`, `cpu` or `cuda` and defaults to `auto`.
+- `SearchType` selects `closed` or `only-mcts` and defaults to `only-mcts`.
+- `MCTSSims` sets the simulation cap and defaults to `100`.
+- `MCTSMinSims` sets the nominal simulation floor and defaults to `0`, which activates the dynamic floor described in each architecture's search specification.
+- `MCTSBatchSize` sets the neural leaf-batch capacity and defaults to `32`.
+- `MoveOverheadMS` reserves time for communication and move submission and defaults to `50`.
+- `CPuct`, `CPuctBase` and `CPuctFactor` configure the visit-dependent exploration coefficient and default to `0.5`, `19652` and `1.0`.
+- `FPUReduction` sets the First Play Urgency reduction and defaults to `0.15`.
+- `VirtualLoss` sets the repeated-path penalty used during batched selection and defaults to `0.0`.
+- `RepetitionPolicyPenalty` sets the RPP coefficient in $[0,1]$ and defaults to `0.0`.
+- `InstantMateFirst` enables IMF and defaults to `false`.
+- `ProgressIntervalMS` sets the periodic report interval and defaults to `750` milliseconds.
+- `MultiPV` sets the number of reported root lines and defaults to `5`.
+- `ScoreScale` sets $c_s$ in the displayed-score equation and defaults to `1000`.
+
+Gadus additionally exposes `Threads`, which controls LibTorch CPU threads and defaults to `2`, and `EvalCacheMB`, which defaults to `256`. A positive `EvalCacheMB` retains compact Policy and Value evaluations across successive `go` commands with least-recently-used eviction. Each search still builds a new MCTS tree. Setting the option to zero disables cross-search retention while preserving duplicate-evaluation removal within the current search. `ucinewgame`, `ModelPath` changes and `Device` changes clear the retained evaluations.
+
+A UCI client may configure the engines with commands such as:
+
+```text
+setoption name Threads value 2
+setoption name EvalCacheMB value 256
+setoption name SearchType value only-mcts
+setoption name MCTSSims value 1000
+setoption name MCTSBatchSize value 64
+setoption name CPuct value 0.5
+setoption name RepetitionPolicyPenalty value 1.0
+setoption name InstantMateFirst value true
+```
+
+`Threads` and `EvalCacheMB` apply only to Gadus. The remaining commands apply to both engines.
+
+### Eleginus
+
+An embedded Eleginus UCI executable reads its Value parameters from its own file at startup. It exposes `BFMExpansions`, with default value `32` and range 1 through 1,000,000. Each `go` command performs one synchronous best-first minimax search. UCI time, depth and node fields do not alter the expansion budget.
+
+For root value $\overline v(x)$, Eleginus reports
+
+$$
+\text{score cp}=\mathrm{round}\left(2000\left(\overline v(x)-\frac12\right)\right).
+$$
+
+The score uses the root side-to-move perspective. `depth` reports the number of expanded parents, `nodes` reports the number of generated and evaluated children and the one-move principal variation contains the selected root move. `bestmove` reports the same move.
 
 ```text
 setoption name BFMExpansions value 128
 ```
 
-The final Eleginus UCI and standalone search executables require neither an external weight file nor
-`torch.dll` or `c10.dll`. The `train` and `embed` tools remain training-side LibTorch programs.
+## Opening Books
 
-## Scripts
+Gadus and Melano arenas read Polyglot books by traversing legal book moves breadth-first from the standard initial position. The effective depth is at least one ply. The reader ignores Polyglot weight and learn fields, randomizes outgoing move order from the selected seed and emits unique nonterminal frontier positions. Position identity includes piece placement, side to move, castling rights and the en-passant field but excludes move counters.
 
-The `scripts/` directory contains repository-level launchers and data-preparation tools. The architecture documents specify the models and algorithms implemented by the compiled executables. The following sections describe the scripts shared across those executables.
+An empty arena book path starts every game from the standard initial position and alternates the candidate's color. A nonempty book must provide at least one unique position for each game pair. The arena shuffles the available positions, selects one position per pair and plays both color assignments.
 
-### PGN Analysis
+Gadus FCPI reads a sampling book as a randomized traversal in which every reachable nonterminal position may enter the starting-state pool, including the standard initial position. It removes transpositions using the same position identity and limits the resulting pool to the requested size. Polyglot weights do not affect this traversal.
 
-`scripts/analyze.py` analyzes every mainline position in a PGN with a UCI engine. For each recorded move, the script compares the engine's best side-to-move centipawn score with the score assigned to the recorded move and reports their nonnegative difference as centipawn regret. Its primary output is a `.cmt` report beside the input PGN.
-
-The `--pgn-comments` option also writes an annotated PGN. Each generated `{+x}` or `{-x}` comment gives the post-move evaluation from White's perspective. The default annotated path is `<input-name>_cmt.pgn`, and `--pgn-output` selects another path.
-
-```bash
-python scripts/analyze.py \
-	--input data/user-pgn/game.pgn \
-	--uci models/stockfish/stockfish \
-	--uci-depth 16 \
-	--uci-multipv 8 \
-	--analysis-cache data/user-pgn/analysis.sqlite \
-	--pgn-comments
-```
-
-On Windows, the UCI path commonly ends in `.exe`, as in `models\stockfish\stockfish.exe`.
-
-### Opening Books
-
-`scripts/opening_book.py` creates two kinds of Polyglot opening books. A sampling book contains unique reachable nonterminal positions drawn from arbitrary plies and supplies varied starting states to Gadus FCPI. The `--sampling-source` option accepts either a PGN or an existing Polyglot book. The following command creates a pool of at least 10,000 positions from an existing book:
+`scripts/opening_book.py` creates two kinds of Polyglot books. A sampling book supplies arbitrary-ply positions to Gadus FCPI. The `--sampling-source` option accepts a PGN or an existing Polyglot book. The following command creates a pool of at least 10,000 positions from an existing book:
 
 ```bash
 python scripts/opening_book.py \
@@ -536,9 +586,33 @@ python scripts/opening_book.py \
 	--log-every 1000
 ```
 
+## Scripts
+
+The `scripts/` directory contains repository-level launchers and data-preparation tools. The architecture documents specify the models and algorithms implemented by the compiled executables. The following sections describe the scripts shared across those executables.
+
+### PGN Analysis
+
+`scripts/analyze.py` analyzes every mainline position in a PGN with a UCI engine. For each recorded move, the script compares the engine's best side-to-move centipawn score with the score assigned to the recorded move and reports their nonnegative difference as centipawn regret. Its primary output is a `.cmt` report beside the input PGN.
+
+The `--pgn-comments` option also writes an annotated PGN. Each generated `{+x}` or `{-x}` comment gives the post-move evaluation from White's perspective. The default annotated path is `<input-name>_cmt.pgn`, and `--pgn-output` selects another path.
+
+```bash
+python scripts/analyze.py \
+	--input data/user-pgn/game.pgn \
+	--uci models/stockfish/stockfish \
+	--uci-depth 16 \
+	--uci-multipv 8 \
+	--analysis-cache data/user-pgn/analysis.sqlite \
+	--pgn-comments
+```
+
+On Windows, the UCI path commonly ends in `.exe`, as in `models\stockfish\stockfish.exe`.
+
 ### Gadus FCPI Launcher
 
 `scripts/gadus_fcpi.sh` launches Gadus FCPI as a background process and then runs an informational closed-search match between the final `current.pth` and the run's `initial.pth`. The launcher records the background process ID in `data/runs/<run-id>/pid`, writes combined output to `data/runs/<run-id>/info.log` and merges the final match report into `summary.json` under `final_arena`.
+
+FCPI stores the aggregated targets for iteration `<NNN>` in `data/runs/<run-id>/fcpi_iter_<NNN>.h5`. Under `models/runs/<run-id>/`, it stores `initial.pth`, `current.pth` and each `candidate_iter_<NNN>.pth`.
 
 ```bash
 bash scripts/gadus_fcpi.sh

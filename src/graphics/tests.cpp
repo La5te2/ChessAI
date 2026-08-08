@@ -1,4 +1,5 @@
-// Verifies that GUI UCI requests preserve the complete legal move history.
+// CTest entrypoint for the graphics game-state boundary. It verifies that UCI requests preserve
+// complete legal move history, historical positions and repetition state.
 #include "graphics/game.hpp"
 #include <iostream>
 #include <stdexcept>

@@ -13,8 +13,8 @@ Melano is a geometry-aware Transformer chess architecture with Policy and Value 
 - $\ell_\theta(s,i)$ denotes the Policy logit assigned to action index $i$.
 - $P_\theta(a\mid s)$ denotes the Policy probability assigned to legal move $a$.
 - $V_\theta(s)\in[-1,1]$ denotes the evaluation of $s$ from the perspective of the side to move.
-- $C$ denotes the embedding width selected by `--channels`.
-- $B$ denotes the number of geometry-attention blocks selected by `--blocks`.
+- $C$ denotes the embedding width.
+- $B$ denotes the number of geometry-attention blocks.
 
 ## 2. State and Action Encoding
 
@@ -242,7 +242,7 @@ The state embedding and the $B$ geometry-attention blocks form the backbone shar
 
 Preprocessing follows each PGN game from its standard initial position or from its `FEN` header. For every parseable SAN move, it records the state immediately before the move as $s$, the played move as $a^*$ and the action index $i^*=i_M(a^*)$.
 
-With `--has-cmt 1`, preprocessing reads signed pawn-unit evaluations such as `+0.60`, `-.25` and `+0.60/12`. The optional suffix after `/` is accepted but does not affect the target. Each comment evaluates the state reached after the move to which the comment is attached. The comment on the preceding move therefore supplies the Value target for the current pre-move state.
+Preprocessing can derive Value targets either from numerical PGN comments or from the final game result. When comments provide the targets, signed pawn-unit evaluations such as `+0.60`, `-.25` and `+0.60/12` are accepted. The optional suffix after `/` does not affect the target. Each comment evaluates the state reached after its associated move, so the comment on the preceding move supplies the Value target for the current pre-move state.
 
 Let $c_W$ be the parsed White-perspective score and let $c_{\mathrm{stm}}$ be the same score from the perspective of the side to move:
 
@@ -260,9 +260,9 @@ $$
 V_{\mathrm{target}}(s)=\tanh\left(\frac{c_{\mathrm{stm}}}{3}\right).
 $$
 
-The initial state has no preceding move comment and receives target 0. Any later state whose preceding comment contains no parseable signed score also receives target 0. A comment-enabled game enters the dataset when at least one of its move comments contains a parseable signed score.
+The initial state has no preceding move comment and receives target 0. Any later state whose preceding comment contains no parseable signed score also receives target 0. When comments provide the targets, preprocessing admits a game if at least one of its move comments contains a parseable signed score.
 
-With `--has-cmt 0`, the PGN result supplies the target. From the perspective of the side to move, a win gives $+1$, a loss gives $-1$ and a draw or unknown result gives 0.
+When the final game result provides the targets, a win from the perspective of the side to move gives $+1$, a loss gives $-1$ and a draw or unknown result gives 0.
 
 ### 4.2 HDF5 Schema
 
@@ -290,7 +290,7 @@ The row-aligned datasets are
 - `moves`, a little-endian unsigned-16 array with shape $[N]$
 - `values`, a little-endian float-32 array with shape $[N]$
 
-All three datasets are extensible along their first dimension and use `--chunk-size` rows per HDF5 chunk. A positive `--compression-level` enables the HDF5 shuffle filter followed by deflate compression. Final file attributes record the number of accepted games, written positions, skipped SAN moves and comment-required games skipped for containing no parseable evaluation.
+All three datasets are extensible along their first dimension and use a common positive row count per HDF5 chunk. Optional compression applies the HDF5 shuffle filter followed by deflate. Final file attributes record the number of accepted games, written positions, skipped SAN moves and games rejected for lacking a parseable evaluation when comments provide the targets.
 
 The training reader validates the architecture, state codec, move codec, target schema, nonempty row count, state width and row alignment of all three datasets before constructing a batch.
 
@@ -304,7 +304,7 @@ R_\theta(i\mid s)=
 {\displaystyle\sum_{j\in\mathcal I_M}\exp\ell_\theta(s,j)}.
 $$
 
-The supervised distribution $R_\theta$ and the legal-move distribution $P_\theta$ in Section 3.2 use the same logits. $R_\theta$ normalizes over all action indices during training, while $P_\theta$ normalizes over the legal moves of the current game state during inference.
+The same Policy logits determine the supervised distribution $R_\theta$ and the legal-move distribution $P_\theta$ defined in Section 3.2. The normalization for $R_\theta$ covers all action indices during training, whereas the normalization for $P_\theta$ covers the legal moves of the current game state during inference.
 
 Let $\delta_{i^*}$ be the one-hot distribution that assigns probability 1 to $i^*$ and 0 to every other action index. The supervised Policy loss is
 
@@ -321,27 +321,31 @@ L_{V,\mathrm{sup}}=
 \mathrm{MSE}\left(V_\theta(s),V_{\mathrm{target}}(s)\right).
 $$
 
-Let $w_V\geq0$ be the coefficient supplied by `--value-weight`. The minibatch objective is
+Let $w_V\geq0$ be the Value-loss coefficient. The minibatch objective is
 
 $$
 L_{\mathrm{sup}}=L_{P,\mathrm{sup}}+w_VL_{V,\mathrm{sup}}.
 $$
 
-Training creates a new model with the requested $C$ and $B$ and optimizes all parameters with AdamW. The loader shuffles HDF5 chunks, reads one subsequent chunk asynchronously while the current chunk is processed and independently shuffles rows within each loaded chunk. CUDA training allocates pinned host tensors and uses nonblocking device transfers.
+Training creates a new model with channel count $C$ and block count $B$, then optimizes all parameters with AdamW. The loader shuffles HDF5 chunks, reads one subsequent chunk asynchronously while the current chunk is processed and independently shuffles rows within each loaded chunk. CUDA training allocates pinned host tensors and uses nonblocking device transfers.
 
-Let $N$ be the number of HDF5 rows and let $m$ be `--batch-size`. The number of optimizer steps in one epoch is
+Let $N$ be the number of HDF5 rows and let $m$ be the minibatch size. The number of optimizer steps in one epoch is
 
 $$
 S_{\mathrm{epoch}}=\left\lceil\frac Nm\right\rceil
 $$
 
-For a positive epoch count, let $T$ be the smaller of the available steps across all epochs and a positive `--max-steps` value. A nonpositive `--max-steps` leaves the step count under the control of `--epochs`. The warmup length is
+Let $E$ be the positive epoch count and let $K_{\max}\in\mathbb N\cup\{\infty\}$ be the optimizer-step cap. The resulting number of steps and the warmup length are
+
+$$
+T=\min\left(K_{\max},E S_{\mathrm{epoch}}\right),
+$$
 
 $$
 T_W=\min\left(T,2000,\max\left(100,\left\lfloor\frac{T}{100}\right\rfloor\right)\right).
 $$
 
-If $\eta_{\max}$ is the learning rate supplied by `--lr`, step $k\geq1$ uses
+For peak learning rate $\eta_{\max}$, step $k\geq1$ uses
 
 $$
 \eta_k=
@@ -351,21 +355,21 @@ $$
 \end{cases}
 $$
 
-Thus the schedule uses linear warmup followed by inverse-square-root decay. The `--seed` value initializes LibTorch and the two shuffle stages. A positive `--grad-clip` clips the global gradient norm before each AdamW step and terminates training when that norm is nonfinite.
+Thus the schedule uses linear warmup followed by inverse-square-root decay. A deterministic seed controls parameter initialization and both shuffle stages. Let $g_{\max}>0$ be the gradient-norm limit. Before each AdamW step, training clips the global gradient norm to $g_{\max}$ and terminates when that norm is nonfinite.
 
-Precision `fp32` evaluates the forward pass and both losses in float32. Precision `bf16` requires CUDA and applies BF16 autocast to the forward pass, while Policy logits, Value predictions and losses are converted to float32 before loss evaluation.
+In FP32 training, the forward pass and both losses use float32. BF16 training requires CUDA and applies BF16 autocast to the forward pass, while Policy logits, Value predictions and losses are converted to float32 before loss evaluation.
 
-Training writes a checkpoint at every positive optimizer step divisible by `--save-every`. It also writes one after each processed epoch pass, including the final partial pass stopped by a positive `--max-steps`. The top-level archive contains `model` and `arch`. The architecture archive stores type identifier 2, $C$, $B$ and action size 4672 as integer tensors. Saving first writes a sibling `.tmp` file and then atomically replaces the destination. Loading validates every architecture field before constructing the model and restoring its parameters.
+Let $K_{\mathrm{save}}>0$ be the periodic checkpoint interval. Training writes a checkpoint whenever the optimizer-step count is divisible by $K_{\mathrm{save}}$, after every processed epoch pass and after the final partial pass imposed by $K_{\max}$. The top-level archive contains `model` and `arch`. The architecture archive stores type identifier 2, $C$, $B$ and action size 4672 as integer tensors. Saving first writes a sibling `.tmp` file and then atomically replaces the destination. Loading validates every architecture field before constructing the model and restoring its parameters.
 
 ## 6. Search
 
 ### 6.1 Search Modes
 
-Search mode `closed` evaluates the root once and derives its initial move ranking from $P_\theta(a\mid s)$. With a positive simulation cap, search mode `only-mcts` evaluates exact-state leaves in neural batches and derives its initial ranking from the resulting MCTS root distribution. An `only-mcts` search with a zero simulation cap returns the same legal Policy distribution as `closed`. Both modes subsequently apply the enabled IMF and RPP decision components defined in Section 6.4.
+In `closed` mode, search evaluates the root once and derives its initial move ranking from $P_\theta(a\mid s)$. In `only-mcts` mode with a positive simulation cap, search evaluates exact-state leaves in neural batches and derives its initial ranking from the resulting MCTS root distribution. An `only-mcts` search with a zero simulation cap returns the same legal Policy distribution as `closed`. In either mode, search subsequently applies the enabled IMF and RPP decision components defined in Section 6.4.
 
-Search precision `fp32` performs neural evaluation in float32. Search precision `bf16` requires CUDA, applies BF16 autocast to the forward pass and converts the legal Policy and Value results to float32 before tree operations.
+With FP32 search precision, neural evaluation uses float32. BF16 search precision requires CUDA, applies BF16 autocast to the forward pass and converts the legal Policy and Value results to float32 before tree operations.
 
-In `only-mcts`, root evaluation creates one outgoing edge $(s,a)$ for every legal action and stores $P_\theta(a\mid s)$ as the edge prior $P(s,a)$. The prior remains fixed throughout the search. Let $N(s,a)$ be the completed visit count of edge $(s,a)$ and let $N(s)=\sum_aN(s,a)$ be the completed visit count of node $s$.
+In `only-mcts` mode, search initializes the root with one outgoing edge $(s,a)$ for every legal action and stores $P_\theta(a\mid s)$ as the edge prior $P(s,a)$. The prior remains fixed throughout the search. Let $N(s,a)$ be the completed visit count of edge $(s,a)$ and let $N(s)=\sum_aN(s,a)$ be the completed visit count of node $s$.
 
 During batched selection, a virtual visit reserves every node on a selected path until the corresponding terminal or neural evaluation has been backed up. Let $N_v(s,a)$ be the virtual-visit count of edge $(s,a)$ and let $N_v(s)=\sum_aN_v(s,a)$. Selection uses the augmented counts
 
@@ -377,7 +381,7 @@ $$
 
 ### 6.2 PUCT Selection
 
-Let $c_0$, $b_0$ and $f_0$ be the values supplied by `--c-puct`, `--c-puct-base` and `--c-puct-factor`. Define $b=\max(1,b_0)$ and $f=\max(0,f_0)$. The visit-dependent exploration coefficient is
+Let $c_0$ be the initial exploration coefficient, let $b_0$ be its schedule base and let $f_0$ be its schedule factor. Define $b=\max(1,b_0)$ and $f=\max(0,f_0)$. The visit-dependent exploration coefficient is
 
 $$
 c_{\mathrm{puct}}(\widetilde N)=
@@ -390,7 +394,7 @@ $$
 Q(s,a)=-Q(s_a).
 $$
 
-For an unvisited edge, First Play Urgency uses the parent value and the prior mass already visited. With $r_{\mathrm{FPU}}=\max(0,\texttt{--fpu-reduction})$, the selection estimate is
+For an unvisited edge, First Play Urgency uses the parent value and the prior mass already visited. Let $r_{\mathrm{FPU}}\geq0$ be the FPU reduction coefficient. The selection estimate is
 
 $$
 Q_{\mathrm{sel}}(s,a)=
@@ -403,7 +407,7 @@ Q(s)-r_{\mathrm{FPU}}
 \end{cases}
 $$
 
-When node $s$ has no completed visit, its FPU baseline $Q(s)$ is 0. With $l_v=\max(0,\texttt{--virtual-loss})$, the PUCT selection score is
+When node $s$ has no completed visit, its FPU baseline $Q(s)$ is 0. Let $l_v\geq0$ be the virtual-loss coefficient. The PUCT selection score is
 
 $$
 S(s,a)=Q_{\mathrm{sel}}(s,a)
@@ -426,7 +430,7 @@ $$
 
 ### 6.3 Dynamic Simulation Budget
 
-Let $N_{\mathrm{cap}}=\max(0,\texttt{--mcts-sims})$, $B_{\mathrm{batch}}=\max(1,\texttt{--mcts-batch-size})$ and $N_{\mathrm{floor}}=\max(0,\texttt{--mcts-min-sims})$. The nominal minimum simulation count is
+Let $N_{\mathrm{cap}}\geq0$ be the simulation cap, let $B_{\mathrm{batch}}\geq1$ be the neural batch capacity and let $N_{\mathrm{floor}}\geq0$ be the simulation-floor parameter. The nominal minimum simulation count is
 
 $$
 N_{\min}=
@@ -441,7 +445,7 @@ N_{\min}=
 \end{cases}
 $$
 
-When UCI supplies a wall-clock limit or sends `stop`, search may terminate with fewer than $N_{\min}$ completed simulations. After $N_{\min}$ simulations have completed, a root with at least two legal actions uses the completed-visit distribution
+An external deadline or cancellation signal may terminate search with fewer than $N_{\min}$ completed simulations. After $N_{\min}$ simulations have completed at a root with at least two legal actions, search forms the completed-visit distribution
 
 $$
 v_a=\frac{N(s,a)}{\displaystyle\sum_{b\in\mathcal A(x)}N(s,b)}.
@@ -475,7 +479,7 @@ N_{\mathrm{target}}=
 N_{\min}+\left\lceil u(N_{\mathrm{cap}}-N_{\min})\right\rceil.
 $$
 
-A root with one legal action uses $u=0$ and $N_{\mathrm{target}}=N_{\min}$. The search loop checks $N_{\mathrm{cap}}$ and $N_{\mathrm{target}}$ between batch-construction passes. Work completed inside the current pass is included in the final statistics, which makes the reported simulation limit a batched soft cap.
+For a root with one legal action, search sets $u=0$ and $N_{\mathrm{target}}=N_{\min}$. The search loop checks $N_{\mathrm{cap}}$ and $N_{\mathrm{target}}$ between batch-construction passes. Work completed inside the current pass is included in the final statistics, which makes the reported simulation limit a batched soft cap.
 
 ### 6.4 Final Decision Components
 
@@ -507,7 +511,7 @@ $$
 
 When $\mathcal M(x)$ is empty, $D_I(a)=D_0(a)$ for every legal action.
 
-Let $\lambda_R\in[0,1]$ be `--repetition-policy-penalty`, and let $V_R$ be the root evaluation returned by search. The set $\mathcal R_3(x)$ contains legal moves that either make a threefold-repetition claim available immediately or allow the opponent to make one with a single reply. RPP computes
+Let $\lambda_R\in[0,1]$ be the repetition-penalty coefficient, and let $V_R$ be the root evaluation returned by search. The set $\mathcal R_3(x)$ contains legal moves that either make a threefold-repetition claim available immediately or allow the opponent to make one with a single reply. RPP computes
 
 $$
 d_R=\lambda_R\mathrm{clip}(V_R,0,1)
@@ -523,13 +527,13 @@ D_I(a),&a\in\mathcal A(x)\setminus\mathcal R_3(x).
 \end{cases}
 $$
 
-The decision layer orders legal moves by descending $D(a)$, then by descending $D_0(a)$ and finally by descending UCI notation. The first move in this order is selected. These components leave network logits, edge priors, visit counts and backed-up values unchanged.
+The decision layer orders legal moves by descending $D(a)$, then by descending $D_0(a)$ and finally by descending coordinate move string. The first move in this order is selected. These components leave network logits, edge priors, visit counts and backed-up values unchanged.
 
 ## 7. Arena
 
-The Melano arena loads the candidate and baseline checkpoints once and creates one searcher for each model. Both searchers receive the same search options. The arena advances up to `--games-in-flight` games together, collects all current positions assigned to each model and calls that model's batched search once per turn.
+The Melano arena loads the candidate and baseline checkpoints once and creates one searcher for each model. Both searchers receive the same search configuration. Let $N_G$ be the positive even number of games and let $K_G\geq1$ be the maximum number of active games. The arena advances at most $K_G$ games together, collects all current positions assigned to each model and calls that model's batched search once per turn.
 
-`--games` must be a positive even number. Each selected opening is played twice, once with the candidate as White and once with the candidate as Black. The rules engine adjudicates checkmate, stalemate, insufficient material, the fifty-move rule and threefold repetition. A game that reaches `--max-plies` is recorded as a draw with termination `max plies`.
+Each selected opening is played twice, once with the candidate as White and once with the candidate as Black. Let $T_G$ be the per-game ply cap. The rules engine adjudicates checkmate, stalemate, insufficient material, the fifty-move rule and threefold repetition. A game that reaches $T_G$ is recorded as a draw with termination `max plies`.
 
 Let $N_W$, $N_D$ and $N_L$ be the candidate's win, draw and loss counts, and let $N_G=N_W+N_D+N_L$. The candidate score and net wins are
 
@@ -559,89 +563,10 @@ $$
 \Delta Elo=400\log_{10}\left(\frac{score_b}{1-score_b}\right).
 $$
 
-Let $M_{\mathrm{gate}}$ be `--min-net-wins`. The result gate accepts the candidate when
+Let $M_{\mathrm{gate}}$ be the minimum required net-win margin. The arena accepts the candidate when
 
 $$
 N_W-N_L\geq M_{\mathrm{gate}}.
 $$
 
 The arena returns the gate result and statistics as JSON. It can also write all games as 80-column SAN PGN with the starting FEN and termination reason. Checkpoint promotion belongs to the training procedure that invokes the arena, so arena evaluation itself does not replace either checkpoint.
-
-## 8. Opening Books
-
-Melano reads Polyglot opening books. Book traversal begins at the standard initial position and performs a breadth-first traversal of legal book moves. The effective traversal depth is $\max(1,\texttt{--book-plies})$. The traversal ignores Polyglot weight and learn fields, shuffles outgoing moves with `--seed` and stops expanding a branch when it reaches the effective depth or when the current position has no legal book move.
-
-Each nonterminal frontier position is emitted once according to its board placement, side to move, castling rights and en-passant field. Move counters do not participate in this opening-pool identity. The effective pool bound is $\max(1,\texttt{--max-book-positions})$. If no frontier position is available, the standard initial position becomes the sole result.
-
-An empty `--opening-book` makes every arena game begin at the standard initial position and alternates the candidate's color. A nonempty book must yield at least half as many unique frontier positions as the requested number of games. The arena shuffles this pool with `--seed`, selects one position per game pair and uses the two color assignments described in Section 7.
-
-## 9. UCI Engine
-
-The UCI executable loads a Melano checkpoint lazily when `isready` or `go` first requires it. `--model` selects the checkpoint. When that argument is absent, the executable reads `melano.pth` from its own directory. The process keeps the loaded model alive across positions and reloads it only after `ModelPath` or `Device` changes. UCI neural evaluation uses fp32.
-
-Search runs on a worker thread, allowing the protocol loop to process `stop`. A `position`, `setoption` or `ucinewgame` command stops and joins the current search before changing engine state.
-
-### 9.1 Evaluation Output
-
-The engine reports MultiPV lines with `score cp`, nodes, NPS, time and a one-move PV. Let $V_R$ be the root evaluation returned by search. In `closed` mode, $V_R=V_\theta(s)$. After MCTS completes at least one simulation, $V_R=Q(s)$ is the mean return backed up to the root.
-
-For a root move $a$, a visited MCTS edge uses $q_{\mathrm{line}}=Q(s,a)$, while an unvisited edge uses $q_{\mathrm{line}}=V_R$. Let $c_s$ be `ScoreScale`. The displayed score is
-
-$$
-score\_cp=\mathrm{round}\left(
-c_s\mathrm{clip}(q_{\mathrm{line}},-0.999,0.999)
-\right).
-$$
-
-The UCI `nodes` field is the completed simulation count, with the initial neural evaluation represented as one node when no simulation has completed. For reported node count $n$, both `depth` and `seldepth` are
-
-$$
-\max\left(1,\left\lfloor\log_2\max(1,n)\right\rfloor+1\right).
-$$
-
-These depth fields summarize search effort rather than the maximum tree depth. NPS is $1000n/t$, where $t$ is elapsed time in milliseconds with a denominator of at least one millisecond.
-
-### 9.2 Options
-
-Melano exposes the following UCI options.
-
-- `ModelPath` selects a Melano checkpoint. A packaged engine defaults to `melano.pth` in the executable directory.
-- `Device` selects `auto`, `cpu` or `cuda`.
-- `SearchType` selects direct Policy ranking with `closed` or exact-state MCTS with `only-mcts`. Both modes apply the enabled final decision components.
-- `MCTSSims` sets the per-root simulation soft cap and defaults to `100`. A UCI command `go nodes <n>` uses `<n>` as the current cap.
-- `MCTSMinSims` sets the nominal minimum simulation count before dynamic budgeting and defaults to `0`. A zero value activates the formula in Section 6.3.
-- `MCTSBatchSize` sets the maximum number of selected leaves in one neural evaluation batch and defaults to `32`.
-- `MoveOverheadMS` reserves communication and move-submission time from a clock allocation and defaults to `50`.
-- `CPuct`, `CPuctBase` and `CPuctFactor` set the exploration schedule and default to `0.5`, `19652` and `1.0`.
-- `FPUReduction` sets the FPU reduction and defaults to `0.15`.
-- `VirtualLoss` sets the repeated-path penalty within one batched selection and defaults to `0.0`.
-- `RepetitionPolicyPenalty` sets $\lambda_R$ in RPP, accepts values in $[0,1]$ and defaults to `0.0`.
-- `InstantMateFirst` enables IMF and defaults to `false`.
-- `ProgressIntervalMS` sets the interval between intermediate UCI `info` reports and defaults to `750`. A zero interval leaves the initial and final reports while suppressing timed intermediate reports.
-- `MultiPV` sets the number of reported root lines and defaults to `5`.
-- `ScoreScale` sets $c_s$ for converting the dimensionless evaluation to the displayed centipawn-like scale and defaults to `1000`.
-
-The `go movetime <ms>` command supplies a nonnegative deadline directly. When `go` supplies the active side's remaining time $t_{\mathrm{remain}}$ and increment $t_{\mathrm{inc}}$, the initial allocation is
-
-$$
-t_0=\frac{t_{\mathrm{remain}}}{30}+0.75t_{\mathrm{inc}}-t_{\mathrm{overhead}}.
-$$
-
-The engine clamps $t_0$ to the interval from 50 to 10000 milliseconds and then limits it to $\max(1,t_{\mathrm{remain}}-t_{\mathrm{overhead}})$. A `go` command without `movetime` or the active side's clock supplies no wall-clock deadline. The simulation budget and `stop` command still bound the search.
-
-The engine publishes the direct root evaluation when search begins, emits timed MCTS snapshots at `ProgressIntervalMS` and sends the final `bestmove` after the selected budget, deadline or cancellation condition is reached.
-
-## 10. Implementation Tests
-
-The build process runs the Melano CTest executable before publishing binaries. The test suite covers
-
-- `fp32` and `bf16` precision parsing
-- Polyglot hashing and the 67-field state layout
-- reachability of all 29 geometry-relation identifiers
-- legal action round trips for ordinary moves, castling, en-passant and promotions
-- checkmate, stalemate, insufficient material, the fifty-move rule and threefold repetition
-- annotated-PGN preprocessing and the `melano_policy_value` HDF5 schema
-- Policy and Value output shapes, finite outputs and finite gradients
-- atomic checkpoint save-load equivalence
-- compact legal-action evaluation in `closed` mode
-- exact-state batched PUCT with a fixed four-simulation test

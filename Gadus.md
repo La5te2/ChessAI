@@ -35,7 +35,7 @@ $$
 
 ## 3. Network
 
-The Gadus network contains a ResNet trunk, a linear policy head and an MLP value head. Let $C$ be the channel count supplied by `--channels`, and let $B$ be the residual-block count supplied by `--blocks`. For encoded input $s\in\mathbb R^{18\times8\times8}$, the stem applies a bias-free $3\times3$ convolution from 18 input planes to $C$ channels, followed by BatchNorm and ReLU:
+The Gadus network contains a ResNet trunk, a linear Policy head and an MLP Value head. Let $C$ be the channel count and let $B$ be the residual-block count. For encoded input $s\in\mathbb R^{18\times8\times8}$, the stem applies a bias-free $3\times3$ convolution from 18 input planes to $C$ channels, followed by BatchNorm and ReLU:
 
 $$
 h_0=\mathrm{ReLU}\left(
@@ -81,6 +81,10 @@ P_\theta(a\mid s)=
 {\displaystyle \sum_{b\in\mathcal A(x)}\exp \ell_\theta(s,i_G(b))}.
 $$
 
+Supervised training evaluates all 4672 rows of the final Policy linear map. During inference, Gadus evaluates only the rows indexed by $i_G(a)$ for legal moves $a\in\mathcal A(x)$. This restricted linear projection produces the same legal-move logits used in the definition of $P_\theta$ above.
+
+The inference model also replaces each convolution-and-BatchNorm pair with an equivalent convolution whose weights and bias incorporate the frozen BatchNorm statistics. Four-dimensional inference tensors use the channels-last memory format. Both transformations exist only in the in-memory inference graph. They neither rewrite the source checkpoint nor change the network function $f_\theta$.
+
 ## 4. Preprocessing
 
 Gadus preprocessing writes the following HDF5 schema:
@@ -97,7 +101,7 @@ target_schema=pv_supervised
 has_cmt=0|1
 ```
 
-`--has-cmt` defaults to `1`. In this mode, the preprocessor reads White-perspective pawn-unit evaluations from comments of the form `{+x}` and `{-x}`. At ply $t$, let $x_t$ be the game state before the recorded move and let $s_t=\phi_G(x_t)$. A comment attached to a PGN move describes the position produced by that move, so the target for $s_t$ comes from the comment attached to the preceding move.
+Preprocessing can derive Value targets either from numerical PGN comments or from the final game result. When comments provide the targets, entries of the form `{+x}` and `{-x}` are interpreted as pawn-unit evaluations from White's perspective. At ply $t$, let $x_t$ be the game state before the recorded move and let $s_t=\phi_G(x_t)$. A comment attached to a PGN move describes the position produced by that move, so the comment on the preceding move supplies the target for $s_t$.
 
 Let $q_t$ be the White-perspective evaluation assigned to $x_t$ by the preceding move's comment. Define $\rho(x_t)=1$ when White is to move and $\rho(x_t)=-1$ when Black is to move. The corresponding side-to-move evaluation and value target are
 
@@ -107,7 +111,7 @@ q_{\mathrm{stm}}(s_t)=\rho(x_t)q_t,
 V_{\mathrm{target}}(s_t)=\tanh\left(\frac{q_{\mathrm{stm}}(s_t)}{3}\right).
 $$
 
-If the preceding comment contains no parseable evaluation, preprocessing sets $q_{\mathrm{stm}}=0$. In `--has-cmt 1` mode, a game is included when at least one comment contains a parseable evaluation. In `--has-cmt 0` mode, $V_{\mathrm{target}}\in\lbrace -1,0,1\rbrace$ is derived from the final result and expressed from the side-to-move perspective.
+If the preceding comment contains no parseable evaluation, $q_{\mathrm{stm}}$ is set to 0 for that state. When comments provide the targets, preprocessing admits a game if at least one of its comments contains a parseable evaluation. When the final game result provides the targets, $V_{\mathrm{target}}\in\lbrace -1,0,1\rbrace$ represents that result from the perspective of the side to move.
 
 ## 5. Supervised Training
 
@@ -138,16 +142,20 @@ L_{V,\mathrm{sup}}=
 \mathrm{MSE}\left(V_\theta(s),V_{\mathrm{target}}(s)\right).
 $$
 
-Let $w_V$ be the nonnegative loss coefficient given by `--value-weight`. The complete supervised objective is
+Let $w_V$ be the nonnegative Value-loss coefficient. The complete supervised objective is
 
 $$
 L_{\mathrm{sup}}=
 L_{P,\mathrm{sup}}+w_VL_{V,\mathrm{sup}}.
 $$
 
-Each training invocation initializes a new Gadus model. `--channels` and `--blocks` determine its width and depth. A positive `--max-steps` limits the number of optimizer steps, while a zero or negative value allows `--epochs` to determine the training length. `--save-every` sets the interval between atomic checkpoint writes. `--seed` controls parameter initialization and dataset shuffling.
+Each supervised run initializes a new Gadus model with dimensions $C$ and $B$. Let $E$ be the epoch count, let $m$ be the minibatch size, let $N$ be the number of training records and let $K_{\max}\in\mathbb N\cup\{\infty\}$ be the optimizer-step cap. The number of updates is
 
-`--precision` accepts `fp32` or `bf16` and defaults to `fp32`. CUDA forward computation uses BF16 in `bf16` mode. The Policy softmax, loss calculations, metric accumulation and checkpoint parameters remain in FP32. CUDA training batches use pinned host memory.
+$$
+K=\min\left(K_{\max},E\left\lceil\frac Nm\right\rceil\right).
+$$
+
+A deterministic random seed controls parameter initialization and dataset shuffling. Training may evaluate the network entirely in FP32 or apply BF16 autocasting to CUDA forward computation. The Policy softmax, loss calculations, metric accumulation and checkpoint parameters remain in FP32. CUDA training batches use pinned host memory.
 
 Each checkpoint contains exactly two top-level keys:
 
@@ -160,7 +168,7 @@ arch  #stores the Gadus identifier and the dimensions required to reconstruct th
 
 ### 6.1 Search Modes
 
-Search mode `closed` derives its initial move ranking directly from the model policy. Search mode `only-mcts` evaluates leaf nodes in neural batches and derives its initial ranking from the resulting MCTS root distribution. Both modes then apply the enabled IMF (Instant Mate First) and RPP (Repetition Policy Penalty) decision components.
+In `closed` mode, search derives its initial move ranking directly from the model Policy. In `only-mcts` mode, search evaluates leaf nodes in neural batches and derives its initial ranking from the resulting MCTS root distribution. Search then applies the enabled IMF (Instant Mate First) and RPP (Repetition Policy Penalty) decision components in either mode.
 
 Within `only-mcts` mode, expanding node $s$ creates one outgoing edge $(s,a)$ for each legal action $a$ and stores policy probability $P(s,a)$ as that edge's prior. Each prior remains fixed throughout the search. The completed visit counts of an edge and its parent node are denoted by $N(s,a)$ and $N(s)=\sum_aN(s,a)$. During batched selection, virtual visits reserve edges for concurrent paths and reduce repeated selection of the same edge. Their corresponding counts are $N_v(s,a)$ and $N_v(s)=\sum_aN_v(s,a)$. Selection combines completed and virtual visits into the augmented counts:
 
@@ -172,7 +180,7 @@ $$
 
 ### 6.2 PUCT Selection
 
-Let $c_0$, $b_0$ and $f_0$ be the values supplied by `--c-puct`, `--c-puct-base` and `--c-puct-factor`. Define $b=\max(1,b_0)$ and $f=\max(0,f_0)$. The visit-dependent exploration coefficient is
+Let $c_0$ be the initial exploration coefficient, let $b_0$ be its schedule base and let $f_0$ be its schedule factor. Define $b=\max(1,b_0)$ and $f=\max(0,f_0)$. The visit-dependent exploration coefficient is
 
 $$
 c_{\mathrm{puct}}(\widetilde N)=
@@ -181,7 +189,7 @@ $$
 
 A terminal leaf supplies the exact rule outcome $z(x)$, while a nonterminal leaf supplies the network evaluation $V_\theta(\phi_G(x))$. Denote either result by $V_{\mathrm{leaf}}$. MCTS backs up this value along the selected path and reverses its sign at every ply. Each completed backup increments $N(s,a)$ and updates the mean return $Q(s,a)$ from the perspective of the player at the parent node $s$.
 
-The selection estimate $Q_{\mathrm{sel}}(s,a)$ equals $Q(s,a)$ when $N(s,a)>0$. For an unvisited edge, $Q(s)$ denotes the mean return backed up to node $s$ from the perspective of the player to move at that node. First Play Urgency combines $Q(s)$ with the explored prior mass. With $r_{\mathrm{FPU}}=\max(0,\texttt{--fpu-reduction})$, the two cases are
+The selection estimate $Q_{\mathrm{sel}}(s,a)$ equals $Q(s,a)$ when $N(s,a)>0$. For an unvisited edge, $Q(s)$ denotes the mean return backed up to node $s$ from the perspective of the player to move at that node. First Play Urgency combines $Q(s)$ with the explored prior mass. Let $r_{\mathrm{FPU}}\geq0$ be the FPU reduction coefficient. The two cases are
 
 $$
 Q_{\mathrm{sel}}(s,a)=
@@ -193,7 +201,7 @@ Q(s)-r_{\mathrm{FPU}}\sqrt{\displaystyle\sum_{a':N(s,a')>0}P(s,a')},-1,1
 \end{cases}
 $$
 
-With $l_v=\max(0,\texttt{--virtual-loss})$, the PUCT selection score is
+Let $l_v\geq0$ be the virtual-loss coefficient. The PUCT selection score is
 
 $$
 S(s,a)=Q_{\mathrm{sel}}(s,a)
@@ -212,9 +220,19 @@ P_{\mathrm{root}}(a\mid s)=
 {\displaystyle\sum_{a'\in\mathcal A(x)}\left(N(s,a')+P(s,a')\right)}.
 $$
 
-### 6.3 Dynamic Simulation Budget
+### 6.3 Neural Evaluation Cache
 
-Let $N_{\mathrm{cap}}=\max(0,\texttt{--mcts-sims})$, $B_{\mathrm{batch}}=\max(1,\texttt{--mcts-batch-size})$ and $N_{\mathrm{floor}}=\max(0,\texttt{--mcts-min-sims})$. The nominal minimum simulation count is
+Evaluating a nonterminal state produces a compact record containing its legal moves, their action indices, the legal-move probabilities $P_\theta(a\mid s)$ and the state evaluation $V_\theta(s)$. Within one search call, inputs with the same Gadus `PackedState` share this record and therefore require one network evaluation. Search consults the cache only for root evaluation in `closed` mode and for both root and leaf evaluation in `only-mcts` mode.
+
+When cross-search retention has positive capacity, the searcher retains compact evaluation records across successive search calls. The cache applies least-recently-used eviction when its approximate memory ceiling is reached. Zero capacity limits evaluation reuse to the current search call.
+
+Rule-terminal detection precedes every cache lookup, so an exact outcome determined by the current game history supplies the leaf value directly. Each search call constructs a new MCTS tree and initializes new visit counts, virtual visits and $Q$ estimates. The cache reuses network outputs without reusing search statistics.
+
+FCPI target generation and arena evaluation assign zero capacity to cross-search retention, so their evaluation records remain local to one batched search call.
+
+### 6.4 Dynamic Simulation Budget
+
+Let $N_{\mathrm{cap}}\geq0$ be the simulation cap, let $B_{\mathrm{batch}}\geq1$ be the neural batch capacity and let $N_{\mathrm{floor}}\geq0$ be the simulation-floor parameter. The nominal minimum simulation count is
 
 $$
 N_{\min}=
@@ -229,7 +247,7 @@ N_{\min}=
 \end{cases}
 $$
 
-When UCI supplies a wall-clock limit or sends `stop`, search may terminate with fewer than $N_{\min}$ completed simulations. After $N_{\min}$ simulations have completed, a root with at least two legal actions uses the empirical visit distribution
+An external deadline or cancellation signal may terminate search with fewer than $N_{\min}$ completed simulations. After $N_{\min}$ simulations have completed at a root with at least two legal actions, search forms the empirical visit distribution
 
 $$
 v_a=\frac{N(s,a)}{\displaystyle\sum_{b\in\mathcal A(x)}N(s,b)}.
@@ -261,9 +279,9 @@ N_{\mathrm{target}}=
 N_{\min}+\left\lceil u(N_{\mathrm{cap}}-N_{\min})\right\rceil.
 $$
 
-A root with one legal action uses $u=0$ and $N_{\mathrm{target}}=N_{\min}$.
+For a root with one legal action, search sets $u=0$ and $N_{\mathrm{target}}=N_{\min}$.
 
-### 6.4 Final Decision Components
+### 6.5 Final Decision Components
 
 The optional IMF (Instant Mate First) and RPP (Repetition Policy Penalty) rules operate on the final ranking rather than on the search tree. Before either rule is applied, the ranking score is
 
@@ -293,7 +311,7 @@ $$
 
 When $\mathcal M(x)$ is empty, $D_I(a)$ equals $D_0(a)$ for every legal action.
 
-Let $\lambda_R\in[0,1]$ be `--repetition-policy-penalty`, and let $V_R$ be the $V$ returned for the root by search. The set $\mathcal R_3(x)$ contains legal moves that either make a threefold-repetition claim available immediately or allow the opponent to do so with one reply. RPP computes
+Let $\lambda_R\in[0,1]$ be the repetition-penalty coefficient, and let $V_R$ be the $V$ returned for the root by search. The set $\mathcal R_3(x)$ contains legal moves that either make a threefold-repetition claim available immediately or allow the opponent to do so with one reply. RPP computes
 
 $$
 d_R=\lambda_R\mathrm{clip}(V_R,0,1).
@@ -309,11 +327,11 @@ D_I(a),&a\in\mathcal A(x)\setminus\mathcal R_3(x).
 \end{cases}
 $$
 
-The decision layer sorts legal moves by descending $D(a)$, then by descending $D_0(a)$ and finally by descending UCI notation. The first move in this order is selected.
+The decision layer sorts legal moves by descending $D(a)$, then by descending $D_0(a)$ and finally by descending coordinate move string. The first move in this order is selected.
 
 ## 7. Arena
 
-The Gadus arena executable loads both checkpoints once and advances several games concurrently. Positions evaluated by the same checkpoint are combined into inference batches. `--games` must be a positive even number because each sampled opening is played once with the candidate as White and once with the candidate as Black. `--games-in-flight` limits the number of active games.
+The Gadus arena loads both checkpoints once and advances games concurrently. Let $N_G$ be the positive even number of games and let $K_G\geq1$ be the maximum number of active games. Positions evaluated by the same checkpoint are combined into inference batches. Each sampled opening is played once with the candidate as White and once with the candidate as Black.
 
 Let $N_W$, $N_D$ and $N_L$ be the candidate's win, draw and loss counts, and let $N_{\mathrm{games}}=N_W+N_D+N_L$. The candidate score and net wins are
 
@@ -343,7 +361,7 @@ $$
 \Delta Elo=400\log_{10}\left(\frac{score_b}{1-score_b}\right).
 $$
 
-Let $M_{\mathrm{gate}}$ be the minimum net wins supplied by `--min-net-wins`. The arena result gate accepts the candidate when
+Let $M_{\mathrm{gate}}$ be the minimum required net-win margin. The arena accepts the candidate when
 
 $$
 N_W-N_L\geq M_{\mathrm{gate}}.
@@ -357,23 +375,23 @@ FCPI stands for Folded Counterfactual Policy Iteration.
 
 Let $C_r$ be the current model at the start of FCPI iteration $r$, with parameters $\theta_{old}$. FCPI freezes $\theta_{old}$ while constructing the training set. For encoded position $s$, the source model returns $P_{old}(\cdot\mid s)$ and $V_{old}(s)$.
 
-The candidate begins as a copy of the source model:
+FCPI initializes a trainable parameter sequence from the source parameters:
 
 $$
-\theta_{new}^{(0)}=\theta_{old}.
+\theta^{(0)}=\theta_{old}.
 $$
 
-The trainable candidate parameters are denoted by $\theta_{new}$, and the corresponding outputs are denoted by $P_{new}(\cdot\mid s)$ and $V_{new}(s)$.
+During optimization, $P_{new}(\cdot\mid s)$ and $V_{new}(s)$ denote the outputs of the current trainable parameter state. Section 8.8 defines the update sequence. After update $K$, FCPI sets $\theta_{new}=\theta^{(K)}$ and calls the model parameterized by $\theta_{new}$ the candidate.
 
 FCPI constructs targets from completed self-play trajectories and finite counterfactual trees. A completed trajectory assigns terminal return $G_t$ to each recorded position and MC advantage coefficient $A_{\mathrm{MC}}(s_t,a_t)$ to the move selected there. A counterfactual tree computes $Q_{\mathrm{CF}}(s,a)$ for legal moves and then derives $\pi^+(\cdot\mid s)$ and $\overline V_{\mathrm{CF}}(s)$.
 
-After aggregating these targets, FCPI trains the candidate with the objective defined in Section 8.7. AdamW updates $\theta_{new}$ from the gradients of that objective. A paired-game arena then compares the trained candidate with $C_r$ and returns the acceptance result. FCPI atomically replaces `current.pth` when that result meets the promotion threshold.
+After aggregating these targets, FCPI forms the objective defined in Section 8.7 and applies the parameter updates defined in Section 8.8. A paired-game arena then compares the candidate with $C_r$ and returns the acceptance result. FCPI atomically replaces `current.pth` when that result meets the promotion threshold.
 
-### 8.2 Self-Play Trajectory Generation
+### 8.2 Self-Play Trajectories
 
-When `--opening-book` names a sampling book, FCPI draws `--games-per-iter` distinct nonterminal positions without replacement from a pool of at most `--max-book-positions` FENs. The pool may include positions from any ply, including the standard initial position. With an empty book path, every game begins from the standard initial position. Iteration $r$ shuffles the pool with seed `--seed + r`.
+Let $\mathcal O_r$ be the finite pool of reachable nonterminal starting states available in iteration $r$. FCPI draws distinct members of $\mathcal O_r$ without replacement for its self-play games. The pool may contain positions from arbitrary plies, including the standard initial position. When no external pool is supplied, every game begins from the standard initial position. A deterministic seed derived from $r$ controls the order of the supplied pool.
 
-Self-play uses the frozen `closed` policy of $C_r$. Let $T_b$ be `--behavior-temperature`, and define the effective temperature
+Self-play uses the frozen `closed` policy of $C_r$. Let $T_b\geq0$ be the behavior temperature, and define the effective temperature
 
 $$
 \widetilde T_b=\max(T_b,10^{-4}).
@@ -396,9 +414,9 @@ a_n=\arg\max_{a\in\mathcal A(x)}
 \left[n\mu_{old}(a\mid s)-N_{n-1}(s,a)\right].
 $$
 
-The legal-move array determines the tie-break order. Before playing $a_t$, FCPI records the FEN of $x_t$, encoded position $s_t$, $V_{old}(s_t)$, legal action indices, $P_{old}(\cdot\mid s_t)$ and selected move $a_t$. The trajectory ends at a terminal state or after `--max-plies` recorded plies.
+The legal-move array determines the tie-break order. Before playing $a_t$, FCPI records the FEN of $x_t$, encoded position $s_t$, $V_{old}(s_t)$, legal action indices, $P_{old}(\cdot\mid s_t)$ and selected move $a_t$. Let $T_{\max}$ be the trajectory-length cap. The trajectory ends at a terminal state or after $T_{\max}$ recorded plies.
 
-### 8.3 Monte Carlo Target Construction
+### 8.3 Monte Carlo Targets
 
 Consider a completed trajectory containing pre-move states $x_0,\ldots,x_{T_{\mathrm{traj}}-1}$. Its final move reaches terminal state $x_{T_{\mathrm{traj}}}$. Starting from terminal outcome $z(x_{T_{\mathrm{traj}}})$, FCPI reverses perspective at each ply:
 
@@ -426,11 +444,11 @@ $$
 
 The selected move $a_t$ is the sole action with MC policy weight one in this record, and its signed coefficient is $A_{\mathrm{MC}}(s_t,a_t)$.
 
-### 8.4 Finite Counterfactual Tree Search
+### 8.4 Counterfactual Trees
 
-Before constructing counterfactual trees, FCPI deduplicates each trajectory by Gadus `PackedState` and keeps the first occurrence of each encoded position. Occurrences with the same `PackedState` produce the same network input, so this step prevents that input from generating multiple trees and receiving repeated weight within one trajectory. Each retained occurrence supplies the FEN that initializes the root of a separate tree, regardless of whether the trajectory ended naturally or reached the ply limit. The FEN restores the board, side to move, castling rights, en passant state and move counters. It does not contain positions visited earlier in the trajectory, so the reconstructed root begins with an empty repetition history. The tree records every move played after that root and applies the chess termination rules to the resulting descendants. It can therefore only detect a threefold repetition when all three occurrences of the repeated position lie on the path from the root to the current node.
+Before constructing counterfactual trees, FCPI deduplicates each trajectory by Gadus `PackedState` and keeps the first occurrence of each encoded position. Occurrences with the same `PackedState` produce the same network input, so this step prevents that input from generating multiple trees and receiving repeated weight within one trajectory. Each retained occurrence supplies the FEN that initializes the root of a separate tree, regardless of whether the trajectory ended naturally or reached the ply limit. Reconstructing the root from this FEN restores the board, side to move, castling rights, en passant state and move counters. The FEN does not contain positions visited earlier in the trajectory, so the reconstructed root begins with an empty repetition history. Tree construction records every move played after the root and applies the chess termination rules to each resulting descendant. It can therefore only detect a threefold repetition when all three occurrences of the repeated position lie on the path from the root to the current node.
 
-Let $B_{\mathrm{CF}}$ denote `--counterfactual-budget`. This budget limits the number of edges evaluated below the root of each tree. An edge evaluation plays one legal move and assigns the successor either its exact terminal outcome or $V_{old}$ from the frozen source model.
+Let $B_{\mathrm{CF}}\geq0$ be the counterfactual edge budget. This budget limits the number of edges evaluated below the root of each tree. An edge evaluation plays one legal move and assigns the successor either its exact terminal outcome or $V_{old}$ from the frozen source model.
 
 FCPI evaluates every legal root move outside this budget. Consequently, $B_{\mathrm{CF}}=0$ still yields a complete one-ply evaluation at the root, while $B_{\mathrm{CF}}>0$ permits further expansion of selected descendants.
 
@@ -455,7 +473,7 @@ g_a=-\log(-\log u_a),
 \quad u_a\sim U(0,1).
 $$
 
-FCPI selects the highest $k(a)$ values until the expansion set reaches width $w(x)$. The Gumbel generator uses seed `--seed + 3000017`.
+FCPI selects the highest $k(a)$ values until the expansion set reaches width $w(x)$. An independent deterministic random stream supplies the Gumbel variates.
 
 Each node in a counterfactual tree stores one environment state. For a given tree, let $\mathcal X_T$ be the set of terminal states stored in its nodes and let $\mathcal X_O$ be the set of stored nonterminal states that have legal moves. The leaf-evaluation function assigns the rule outcome to a state in $\mathcal X_T$ and the frozen source-model evaluation to a state in $\mathcal X_O$:
 
@@ -492,7 +510,7 @@ $$
 \overline V_{\mathrm{CF}}(\phi_G(x'))=V_{old}(\phi_G(x')).
 $$
 
-Let $E(x)\subseteq\mathcal A(x)$ be the moves evaluated explicitly at node $x$. Once the backed-up values of its evaluated children are available, node $x$ uses $s=\phi_G(x)$ and $x_a'=T(x,a)$ to define
+Let $E(x)\subseteq\mathcal A(x)$ be the moves evaluated explicitly at node $x$. Once the backed-up values of its evaluated children are available, define the edge values at $x$ using $s=\phi_G(x)$ and $x_a'=T(x,a)$:
 
 $$
 Q_{\mathrm{CF}}(s,a)=
@@ -506,7 +524,7 @@ $$
 
 An evaluated move that ends the game receives the exact terminal outcome from the parent's perspective. An evaluated nonterminal move receives the negated value backed up from its child. The final branch of the definition assigns $Q_{\mathrm{CF}}(s,a)=V_{old}(s)$ to every unevaluated move. Section 8.5 defines the backed-up value of an expanded node from its completed set of edge values.
 
-### 8.5 Policy-Value Targets
+### 8.5 Counterfactual Targets
 
 At an expanded node, the $P_{old}$-weighted mean of $Q_{\mathrm{CF}}$ is
 
@@ -522,7 +540,7 @@ $$
 \mathrm{clip}(P_{old}(a\mid s),10^{-12},1).
 $$
 
-The implementation fixes the counterfactual-policy temperature at $T_{\mathrm{CF}}=1$. Thus the target distribution is
+FCPI uses counterfactual-policy temperature $T_{\mathrm{CF}}=1$. The resulting target distribution is
 
 $$
 \pi^+(a\mid s)=
@@ -600,7 +618,7 @@ $$
 =\sum_{x\in\mathcal T_{\mathrm{exp}}}w_T(x)=1.
 $$
 
-### 8.6 Aggregation and Weighting
+### 8.6 Target Aggregation
 
 Each expanded decision node produces one training record. Records at tree roots include the MC targets inherited from self-play, and records below the root contain counterfactual targets. FCPI groups records with identical Gadus `PackedState` encodings across the iteration and verifies that every member of a group has the same legal-move list.
 
@@ -679,9 +697,9 @@ $$
 
 $S_A(s,a)$ is the weighted sum of MC advantage coefficients for selected move $a$ at encoded position $s$. $W_A(s,a)$ is the corresponding sample weight. The HDF5 datasets `mc_policy_advantage_sums` and `mc_policy_weights` store these two quantities.
 
-### 8.7 Joint Training Objective
+### 8.7 Training Objective
 
-Let $\ell_{new}(s,i_G(a))$ be the candidate logit for legal move $a$. The resulting legal-move policy is
+Let $\ell_{new}(s,i_G(a))$ be the trainable model's logit for legal move $a$. The resulting legal-move policy is
 
 $$
 P_{new}(a\mid s)=
@@ -689,7 +707,7 @@ P_{new}(a\mid s)=
 {\sum_{b\in\mathcal A_s}\exp\ell_{new}(s,i_G(b))}.
 $$
 
-The distribution $\mu_{new}(a\mid s)$ used by $L_{P,\mathrm{MC}}^{(\mathcal B)}$ applies the same behavior temperature as self-play:
+To obtain the distribution $\mu_{new}(a\mid s)$ used by $L_{P,\mathrm{MC}}^{(\mathcal B)}$, FCPI applies the self-play behavior temperature to the trainable logits:
 
 $$
 \mu_{new}(a\mid s)=
@@ -766,9 +784,76 @@ L_{P,\mathrm{MC}}^{(\mathcal B)}+
 L_V^{(\mathcal B)}.
 $$
 
-Automatic differentiation computes $\nabla_{\theta_{new}}L^{(\mathcal B)}$, and AdamW updates the policy head, value head and shared ResNet trunk. Every minibatch supplies its own weight denominators, so minibatches with different total weights are normalized independently.
+Every minibatch supplies its own weight denominators, so minibatches with different total weights are normalized independently. Section 8.8 defines the parameter updates obtained from this objective.
 
-### 8.8 Theoretical Analysis of Iterative Policy Shift
+### 8.8 Parameter Optimization
+
+Let $\mathcal D$ be the aggregated training set defined in Section 8.6. The source model that generated $\mathcal D$ remains fixed at $\theta_{old}$ while the trainable parameter sequence begins at $\theta^{(0)}$ as defined in Section 8.1.
+
+Let $E$ be the number of epochs, let $M$ be the minibatch size and let $K_{\max}\in\mathbb N\cup\{\infty\}$ be the update cap. At the beginning of each epoch, a seeded random generator permutes $\mathcal D$, and the resulting order is partitioned into minibatches. Concatenating these minibatch sequences and applying the update cap gives $\mathcal B_1,\ldots,\mathcal B_K$, where
+
+$$
+K=\min\left(K_{\max},E\left\lceil\frac{|\mathcal D|}{M}\right\rceil\right).
+$$
+
+For update $k$, the objective $L^{(\mathcal B_k)}$ is the sum defined in Section 8.7, and its parameter gradient is
+
+$$
+g_k=\nabla_{\theta^{(k-1)}}L^{(\mathcal B_k)}.
+$$
+
+FCPI clips the global Euclidean norm of this gradient to one. With $\varepsilon_c=10^{-6}$, the gradient supplied to the optimizer is
+
+$$
+\overline g_k=\alpha_k g_k,
+\qquad
+\alpha_k=\min\left(1,\frac{1}{\lVert g_k\rVert_2+\varepsilon_c}\right).
+$$
+
+BatchNorm layers use the running means $\mu_{j,old}$ and variances $\sigma^2_{j,old}$ stored by the source model. These statistics remain fixed throughout the update sequence, while the affine scale $\gamma_j^{(k)}$ and bias $\beta_j^{(k)}$ remain trainable. With $\varepsilon_{\mathrm{BN}}=10^{-5}$, layer $j$ therefore maps activation $u$ to
+
+$$
+\mathrm{BN}_j^{(k)}(u)=
+\gamma_j^{(k)}\odot
+\frac{u-\mu_{j,old}}{\sqrt{\sigma^2_{j,old}+\varepsilon_{\mathrm{BN}}}}
++\beta_j^{(k)}.
+$$
+
+The optimizer is AdamW with $\beta_1=0.9$, $\beta_2=0.999$, $\varepsilon_A=10^{-8}$ and weight-decay coefficient $\lambda=10^{-4}$. Starting from $m_0=v_0=0$, update $k$ computes
+
+$$
+m_k=\beta_1m_{k-1}+(1-\beta_1)\overline g_k,
+\qquad
+v_k=\beta_2v_{k-1}+(1-\beta_2)\overline g_k^2,
+$$
+
+$$
+\widehat m_k=\frac{m_k}{1-\beta_1^k},
+\qquad
+\widehat v_k=\frac{v_k}{1-\beta_2^k},
+$$
+
+and, for learning rate $\eta$,
+
+$$
+\theta^{(k)}=
+(1-\eta\lambda)\theta^{(k-1)}
+-\eta\frac{\widehat m_k}{\sqrt{\widehat v_k}+\varepsilon_A}.
+$$
+
+The square, division and square root in the AdamW equations act componentwise. After $K$ updates, the candidate parameters are $\theta_{new}=\theta^{(K)}$. CUDA may evaluate the network under BF16 autocasting, while the selected Policy logits, $V$ outputs, losses, optimizer parameters and saved candidate parameters remain in FP32.
+
+### 8.9 Acceptance and Promotion
+
+The iteration arena compares the candidate with the `current.pth` that generated its targets. If the candidate records $N_W$ wins, $N_D$ draws and $N_L$ losses, promotion occurs when
+
+$$
+N_W-N_L\geq M_{\mathrm{gate}}.
+$$
+
+An accepted candidate atomically replaces the run's `current.pth`. A rejected candidate leaves that file unchanged, so the same current model generates the next iteration's targets.
+
+### 8.10 Idealized Policy Shift
 
 Let the clipping floor $10^{-12}$ tend to zero, and suppose the candidate fits $\pi^+$ exactly. For two actions $a$ and $b$ at the same state,
 
@@ -793,83 +878,3 @@ k>
 $$
 
 This statement applies to one fixed state, one fixed action pair and a constant $\Delta$.
-
-### 8.9 Training Implementation and Target Storage
-
-Each iteration initializes the candidate from that iteration's `current.pth` and creates a new AdamW optimizer with weight decay $10^{-4}$. The training process initializes its random generator from `--seed` and uses that generator to shuffle records before every epoch. A positive `--train-max-steps` limits the number of optimizer steps, while a zero or negative value allows `--epochs` to determine the training length.
-
-The model remains in `eval()` mode during FCPI training, which keeps BatchNorm running statistics fixed while preserving parameter gradients. Global gradient-norm clipping uses threshold one. CUDA forward computation uses BF16 when `--precision bf16` is selected. The policy logits, $V$ outputs, loss calculations and checkpoint parameters use FP32.
-
-Each iteration writes an HDF5 target file containing `policy_targets`, `policy_weights`, `mc_policy_advantage_sums`, `mc_policy_weights`, `mc_value_targets`, `mc_value_weights`, `tree_value_targets` and `tree_value_weights`. The file is a persistent record of the aggregated targets. Candidate training consumes the same aggregated records from memory.
-
-For reporting, the metrics `value_mc` and `value_tree` normalize each value-loss component by its own weight. Backpropagation uses the minibatch loss $L_V^{(\mathcal B)}$ defined above.
-
-### 8.10 Acceptance and Promotion
-
-The iteration arena compares the candidate with the `current.pth` that generated its targets. If the candidate records $N_W$ wins, $N_D$ draws and $N_L$ losses, promotion occurs when
-
-$$
-N_W-N_L\geq\texttt{--eval-min-net-wins}.
-$$
-
-An accepted candidate atomically replaces the run's `current.pth`. A rejected candidate leaves that file unchanged, so the same current model generates the next iteration's targets.
-
-Every FCPI invocation assigns a run identifier of the form `fcpi_YYYYMMDD_HHMMSS_id` and creates the following artifacts:
-
-```text
-data/runs/<run-id>/
-	fcpi_iter_001.h5
-	summary.json
-models/runs/<run-id>/
-	initial.pth
-	current.pth
-	candidate_iter_001.pth
-```
-
-## 9. Opening Books
-
-FCPI sampling books contain reachable nonterminal states from arbitrary plies, covering both balanced and unbalanced positions. FCPI selects this position pool with `--opening-book` and limits the loaded pool with `--max-book-positions`.
-
-Paired arena evaluation uses positions sampled at a fixed ply and filtered by a UCI evaluation bound. Each selected position is played once with each color assignment.
-
-## 10. UCI Engine
-
-### 10.1 Evaluation Output
-
-The engine reports MultiPV lines, side-to-move `score cp`, nodes, NPS, elapsed time and a one-move PV. Let $V_{root}$ denote the root evaluation returned by search. In `closed` mode, $V_{root}=V_\theta(s)$. After MCTS completes at least one simulation, $V_{root}$ is the mean return backed up to the root. A visited MCTS root edge reports $q_{line}=Q(s,a)$, while an unvisited root edge reports $q_{line}=V_{root}$. Let $c_s$ be `ScoreScale`. The displayed score is
-
-$$
-score\_cp=\mathrm{round}\left(
-c_s\mathrm{clip}(q_{line},-0.999,0.999)
-\right).
-$$
-
-### 10.2 Options
-
-Gadus exposes the following UCI options.
-
-- `ModelPath` selects a Gadus checkpoint. A packaged engine defaults to `gadus.pth` in the executable directory.
-- `Device` selects `auto`, `cpu` or `cuda`.
-- `Threads` sets the number of LibTorch CPU computation threads and defaults to `2`. This option does not affect CUDA inference.
-- `EvalCacheMB` sets the approximate memory ceiling for compact Policy/Value evaluations retained across `go` commands and defaults to `256`. A zero value disables cross-search retention. Each search still deduplicates repeated network inputs within that search. The cache contains no MCTS nodes, visits or action-value statistics. `ucinewgame`, `ModelPath` changes and `Device` changes discard its contents automatically.
-- `SearchType` selects direct policy ranking with `closed` or Gadus MCTS with `only-mcts`. Both modes apply the enabled final decision components.
-- `MCTSSims` sets the MCTS simulation cap and defaults to `100`. A UCI command `go nodes <n>` uses `<n>` as the current cap.
-- `MCTSMinSims` sets the nominal minimum simulation count before dynamic budgeting and defaults to `0`. A zero value activates the formula derived from the cap and batch size. A time limit or UCI `stop` command may end search before this count is reached.
-- `MCTSBatchSize` sets the neural leaf batch size and defaults to `32`.
-- `MoveOverheadMS` reserves communication and move-submission time from a clock allocation. Its default is `50`.
-- `CPuct`, `CPuctBase` and `CPuctFactor` set the PUCT exploration schedule and default to `0.5`, `19652` and `1.0`.
-- `FPUReduction` sets the FPU reduction and defaults to `0.15`.
-- `VirtualLoss` sets the repeated-path penalty within one batched selection and defaults to `0.0`.
-- `RepetitionPolicyPenalty` sets $\lambda_R$ in the RPP decision component, accepts $[0,1]$ and defaults to `0.0`.
-- `InstantMateFirst` enables IMF and defaults to `false`.
-- `ProgressIntervalMS` sets the interval between intermediate UCI `info` reports and defaults to `750`. A zero interval suppresses intermediate reports.
-- `MultiPV` sets the number of reported analysis lines and defaults to `5`.
-- `ScoreScale` sets $c_s$ for converting the engine's dimensionless evaluation to the displayed centipawn scale and defaults to `1000`.
-
-The `go movetime` command supplies a fixed time budget directly. When `go` supplies the active side's remaining time and increment, the engine subtracts `MoveOverheadMS` from the allocation $t_{remain}/30+0.75t_{inc}$, bounds the result between 50 and 10000 milliseconds and then limits it to the usable remaining time. A `go` command without `movetime` or clock fields imposes no time limit.
-
-The engine publishes its direct policy ranking when search begins and publishes intermediate MCTS results at intervals of `ProgressIntervalMS`. Search limits and the UCI `stop` command determine the final result.
-
-## 11. Implementation Tests
-
-The build process runs the Gadus CTest executable before publishing binaries. The test suite covers `gadus_18_planes`, ordinary and special action encoding, terminal-state detection, policy and value output shapes, finite numerical results, backward propagation, checkpoint round trips, `closed` search and batched MCTS.
