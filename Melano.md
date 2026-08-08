@@ -200,13 +200,33 @@ $$
 \ell_\theta(s,64q+k)=\frac{u_q\cdot v_k}{\sqrt C}.
 $$
 
-A third linear map produces nine underpromotion logits from each normalized source token. Its output order matches the underpromotion index formula in Section 2.2. Flattening the $64\times64$ source-destination matrix and the $64\times9$ underpromotion matrix gives
+A third linear map produces nine underpromotion logits from each normalized source token:
+
+$$
+c_q=W_U\mathrm{LN}(z_q)+b_U\in\mathbb R^9.
+$$
+
+For $m\in\{0,\ldots,8\}$, the underpromotion logit is
+
+$$
+\ell_\theta(s,4096+9q+m)=c_{q,m}.
+$$
+
+The component order of $c_q$ matches the underpromotion index formula in Section 2.2. Flattening the $64\times64$ source-destination matrix and the $64\times9$ underpromotion matrix gives
 
 $$
 \ell_\theta(s)\in\mathbb R^{4672}.
 $$
 
-Inference and search normalize the logits only over legal moves:
+Search supplies an encoded-state batch $\mathbf s=(s_1,\ldots,s_n)$ and a matrix $J\in\mathcal I_M^{n\times L}$ of requested legal-action indices. For an ordinary index $J_{rj}=64q+k$, the legal-action forward pass computes only $u_q\cdot v_k/\sqrt C$. For an underpromotion index $J_{rj}=4096+9q+m$, it applies the underpromotion map to source token $q$ and selects component $m$. The resulting tensor
+
+$$
+\Lambda_\theta(\mathbf s,J)_{rj}=\ell_\theta(s_r,J_{rj})
+$$
+
+contains the same requested logits as the complete Policy vector without constructing logits for unrequested actions.
+
+For a game state $x$ with $s=\phi_M(x)$, legal-move inference normalizes the logits over $\mathcal A(x)$:
 
 $$
 P_\theta(a\mid s)=
@@ -234,7 +254,7 @@ f_\theta(s)=\left(\ell_\theta(s),V_\theta(s)\right),
 \ell_\theta(s)\in\mathbb R^{4672},\quad V_\theta(s)\in[-1,1].
 $$
 
-The state embedding and the $B$ geometry-attention blocks form the backbone shared by the Policy and Value heads. Gradients from both supervised objectives therefore update the shared representation $E_\theta$.
+The state embedding and the $B$ geometry-attention blocks form the backbone shared by the Policy and Value heads.
 
 ## 4. Preprocessing
 
@@ -266,7 +286,7 @@ When the final game result provides the targets, a win from the perspective of t
 
 ### 4.2 HDF5 Schema
 
-Preprocessing creates a new HDF5 file and writes the following identifying attributes:
+Preprocessing creates an HDF5 file with the following identifying attributes:
 
 ```text
 arch_type=melano
@@ -292,7 +312,7 @@ The row-aligned datasets are
 
 All three datasets are extensible along their first dimension and use a common positive row count per HDF5 chunk. Optional compression applies the HDF5 shuffle filter followed by deflate. Final file attributes record the number of accepted games, written positions, skipped SAN moves and games rejected for lacking a parseable evaluation when comments provide the targets.
 
-The training reader validates the architecture, state codec, move codec, target schema, nonempty row count, state width and row alignment of all three datasets before constructing a batch.
+A valid Melano dataset has the identifying attributes above, a nonempty state array of width 67 and equal row counts across all three datasets.
 
 ## 5. Supervised Training
 
@@ -327,7 +347,9 @@ $$
 L_{\mathrm{sup}}=L_{P,\mathrm{sup}}+w_VL_{V,\mathrm{sup}}.
 $$
 
-Training creates a new model with channel count $C$ and block count $B$, then optimizes all parameters with AdamW. The loader shuffles HDF5 chunks, reads one subsequent chunk asynchronously while the current chunk is processed and independently shuffles rows within each loaded chunk. CUDA training allocates pinned host tensors and uses nonblocking device transfers.
+Because the Policy and Value heads receive the shared representation $E_\theta$, gradients from both loss terms contribute to updates of the state embedding and geometry-attention blocks.
+
+Training initializes a model with channel count $C$ and block count $B$, then optimizes all parameters with AdamW. The loader shuffles HDF5 chunks, reads the next chunk asynchronously while processing another chunk and independently shuffles rows within each loaded chunk.
 
 Let $N$ be the number of HDF5 rows and let $m$ be the minibatch size. The number of optimizer steps in one epoch is
 
@@ -357,19 +379,52 @@ $$
 
 Thus the schedule uses linear warmup followed by inverse-square-root decay. A deterministic seed controls parameter initialization and both shuffle stages. Let $g_{\max}>0$ be the gradient-norm limit. Before each AdamW step, training clips the global gradient norm to $g_{\max}$ and terminates when that norm is nonfinite.
 
-In FP32 training, the forward pass and both losses use float32. BF16 training requires CUDA and applies BF16 autocast to the forward pass, while Policy logits, Value predictions and losses are converted to float32 before loss evaluation.
-
 Let $K_{\mathrm{save}}>0$ be the periodic checkpoint interval. Training writes a checkpoint whenever the optimizer-step count is divisible by $K_{\mathrm{save}}$, after every processed epoch pass and after the final partial pass imposed by $K_{\max}$. The top-level archive contains `model` and `arch`. The architecture archive stores type identifier 2, $C$, $B$ and action size 4672 as integer tensors. Saving first writes a sibling `.tmp` file and then atomically replaces the destination. Loading validates every architecture field before constructing the model and restoring its parameters.
 
 ## 6. Search
 
 ### 6.1 Search Modes
 
-In `closed` mode, search evaluates the root once and derives its initial move ranking from $P_\theta(a\mid s)$. In `only-mcts` mode with a positive simulation cap, search evaluates exact-state leaves in neural batches and derives its initial ranking from the resulting MCTS root distribution. An `only-mcts` search with a zero simulation cap returns the same legal Policy distribution as `closed`. In either mode, search subsequently applies the enabled IMF and RPP decision components defined in Section 6.4.
+In `closed` mode, search evaluates the root once and derives its initial move ranking from $P_\theta(a\mid s)$. In `only-mcts` mode with a positive simulation cap, search evaluates exact-state leaves in neural batches and derives its initial ranking from the resulting MCTS root distribution. An `only-mcts` search with a zero simulation cap returns the same legal Policy distribution as `closed`. In either mode, search subsequently applies the enabled IMF and RPP decision components defined in Section 6.6.
 
-With FP32 search precision, neural evaluation uses float32. BF16 search precision requires CUDA, applies BF16 autocast to the forward pass and converts the legal Policy and Value results to float32 before tree operations.
+### 6.2 Neural Evaluation Representation
 
-In `only-mcts` mode, search initializes the root with one outgoing edge $(s,a)$ for every legal action and stores $P_\theta(a\mid s)$ as the edge prior $P(s,a)$. The prior remains fixed throughout the search. Let $N(s,a)$ be the completed visit count of edge $(s,a)$ and let $N(s)=\sum_aN(s,a)$ be the completed visit count of node $s$.
+For a neural batch $\mathbf s=(s_1,\ldots,s_n)$, let $L$ be the largest legal-move count in the batch. Search constructs the legal-action matrix $J\in\mathcal I_M^{n\times L}$ and a mask $M\in\{0,1\}^{n\times L}$. Entries with $M_{rj}=1$ identify legal actions, while entries with $M_{rj}=0$ pad shorter rows. The legal-action forward pass defined in Section 3.2 returns $\Lambda_\theta(\mathbf s,J)$ and $(V_\theta(s_1),\ldots,V_\theta(s_n))$. Search replaces padded logits with $-\infty$ and applies softmax across each row, so the resulting probabilities are normalized over the legal actions of each state.
+
+Selections from independent roots share neural batches. Duplicate selections of the same nonterminal leaf within one root batch are discarded before neural evaluation. The remaining requests are grouped by their 67-token encoded state, and all requests in one group share one network evaluation.
+
+Each evaluated state produces a compact record containing its legal moves, action indices, legal-move probabilities and $V_\theta(s)$. Root initialization and leaf expansion create one edge from each aligned legal-move entry without constructing a 4672-entry Policy vector.
+
+Let $p(a)$ denote the distribution supplied by direct Policy inference or by the MCTS root visit calculation. A final search result or progress snapshot materializes the public action-space representation
+
+$$
+p_{\mathrm{dense}}(i\mid s)=
+\begin{cases}
+p(a),&i=i_M(a)\text{ for }a\in\mathcal A(x),\\
+0,&i\notin\{i_M(a):a\in\mathcal A(x)\}.
+\end{cases}
+$$
+
+### 6.3 Evaluation Reuse
+
+Let $k(s)$ be the 67-byte state encoding defined in Section 2.1. A cached evaluation associates $k(s)$ with the compact record defined in Section 6.2. Equality of cache keys therefore means equality of every feature supplied to the network. Rule-terminal detection precedes neural evaluation, so a terminal leaf contributes its rule outcome without consulting the cache.
+
+Each search call creates a local evaluation cache. This cache removes repeated neural evaluations across batches and independent roots within that call. A positive cross-search capacity selects a persistent TLRU (trajectory-aware least-recently-used) cache instead. Setting the capacity to zero selects the local cache and discards its records when the search call returns.
+
+An exact lookup moves its entry to the most-recent end of the LRU order. When an evaluated transition connects cached parent key $k_p$ to cached child key $k_c$, TLRU records the directed relation $k_p\rightarrow k_c$ without changing the recency of either entry. For the root key $k_r$ of a search call, define
+
+$$
+\mathcal N_2(k_r)=
+\left\{k:\ d_C(k_r,k)\leq2\right\},
+$$
+
+where $d_C$ is the shortest directed-path length through recorded relations. Before root evaluation, TLRU moves entries in $\mathcal N_2(k_r)$ to the most-recent end in descending distance order. The resulting order places the root first, followed by its one-ply descendants and then its two-ply descendants. When the approximate byte capacity is exceeded, eviction removes entries from the least-recent end.
+
+The cache stores network Policy and Value outputs. Each search call creates an independent MCTS tree with zero visits, zero virtual visits and zero accumulated returns.
+
+### 6.4 PUCT Selection
+
+In `only-mcts` mode, search initializes the root with one outgoing edge $(s,a)$ for every legal action and stores $P_\theta(a\mid s)$ as the edge prior $P(s,a)$. The child edges of one node occupy one contiguous array whose capacity equals the legal-action count at expansion. The prior remains fixed throughout the search. Let $N(s,a)$ be the completed visit count of edge $(s,a)$ and let $N(s)=\sum_aN(s,a)$ be the completed visit count of node $s$.
 
 During batched selection, a virtual visit reserves every node on a selected path until the corresponding terminal or neural evaluation has been backed up. Let $N_v(s,a)$ be the virtual-visit count of edge $(s,a)$ and let $N_v(s)=\sum_aN_v(s,a)$. Selection uses the augmented counts
 
@@ -378,8 +433,6 @@ $$
 \qquad
 \widetilde N(s)=N(s)+N_v(s).
 $$
-
-### 6.2 PUCT Selection
 
 Let $c_0$ be the initial exploration coefficient, let $b_0$ be its schedule base and let $f_0$ be its schedule factor. Define $b=\max(1,b_0)$ and $f=\max(0,f_0)$. The visit-dependent exploration coefficient is
 
@@ -394,7 +447,7 @@ $$
 Q(s,a)=-Q(s_a).
 $$
 
-For an unvisited edge, First Play Urgency uses the parent value and the prior mass already visited. Let $r_{\mathrm{FPU}}\geq0$ be the FPU reduction coefficient. The selection estimate is
+For an unvisited edge, First Play Urgency uses the parent value and the prior mass already visited. A node initializes this mass to zero and adds $P(s,a)$ when edge $(s,a)$ receives its first completed visit. Let $r_{\mathrm{FPU}}\geq0$ be the FPU reduction coefficient. The selection estimate is
 
 $$
 Q_{\mathrm{sel}}(s,a)=
@@ -418,8 +471,6 @@ $$
 
 Equal selection scores are ordered by descending $P(s,a)$ and then by descending $Q_{\mathrm{sel}}(s,a)$.
 
-Selections from independent roots share neural batches. Each selected nonterminal leaf is encoded from its exact `chess::Board` state, evaluated by the Melano network and expanded with one child per legal move. Duplicate selections of the same nonterminal leaf within one root batch are discarded before neural evaluation. The CUDA path transfers compact legal-action indices and masks, gathers only legal logits on the device and converts the resulting legal Policy and Value to float32 on the CPU.
-
 When search ends, each legal root move receives weight $N(s,a)+P(s,a)$. Normalizing these weights gives
 
 $$
@@ -428,7 +479,7 @@ P_{\mathrm{root}}(a\mid s)=
 {\displaystyle\sum_{a'\in\mathcal A(x)}\left(N(s,a')+P(s,a')\right)}.
 $$
 
-### 6.3 Dynamic Simulation Budget
+### 6.5 Dynamic Simulation Budget
 
 Let $N_{\mathrm{cap}}\geq0$ be the simulation cap, let $B_{\mathrm{batch}}\geq1$ be the neural batch capacity and let $N_{\mathrm{floor}}\geq0$ be the simulation-floor parameter. The nominal minimum simulation count is
 
@@ -481,7 +532,7 @@ $$
 
 For a root with one legal action, search sets $u=0$ and $N_{\mathrm{target}}=N_{\min}$. The search loop checks $N_{\mathrm{cap}}$ and $N_{\mathrm{target}}$ between batch-construction passes. Work completed inside the current pass is included in the final statistics, which makes the reported simulation limit a batched soft cap.
 
-### 6.4 Final Decision Components
+### 6.6 Final Decision Components
 
 The optional IMF, or Instant Mate First, and RPP, or Repetition Policy Penalty, components modify the final ranking after Policy evaluation or MCTS. Before either component is applied, the ranking score is
 

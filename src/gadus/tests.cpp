@@ -235,6 +235,19 @@ int main() {
 		const auto mcts_result = mcts_searcher.search(board);
 		require(mcts_result.sims_completed == 4, "MCTS simulation budget mismatch");
 		require(mcts_result.expanded_nodes > 0, "MCTS did not expand a node");
+
+		// A searched child becomes the next root and reuses its exact evaluation through TLRU.
+		auto trajectory_options = mcts_options;
+		trajectory_options.evaluation_cache_mb = 1;
+		gadus::Searcher trajectory_searcher(loaded, torch::Device(torch::kCPU), trajectory_options);
+		const auto trajectory_root = trajectory_searcher.search(board);
+		auto trajectory_child = board;
+		trajectory_child.makeMove(trajectory_root.move);
+		const auto trajectory_next = trajectory_searcher.search(trajectory_child);
+		require(trajectory_next.evaluation_reuses > 0,
+				"trajectory-aware cache did not reuse the searched child root");
+		require(trajectory_next.sims_completed == trajectory_options.mcts_sims,
+				"trajectory-aware cache changed the simulation budget");
 		std::filesystem::remove(checkpoint);
 
 		std::cout << "gadustests passed" << std::endl;

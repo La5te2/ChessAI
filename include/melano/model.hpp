@@ -2,10 +2,10 @@
 
 // Melano geometry-aware transformer with a shared exact-state encoder and policy/value heads.
 
-#include <cstdint>
-#include <tuple>
-#include <torch/nn.h>
 #include "melano/game.hpp"
+#include <cstdint>
+#include <torch/nn.h>
+#include <tuple>
 
 namespace melano {
 
@@ -57,6 +57,8 @@ struct ActionHeadImpl : torch::nn::Module {
 	explicit ActionHeadImpl(int channels);
 	/// Maps 64 square tokens to Melano's 4672 action logits.
 	torch::Tensor forward(torch::Tensor square_tokens);
+	/// Computes logits only for the requested Melano action indices [batch, legal_width].
+	torch::Tensor forward_legal(torch::Tensor square_tokens, torch::Tensor legal_indices);
 
 	torch::nn::LayerNorm norm{nullptr};
 	torch::nn::Linear from_proj{nullptr};
@@ -81,6 +83,9 @@ struct ModelImpl : torch::nn::Module {
 	ModelImpl(int channels = 128, int blocks = 10);
 	/// Returns policy logits and side-to-move V(s) for an exact board state.
 	std::tuple<torch::Tensor, torch::Tensor> forward(torch::Tensor state);
+	/// Returns legal-action logits [batch, legal_width] and the same side-to-move V(s).
+	std::tuple<torch::Tensor, torch::Tensor> forward_legal(torch::Tensor state,
+														   torch::Tensor legal_indices);
 
 	StateEmbedding state_embedding{nullptr};
 	torch::nn::Sequential trunk{nullptr};

@@ -21,7 +21,7 @@ Gadus is a residual policy-value network for chess with an AlphaZero-style actio
 
 The `gadus_18_planes` state encoding uses planes 0 through 5 for White pawn, knight, bishop, rook, queen and king, followed by the corresponding six Black piece planes. Plane 12 is filled with ones when White is to move and zeros when Black is to move. Planes 13 through 16 represent White kingside, White queenside, Black kingside and Black queenside castling rights. Plane 17 marks the en passant file on every rank when an en passant square exists.
 
-Squares use the order `a1` through `h8`. Within each plane, rank 1 is stored before rank 2 and so forth. Each rank occupies one byte whose most significant bit represents file `a` and whose least significant bit represents file `h`. This packing gives an HDF5 state size of $18\times8$ bytes.
+Squares use the order `a1` through `h8`. Within each plane, rank 1 is stored before rank 2 and so forth. Each rank occupies one byte whose most significant bit represents file `a` and whose least significant bit represents file `h`. This packing gives a fixed state representation of $18\times8=144$ bytes.
 
 The `alphazero_64x73` action encoding assigns 73 action planes to each source square. Its action index is $73q+p$, where $q\in\{0,\ldots,63\}$ is the source square and $p\in\{0,\ldots,72\}$ is the action plane. Planes 0 through 55 encode distances 1 through 7 in the ordered rank-file directions $(-1,-1)$, $(-1,0)$, $(-1,1)$, $(0,-1)$, $(0,1)$, $(1,-1)$, $(1,0)$ and $(1,1)$. Planes 56 through 63 encode knight offsets $(-2,-1)$, $(-2,1)$, $(-1,-2)$, $(-1,2)$, $(1,-2)$, $(1,2)$, $(2,-1)$ and $(2,1)$.
 
@@ -31,7 +31,7 @@ $$
 |\mathcal I_G|=64\times(56+8+9)=4672.
 $$
 
-`PackedState` is the fixed byte representation produced by `gadus_18_planes`. FCPI uses it as the grouping key for positions that have identical network inputs.
+`PackedState` is the fixed byte representation produced by `gadus_18_planes`. Complete states with the same `PackedState` produce the same network input.
 
 ## 3. Network
 
@@ -81,9 +81,25 @@ P_\theta(a\mid s)=
 {\displaystyle \sum_{b\in\mathcal A(x)}\exp \ell_\theta(s,i_G(b))}.
 $$
 
-Supervised training evaluates all 4672 rows of the final Policy linear map. During inference, Gadus evaluates only the rows indexed by $i_G(a)$ for legal moves $a\in\mathcal A(x)$. This restricted linear projection produces the same legal-move logits used in the definition of $P_\theta$ above.
+The normalization above depends only on logits associated with legal moves. During inference, Gadus therefore evaluates only the rows of the final Policy linear map indexed by $i_G(a)$ for legal moves $a\in\mathcal A(x)$. Let $W_P\in\mathbb R^{4672\times2048}$ and $b_P\in\mathbb R^{4672}$ be the parameters of this map, and let $h_P(s)\in\mathbb R^{2048}$ be its input. The restricted projection is
 
-The inference model also replaces each convolution-and-BatchNorm pair with an equivalent convolution whose weights and bias incorporate the frozen BatchNorm statistics. Four-dimensional inference tensors use the channels-last memory format. Both transformations exist only in the in-memory inference graph. They neither rewrite the source checkpoint nor change the network function $f_\theta$.
+$$
+\ell_\theta(s,i_G(a))=
+W_{P,i_G(a)}h_P(s)+b_{P,i_G(a)},
+\qquad a\in\mathcal A(x).
+$$
+
+Selecting these rows preserves every logit used to compute $P_\theta$.
+
+The inference model also replaces each convolution-and-BatchNorm pair with an equivalent convolution. For output channel $o$, let $W_o$ be the bias-free convolution weights, and let $\mu_o$, $\sigma_o^2$, $\gamma_o$, $\beta_o$ and $\epsilon$ be the frozen BatchNorm mean, variance, scale, offset and stability constant. The fused parameters are
+
+$$
+W'_o=\frac{\gamma_o}{\sqrt{\sigma_o^2+\epsilon}}W_o,
+\qquad
+b'_o=\beta_o-\frac{\gamma_o\mu_o}{\sqrt{\sigma_o^2+\epsilon}}.
+$$
+
+This substitution preserves the output of the convolution-and-BatchNorm pair in evaluation mode. Four-dimensional inference tensors use the channels-last memory format. Fusion and layout conversion affect only the in-memory inference graph; they neither rewrite the source checkpoint nor change the network function $f_\theta$.
 
 ## 4. Preprocessing
 
@@ -155,7 +171,7 @@ $$
 K=\min\left(K_{\max},E\left\lceil\frac Nm\right\rceil\right).
 $$
 
-A deterministic random seed controls parameter initialization and dataset shuffling. Training may evaluate the network entirely in FP32 or apply BF16 autocasting to CUDA forward computation. The Policy softmax, loss calculations, metric accumulation and checkpoint parameters remain in FP32. CUDA training batches use pinned host memory.
+A deterministic random seed controls parameter initialization and dataset shuffling.
 
 Each checkpoint contains exactly two top-level keys:
 
@@ -220,15 +236,34 @@ P_{\mathrm{root}}(a\mid s)=
 {\displaystyle\sum_{a'\in\mathcal A(x)}\left(N(s,a')+P(s,a')\right)}.
 $$
 
-### 6.3 Neural Evaluation Cache
+### 6.3 Neural Evaluation Representation and Cache
 
-Evaluating a nonterminal state produces a compact record containing its legal moves, their action indices, the legal-move probabilities $P_\theta(a\mid s)$ and the state evaluation $V_\theta(s)$. Within one search call, inputs with the same Gadus `PackedState` share this record and therefore require one network evaluation. Search consults the cache only for root evaluation in `closed` mode and for both root and leaf evaluation in `only-mcts` mode.
+Evaluating a nonterminal state produces a compact record containing its legal moves, their action indices, the legal-move probabilities $P_\theta(a\mid s)$ and the state evaluation $V_\theta(s)$. The `closed` path and MCTS tree expansion consume the aligned legal-action arrays without constructing a 4672-entry Policy vector.
 
-When cross-search retention has positive capacity, the searcher retains compact evaluation records across successive search calls. The cache applies least-recently-used eviction when its approximate memory ceiling is reached. Zero capacity limits evaluation reuse to the current search call.
+Let $p(a)$ denote the legal distribution that supplies the result: $P_\theta(a\mid s)$ for direct Policy output and $P_{\mathrm{root}}(a\mid s)$ after MCTS. When search assembles its final result or a progress snapshot, it materializes the dense representation
+
+$$
+p_{\mathrm{dense}}(i\mid s)=
+\begin{cases}
+p(a),&i=i_G(a)\text{ for }a\in\mathcal A(x),\\
+0,&i\notin\{i_G(a):a\in\mathcal A(x)\}.
+\end{cases}
+$$
+
+Within one search call, inputs with the same Gadus `PackedState` share the compact record and therefore require one network evaluation. Different simulations can reuse the record when distinct tree nodes reach the same encoded state, while an expanded node reads its evaluation from the node itself. Search consults the cache only for root evaluation in `closed` mode and for both root and leaf evaluation in `only-mcts` mode.
+
+When cross-search retention has positive capacity, the searcher retains compact evaluation records across successive search calls using TLRU (trajectory-aware least-recently-used). Each successful lookup moves the corresponding entry to the most-recent end of the recency order. When MCTS evaluates a child state whose parent evaluation is present in the cache, TLRU records a directed link from the parent entry to the child entry.
+
+Let $\mathcal C$ be the set of retained entries, and let $E_C\subseteq\mathcal C\times\mathcal C$ be the recorded parent-child links. For a new search root $r\in\mathcal C$, define its retained trajectory neighborhood as
+
+$$
+\mathcal N_2(r)=
+\left\{y\in\mathcal C:d_C(r,y)\leq2\right\},
+$$
+
+where $d_C(r,y)$ is the length of the shortest directed path from $r$ to $y$ through recorded links. At the beginning of a search call with root $r$, TLRU moves entries in $\mathcal N_2(r)$ to the most-recent end in descending distance order. The resulting order places the root first, followed by its one-ply descendants and then its two-ply descendants. Lookups and insertions update the same recency order. When the approximate memory ceiling is exceeded, TLRU removes entries from the least-recent end. Zero cross-search capacity creates a cache for one search call and discards it when that call ends.
 
 Rule-terminal detection precedes every cache lookup, so an exact outcome determined by the current game history supplies the leaf value directly. Each search call constructs a new MCTS tree and initializes new visit counts, virtual visits and $Q$ estimates. The cache reuses network outputs without reusing search statistics.
-
-FCPI target generation and arena evaluation assign zero capacity to cross-search retention, so their evaluation records remain local to one batched search call.
 
 ### 6.4 Dynamic Simulation Budget
 
@@ -450,7 +485,7 @@ Before constructing counterfactual trees, FCPI deduplicates each trajectory by G
 
 Let $B_{\mathrm{CF}}\geq0$ be the counterfactual edge budget. This budget limits the number of edges evaluated below the root of each tree. An edge evaluation plays one legal move and assigns the successor either its exact terminal outcome or $V_{old}$ from the frozen source model.
 
-FCPI evaluates every legal root move outside this budget. Consequently, $B_{\mathrm{CF}}=0$ still yields a complete one-ply evaluation at the root, while $B_{\mathrm{CF}}>0$ permits further expansion of selected descendants.
+FCPI evaluates every legal root move outside this budget. Consequently, $B_{\mathrm{CF}}=0$ yields a complete one-ply evaluation at the root, while $B_{\mathrm{CF}}>0$ permits further expansion of selected descendants.
 
 Let $B_{\mathrm{rem}}$ be the number of evaluations from $B_{\mathrm{CF}}$ that remain when FCPI expands non-root node $x$. For $B_{\mathrm{rem}}>0$, the expansion width is
 
@@ -841,7 +876,7 @@ $$
 -\eta\frac{\widehat m_k}{\sqrt{\widehat v_k}+\varepsilon_A}.
 $$
 
-The square, division and square root in the AdamW equations act componentwise. After $K$ updates, the candidate parameters are $\theta_{new}=\theta^{(K)}$. CUDA may evaluate the network under BF16 autocasting, while the selected Policy logits, $V$ outputs, losses, optimizer parameters and saved candidate parameters remain in FP32.
+The square, division and square root in the AdamW equations act componentwise. After $K$ updates, the candidate parameters are $\theta_{new}=\theta^{(K)}$.
 
 ### 8.9 Acceptance and Promotion
 

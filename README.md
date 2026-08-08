@@ -377,10 +377,11 @@ Preprocess a PGN into the architecture-locked Eleginus Value schema with:
 
 ```bash
 build/eleginus/preprocess \
-	--input data/games.cmt.pgn \
+	--input data/ccrl.pgn \
 	--output data/games.eleginus.h5 \
 	--has-cmt 1 \
-	--compression-level 4
+	--compression-level 4 \
+	--max-games 500000
 ```
 
 The HDF5 file uses the same `states`, `moves` and `values` dataset names as Gadus and Melano, but
@@ -395,7 +396,7 @@ Train a new Eleginus Value network with:
 build/eleginus/train \
 	--data data/games.eleginus.h5 \
 	--out models/eleginus/eleginus.pth \
-	--epochs 10 \
+	--epochs 2 \
 	--batch-size 512 \
 	--lr 0.001 \
 	--device cuda \
@@ -406,7 +407,7 @@ Eleginus uses the same `--max-steps` convention: a positive value caps optimizer
 
 This command trains the sole Eleginus Value network. Supplying `--model existing.pth` initializes
 the training run from those parameters, while omitting it initializes a new Value model. Each run
-constructs a new AdamW optimizer. Eleginus currently defines no self-learning procedure.
+constructs an AdamW optimizer with fresh state. Eleginus training consists of supervised optimization.
 
 The `.pth` checkpoint is the only standalone Eleginus weight file. Like the other architecture
 checkpoints, its top level contains `model` and `arch`; the latter identifies Eleginus with
@@ -423,9 +424,9 @@ into a copy of the standalone search template and analyze one position:
 build/eleginus/embed \
 	--model models/eleginus/eleginus.pth \
 	--input build/eleginus/search \
-	--output models/eleginus/eleginus-search
+	--output models/eleginus/eleginus
 
-models/eleginus/eleginus-search \
+models/eleginus/eleginus \
 	--fen startpos \
 	--expansions 32
 ```
@@ -509,7 +510,7 @@ Gadus and Melano expose these shared options:
 - `MultiPV` sets the number of reported root lines and defaults to `5`.
 - `ScoreScale` sets $c_s$ in the displayed-score equation and defaults to `1000`.
 
-Gadus additionally exposes `Threads`, which controls LibTorch CPU threads and defaults to `2`, and `EvalCacheMB`, which defaults to `256`. A positive `EvalCacheMB` retains compact Policy and Value evaluations across successive `go` commands with least-recently-used eviction. Each search still builds a new MCTS tree. Setting the option to zero disables cross-search retention while preserving duplicate-evaluation removal within the current search. `ucinewgame`, `ModelPath` changes and `Device` changes clear the retained evaluations.
+Gadus and Melano expose `Threads`, which controls LibTorch CPU threads and defaults to `2`, and `EvalCacheMB`, which defaults to `256`. A positive `EvalCacheMB` retains compact Policy and Value evaluations across successive `go` commands in TLRU (trajectory-aware least-recently-used). TLRU records evaluated parent-child transitions, and the root of each search call promotes its retained descendants within two recorded plies before capacity-based eviction resumes. Every search call creates a separate MCTS tree. Setting the option to zero selects a per-search cache that removes duplicate evaluations within the call and discards its records when the call returns. `ucinewgame`, `ModelPath` changes and `Device` changes clear retained cross-search evaluations.
 
 A UCI client may configure the engines with commands such as:
 
@@ -524,7 +525,7 @@ setoption name RepetitionPolicyPenalty value 1.0
 setoption name InstantMateFirst value true
 ```
 
-`Threads` and `EvalCacheMB` apply only to Gadus. The remaining commands apply to both engines.
+All commands above apply to Gadus and Melano.
 
 ### Eleginus
 

@@ -2,14 +2,14 @@
 
 // Melano direct-policy and exact-state batched PUCT search API.
 
+#include "melano/game.hpp"
+#include "melano/model.hpp"
+#include "melano/precision.hpp"
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
 #include <vector>
-#include "melano/game.hpp"
-#include "melano/model.hpp"
-#include "melano/precision.hpp"
 
 namespace melano {
 
@@ -18,6 +18,7 @@ enum class SearchType { Closed, OnlyMcts };
 struct SearchOptions {
 	SearchType type = SearchType::OnlyMcts;
 	ComputePrecision precision = ComputePrecision::Fp32;
+	int cpu_threads = 0;
 	int mcts_sims = 100;
 	int mcts_min_sims = 0;
 	int mcts_batch_size = 32;
@@ -29,6 +30,7 @@ struct SearchOptions {
 	double virtual_loss = 0.0;
 	double repetition_policy_penalty = 0.0;
 	bool instant_mate_first = false;
+	int evaluation_cache_mb = 0;
 	int root_topn = 10;
 };
 
@@ -52,6 +54,9 @@ struct SearchResult {
 	int dynamic_target = 0;
 	int expanded_nodes = 0;
 	int nn_batches = 0;
+	int nn_evaluations = 0;
+	int evaluation_reuses = 0;
+	int cpu_threads = 0;
 	double uncertainty = 0.0;
 	double elapsed_ms = 0.0;
 	std::vector<RootMove> root;
@@ -62,14 +67,17 @@ using SearchCancelCallback = std::function<bool()>;
 
 class Searcher {
 	public:
-	/// Owns a Melano model in inference mode with an immutable search configuration.
+	/// Owns a Melano model in inference mode and applies the configured search controls.
 	Searcher(Model model, torch::Device device, SearchOptions options);
 	/// Searches one position and optionally emits periodic snapshots for interactive clients.
-	SearchResult search(const chess::Board &board,
-						const SearchProgressCallback &progress = {}, int progress_interval_ms = 0,
-						const SearchCancelCallback &cancel = {});
+	SearchResult search(const chess::Board &board, const SearchProgressCallback &progress = {},
+						int progress_interval_ms = 0, const SearchCancelCallback &cancel = {});
 	/// Searches independent positions together so leaf evaluations share neural batches.
 	std::vector<SearchResult> search_many(const std::vector<chess::Board> &boards);
+	/// Applies search controls while retaining network evaluations compatible with the model.
+	void set_options(SearchOptions options);
+	/// Clears cross-search network evaluations without changing the configured capacity.
+	void clear_evaluation_cache();
 
 	private:
 	struct Impl;

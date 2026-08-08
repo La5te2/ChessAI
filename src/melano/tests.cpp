@@ -1,7 +1,13 @@
 // CTest entrypoint for Melano invariants. It covers precision parsing, state and move codecs,
 // geometry relations, terminal rules, annotated-PGN preprocessing, HDF5 schema validation,
-// Policy and Value shapes and gradients, checkpoint round trips, direct Policy search and batched PUCT.
+// Policy and Value shapes and gradients, checkpoint round trips, direct Policy search and batched
+// PUCT.
 
+#include "melano/checkpoint.hpp"
+#include "melano/dataset.hpp"
+#include "melano/game.hpp"
+#include "melano/model.hpp"
+#include "melano/search.hpp"
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -10,11 +16,6 @@
 #include <iostream>
 #include <stdexcept>
 #include <unordered_set>
-#include "melano/checkpoint.hpp"
-#include "melano/dataset.hpp"
-#include "melano/game.hpp"
-#include "melano/model.hpp"
-#include "melano/search.hpp"
 
 namespace {
 
@@ -62,8 +63,7 @@ int main() {
 		chess::Board board;
 		require(board.hash() == 0x463b96181691fc9cULL, "Polyglot start-position hash mismatch");
 		const auto packed = melano::encode_state(board);
-		require(packed[0] == 4 && packed[4] == 6 && packed[8] == 1,
-				"white piece token mismatch");
+		require(packed[0] == 4 && packed[4] == 6 && packed[8] == 1, "white piece token mismatch");
 		require(packed[48] == 7 && packed[60] == 12 && packed[63] == 10,
 				"black piece token mismatch");
 		require(packed[64] == 1, "side-to-move token mismatch");
@@ -159,8 +159,7 @@ int main() {
 				"fifty-move termination mismatch");
 
 		chess::Board repetition;
-		for (const char *uci : {"g1f3", "g8f6", "f3g1", "f6g8", "g1f3", "g8f6",
-							"f3g1", "f6g8"}) {
+		for (const char *uci : {"g1f3", "g8f6", "f3g1", "f6g8", "g1f3", "g8f6", "f3g1", "f6g8"}) {
 			repetition.makeMove(chess::uci::uciToMove(repetition, uci));
 		}
 		require(repetition.isRepetition(2), "threefold repetition count mismatch");
@@ -217,30 +216,62 @@ int main() {
 		require(policy.sizes() == torch::IntArrayRef({2, melano::kActionSize}),
 				"policy shape mismatch");
 		require(value.sizes() == torch::IntArrayRef({2, 1}), "value shape mismatch");
-		require(torch::isfinite(policy).all().item<bool>(),
-				"policy contains a non-finite value");
-		require(torch::isfinite(value).all().item<bool>(),
-				"value contains a non-finite value");
+		require(torch::isfinite(policy).all().item<bool>(), "policy contains a non-finite value");
+		require(torch::isfinite(value).all().item<bool>(), "value contains a non-finite value");
 		require(value.abs().max().item<float>() <= 1.000001F, "value range mismatch");
+
+		const std::vector<chess::Board> legal_test_boards{board, promotion};
+		std::vector<std::vector<int>> legal_test_actions;
+		std::size_t legal_test_width = 0;
+		for (const auto &test_board : legal_test_boards) {
+			std::vector<int> actions;
+			for (const auto &move : melano::legal_moves(test_board)) {
+				actions.push_back(melano::move_to_index(move));
+			}
+			legal_test_width = std::max(legal_test_width, actions.size());
+			legal_test_actions.push_back(std::move(actions));
+		}
+		auto legal_indices = torch::zeros({static_cast<std::int64_t>(legal_test_boards.size()),
+										   static_cast<std::int64_t>(legal_test_width)},
+										  torch::TensorOptions().dtype(torch::kInt64));
+		auto legal_rows = legal_indices.accessor<std::int64_t, 2>();
+		for (std::size_t row = 0; row < legal_test_actions.size(); ++row) {
+			for (std::size_t column = 0; column < legal_test_actions[row].size(); ++column) {
+				legal_rows[static_cast<std::int64_t>(row)][static_cast<std::int64_t>(column)] =
+					legal_test_actions[row][column];
+			}
+		}
+		auto legal_test_states = melano::encode_boards(legal_test_boards);
+		auto [full_logits, full_values] = model->forward(legal_test_states);
+		auto [legal_logits, legal_values] = model->forward_legal(legal_test_states, legal_indices);
+		for (std::size_t row = 0; row < legal_test_actions.size(); ++row) {
+			for (std::size_t column = 0; column < legal_test_actions[row].size(); ++column) {
+				const auto batch = static_cast<std::int64_t>(row);
+				const auto slot = static_cast<std::int64_t>(column);
+				const auto action = legal_test_actions[row][column];
+				require(std::abs(legal_logits.index({batch, slot}).item<float>() -
+								 full_logits.index({batch, action}).item<float>()) < 1.0e-5F,
+						"legal-only Policy logit differs from the complete Policy head");
+			}
+		}
+		require(torch::allclose(legal_values, full_values),
+				"legal-only Policy path changed the Value output");
 		(policy.mean() + value.mean()).backward();
 		require_finite_gradients(model);
 
 		const auto checkpoint = std::filesystem::temp_directory_path() / "melanotest.pth";
 		model->eval();
-		auto [reference_policy, reference_value] =
-			model->forward(melano::encode_boards({board}));
+		auto [reference_policy, reference_value] = model->forward(melano::encode_boards({board}));
 		melano::save_checkpoint_atomic(checkpoint, model, {8, 1});
 		melano::ArchitectureInfo info;
 		auto loaded = melano::load_checkpoint(checkpoint, torch::Device(torch::kCPU), &info);
 		require(info.channels == 8 && info.blocks == 1, "checkpoint architecture mismatch");
 		loaded->eval();
 		auto [loaded_policy, loaded_value] = loaded->forward(melano::encode_boards({board}));
-		require(loaded_policy.size(1) == melano::kActionSize,
-				"loaded model output mismatch");
+		require(loaded_policy.size(1) == melano::kActionSize, "loaded model output mismatch");
 		require(torch::allclose(reference_policy, loaded_policy),
 				"checkpoint changed policy output");
-		require(torch::allclose(reference_value, loaded_value),
-				"checkpoint changed value output");
+		require(torch::allclose(reference_value, loaded_value), "checkpoint changed value output");
 
 		// Closed search ranks legal actions with Policy before optional decision components.
 		melano::SearchOptions closed_options;
@@ -255,6 +286,37 @@ int main() {
 					closed_result.move,
 				"closed search selected an illegal move");
 
+		// Duplicate roots share one exact evaluation inside a batched search call.
+		melano::Searcher batched_searcher(loaded, torch::Device(torch::kCPU), closed_options);
+		const auto batched_results = batched_searcher.search_many({board, board});
+		require(batched_results[0].nn_evaluations + batched_results[1].nn_evaluations == 1,
+				"duplicate roots performed more than one network evaluation");
+		require(batched_results[0].evaluation_reuses + batched_results[1].evaluation_reuses == 1,
+				"duplicate root reuse was not reported");
+
+		// Positive cache capacity reuses network output while each call builds fresh search
+		// statistics.
+		auto cached_options = closed_options;
+		cached_options.evaluation_cache_mb = 1;
+		melano::Searcher cached_searcher(loaded, torch::Device(torch::kCPU), cached_options);
+		const auto first_cached = cached_searcher.search(board);
+		const auto second_cached = cached_searcher.search(board);
+		require(first_cached.nn_evaluations == 1 && first_cached.evaluation_reuses == 0,
+				"first cache search did not evaluate its root");
+		require(second_cached.nn_evaluations == 0 && second_cached.evaluation_reuses == 1,
+				"second cache search did not reuse its root");
+		require(second_cached.sims_completed == 0 && second_cached.expanded_nodes == 1,
+				"evaluation cache retained MCTS statistics");
+		require(torch::allclose(torch::tensor(first_cached.policy),
+								torch::tensor(second_cached.policy), 1e-6, 1e-7),
+				"evaluation cache changed Policy");
+		require(std::abs(first_cached.value - second_cached.value) < 1e-7F,
+				"evaluation cache changed Value");
+		cached_searcher.clear_evaluation_cache();
+		const auto after_clear = cached_searcher.search(board);
+		require(after_clear.nn_evaluations == 1 && after_clear.evaluation_reuses == 0,
+				"cache clear did not force root reevaluation");
+
 		// Four simulations cover PUCT selection, neural expansion, and value backup.
 		melano::SearchOptions mcts_options = closed_options;
 		mcts_options.type = melano::SearchType::OnlyMcts;
@@ -266,6 +328,20 @@ int main() {
 		require(mcts_result.sims_completed == 4, "MCTS simulation budget mismatch");
 		require(mcts_result.expanded_nodes > 0, "MCTS did not expand a node");
 		require(mcts_result.nn_batches > 1, "MCTS did not evaluate exact-state leaves");
+
+		// A searched child reuses its exact evaluation as the root of the next search call.
+		auto trajectory_options = mcts_options;
+		trajectory_options.evaluation_cache_mb = 1;
+		melano::Searcher trajectory_searcher(loaded, torch::Device(torch::kCPU),
+											 trajectory_options);
+		const auto trajectory_root = trajectory_searcher.search(board);
+		auto trajectory_child = board;
+		trajectory_child.makeMove(trajectory_root.move);
+		const auto trajectory_next = trajectory_searcher.search(trajectory_child);
+		require(trajectory_next.evaluation_reuses > 0,
+				"trajectory cache did not reuse the searched child root");
+		require(trajectory_next.sims_completed == trajectory_options.mcts_sims,
+				"trajectory cache changed the simulation budget");
 		std::filesystem::remove(checkpoint);
 
 		std::cout << "melanotests passed" << std::endl;

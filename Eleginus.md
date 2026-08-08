@@ -19,17 +19,14 @@ best-first minimax (BFM) search.
 - $R_t\in[0,1]$ is the training target for the state $x_t$ recorded before ply $t$.
 - $V(x)\in[0,1]$ is the Value network prediction computed from $\phi_E(x)$.
 
-Neural targets and terminal scores deliberately share the same range and perspective, so search can
-replace a leaf prediction directly with an exact rule outcome. The source of the training targets
-determines the statistical meaning of Value. A model fitted to game-result targets estimates expected
-game score. A model fitted to comment-derived targets estimates the transformed numerical evaluation.
+Value targets, network predictions and terminal scores use the same range and side-to-move perspective.
 
 ## 2. State and Action Encoding
 
 The rules engine operates on $x$, and the network observes $\phi_E(x)$. This division keeps the
 neural representation compact while the complete rules state preserves legality and terminal
-adjudication. Consequently, states that share an encoding may remain different search nodes with
-different legal histories.
+adjudication. Complete states can share an encoding while differing in move counters or repetition
+history.
 
 ### 2.1 State Encoding
 
@@ -109,18 +106,12 @@ separately together with the side to move. Before dense evaluation, the network 
 side-to-move perspective first and the opposing perspective second.
 
 Piece placement, castling rights, en-passant context and side to move determine the neural
-projection, while move counters and repetition history remain in the complete rules state. Complete
-states that share the projected fields consequently receive the same neural prediction while
-retaining separate search nodes and path histories. As search extends a path, the rules engine uses
-that complete history to recognize a repetition or move-count terminal and supplies the
-corresponding exact draw score.
+projection. Move counters and repetition history remain outside $\phi_E(x)$, so complete states that
+differ only in those fields receive the same neural prediction.
 
 ### 2.2 Action Encoding
 
-Preprocessing stores the played move beside every Value record, although the current supervised
-objective does not consume that move. The fixed codec gives this stored field and the checkpoint
-descriptor a stable action space containing 4096 source-destination indices and 576 underpromotion
-indices:
+The fixed action codec contains 4096 source-destination indices and 576 underpromotion indices:
 
 $$
 |\mathcal I_E|=64\times64+64\times9=4672.
@@ -244,8 +235,9 @@ satisfy $V(x)=1/2$ across the complete state space.
 
 ### 3.4 Incremental Evaluation
 
-Search realizes the Efficiently Updatable Neural Network (NNUE) principle by carrying the unclipped
-accumulators along each tree edge. If $x'=T(x,a)$, then for either color perspective
+The incremental evaluator realizes the Efficiently Updatable Neural Network (NNUE) principle by
+carrying the unclipped accumulators across a state transition. If $x'=T(x,a)$, then for either color
+perspective
 
 $$
 u_c(x')=u_c(x)
@@ -265,11 +257,11 @@ replace almost every piece row in one perspective and approach refresh cost. The
 therefore determines the sparse-input saving; the dense tail performs the same 34,848
 multiply-accumulates after every accumulator update.
 
-### 3.5 Training and Search Evaluation
+### 3.5 Numerical Realizations
 
-Training evaluates the network in float32 batches with automatic differentiation, while search uses
-a scalar float32 realization of the same embedding and affine equations. The scalar path bounds the
-input to the final sigmoid so that its exponential remains numerically stable:
+The batched LibTorch realization and the scalar float32 realization use the same embedding and affine
+parameters. The scalar realization bounds the input to the final sigmoid so that its exponential
+remains numerically stable:
 
 $$
 \sigma\left(
@@ -278,8 +270,7 @@ $$
 \right).
 $$
 
-Because both numerical paths use the same learned embedding and affine parameters, this bounded
-sigmoid completes the search-time realization of the trained Value function.
+The bounded sigmoid is the final operation in the scalar realization of the parameterized Value function.
 
 ## 4. Preprocessing
 
@@ -337,8 +328,7 @@ The Hierarchical Data Format version 5 (HDF5) output contains three row-aligned 
 has type `uint16` and shape $[N,2,34]$;
 its first perspective is the side to move and its second perspective is the opponent. `moves` has
 type `uint16` and shape $[N]$, while `values` has type `float32` and shape $[N]$. The move index
-preserves the recorded action under $i_E$, although the Value-only supervised objective uses only
-`states` and `values`.
+preserves the recorded action under $i_E$.
 
 The root attributes identify the schema as follows:
 
@@ -351,12 +341,15 @@ The root attributes identify the schema as follows:
 
 Comment-derived data additionally records `comment_eval_perspective=white` and the transformation
 shown in Section 4.1. The writer requires every move index to belong to $\mathcal I_E$ and every
-Value target to be finite and contained in $[0,1]$. The reader verifies the five schema identities,
-the $[N,2,34]$ state shape and equal row counts across all three datasets before training begins.
+Value target to be finite and contained in $[0,1]$.
+
+A valid Eleginus dataset has the five schema identities above, state shape $[N,2,34]$ and equal row
+counts across all three datasets.
 
 ## 5. Supervised Training
 
-For a minibatch $\mathcal B$, supervised learning minimizes mean squared prediction error:
+For a minibatch $\mathcal B$ drawn from the `states` and `values` datasets, supervised learning
+minimizes mean squared prediction error:
 
 $$
 L_V^{(\mathcal B)}=
@@ -364,6 +357,8 @@ L_V^{(\mathcal B)}=
 \sum_{x_t\in\mathcal B}
 \left(V(x_t)-R_t\right)^2.
 $$
+
+The aligned `moves` dataset does not enter $L_V^{(\mathcal B)}$.
 
 For a fixed data distribution, the population minimizer of this objective is
 
@@ -400,14 +395,27 @@ reference seed controls new-model initialization, chunk-order shuffling and row-
 Supplying an existing checkpoint initializes $\theta_V$ from its saved parameters while retaining
 the newly constructed optimizer state.
 
-CPU and CUDA evaluate the same float32 objective. Their backend-specific reduction orders determine
-the exact sequence of floating-point operations and may therefore produce different final parameter
-bits.
-
 Let $E$ be the epoch count and let $K_{\max}\in\mathbb N\cup\{\infty\}$ be the
 optimizer-step cap. Training writes the final parameters after completing
 $\min(K_{\max},E\lceil N/B\rceil)$ updates, where $N$ is the dataset size and $B$ is the minibatch
 size.
+
+An Eleginus training checkpoint is a `.pth` archive with two top-level entries. `model` contains the
+Value network parameters, while `arch` contains the fixed architecture descriptor:
+
+| Field | Value |
+| --- | ---: |
+| `type_id` | 3 |
+| `feature_count` | 49178 |
+| `feature_slots` | 34 |
+| `accumulator` | 256 |
+| `hidden` | 64 |
+| `bottleneck` | 32 |
+| `action_size` | 4672 |
+
+Loading a checkpoint validates every descriptor field before restoring the parameters. Saving first
+writes a temporary archive and then replaces the destination, so the destination changes only after
+the complete archive has been written.
 
 ## 6. Search
 
@@ -426,6 +434,10 @@ V(x),&x\text{ is ongoing}.
 \end{cases}
 $$
 
+Ongoing nodes evaluate $V(x)$ through the scalar realization defined in Section 3.5. Complete rules
+states remain distinct tree nodes even when they share the same neural encoding, so each path retains
+its own repetition and move-count history.
+
 Before any children have been generated, the backed value is initialized as
 $\overline v(x)=v_0(x)$. This initialization uses Value for an ongoing frontier leaf and the exact
 game result for a terminal node; consequently, a terminal root returns its exact score immediately.
@@ -434,9 +446,6 @@ When the model is trained on game-result targets, neural and terminal values sha
 interpretation. With comment-derived targets, ongoing leaves carry transformed comment evaluations and
 terminal leaves carry exact game scores. Their common range makes minimax arithmetic well-defined. Their
 relative calibration follows the distribution and transformation of the comment evaluations.
-
-The tree preserves one node per path. Two paths reaching equivalent board positions therefore
-remain separate nodes and retain their own repetition and move-count histories.
 
 ### 6.2 Best-First Selection
 
@@ -516,11 +525,10 @@ and the reported position value is $\overline v(x)$. Root decision uses these ba
 directly. If several actions have exactly the same backed value, the first one in the rules engine's
 legal-move enumeration is selected.
 
-The initialization in Section 3.3 makes every ongoing prediction exactly $1/2$. At initialization,
-all ongoing children at a common depth consequently have identical static values and priorities.
-Exact terminal outcomes discovered inside the finite tree distinguish their corresponding moves;
-the queue ordering and legal-move order resolve the remaining ties. Supervised training then
-introduces position-dependent Value differences.
+Under the uniform initialization defined in Section 3.3, all ongoing children at a common depth have
+identical static values and priorities. Exact terminal outcomes discovered inside the finite tree
+distinguish their corresponding moves, while the queue ordering and legal-move order resolve the
+remaining ties.
 
 ### 6.5 Search Limits and Algorithmic Properties
 
@@ -541,24 +549,7 @@ path. Subsequent expansions preserve path-specific nodes, generate complete lega
 the global queue to choose the next frontier node. Minimax backup connects these local expansions to
 the root decision, completing a finite best-first minimax procedure.
 
-## 7. Checkpoint and Embedded Runtime
-
-An Eleginus training checkpoint is a `.pth` archive with two top-level entries. `model` contains the
-Value network parameters, while `arch` contains the fixed architecture descriptor:
-
-| Field | Value |
-| --- | ---: |
-| `type_id` | 3 |
-| `feature_count` | 49178 |
-| `feature_slots` | 34 |
-| `accumulator` | 256 |
-| `hidden` | 64 |
-| `bottleneck` | 32 |
-| `action_size` | 4672 |
-
-Loading a checkpoint validates every descriptor field before restoring the parameters. Saving first
-writes a temporary archive and then replaces the destination, so the destination changes only after
-the complete archive has been written.
+## 7. Embedded Runtime
 
 Standalone inference uses a different representation. The embedding tool reads a `.pth` checkpoint
 on the CPU, extracts its float32 parameter arrays and appends them to a copy of a weightless

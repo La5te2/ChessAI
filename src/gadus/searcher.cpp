@@ -4,15 +4,16 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <list>
 #include <memory>
 #include <stdexcept>
+#include <torch/utils.h>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
-#include <torch/utils.h>
 
 namespace gadus {
 
@@ -26,6 +27,7 @@ struct EvaluationRow {
 	std::vector<float> legal_policy;
 	float value = 0.0F;
 	bool reused = false;
+	std::uint64_t cache_id = 0;
 };
 
 struct PackedStateHash {
@@ -40,10 +42,13 @@ struct PackedStateHash {
 	}
 };
 
-class EvaluationCache {
+// Stores exact network rows and combines ordinary recency with root-trajectory locality.
+class TrajectoryLruCache {
 	struct Entry {
 		EvaluationRow evaluation;
 		std::list<PackedState>::iterator recency;
+		std::vector<std::uint64_t> children;
+		std::uint64_t id = 0;
 		std::size_t bytes = 0;
 	};
 
@@ -51,7 +56,7 @@ class EvaluationCache {
 
 	public:
 	/// Creates a cache with an approximate byte ceiling; the maximum size disables eviction.
-	explicit EvaluationCache(
+	explicit TrajectoryLruCache(
 		std::size_t capacity_bytes = std::numeric_limits<std::size_t>::max())
 		: capacity_bytes_(capacity_bytes) {}
 
@@ -61,57 +66,124 @@ class EvaluationCache {
 		if (found == entries_.end()) {
 			return false;
 		}
-		recency_.splice(recency_.end(), recency_, found->second.recency);
+		touch(found->second);
 		output = found->second.evaluation;
+		output.cache_id = found->second.id;
 		return true;
 	}
 
-	/// Inserts or replaces one compact Policy/Value row and evicts least-recently-used entries.
-	void put(const PackedState &state, const EvaluationRow &evaluation) {
+	/// Inserts one compact Policy/Value row and returns its stable cache-local identity.
+	std::uint64_t put(const PackedState &state, const EvaluationRow &evaluation) {
 		if (capacity_bytes_ == 0) {
-			return;
+			return 0;
+		}
+		if (const auto found = entries_.find(state); found != entries_.end()) {
+			touch(found->second);
+			return found->second.id;
 		}
 		const std::size_t bytes = entry_bytes(evaluation);
 		if (bytes > capacity_bytes_) {
-			return;
-		}
-		if (const auto found = entries_.find(state); found != entries_.end()) {
-			used_bytes_ -= found->second.bytes;
-			recency_.erase(found->second.recency);
-			entries_.erase(found);
-		}
-		while (!recency_.empty() && used_bytes_ + bytes > capacity_bytes_) {
-			const auto oldest = entries_.find(recency_.front());
-			if (oldest != entries_.end()) {
-				used_bytes_ -= oldest->second.bytes;
-				entries_.erase(oldest);
-			}
-			recency_.pop_front();
+			return 0;
 		}
 		recency_.push_back(state);
 		auto iterator = std::prev(recency_.end());
-		entries_.emplace(state, Entry{evaluation, iterator, bytes});
+		auto stored = evaluation;
+		stored.cache_id = 0;
+		const auto id = next_id_++;
+		auto [inserted, success] =
+			entries_.emplace(state, Entry{std::move(stored), iterator, {}, id, bytes});
+		if (!success) {
+			recency_.erase(iterator);
+			throw std::logic_error("evaluation cache insertion failed");
+		}
+		entries_by_id_.emplace(id, &inserted->second);
 		used_bytes_ += bytes;
+		evict_to_capacity();
+		return entries_by_id_.contains(id) ? id : 0;
+	}
+
+	/// Records one evaluated parent-child transition without changing ordinary LRU recency.
+	void link(std::uint64_t parent_id, std::uint64_t child_id) {
+		if (parent_id == 0 || child_id == 0 || parent_id == child_id) {
+			return;
+		}
+		const auto parent_found = entries_by_id_.find(parent_id);
+		const auto child_found = entries_by_id_.find(child_id);
+		if (parent_found == entries_by_id_.end() || child_found == entries_by_id_.end()) {
+			return;
+		}
+		auto &parent = *parent_found->second;
+		parent.children.erase(
+			std::remove_if(parent.children.begin(), parent.children.end(),
+						   [&](std::uint64_t id) { return !entries_by_id_.contains(id); }),
+			parent.children.end());
+		if (std::find(parent.children.begin(), parent.children.end(), child_id) !=
+			parent.children.end()) {
+			return;
+		}
+		const auto previous_capacity = parent.children.capacity();
+		parent.children.push_back(child_id);
+		const auto added_bytes =
+			(parent.children.capacity() - previous_capacity) * sizeof(std::uint64_t);
+		parent.bytes += added_bytes;
+		used_bytes_ += added_bytes;
+		evict_to_capacity();
+	}
+
+	/// Promotes cached descendants near the new root before ordinary LRU replacement resumes.
+	void promote_trajectory_neighborhood(const PackedState &root, int radius) {
+		const auto found = entries_.find(root);
+		if (found == entries_.end() || radius < 0) {
+			return;
+		}
+		struct FrontierItem {
+			std::uint64_t id = 0;
+			int depth = 0;
+		};
+		std::vector<FrontierItem> frontier{{found->second.id, 0}};
+		std::vector<std::uint64_t> neighborhood;
+		std::unordered_set<std::uint64_t> visited;
+		visited.reserve(64);
+		for (std::size_t cursor = 0; cursor < frontier.size(); ++cursor) {
+			const auto item = frontier[cursor];
+			if (!visited.insert(item.id).second) {
+				continue;
+			}
+			const auto entry = entries_by_id_.find(item.id);
+			if (entry == entries_by_id_.end()) {
+				continue;
+			}
+			neighborhood.push_back(item.id);
+			if (item.depth >= radius) {
+				continue;
+			}
+			for (const auto child_id : entry->second->children) {
+				if (entries_by_id_.contains(child_id)) {
+					frontier.push_back({child_id, item.depth + 1});
+				}
+			}
+		}
+		// Promote distant descendants first so the root and its nearest children remain newest.
+		for (auto iterator = neighborhood.rbegin(); iterator != neighborhood.rend(); ++iterator) {
+			if (const auto entry = entries_by_id_.find(*iterator); entry != entries_by_id_.end()) {
+				touch(*entry->second);
+			}
+		}
 	}
 
 	/// Changes the byte ceiling and evicts old entries until the cache fits.
 	void set_capacity(std::size_t capacity_bytes) {
 		capacity_bytes_ = capacity_bytes;
-		while (!recency_.empty() && used_bytes_ > capacity_bytes_) {
-			const auto oldest = entries_.find(recency_.front());
-			if (oldest != entries_.end()) {
-				used_bytes_ -= oldest->second.bytes;
-				entries_.erase(oldest);
-			}
-			recency_.pop_front();
-		}
+		evict_to_capacity();
 	}
 
 	/// Clears all retained rows without changing the configured byte ceiling.
 	void clear() {
 		entries_.clear();
+		entries_by_id_.clear();
 		recency_.clear();
 		used_bytes_ = 0;
+		next_id_ = 1;
 	}
 
 	private:
@@ -123,10 +195,35 @@ class EvaluationCache {
 			   evaluation.legal_policy.capacity() * sizeof(float);
 	}
 
+	// Move one live entry to the newest end without changing its cached value.
+	void touch(Entry &entry) { recency_.splice(recency_.end(), recency_, entry.recency); }
+
+	// Remove one map entry and its LRU node while leaving stale graph ids harmless.
+	void erase_entry(Entries::iterator entry) {
+		used_bytes_ -= entry->second.bytes;
+		entries_by_id_.erase(entry->second.id);
+		recency_.erase(entry->second.recency);
+		entries_.erase(entry);
+	}
+
+	// Enforce the approximate byte ceiling after insertions, links, or capacity changes.
+	void evict_to_capacity() {
+		while (!recency_.empty() && used_bytes_ > capacity_bytes_) {
+			const auto oldest = entries_.find(recency_.front());
+			if (oldest == entries_.end()) {
+				recency_.pop_front();
+				continue;
+			}
+			erase_entry(oldest);
+		}
+	}
+
 	std::size_t capacity_bytes_;
 	std::size_t used_bytes_ = 0;
+	std::uint64_t next_id_ = 1;
 	std::list<PackedState> recency_;
 	Entries entries_;
+	std::unordered_map<std::uint64_t, Entry *> entries_by_id_;
 };
 
 struct Node {
@@ -142,6 +239,7 @@ struct Node {
 	int visits = 0;
 	float value_sum = 0.0F;
 	int virtual_visits = 0;
+	std::uint64_t evaluation_id = 0;
 	std::vector<Node> children;
 };
 
@@ -225,13 +323,13 @@ struct Searcher::Impl {
 		auto parameters = model->parameters();
 		for (auto &parameter : parameters) {
 			if (parameter.dim() == 4) {
-				parameter.set_data(
-					parameter.contiguous(torch::MemoryFormat::ChannelsLast));
+				parameter.set_data(parameter.contiguous(torch::MemoryFormat::ChannelsLast));
 			}
 		}
 	}
 
-	// Apply mutable search controls without rebuilding the model or discarding compatible cache rows.
+	// Apply mutable search controls without rebuilding the model or discarding compatible cache
+	// rows.
 	void set_options(SearchOptions source_options) {
 		validate_compute_precision(source_options.precision, device);
 		source_options.virtual_loss = std::max(0.0, source_options.virtual_loss);
@@ -246,9 +344,10 @@ struct Searcher::Impl {
 		options = source_options;
 	}
 
-	// Evaluate a frozen batch and retain legal moves so tree expansion does not generate them again.
+	// Evaluate a frozen batch and retain legal moves so tree expansion does not generate them
+	// again.
 	std::vector<EvaluationRow> evaluate_rows(const std::vector<chess::Board> &boards,
-											 EvaluationCache *cache = nullptr) {
+											 TrajectoryLruCache *cache = nullptr) {
 		if (boards.empty()) {
 			return {};
 		}
@@ -271,8 +370,7 @@ struct Searcher::Impl {
 					continue;
 				}
 			}
-			const auto [found, inserted] =
-				pending_lookup.emplace(state, pending.size());
+			const auto [found, inserted] = pending_lookup.emplace(state, pending.size());
 			row_to_pending[row] = found->second;
 			if (!inserted) {
 				row_reused[row] = true;
@@ -296,38 +394,32 @@ struct Searcher::Impl {
 		}
 
 		const bool pin_memory = device.is_cuda();
-		auto index_options =
-			torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
-		auto mask_options =
-			torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU);
+		auto index_options = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
+		auto mask_options = torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU);
 		if (pin_memory) {
 			index_options = index_options.pinned_memory(true);
 			mask_options = mask_options.pinned_memory(true);
 		}
-		auto legal_indices =
-			torch::zeros({static_cast<std::int64_t>(pending.size()),
-						  static_cast<std::int64_t>(legal_width)},
-						 index_options);
-		auto legal_mask =
-			torch::zeros({static_cast<std::int64_t>(pending.size()),
-						  static_cast<std::int64_t>(legal_width)},
-						 mask_options);
+		auto legal_indices = torch::zeros(
+			{static_cast<std::int64_t>(pending.size()), static_cast<std::int64_t>(legal_width)},
+			index_options);
+		auto legal_mask = torch::zeros(
+			{static_cast<std::int64_t>(pending.size()), static_cast<std::int64_t>(legal_width)},
+			mask_options);
 		auto index_rows = legal_indices.accessor<std::int64_t, 2>();
 		auto mask_rows = legal_mask.accessor<bool, 2>();
 		for (std::size_t row = 0; row < pending.size(); ++row) {
 			for (std::size_t column = 0; column < pending[row].legal_indices.size(); ++column) {
-				index_rows[static_cast<std::int64_t>(row)]
-						  [static_cast<std::int64_t>(column)] =
+				index_rows[static_cast<std::int64_t>(row)][static_cast<std::int64_t>(column)] =
 					pending[row].legal_indices[column];
-				mask_rows[static_cast<std::int64_t>(row)]
-						 [static_cast<std::int64_t>(column)] = true;
+				mask_rows[static_cast<std::int64_t>(row)][static_cast<std::int64_t>(column)] = true;
 			}
 		}
 
 		torch::InferenceMode guard;
-		auto states = decode_states_device(
-			reinterpret_cast<const std::uint8_t *>(pending_states.data()),
-			static_cast<std::int64_t>(pending_states.size()), device);
+		auto states =
+			decode_states_device(reinterpret_cast<const std::uint8_t *>(pending_states.data()),
+								 static_cast<std::int64_t>(pending_states.size()), device);
 		states = states.contiguous(torch::MemoryFormat::ChannelsLast);
 		auto device_indices = legal_indices.to(device, true);
 		auto device_mask = legal_mask.to(device, true);
@@ -338,14 +430,10 @@ struct Searcher::Impl {
 			std::tie(logits, raw_values) = model->forward_legal(states, device_indices);
 		}
 		auto compact_logits = logits.to(torch::kFloat32);
-		compact_logits = compact_logits.masked_fill(
-			~device_mask, -std::numeric_limits<float>::infinity());
-		auto probabilities =
-			torch::softmax(compact_logits, 1).to(torch::kCPU).contiguous();
-		auto values = raw_values.reshape({-1})
-						  .to(torch::kFloat32)
-						  .to(torch::kCPU)
-						  .contiguous();
+		compact_logits =
+			compact_logits.masked_fill(~device_mask, -std::numeric_limits<float>::infinity());
+		auto probabilities = torch::softmax(compact_logits, 1).to(torch::kCPU).contiguous();
+		auto values = raw_values.reshape({-1}).to(torch::kFloat32).to(torch::kCPU).contiguous();
 
 		auto probability_rows = probabilities.accessor<float, 2>();
 		auto value_rows = values.accessor<float, 1>();
@@ -360,7 +448,7 @@ struct Searcher::Impl {
 			if (cache != nullptr) {
 				auto cached = pending[row];
 				cached.reused = false;
-				cache->put(pending_states[row], cached);
+				pending[row].cache_id = cache->put(pending_states[row], cached);
 			}
 		}
 		for (std::size_t row = 0; row < output.size(); ++row) {
@@ -418,6 +506,7 @@ struct Searcher::Impl {
 
 	// Create one child per legal action directly from the compact network evaluation.
 	void expand(Node *node, const EvaluationRow &evaluation) {
+		node->evaluation_id = evaluation.cache_id;
 		if (!node->children.empty()) {
 			return;
 		}
@@ -454,7 +543,8 @@ struct Searcher::Impl {
 		return child->visits > 0 ? -child->q() : fpu(parent);
 	}
 
-	// Increase exploration logarithmically with parent visits: c_init + factor*log((N+base+1)/base).
+	// Increase exploration logarithmically with parent visits: c_init +
+	// factor*log((N+base+1)/base).
 	double scheduled_c_puct(const Node *parent) const {
 		const double visits = std::max(0, parent->visits + parent->virtual_visits);
 		const double base = std::max(1.0, options.c_puct_base);
@@ -478,19 +568,19 @@ struct Searcher::Impl {
 		if (parent->children.empty()) {
 			return nullptr;
 		}
-		auto selected = std::max_element(parent->children.begin(), parent->children.end(),
-									 [&] (const Node &left, const Node &right) {
-									const double left_score = selection_score(parent, &left);
-									const double right_score = selection_score(parent, &right);
-									if (left_score != right_score) {
-										return left_score < right_score;
-									}
-									if (left.prior != right.prior) {
-										return left.prior < right.prior;
-									}
-									return edge_value(parent, &left) <
-										   edge_value(parent, &right);
-								});
+		auto selected =
+			std::max_element(parent->children.begin(), parent->children.end(),
+							 [&](const Node &left, const Node &right) {
+								 const double left_score = selection_score(parent, &left);
+								 const double right_score = selection_score(parent, &right);
+								 if (left_score != right_score) {
+									 return left_score < right_score;
+								 }
+								 if (left.prior != right.prior) {
+									 return left.prior < right.prior;
+								 }
+								 return edge_value(parent, &left) < edge_value(parent, &right);
+							 });
 		return &*selected;
 	}
 
@@ -708,9 +798,9 @@ struct Searcher::Impl {
 
 	// Search many independent roots while sharing neural leaf batches across games.
 	std::vector<SearchResult> search_many(const std::vector<chess::Board> &boards,
-									   const SearchProgressCallback &progress = {},
-									   int progress_interval_ms = 0,
-									   const SearchCancelCallback &cancel = {}) {
+										  const SearchProgressCallback &progress = {},
+										  int progress_interval_ms = 0,
+										  const SearchCancelCallback &cancel = {}) {
 		if (boards.empty()) {
 			return {};
 		}
@@ -733,10 +823,16 @@ struct Searcher::Impl {
 			state.board = board;
 			states.push_back(std::move(state));
 		}
-		EvaluationCache local_evaluation_cache;
-		auto *evaluation_cache = options.evaluation_cache_mb > 0
-								 ? &persistent_evaluation_cache
-								 : &local_evaluation_cache;
+		TrajectoryLruCache local_evaluation_cache;
+		auto *evaluation_cache = options.evaluation_cache_mb > 0 ? &persistent_evaluation_cache
+																 : &local_evaluation_cache;
+		if (options.evaluation_cache_mb > 0) {
+			constexpr int kTrajectoryNeighborhoodRadius = 2;
+			for (const auto &board : boards) {
+				persistent_evaluation_cache.promote_trajectory_neighborhood(
+					encode_state(board), kTrajectoryNeighborhoodRadius);
+			}
+		}
 		auto roots = evaluate_rows(boards, evaluation_cache);
 		const int minimum = minimum_simulations();
 		for (std::size_t index = 0; index < states.size(); ++index) {
@@ -752,8 +848,8 @@ struct Searcher::Impl {
 		auto next_progress = start;
 		if (progress && states.size() == 1) {
 			progress(make_result(states[0], start));
-			next_progress = Clock::now() +
-				std::chrono::milliseconds(std::max(1, progress_interval_ms));
+			next_progress =
+				Clock::now() + std::chrono::milliseconds(std::max(1, progress_interval_ms));
 		}
 
 		if (options.type == SearchType::OnlyMcts && options.mcts_sims > 0) {
@@ -813,6 +909,11 @@ struct Searcher::Impl {
 						auto &leaf = selected[index];
 						auto &state = states[leaf.state_index];
 						const std::size_t row = index - begin;
+						if (options.evaluation_cache_mb > 0 && leaf.path.size() > 1) {
+							persistent_evaluation_cache.link(
+								leaf.path[leaf.path.size() - 2]->evaluation_id,
+								evaluation[row].cache_id);
+						}
 						if (leaf.leaf->children.empty()) {
 							expand(leaf.leaf, evaluation[row]);
 							state.expanded_nodes += 1;
@@ -841,8 +942,7 @@ struct Searcher::Impl {
 				if (progress && states.size() == 1 && progress_interval_ms > 0 &&
 					Clock::now() >= next_progress) {
 					progress(make_result(states[0], start));
-					next_progress = Clock::now() +
-						std::chrono::milliseconds(progress_interval_ms);
+					next_progress = Clock::now() + std::chrono::milliseconds(progress_interval_ms);
 				}
 				if (!active || !progressed) {
 					break;
@@ -861,7 +961,7 @@ struct Searcher::Impl {
 	Model model;
 	torch::Device device;
 	SearchOptions options;
-	EvaluationCache persistent_evaluation_cache{0};
+	TrajectoryLruCache persistent_evaluation_cache{0};
 	int active_cpu_threads = 0;
 };
 
@@ -870,9 +970,8 @@ Searcher::Searcher(Model model, torch::Device device, SearchOptions options)
 	: impl_(std::make_shared<Impl>(std::move(model), std::move(device), options)) {}
 
 // Search one position and expose timed snapshots to interactive front ends.
-SearchResult Searcher::search(const chess::Board &board,
-							  const SearchProgressCallback &progress, int progress_interval_ms,
-							  const SearchCancelCallback &cancel) {
+SearchResult Searcher::search(const chess::Board &board, const SearchProgressCallback &progress,
+							  int progress_interval_ms, const SearchCancelCallback &cancel) {
 	return impl_->search_many({board}, progress, progress_interval_ms, cancel)[0];
 }
 

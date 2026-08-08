@@ -1,5 +1,8 @@
 // Exposes Melano checkpoints as a standards-oriented UCI process for GUI and bot clients.
 
+#include "melano/args.hpp"
+#include "melano/checkpoint.hpp"
+#include "melano/search.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -14,9 +17,6 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
-#include "melano/args.hpp"
-#include "melano/checkpoint.hpp"
-#include "melano/search.hpp"
 
 namespace {
 
@@ -112,9 +112,7 @@ class UciEngine {
 	public:
 	// Store initial options; model loading remains lazy until readiness or search.
 	explicit UciEngine(EngineOptions options) : options_(std::move(options)) {}
-	~UciEngine() {
-		stop_and_join();
-	}
+	~UciEngine() { stop_and_join(); }
 
 	// Dispatch UCI commands until quit or end-of-input, reporting command errors as info strings.
 	void loop() {
@@ -137,6 +135,9 @@ class UciEngine {
 				} else if (command == "ucinewgame") {
 					stop_and_join();
 					board_ = chess::Board();
+					if (searcher_) {
+						searcher_->clear_evaluation_cache();
+					}
 				} else if (command == "position") {
 					stop_and_join();
 					set_position(line);
@@ -146,8 +147,7 @@ class UciEngine {
 					stop_requested_ = true;
 				} else if (command == "quit") {
 					break;
-				} else if (command == "debug" || command == "ponderhit" ||
-						   command == "register") {
+				} else if (command == "debug" || command == "ponderhit" || command == "register") {
 					continue;
 				} else {
 					print("info string unknown command: " + line);
@@ -187,10 +187,12 @@ class UciEngine {
 		print("id author La5te2");
 		print("option name ModelPath type string default " + options_.model_path.string());
 		print("option name Device type string default " + options_.device);
+		print("option name Threads type spin default " +
+			  std::to_string(options_.search.cpu_threads) + " min 1 max 256");
 		print("option name SearchType type combo default " +
 			  melano::search_type_name(options_.search.type) + " var closed var only-mcts");
-		print("option name MCTSSims type spin default " + std::to_string(options_.search.mcts_sims) +
-			  " min 0 max 1000000");
+		print("option name MCTSSims type spin default " +
+			  std::to_string(options_.search.mcts_sims) + " min 0 max 1000000");
 		print("option name MCTSMinSims type spin default " +
 			  std::to_string(options_.search.mcts_min_sims) + " min 0 max 1000000");
 		print("option name MCTSBatchSize type spin default " +
@@ -210,6 +212,8 @@ class UciEngine {
 			  std::to_string(options_.search.repetition_policy_penalty));
 		print(std::string("option name InstantMateFirst type check default ") +
 			  (options_.search.instant_mate_first ? "true" : "false"));
+		print("option name EvalCacheMB type spin default " +
+			  std::to_string(options_.search.evaluation_cache_mb) + " min 0 max 65536");
 		print("option name ProgressIntervalMS type spin default " +
 			  std::to_string(options_.progress_interval_ms) + " min 0 max 60000");
 		print("option name MultiPV type spin default " + std::to_string(options_.multipv) +
@@ -224,11 +228,13 @@ class UciEngine {
 		if (options_.model_path.empty()) {
 			throw std::runtime_error("ModelPath is empty");
 		}
-		if (model_ && loaded_model_path_ == options_.model_path && loaded_device_ == options_.device) {
+		if (model_ && loaded_model_path_ == options_.model_path &&
+			loaded_device_ == options_.device) {
 			return;
 		}
 		device_ = melano::resolve_device(options_.device);
 		model_ = melano::load_checkpoint(options_.model_path, device_);
+		searcher_.reset();
 		loaded_model_path_ = options_.model_path;
 		loaded_device_ = options_.device;
 	}
@@ -240,42 +246,58 @@ class UciEngine {
 			return;
 		}
 		const auto value_at = line.find(" value ", name_at + 6);
-		const auto name = trim(line.substr(name_at + 6, value_at == std::string::npos
-													? std::string::npos
-													: value_at - name_at - 6));
-		const auto value = value_at == std::string::npos ? std::string() : trim(line.substr(value_at + 7));
+		const auto name =
+			trim(line.substr(name_at + 6, value_at == std::string::npos ? std::string::npos
+																		: value_at - name_at - 6));
+		const auto value =
+			value_at == std::string::npos ? std::string() : trim(line.substr(value_at + 7));
 		const auto key = normalized(name);
 		if (key == "modelpath") {
 			options_.model_path = value;
 			model_ = nullptr;
+			searcher_.reset();
 		} else if (key == "device") {
 			options_.device = value;
 			model_ = nullptr;
+			searcher_.reset();
+		} else if (key == "threads") {
+			options_.search.cpu_threads =
+				std::clamp(parse_int(value, options_.search.cpu_threads), 1, 256);
 		} else if (key == "searchtype") {
 			options_.search.type = melano::parse_search_type(value);
 		} else if (key == "mctssims") {
 			options_.search.mcts_sims = std::max(0, parse_int(value, options_.search.mcts_sims));
 		} else if (key == "mctsminsims") {
-			options_.search.mcts_min_sims = std::max(0, parse_int(value, options_.search.mcts_min_sims));
+			options_.search.mcts_min_sims =
+				std::max(0, parse_int(value, options_.search.mcts_min_sims));
 		} else if (key == "mctsbatchsize") {
-			options_.search.mcts_batch_size = std::max(1, parse_int(value, options_.search.mcts_batch_size));
+			options_.search.mcts_batch_size =
+				std::max(1, parse_int(value, options_.search.mcts_batch_size));
 		} else if (key == "moveoverheadms") {
 			options_.move_overhead_ms = std::max(0, parse_int(value, options_.move_overhead_ms));
 		} else if (key == "cpuct") {
 			options_.search.c_puct = std::max(0.0, parse_double(value, options_.search.c_puct));
 		} else if (key == "cpuctbase") {
-			options_.search.c_puct_base = std::max(1.0, parse_double(value, options_.search.c_puct_base));
+			options_.search.c_puct_base =
+				std::max(1.0, parse_double(value, options_.search.c_puct_base));
 		} else if (key == "cpuctfactor") {
-			options_.search.c_puct_factor = std::max(0.0, parse_double(value, options_.search.c_puct_factor));
+			options_.search.c_puct_factor =
+				std::max(0.0, parse_double(value, options_.search.c_puct_factor));
 		} else if (key == "fpureduction") {
-			options_.search.fpu_reduction = std::max(0.0, parse_double(value, options_.search.fpu_reduction));
+			options_.search.fpu_reduction =
+				std::max(0.0, parse_double(value, options_.search.fpu_reduction));
 		} else if (key == "virtualloss") {
-			options_.search.virtual_loss = std::max(0.0, parse_double(value, options_.search.virtual_loss));
+			options_.search.virtual_loss =
+				std::max(0.0, parse_double(value, options_.search.virtual_loss));
 		} else if (key == "repetitionpolicypenalty") {
-			options_.search.repetition_policy_penalty =
-				std::clamp(parse_double(value, options_.search.repetition_policy_penalty), 0.0, 1.0);
+			options_.search.repetition_policy_penalty = std::clamp(
+				parse_double(value, options_.search.repetition_policy_penalty), 0.0, 1.0);
 		} else if (key == "instantmatefirst") {
-			options_.search.instant_mate_first = parse_bool(value, options_.search.instant_mate_first);
+			options_.search.instant_mate_first =
+				parse_bool(value, options_.search.instant_mate_first);
+		} else if (key == "evalcachemb") {
+			options_.search.evaluation_cache_mb =
+				std::clamp(parse_int(value, options_.search.evaluation_cache_mb), 0, 65536);
 		} else if (key == "progressintervalms") {
 			options_.progress_interval_ms =
 				std::clamp(parse_int(value, options_.progress_interval_ms), 0, 60000);
@@ -346,14 +368,14 @@ class UciEngine {
 		const auto increment_key = white ? "winc" : "binc";
 		if (const auto found = go.find(time_key); found != go.end()) {
 			const int remaining = std::max(0, parse_int(found->second, 0));
-			const int increment = go.contains(increment_key)
-								  ? std::max(0, parse_int(go.at(increment_key), 0))
-								  : 0;
+			const int increment =
+				go.contains(increment_key) ? std::max(0, parse_int(go.at(increment_key), 0)) : 0;
 			double budget = remaining / kTimeDivisor + increment * kIncrementFraction -
 							options_.move_overhead_ms;
 			budget = std::clamp(budget, static_cast<double>(kMinimumMoveTimeMs),
-							static_cast<double>(kMaximumMoveTimeMs));
-			budget = std::min(budget, static_cast<double>(std::max(1, remaining - options_.move_overhead_ms)));
+								static_cast<double>(kMaximumMoveTimeMs));
+			budget = std::min(
+				budget, static_cast<double>(std::max(1, remaining - options_.move_overhead_ms)));
 			return std::max(0, static_cast<int>(budget));
 		}
 		return 0;
@@ -361,7 +383,8 @@ class UciEngine {
 
 	// Map bounded neural value to a monotonic centipawn-like UCI display score.
 	int score_cp(float value) const {
-		return static_cast<int>(std::lround(std::clamp(value, -0.999F, 0.999F) * options_.score_scale));
+		return static_cast<int>(
+			std::lround(std::clamp(value, -0.999F, 0.999F) * options_.score_scale));
 	}
 
 	// Emit final or progressive MultiPV lines using root-side values and search statistics.
@@ -394,19 +417,22 @@ class UciEngine {
 		const auto go_values = parse_go(line);
 		search_options.movetime_ms = movetime_for(go_values);
 		if (const auto nodes = go_values.find("nodes"); nodes != go_values.end()) {
-			search_options.mcts_sims = std::max(0, parse_int(nodes->second, search_options.mcts_sims));
+			search_options.mcts_sims =
+				std::max(0, parse_int(nodes->second, search_options.mcts_sims));
 		}
 		search_options.root_topn = std::max(options_.multipv, search_options.root_topn);
 		const auto board = board_;
-		const auto model = model_;
-		const auto device = device_;
+		if (!searcher_) {
+			searcher_ = std::make_shared<melano::Searcher>(model_, device_, search_options);
+		} else {
+			searcher_->set_options(search_options);
+		}
+		const auto searcher = searcher_;
 		const int progress_interval_ms = options_.progress_interval_ms;
 		stop_requested_ = false;
-		search_thread_ = std::thread([this, board, model, device, search_options,
-									  progress_interval_ms] {
+		search_thread_ = std::thread([this, board, searcher, progress_interval_ms] {
 			try {
-				melano::Searcher searcher(model, device, search_options);
-				const auto result = searcher.search(
+				const auto result = searcher->search(
 					board, [this](const melano::SearchResult &partial) { emit_info(partial); },
 					progress_interval_ms, [this] { return stop_requested_.load(); });
 				emit_info(result);
@@ -430,6 +456,7 @@ class UciEngine {
 	chess::Board board_;
 	torch::Device device_{torch::kCPU};
 	melano::Model model_{nullptr};
+	std::shared_ptr<melano::Searcher> searcher_;
 	std::filesystem::path loaded_model_path_;
 	std::string loaded_device_;
 	std::thread search_thread_;
@@ -450,10 +477,12 @@ EngineOptions options_from_args(int argc, char **argv) {
 		}
 	}
 	options.device = args.get("device", options.device);
+	options.search.cpu_threads = std::clamp(args.get_int("threads", 2), 1, 256);
 	options.search.type = melano::parse_search_type(args.get("search-type", "only-mcts"));
 	options.search.mcts_sims = args.get_int("mcts-sims", options.search.mcts_sims);
 	options.search.mcts_min_sims = args.get_int("mcts-min-sims", options.search.mcts_min_sims);
-	options.search.mcts_batch_size = args.get_int("mcts-batch-size", options.search.mcts_batch_size);
+	options.search.mcts_batch_size =
+		args.get_int("mcts-batch-size", options.search.mcts_batch_size);
 	options.search.c_puct = args.get_double("c-puct", options.search.c_puct);
 	options.search.c_puct_base = args.get_double("c-puct-base", options.search.c_puct_base);
 	options.search.c_puct_factor = args.get_double("c-puct-factor", options.search.c_puct_factor);
@@ -463,6 +492,7 @@ EngineOptions options_from_args(int argc, char **argv) {
 		args.get_double("repetition-policy-penalty", options.search.repetition_policy_penalty);
 	options.search.instant_mate_first =
 		args.get_bool("instant-mate-first", options.search.instant_mate_first);
+	options.search.evaluation_cache_mb = std::clamp(args.get_int("eval-cache-mb", 256), 0, 65536);
 	options.search.root_topn = args.get_int("root-topn", options.search.root_topn);
 	options.progress_interval_ms =
 		args.get_int("progress-interval-ms", options.progress_interval_ms);

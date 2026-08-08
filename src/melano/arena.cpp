@@ -1,8 +1,8 @@
 // Melano arena command-line entry point; match logic lives in match.cpp.
 
-#include <iostream>
 #include "melano/arena.hpp"
 #include "melano/args.hpp"
+#include <iostream>
 
 // Parse arena/search options, run evaluation, and print the final JSON summary.
 int main(int argc, char **argv) {
@@ -11,12 +11,13 @@ int main(int argc, char **argv) {
 		if (args.has("help")) {
 			std::cout
 				<< "Usage: arena --candidate <model> --baseline <model> [options]\n"
-				<< "  --device <auto|cpu|cuda> --precision <fp32|bf16>\n"
+				<< "  --device <auto|cpu|cuda> --precision <fp32|bf16> --threads <n|0=auto>\n"
 				<< "  --games <n> --games-in-flight <n> --max-plies <n>\n"
 				<< "  --opening-book <path|empty> --book-plies <n> --max-book-positions <n>\n"
 				<< "  --search-type <closed|only-mcts> --sims <n> --mcts-min-sims <n>\n"
 				<< "  --mcts-batch-size <n> --c-puct <x> --c-puct-base <x>\n"
 				<< "  --c-puct-factor <x> --fpu-reduction <x> --virtual-loss <x>\n"
+				<< "  --eval-cache-mb <n>\n"
 				<< "  --repetition-policy-penalty <x> --instant-mate-first <0|1>\n"
 				<< "  --min-net-wins <n> --pgn-output <path> --seed <n> --log-every <games>\n";
 			return 0;
@@ -37,8 +38,8 @@ int main(int argc, char **argv) {
 		options.pgn_output = args.get("pgn-output", options.pgn_output.string());
 
 		auto &search = options.search;
-		search.precision =
-			melano::parse_compute_precision(args.get("precision", "fp32"));
+		search.precision = melano::parse_compute_precision(args.get("precision", "fp32"));
+		search.cpu_threads = std::max(0, args.get_int("threads", search.cpu_threads));
 		search.type = melano::parse_search_type(args.get("search-type", "only-mcts"));
 		search.mcts_sims = args.get_int("sims", search.mcts_sims);
 		search.mcts_min_sims = args.get_int("mcts-min-sims", search.mcts_min_sims);
@@ -48,6 +49,7 @@ int main(int argc, char **argv) {
 		search.c_puct_factor = args.get_double("c-puct-factor", search.c_puct_factor);
 		search.fpu_reduction = args.get_double("fpu-reduction", search.fpu_reduction);
 		search.virtual_loss = args.get_double("virtual-loss", search.virtual_loss);
+		search.evaluation_cache_mb = args.get_int("eval-cache-mb", search.evaluation_cache_mb);
 		search.repetition_policy_penalty =
 			args.get_double("repetition-policy-penalty", search.repetition_policy_penalty);
 		search.instant_mate_first = args.get_bool("instant-mate-first", search.instant_mate_first);
