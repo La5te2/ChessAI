@@ -1,4 +1,4 @@
-// Eleginus supervised Value training command-line entry point.
+// Eleginus joint supervised Policy/Value training command-line entry point.
 
 #include <iostream>
 
@@ -38,13 +38,13 @@ int main(int argc, char **argv) {
 		}
 		const auto device = resolve_device(args.get("device", "auto"));
 		const auto seed = static_cast<std::uint64_t>(args.get_int64("seed", 2026));
-		eleginus::ValueNetwork model;
+		eleginus::Model model;
 		if (const auto existing = args.optional("model"); existing && !existing->empty())
 			model = eleginus::load_checkpoint(*existing, device);
 		else
 			model = eleginus::make_model(device, seed);
 
-		eleginus::ValueTrainOptions options;
+		eleginus::TrainOptions options;
 		options.data = args.get("data", "data/games.eleginus.h5");
 		options.epochs = args.get_int("epochs", options.epochs);
 		options.batch_size = args.get_int("batch-size", options.batch_size);
@@ -54,10 +54,13 @@ int main(int argc, char **argv) {
 		options.log_every = args.get_int("log-every", options.log_every);
 		options.seed = seed;
 		const auto output = std::filesystem::path(args.get("out", "models/eleginus/eleginus.pth"));
-		const auto stats = eleginus::train_value_from_h5(model, options, device);
+		const auto stats = eleginus::train_from_h5(model, options, device);
 		eleginus::save_checkpoint_atomic(output, model);
-		std::cout << "Eleginus supervised Value complete: rows=" << stats.samples
-				  << " steps=" << stats.steps << " mean_loss=" << stats.mean_loss
+		std::cout << "Eleginus supervised training complete: rows=" << stats.samples
+				  << " steps=" << stats.steps
+				  << " mean_policy=" << stats.mean_policy_loss
+				  << " mean_value=" << stats.mean_value_loss
+				  << " mean_loss=" << stats.mean_loss
 				  << " checkpoint=" << output.string() << std::endl;
 		return 0;
 	} catch (const std::exception &error) {

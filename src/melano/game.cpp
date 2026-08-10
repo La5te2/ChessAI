@@ -1,15 +1,10 @@
-// Implements Melano's chess-facing codecs, rule queries, and Polyglot opening traversal.
+// Implements Melano's chess-facing codecs and rule queries.
 
 #include "melano/game.hpp"
 #include <algorithm>
-#include <bit>
 #include <cmath>
 #include <cstring>
-#include <fstream>
-#include <queue>
 #include <stdexcept>
-#include <unordered_map>
-#include <unordered_set>
 #include <torch/cuda.h>
 
 namespace melano {
@@ -28,61 +23,6 @@ int piece_token(const chess::Piece &piece) {
 	}
 	return type;
 }
-
-// Read a Polyglot 16-bit field, whose on-disk byte order is big-endian.
-std::uint16_t read_be16(std::istream &input) {
-	std::uint8_t bytes[2]{};
-	input.read(reinterpret_cast<char *>(bytes), 2);
-	return static_cast<std::uint16_t>((bytes[0] << 8U) | bytes[1]);
-}
-
-// Read a Polyglot 32-bit field in big-endian order.
-std::uint32_t read_be32(std::istream &input) {
-	std::uint8_t bytes[4]{};
-	input.read(reinterpret_cast<char *>(bytes), 4);
-	return (static_cast<std::uint32_t>(bytes[0]) << 24U) |
-		   (static_cast<std::uint32_t>(bytes[1]) << 16U) |
-		   (static_cast<std::uint32_t>(bytes[2]) << 8U) | static_cast<std::uint32_t>(bytes[3]);
-}
-
-// Read a Polyglot 64-bit field in big-endian order.
-std::uint64_t read_be64(std::istream &input) {
-	std::uint8_t bytes[8]{};
-	input.read(reinterpret_cast<char *>(bytes), 8);
-	std::uint64_t value = 0;
-	for (const auto byte : bytes) {
-		value = (value << 8U) | byte;
-	}
-	return value;
-}
-
-// Match a raw Polyglot move against legal moves so special move flags remain correct.
-chess::Move decode_polyglot_move(std::uint16_t raw, const chess::Board &board) {
-	const int to_file = raw & 7;
-	const int to_rank = (raw >> 3) & 7;
-	const int from_file = (raw >> 6) & 7;
-	const int from_rank = (raw >> 9) & 7;
-	const int promotion = (raw >> 12) & 7;
-	const int from = from_rank * 8 + from_file;
-	const int to = to_rank * 8 + to_file;
-
-	for (const auto &move : legal_moves(board)) {
-		if (move.from().index() != from || move.to().index() != to) {
-			continue;
-		}
-		if (promotion == 0 && move.typeOf() != chess::Move::PROMOTION) {
-			return move;
-		}
-		if (promotion > 0 && move.typeOf() == chess::Move::PROMOTION &&
-			static_cast<int>(move.promotionType().internal()) == promotion) {
-			return move;
-		}
-	}
-	return chess::Move(chess::Move::NO_MOVE);
-}
-
-// Use repetition-relevant FEN fields as the opening traversal identity.
-std::string state_key(const chess::Board &board) { return board.getFen(false); }
 
 } // namespace
 
@@ -325,115 +265,6 @@ torch::Device resolve_device(const std::string &requested) {
 		return torch::Device(torch::kCPU);
 	}
 	throw std::invalid_argument("unsupported device: " + requested);
-}
-
-// Breadth-first traverse Polyglot entries and emit unique non-terminal frontier positions.
-std::vector<std::string> load_opening_positions(const std::string &path, int book_plies,
-												int max_positions, std::uint64_t seed) {
-	if (path.empty()) {
-		return {std::string(chess::constants::STARTPOS)};
-	}
-	std::ifstream input(path, std::ios::binary);
-	if (!input) {
-		throw std::runtime_error("opening book not found: " + path);
-	}
-	std::unordered_multimap<std::uint64_t, std::uint16_t> entries;
-	while (input.peek() != std::char_traits<char>::eof()) {
-		const auto key = read_be64(input);
-		const auto move = read_be16(input);
-		static_cast<void>(read_be16(input));
-		static_cast<void>(read_be32(input));
-		if (!input) {
-			throw std::runtime_error("truncated Polyglot opening book: " + path);
-		}
-		entries.emplace(key, move);
-	}
-
-	struct Pending {
-		chess::Board board;
-		int ply;
-	};
-	std::queue<Pending> queue;
-	queue.push({chess::Board(), 0});
-	std::unordered_set<std::string> visited;
-	std::unordered_set<std::string> emitted;
-	std::vector<std::string> positions;
-	std::mt19937_64 rng(seed);
-
-	while (!queue.empty() && static_cast<int>(positions.size()) < std::max(1, max_positions)) {
-		auto current = std::move(queue.front());
-		queue.pop();
-		const auto key = state_key(current.board) + "|" + std::to_string(current.ply);
-		if (!visited.insert(key).second) {
-			continue;
-		}
-
-		std::vector<chess::Move> moves;
-		if (current.ply < std::max(1, book_plies)) {
-			const auto range = entries.equal_range(current.board.hash());
-			for (auto it = range.first; it != range.second; ++it) {
-				const auto move = decode_polyglot_move(it->second, current.board);
-				if (move.move() != chess::Move::NO_MOVE) {
-					moves.push_back(move);
-				}
-			}
-			std::shuffle(moves.begin(), moves.end(), rng);
-		}
-
-		if (current.ply > 0 && (current.ply >= std::max(1, book_plies) || moves.empty())) {
-			const auto fen = current.board.getFen();
-			if (!game_is_over(current.board) && emitted.insert(state_key(current.board)).second) {
-				positions.push_back(fen);
-			}
-			continue;
-		}
-		for (const auto &move : moves) {
-			auto child = current.board;
-			child.makeMove(move);
-			if (!game_is_over(child)) {
-				queue.push({std::move(child), current.ply + 1});
-			}
-		}
-	}
-	if (positions.empty()) {
-		positions.push_back(std::string(chess::constants::STARTPOS));
-	}
-	return positions;
-}
-
-// Pair each selected FEN with swapped candidate colors to remove first-move/color bias.
-std::vector<OpeningSpec> make_arena_specs(int games, const std::string &opening_book,
-										  int book_plies, int max_positions, std::uint64_t seed) {
-	if (games <= 0) {
-		return {};
-	}
-	if (opening_book.empty()) {
-		std::vector<OpeningSpec> specs;
-		specs.reserve(games);
-		for (int index = 0; index < games; ++index) {
-			specs.push_back({std::string(chess::constants::STARTPOS), index % 2 == 0});
-		}
-		return specs;
-	}
-
-	auto positions = load_opening_positions(opening_book, book_plies, max_positions, seed);
-	const int required = (games + 1) / 2;
-	if (static_cast<int>(positions.size()) < required) {
-		throw std::runtime_error(
-			"arena requires enough unique opening states: required=" + std::to_string(required) +
-			" available=" + std::to_string(positions.size()));
-	}
-	std::mt19937_64 rng(seed);
-	std::shuffle(positions.begin(), positions.end(), rng);
-	std::vector<OpeningSpec> specs;
-	specs.reserve(games);
-	for (int pair = 0; static_cast<int>(specs.size()) < games; ++pair) {
-		specs.push_back({positions[pair], true});
-		if (static_cast<int>(specs.size()) < games) {
-			specs.push_back({positions[pair], false});
-		}
-	}
-	return specs;
 }
 
 } // namespace melano

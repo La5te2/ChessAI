@@ -183,7 +183,6 @@ run_pipeline() {
 		--mcts-batch-size "${EVAL_MCTS_BATCH_SIZE}" \
 		--repetition-policy-penalty "${EVAL_REPETITION_POLICY_PENALTY}" \
 		--instant-mate-first "${EVAL_INSTANT_MATE_FIRST}" \
-		--min-net-wins 0 \
 		--pgn-output "${pgn}" \
 		--seed "$((SEED + ITERATIONS + 1))" \
 		--log-every "${LOG_EVERY}" \
@@ -201,8 +200,6 @@ marker = "arena summary:\n"
 if marker not in arena_log:
 	raise RuntimeError("final Arena output does not contain a JSON summary")
 arena = json.loads(arena_log.rsplit(marker, 1)[1])
-for key in ("accepted", "result_ok", "min_net_wins"):
-	arena.pop(key, None)
 arena["informational"] = True
 summary = json.loads(summary_path.read_text(encoding="utf-8"))
 summary["final_arena"] = arena

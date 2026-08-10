@@ -1,6 +1,6 @@
 #pragma once
 
-// Trainable NNUE-style Value network plus custom incremental CPU inference.
+// Independent trainable NNUE-style Policy and Value networks.
 
 #include <cstdint>
 #include <vector>
@@ -21,8 +21,20 @@ struct SparseEncoderImpl : torch::nn::Module {
 
 	int width;
 	torch::nn::Embedding table{nullptr};
+	torch::Tensor bias;
 };
 TORCH_MODULE(SparseEncoder);
+
+struct PolicyNetworkImpl : torch::nn::Module {
+	PolicyNetworkImpl();
+	torch::Tensor hidden_state(torch::Tensor features, torch::Tensor white_to_move);
+	torch::Tensor forward(torch::Tensor features, torch::Tensor white_to_move);
+
+	SparseEncoder encoder{nullptr};
+	torch::nn::Linear hidden{nullptr};
+	torch::nn::Linear output{nullptr};
+};
+TORCH_MODULE(PolicyNetwork);
 
 struct ValueNetworkImpl : torch::nn::Module {
 	ValueNetworkImpl();
@@ -36,9 +48,19 @@ struct ValueNetworkImpl : torch::nn::Module {
 };
 TORCH_MODULE(ValueNetwork);
 
+struct ModelImpl : torch::nn::Module {
+	ModelImpl();
+
+	PolicyNetwork policy{nullptr};
+	ValueNetwork value{nullptr};
+};
+TORCH_MODULE(Model);
+
 /// Copies trainable tensors into a Torch-free immutable CPU evaluator.
+CpuPolicy snapshot_policy(const PolicyNetwork &model);
 CpuValue snapshot_value(const ValueNetwork &model);
 /// Restores runtime weights into a trainable LibTorch module.
+void restore_policy(const PolicyNetwork &model, const PolicyWeights &weights);
 void restore_value(const ValueNetwork &model, const ValueWeights &weights);
 
 /// Counts scalar parameter elements in one module.

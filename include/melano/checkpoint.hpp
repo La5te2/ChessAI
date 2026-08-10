@@ -1,10 +1,9 @@
 #pragma once
 
-// Stable checkpoint serialization, hashing, and atomic file replacement for Melano.
+// Stable checkpoint serialization and atomic file replacement for Melano.
 
 #include <cstdint>
 #include <filesystem>
-#include <string>
 #include "melano/model.hpp"
 
 namespace melano {
@@ -21,8 +20,5 @@ void save_checkpoint_atomic(const std::filesystem::path &path, const Model &mode
 /// Loads a Melano checkpoint, validates its architecture tag, and moves it to device.
 Model load_checkpoint(const std::filesystem::path &path, const torch::Device &device,
 					  ArchitectureInfo *arch = nullptr);
-
-/// Computes the lowercase hexadecimal SHA-256 digest of a file.
-std::string file_sha256(const std::filesystem::path &path);
 
 } // namespace melano

@@ -114,7 +114,7 @@ if "%BUILD_GADUS%"=="ON" (
 )
 
 if "%BUILD_MELANO%"=="ON" (
-	for %%F in (preprocess train search arena uci) do (
+	for %%F in (preprocess train search uci) do (
 		if not exist "%WORK_DIR%\melano\%%F.exe" goto :failed
 		copy /y "%WORK_DIR%\melano\%%F.exe" "%PUBLISH_DIR%\melano\%%F.exe" >nul || goto :failed
 	)

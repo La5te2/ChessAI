@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -60,7 +61,9 @@ int main(int argc, char **argv) {
 			else
 				throw std::invalid_argument("unknown argument: " + argument);
 		}
-		eleginus::CpuValue value(eleginus::load_embedded_runtime_model());
+		auto weights = eleginus::load_embedded_runtime_model();
+		eleginus::CpuPolicy policy(std::move(weights.policy));
+		eleginus::CpuValue value(std::move(weights.value));
 		chess::Board board;
 		std::string line;
 		while (std::getline(std::cin, line)) {
@@ -78,7 +81,7 @@ int main(int argc, char **argv) {
 			} else if (line.starts_with("go")) {
 				eleginus::SearchOptions options;
 				options.expansions = expansions;
-				const auto result = eleginus::Searcher(value, options).search(board);
+				const auto result = eleginus::Searcher(policy, value, options).search(board);
 				const int cp = static_cast<int>(std::lround((result.value - 0.5F) * 2000.0F));
 				std::cout << "info depth " << result.expanded_nodes << " nodes "
 						  << result.evaluated_nodes << " score cp " << cp << " pv "

@@ -1,34 +1,46 @@
 # Melano
 
-Melano is a geometry-aware Transformer chess architecture with Policy and Value outputs.
+Melano is a geometry-aware Transformer chess network that jointly predicts a move policy and a side-to-move position evaluation.
 
-## 1. Notations
+## 1. Notation
 
-- $x$ denotes a complete game state maintained by the chess rules engine.
-- $s=\phi_M(x)$ denotes the 67-integer network input encoded from $x$.
-- $\mathcal A(x)$ denotes the set of legal moves in $x$.
-- $\mathcal I_M=\{0,\ldots,4671\}$ denotes the complete Melano action-index set.
-- $i_M(a)\in\mathcal I_M$ denotes the action index assigned to move $a$.
-- $\theta$ denotes the trainable model parameters.
-- $\ell_\theta(s,i)$ denotes the Policy logit assigned to action index $i$.
-- $P_\theta(a\mid s)$ denotes the Policy probability assigned to legal move $a$.
-- $V_\theta(s)\in[-1,1]$ denotes the evaluation of $s$ from the perspective of the side to move.
-- $C$ denotes the embedding width.
-- $B$ denotes the number of geometry-attention blocks.
+- $\mathcal X$ is the set of complete chess states maintained by the rules engine.
+- $x\in\mathcal X$ is a complete chess state containing the board, side to move, castling rights, en passant state, move counters and repetition history.
+- $\mathcal A(x)$ is the set of legal actions in state $x$.
+- $T(x,a)$ is the complete state reached by applying legal action $a\in\mathcal A(x)$ to state $x$.
+- $z(x)\in\lbrace-1,0,1\rbrace$ is the exact outcome of terminal state $x$ from the perspective of its side to move, with $1$, $0$ and $-1$ representing a win, draw and loss.
+- $\phi_M$ is the Melano state encoder that maps a complete chess state to a network input.
+- $s=\phi_M(x)$ is the Melano network input obtained from complete state $x$.
+- $\mathcal I_M=\lbrace0,\ldots,4671\rbrace$ is the fixed set of Melano action indices.
+- $i_M(a)\in\mathcal I_M$ is the action index assigned to legal action $a$.
+- $\theta$ denotes the trainable network parameters.
+- $\ell_\theta(s)\in\mathbb R^{4672}$ is the complete vector of Policy logits produced by the network with parameters $\theta$ and $\ell_\theta(s,i)$ is its scalar component for action index $i\in\mathcal I_M$.
+- $\text{P}$, which stands for Policy, is the network output that assigns a probability distribution over the legal actions available in each encoded state.
+- $\text{V}$, which stands for Value, is a scalar network output in $[-1,1]$ that estimates the expected game result from the perspective of the side to move.
+- $Q$ denotes a state or action evaluation defined by a particular procedure. Each definition specifies its arguments and observation perspective.
+- $\mathrm{clip}_{[l,u]}(y)=\min(u,\max(l,y))$ restricts scalar $y$ to the closed interval $[l,u]$.
 
 ## 2. State and Action Encoding
 
 ### 2.1 State Encoding
 
-The rules engine represents the complete state $x$, including move counters and repetition history. The state codec `melano_states` maps $x$ to a 67-integer network input by retaining its board occupancy, side to move, castling rights and en-passant file:
+The network requires a fixed numerical representation of each complete chess state. Melano represents a state with 64 categorical square entries followed by three entries for rule information. The state encoder $\phi_M$ produces
 
 $$
-s=(p_0,\ldots,p_{63},t,c,e).
+\phi_M(x)=s=(p_0,\ldots,p_{63},t,c,e),
 $$
 
-Squares are indexed from 0 at `a1` to 63 at `h8`. For each square $q$, the token $p_q$ belongs to $\{0,\ldots,12\}$. Token 0 represents an empty square. White pawn, knight, bishop, rook, queen and king use tokens 1 through 6, while the corresponding Black pieces use tokens 7 through 12.
+where each $p_q$ describes one board square, $t$ describes the side to move, $c$ describes the castling rights and $e$ describes the en passant file.
 
-The side token is
+To order the square entries, let $r\in\lbrace0,\ldots,7\rbrace$ be a rank coordinate and let $f\in\lbrace0,\ldots,7\rbrace$ be a file coordinate. Rank 1 has coordinate $r=0$, and the coordinate increases toward rank 8. File `a` has coordinate $f=0$, and the coordinate increases toward file `h`. The square index is
+
+$$
+q=8r+f.
+$$
+
+For each $q\in\lbrace0,\ldots,63\rbrace$, the categorical entry $p_q\in\lbrace0,\ldots,12\rbrace$ records the occupant of that square. The value 0 represents an empty square. White pawn, knight, bishop, rook, queen and king use values 1 through 6, and the corresponding Black pieces use values 7 through 12.
+
+The side-to-move entry is
 
 $$
 t=
@@ -38,115 +50,156 @@ t=
 \end{cases}
 $$
 
-The castling token $c\in\{0,\ldots,15\}$ is a four-bit mask. Its bits, from least to most significant, represent White kingside, White queenside, Black kingside and Black queenside castling rights. The en-passant token is 0 when no en-passant square exists and equals $1+f_{\mathrm{ep}}$ otherwise, where $f_{\mathrm{ep}}\in\{0,\ldots,7\}$ is the en-passant file.
+The castling entry $c\in\lbrace0,\ldots,15\rbrace$ is a four-bit mask. From least to most significant, its bits represent White kingside, White queenside, Black kingside and Black queenside castling rights. The en passant entry is
+
+$$
+e=
+\begin{cases}
+0,&\text{no en passant square exists},\\
+1+f_{\mathrm{ep}},&\text{an en passant square exists on file }f_{\mathrm{ep}},
+\end{cases}
+$$
+
+where $f_{\mathrm{ep}}\in\lbrace0,\ldots,7\rbrace$ uses the same file coordinates as the square entries.
+
+Each of the 67 entries fits in one unsigned byte. `PackedState` denotes their 67-byte storage representation in the order shown in $s$, and converting those bytes to integer embedding indices reproduces $\phi_M(x)$ exactly.
+
+The encoded state $\phi_M(x)$ records piece placement, side to move, castling rights and the en passant file. The complete state $x$ additionally records move counters and repetition history. Since $\phi_M$ omits those two fields, complete states that differ only in move counters or repetition history produce the same network input.
 
 ### 2.2 Action Encoding
 
-The move codec `sd_64x64_underpromo9` contains 4096 source-destination indices and 576 underpromotion indices:
+The legal-action set $\mathcal A(x)$ varies with the complete state $x$. To give actions a state-independent numerical representation, Melano assigns each legal action $a\in\mathcal A(x)$ an index $i_M(a)$ in the fixed set $\mathcal I_M$.
+
+Melano divides $\mathcal I_M$ into 4096 source-destination indices and 576 underpromotion indices. Let $q\in\lbrace0,\ldots,63\rbrace$ be the source-square index of action $a$, and let $k\in\lbrace0,\ldots,63\rbrace$ be its destination-square index. An ordinary move or a promotion to a queen uses
+
+$$
+i_M(a)=64q+k.
+$$
+
+This formula assigns indices 0 through 4095 to all $64\times64$ source-destination pairs. The rules library represents castling internally with the rook square as the destination of the king move. Before computing $k$, Melano replaces that internal destination with the king destination `g1`, `c1`, `g8` or `c8`.
+
+An underpromotion is determined by its source square, destination-file displacement and promoted piece. Let $\Delta f\in\lbrace-1,0,1\rbrace$ be the destination file minus the source file, and let
+
+$$
+u=
+\begin{cases}
+0,&\text{promotion to a knight},\\
+1,&\text{promotion to a bishop},\\
+2,&\text{promotion to a rook}.
+\end{cases}
+$$
+
+The underpromotion index is
+
+$$
+i_M(a)=4096+9q+3(\Delta f+1)+u.
+$$
+
+This formula assigns indices 4096 through 4671 to the $64\times3\times3=576$ combinations. Together, the two regions give
 
 $$
 |\mathcal I_M|=64\times64+64\times9=4672.
 $$
 
-Let $f(a)$ denote the source square of move $a$, and let $t(a)$ denote the destination used by the codec. Ordinary moves and queen promotions use
+For complete state $x$, the available action indices are
 
 $$
-i_M(a)=64f(a)+t(a).
+\mathcal I_M(x)=
+\lbrace i_M(a)\mid a\in\mathcal A(x)\rbrace.
 $$
 
-The chess library represents castling internally as a king-to-rook move. The codec replaces that destination with the king's final square, `g1`, `c1`, `g8` or `c8`, before applying the source-destination formula.
-
-Knight, bishop and rook underpromotions occupy the final 576 indices. Let $\Delta_f(a)\in\{-1,0,1\}$ be the destination-file displacement and let
-
-$$
-r(a)=
-\begin{cases}
-0,&\text{knight promotion},\\
-1,&\text{bishop promotion},\\
-2,&\text{rook promotion}.
-\end{cases}
-$$
-
-Their action index is
-
-$$
-i_M(a)=4096+9f(a)+3\left(\Delta_f(a)+1\right)+r(a).
-$$
-
-Decoding compares an action index with every legal move in the current game state and returns the legal move whose encoded index matches. This round trip preserves castling, en-passant and promotion flags supplied by the rules engine.
+To decode an available index, Melano generates $\mathcal A(x)$ and selects the legal action whose encoding equals that index. The selected action contains the castling, en passant or promotion information required by the rules engine.
 
 ## 3. Network
 
 ### 3.1 Geometry-Attention Encoder
 
-For a batch of $n$ states, the state embedding produces a tensor $h_0\in\mathbb R^{n\times65\times C}$. Token 0 is a learned global token and tokens 1 through 64 correspond to board squares.
+The Melano network derives its $\text{P}$ and $\text{V}$ from a shared geometry-attention encoder. The state embedding converts the encoded state $s$ into one global token and 64 square tokens, and a sequence of geometry-attention blocks transforms these tokens into the shared representation used by both output heads.
 
-The rule-context embedding is
+Let $C\geq1$ be the feature width of every token and let $B\geq1$ be the number of geometry-attention blocks. The state embedding produces
+
+$$
+h_0(s)\in\mathbb R^{65\times C},
+$$
+
+where token 0 is global and token $q+1$ corresponds to square index $q\in\lbrace0,\ldots,63\rbrace$.
+
+The side-to-move, castling and en passant entries first form the rule-context embedding
 
 $$
 r(s)=E_{\mathrm{side}}(t)+E_{\mathrm{castling}}(c)+E_{\mathrm{ep}}(e).
 $$
 
-For square $q$, the initial square token is
+The rule-context embedding contributes to all 65 initial tokens. For square $q$, it is added to the embeddings of the square occupant and the absolute square index:
 
 $$
 h_{0,q+1}(s)=E_{\mathrm{piece}}(p_q)+E_{\mathrm{square}}(q)+r(s).
 $$
 
-The initial global token is
+The global token combines the same context with a trainable vector $g\in\mathbb R^C$:
 
 $$
-h_{0,0}(s)=g+r(s),
+h_{0,0}(s)=g+r(s).
 $$
 
-where $g\in\mathbb R^C$ is trainable. The piece, square, side, castling and en-passant embedding tables contain 13, 64, 2, 16 and 9 entries respectively.
+The piece, square, side-to-move, castling and en passant embedding tables contain 13, 64, 2, 16 and 9 vectors, respectively.
 
-Each attention block uses the largest value in $\{8,4,2,1\}$ that divides $C$ as its head count $H$. The dimension of each head is $d=C/H$.
-
-Melano assigns one of 29 relation identifiers to every pair of tokens. Relation 0 applies whenever either token is the global token. For two square tokens, let $d_r$ and $d_f$ be the absolute rank and file differences. Their relation identifier is
+Each geometry-attention block uses the largest member of $\lbrace8,4,2,1\rbrace$ that divides $C$ as its head count $H$. The resulting feature width of each head is
 
 $$
-\rho(d_r,d_f)=
+d=\frac{C}{H}.
+$$
+
+Attention scores combine learned token features with relations derived from chessboard geometry. Let $\rho(u,v)\in\lbrace0,\ldots,28\rbrace$ be the relation identifier assigned to source token $u$ and target token $v$. The global token has index 0, and every pair containing that token uses
+
+$$
+\rho(u,v)=0.
+$$
+
+When $u$ and $v$ are square-token indices, let $d_r$ and $d_f$ be the absolute rank and file differences between squares $u-1$ and $v-1$. Their relation identifier is
+
+$$
+\rho(u,v)=
 \begin{cases}
 1,&d_r=0\ \text{and}\ d_f=0,\\
 1+d_f,&d_r=0\ \text{and}\ 1\leq d_f\leq7,\\
 8+d_r,&d_f=0\ \text{and}\ 1\leq d_r\leq7,\\
 15+d_r,&d_r=d_f\ \text{and}\ 1\leq d_r\leq7,\\
-23,&\{d_r,d_f\}=\{1,2\},\\
+23,&\lbrace d_r,d_f\rbrace=\lbrace1,2\rbrace,\\
 24+\min(4,d_r+d_f-4),&\text{otherwise}.
 \end{cases}
 $$
 
-These cases produce identity, same-rank distance, same-file distance, diagonal distance, knight-move and five residual distance classes. Every identifier in $\{0,\ldots,28\}$ is reachable.
+The square-token cases distinguish identical squares, distances along a rank, distances along a file, diagonal distances, knight-move geometry and five classes for the remaining relative positions. Together with relation 0, these cases use every identifier in $\lbrace0,\ldots,28\rbrace$.
 
-For block $b\in\{0,\ldots,B-1\}$, let $Z_b\in\mathbb R^{65\times C}$ be its learned token-position tensor and define
+For block $b\in\lbrace0,\ldots,B-1\rbrace$, let $Z_b\in\mathbb R^{65\times C}$ be its trainable position tensor. Adding this tensor to the block input gives
 
 $$
 \widetilde h_b=h_b+Z_b.
 $$
 
-A pre-normalized linear projection produces $3C$ features for every token. Splitting the last dimension into three parts and reshaping each part to $H$ heads gives
+The first LayerNorm in the block normalizes each token across its $C$ features. A linear map then produces the query, key and value features, which are reshaped into $H$ heads:
 
 $$
 (Q_b,K_b,U_b)=
-\mathrm{split}_{3}\left(
-\mathrm{reshape}_{3,H,d}
+\mathrm{Split}_{3}\left(
+\mathrm{Reshape}_{3,H,d}
 \left(W_{qkv,b}\mathrm{LN}_{b,1}(\widetilde h_b)+b_{qkv,b}\right)
 \right).
 $$
 
-Each block contains a learned static bias table $\beta_b\in\mathbb R^{29\times H}$. It also derives a state-dependent bias table from the position-adjusted global token:
+Each block contains a static geometry-bias table $\beta_b\in\mathbb R^{29\times H}$. The block also derives a state-dependent geometry-bias table from its position-adjusted global token:
 
 $$
 \Gamma_b(s)=
-\mathrm{reshape}_{H,29}\left(
+\mathrm{Reshape}_{H,29}\left(
 W_{\gamma,b,2}\mathrm{GELU}
 \left(W_{\gamma,b,1}\mathrm{LN}(\widetilde h_{b,0})+b_{\gamma,b,1}\right)
 +b_{\gamma,b,2}
 \right).
 $$
 
-For head $h$, source token $u$ and target token $v$, the attention score is
+For attention head $h$, source token $u$ and target token $v$, the query-key similarity, static geometry bias and state-dependent geometry bias define the attention score
 
 $$
 S_{b,h,u,v}=
@@ -155,20 +208,24 @@ S_{b,h,u,v}=
 +\Gamma_b(s)_{h,\rho(u,v)}.
 $$
 
-The softmax function normalizes $S_{b,h,u,v}$ over target token $v$. The output of head $h$ for source token $u$ is
+SoftMax normalizes these scores over all 65 possible target tokens for each fixed block, head and source token. The resulting output of head $h$ for source token $u$ is
 
 $$
-o_{b,h,u}=\sum_v\mathrm{softmax}_v(S_{b,h,u,v})U_{b,h,v}.
+o_{b,h,u}=
+\sum_{v=0}^{64}
+\frac{\exp S_{b,h,u,v}}
+{\displaystyle\sum_{w=0}^{64}\exp S_{b,h,u,w}}
+U_{b,h,v}.
 $$
 
-Concatenating the head outputs and applying the output projection gives the first residual update:
+Concatenating the $H$ head outputs, applying the output projection and adding the block input produces the attention residual output
 
 $$
 y_{b,u}=\widetilde h_{b,u}+
 W_{o,b}\mathrm{Concat}_{h=1}^{H}(o_{b,h,u})+b_{o,b}.
 $$
 
-After attention has exchanged information among the tokens, a pre-normalized feed-forward network transforms each token independently and forms the second residual update:
+A second LayerNorm supplies each token to a feed-forward network whose hidden width is $4C$. The feed-forward result is added to $y_b$ to produce the block output
 
 $$
 h_{b+1}=y_b+
@@ -176,312 +233,434 @@ W_{f,b,2}\mathrm{GELU}
 \left(W_{f,b,1}\mathrm{LN}_{b,2}(y_b)+b_{f,b,1}\right)+b_{f,b,2}.
 $$
 
-The feed-forward network expands each token from $C$ to $4C$ features and projects it back to $C$. Applying all $B$ geometry-attention blocks defines the shared representation
+Applying all $B$ blocks defines the shared geometry-aware representation
 
 $$
 E_\theta(s)=h_B(s)\in\mathbb R^{65\times C}.
 $$
 
-The global token $g$ and every position tensor $Z_b$ are initialized to zero. Embedding tables and linear maps use the default LibTorch initialization. LayerNorm uses trainable affine parameters, unit scale, zero bias and epsilon $10^{-5}$. The encoder contains no dropout.
-
-### 3.2 Policy Head
-
-Let $z_q=E_\theta(s)_{q+1}$ be the transformed token for square $q$. The Policy head applies a shared LayerNorm to each square token and then uses separate source and destination projections:
+The complete encoder path is
 
 $$
-u_q=W_F\mathrm{LN}(z_q)+b_F,
+s\longrightarrow\text{state embedding}\longrightarrow h_0
+\longrightarrow\text{$B$ geometry-attention blocks}
+\longrightarrow E_\theta(s).
+$$
+
+The trainable global token $g$ and every position tensor $Z_b$ begin at zero. Embedding tables and linear maps use the default LibTorch initialization. Each LayerNorm has trainable scale and bias, uses epsilon $10^{-5}$ and begins with unit scale and zero bias. The encoder applies no dropout.
+
+### 3.2 Policy and Value Heads
+
+The Policy head derives action logits from the 64 transformed square tokens in $E_\theta(s)$. Let
+
+$$
+z_q=E_\theta(s)_{q+1},
+\qquad q\in\lbrace0,\ldots,63\rbrace,
+$$
+
+and let $\overline z_q=\mathrm{LN}_P(z_q)$ be the normalized token for square $q$. Separate linear maps produce its source and destination features:
+
+$$
+u_q=W_F\overline z_q+b_F,
 \qquad
-v_k=W_T\mathrm{LN}(z_k)+b_T.
+v_q=W_T\overline z_q+b_T.
 $$
 
-The source-destination logit for action index $64q+k$ is
+For source square $q$ and destination square $k$, their scaled dot product is the logit of source-destination index $64q+k$:
 
 $$
 \ell_\theta(s,64q+k)=\frac{u_q\cdot v_k}{\sqrt C}.
 $$
 
-A third linear map produces nine underpromotion logits from each normalized source token:
+A third linear map produces the nine underpromotion logits associated with source square $q$:
 
 $$
-c_q=W_U\mathrm{LN}(z_q)+b_U\in\mathbb R^9.
+c_q=W_U\overline z_q+b_U\in\mathbb R^9.
 $$
 
-For $m\in\{0,\ldots,8\}$, the underpromotion logit is
+For $m\in\lbrace0,\ldots,8\rbrace$, the corresponding logit is
 
 $$
 \ell_\theta(s,4096+9q+m)=c_{q,m}.
 $$
 
-The component order of $c_q$ matches the underpromotion index formula in Section 2.2. Flattening the $64\times64$ source-destination matrix and the $64\times9$ underpromotion matrix gives
+The component index $m=3(\Delta f+1)+u$ uses the destination-file displacement $\Delta f$ and promoted-piece index $u$ defined in Section 2.2. Flattening the $64\times64$ source-destination matrix and appending the $64\times9$ underpromotion matrix produces the complete Policy-logit vector
 
 $$
 \ell_\theta(s)\in\mathbb R^{4672}.
 $$
 
-Search supplies an encoded-state batch $\mathbf s=(s_1,\ldots,s_n)$ and a matrix $J\in\mathcal I_M^{n\times L}$ of requested legal-action indices. For an ordinary index $J_{rj}=64q+k$, the legal-action forward pass computes only $u_q\cdot v_k/\sqrt C$. For an underpromotion index $J_{rj}=4096+9q+m$, it applies the underpromotion map to source token $q$ and selects component $m$. The resulting tensor
-
-$$
-\Lambda_\theta(\mathbf s,J)_{rj}=\ell_\theta(s_r,J_{rj})
-$$
-
-contains the same requested logits as the complete Policy vector without constructing logits for unrequested actions.
-
-For a game state $x$ with $s=\phi_M(x)$, legal-move inference normalizes the logits over $\mathcal A(x)$:
+For complete state $x$ with $s=\phi_M(x)$, selecting the logits indexed by legal actions and normalizing them with softmax produces the legal-move Policy:
 
 $$
 P_\theta(a\mid s)=
 \frac{\exp\ell_\theta(s,i_M(a))}
-{\displaystyle\sum_{b\in\mathcal A(x)}\exp\ell_\theta(s,i_M(b))}.
+{\displaystyle\sum_{b\in\mathcal A(x)}\exp\ell_\theta(s,i_M(b))},
+\qquad a\in\mathcal A(x).
 $$
 
-### 3.3 Value Head
+The denominator ranges over $\mathcal A(x)$, so $P_\theta(\cdot\mid s)$ is a probability distribution over the legal actions in complete state $x$.
 
-The Value head reads the transformed global token $E_\theta(s)_0$. It applies LayerNorm, a $C\rightarrow256$ linear map, ReLU, a $256\rightarrow1$ linear map and a final hyperbolic tangent:
+The Value head derives its scalar output from the transformed global token $E_\theta(s)_0$. LayerNorm supplies that token to a $C\rightarrow256$ linear map and ReLU, and a $256\rightarrow1$ linear map followed by a hyperbolic tangent produces
 
 $$
 V_\theta(s)=
 \tanh\left(
 W_{V,2}\mathrm{ReLU}
-\left(W_{V,1}\mathrm{LN}(E_\theta(s)_0)+b_{V,1}\right)+b_{V,2}
-\right).
+\left(W_{V,1}\mathrm{LN}_V(E_\theta(s)_0)+b_{V,1}\right)+b_{V,2}
+\right)
+\in[-1,1].
 $$
 
-The complete forward pass is
+Writing $f_\theta$ for the complete network gives
 
 $$
-f_\theta(s)=\left(\ell_\theta(s),V_\theta(s)\right),
-\qquad
-\ell_\theta(s)\in\mathbb R^{4672},\quad V_\theta(s)\in[-1,1].
+f_\theta(s)=\left(\ell_\theta(s),V_\theta(s)\right).
 $$
 
-The state embedding and the $B$ geometry-attention blocks form the backbone shared by the Policy and Value heads.
-
-## 4. Preprocessing
-
-### 4.1 Policy and Value Targets
-
-Preprocessing follows each PGN game from its standard initial position or from its `FEN` header. For every parseable SAN move, it records the state immediately before the move as $s$, the played move as $a^*$ and the action index $i^*=i_M(a^*)$.
-
-Preprocessing can derive Value targets either from numerical PGN comments or from the final game result. When comments provide the targets, signed pawn-unit evaluations such as `+0.60`, `-.25` and `+0.60/12` are accepted. The optional suffix after `/` does not affect the target. Each comment evaluates the state reached after its associated move, so the comment on the preceding move supplies the Value target for the current pre-move state.
-
-Let $c_W$ be the parsed White-perspective score and let $c_{\mathrm{stm}}$ be the same score from the perspective of the side to move:
+The shared encoder and the two output heads form the path
 
 $$
-c_{\mathrm{stm}}=
+s\longrightarrow E_\theta(s)\longrightarrow
 \begin{cases}
-c_W,&\text{White to move},\\
--c_W,&\text{Black to move}.
+\text{Policy head}\longrightarrow\ell_\theta(s)
+\longrightarrow P_\theta(\cdot\mid s),\\
+\text{Value head}\longrightarrow V_\theta(s).
 \end{cases}
 $$
 
-The comment-derived target is
+### 3.3 Inference Evaluation
+
+While the Policy head defines one logit for every action index, forming the complete vector $\ell_\theta(s)$, legal-move inference requires only the components indexed by actions in $\mathcal A(x)$. The inference path therefore reuses the square-token projections defined in Section 3.2 and directly evaluates the corresponding source-destination dot products and underpromotion logits.
+
+For a batch of encoded states $\mathbf s=(s_1,\ldots,s_n)$, let $L$ be the largest legal-action count in the batch. A matrix $J\in\mathcal I_M^{n\times L}$ stores the requested action indices, and a mask $M\in\lbrace0,1\rbrace^{n\times L}$ marks the entries that represent legal actions rather than padding. The selected-logit tensor is
 
 $$
-V_{\mathrm{target}}(s)=\tanh\left(\frac{c_{\mathrm{stm}}}{3}\right).
+\Lambda_\theta(\mathbf s,J)_{rj}
+=
+\ell_\theta(s_r,J_{rj}).
 $$
 
-The initial state has no preceding move comment and receives target 0. Any later state whose preceding comment contains no parseable signed score also receives target 0. When comments provide the targets, preprocessing admits a game if at least one of its move comments contains a parseable signed score.
+For an index $J_{rj}=64q+k$, Melano computes the source-destination dot product $u_q\cdot v_k/\sqrt C$. For an index $J_{rj}=4096+9q+m$, it selects component $m$ from $c_q$. Padded positions are excluded before softmax, so each row is normalized over the legal actions of its own complete state. This selected-logit evaluation produces the same legal-action logits and the same $P_\theta(\cdot\mid s_r)$ as the corresponding components of the complete vector.
 
-When the final game result provides the targets, a win from the perspective of the side to move gives $+1$, a loss gives $-1$ and a draw or unknown result gives 0.
+## 4. Supervised Training
 
-### 4.2 HDF5 Schema
+### 4.1 Supervised Data
 
-Preprocessing creates an HDF5 file with the following identifying attributes:
+Let $\mathcal D_{\mathrm{sup}}$ be a supervised dataset containing $N$ records:
 
-```text
-arch_type=melano
-state_encoding=melano_states
-move_encoding=sd_64x64_underpromo9
-target_schema=melano_policy_value
-value_perspective=side_to_move
-has_cmt=<0 or 1>
-```
+$$
+\mathcal D_{\mathrm{sup}}=
+\lbrace\xi_n\rbrace_{n=1}^{N}.
+$$
 
-When `has_cmt=1`, the file also contains
+Each record is associated with a complete pre-move state $x_n$ and a selected legal action $a_n\in\mathcal A(x_n)$. The record is
 
-```text
-comment_eval_perspective=white
-comment_value_transform=tanh(side_to_move_pawn_score/3)
-```
+$$
+\xi_n=(s_n,i_n,y_n),
+$$
 
-The row-aligned datasets are
+where
 
-- `states`, a little-endian unsigned-byte array with shape $[N,67]$
-- `moves`, a little-endian unsigned-16 array with shape $[N]$
-- `values`, a little-endian float-32 array with shape $[N]$
+$$
+s_n=\phi_M(x_n),
+\qquad
+i_n=i_M(a_n),
+\qquad
+y_n\in[-1,1].
+$$
 
-All three datasets are extensible along their first dimension and use a common positive row count per HDF5 chunk. Optional compression applies the HDF5 shuffle filter followed by deflate. Final file attributes record the number of accepted games, written positions, skipped SAN moves and games rejected for lacking a parseable evaluation when comments provide the targets.
+The encoded state $s_n$ is the network input, and the action index $i_n$ is the Policy target. The scalar $y_n$ is the Value target, expressed as an estimate of the expected game result from the perspective of the side to move in $x_n$. On this scale, $-1$ denotes a loss, $0$ denotes a draw and $1$ denotes a win, and intermediate values express expectations between these outcomes.
 
-A valid Melano dataset has the identifying attributes above, a nonempty state array of width 67 and equal row counts across all three datasets.
+### 4.2 Supervised Objective
 
-## 5. Supervised Training
+For network input $s$, the Policy head produces the complete logit vector
 
-For a training row $(s,i^*,V_{\mathrm{target}})$, the model produces all 4672 Policy logits. Supervised training applies softmax over the complete action-index set:
+$$
+\ell_\theta(s)=
+\left(\ell_\theta(s,i)\right)_{i\in\mathcal I_M}
+\in\mathbb R^{4672}.
+$$
+
+Applying softmax to all 4672 components produces the supervised action-index distribution $R_\theta$:
 
 $$
 R_\theta(i\mid s)=
 \frac{\exp\ell_\theta(s,i)}
-{\displaystyle\sum_{j\in\mathcal I_M}\exp\ell_\theta(s,j)}.
+{\displaystyle\sum_{j\in\mathcal I_M}\exp\ell_\theta(s,j)},
+\qquad i\in\mathcal I_M.
 $$
 
-The same Policy logits determine the supervised distribution $R_\theta$ and the legal-move distribution $P_\theta$ defined in Section 3.2. The normalization for $R_\theta$ covers all action indices during training, whereas the normalization for $P_\theta$ covers the legal moves of the current game state during inference.
+Both $R_\theta(\cdot\mid s)$ and the legal-move distribution $P_\theta(\cdot\mid s)$ are derived from $\ell_\theta(s)$, but they differ in normalization domain. $R_\theta$ normalizes all 4672 components for supervised learning, whereas $P_\theta$ selects the components indexed by actions in $\mathcal A(x)$ and normalizes those components for legal-move inference.
 
-Let $\delta_{i^*}$ be the one-hot distribution that assigns probability 1 to $i^*$ and 0 to every other action index. The supervised Policy loss is
-
-$$
-L_{P,\mathrm{sup}}=
-L_{\mathrm{CE}}\left(R_\theta(\cdot\mid s),\delta_{i^*}\right)
-=-\log R_\theta(i^*\mid s).
-$$
-
-The supervised Value loss is
+For minibatch $\mathcal B\subseteq\mathcal D_{\mathrm{sup}}$, the supervised Policy loss is the mean negative log-probability assigned to the target action indices:
 
 $$
-L_{V,\mathrm{sup}}=
-\mathrm{MSE}\left(V_\theta(s),V_{\mathrm{target}}(s)\right).
+L_{P,\mathrm{sup}}^{(\mathcal B)}=
+-\frac{1}{|\mathcal B|}
+\sum_{(s,i,y)\in\mathcal B}
+\log R_\theta(i\mid s).
 $$
 
-Let $w_V\geq0$ be the Value-loss coefficient. The minibatch objective is
+The supervised Value loss is the mean squared difference between the predicted and target expected results in the same minibatch:
 
 $$
-L_{\mathrm{sup}}=L_{P,\mathrm{sup}}+w_VL_{V,\mathrm{sup}}.
+L_{V,\mathrm{sup}}^{(\mathcal B)}=
+\frac{1}{|\mathcal B|}
+\sum_{(s,i,y)\in\mathcal B}
+\left(V_\theta(s)-y\right)^2.
 $$
 
-Because the Policy and Value heads receive the shared representation $E_\theta$, gradients from both loss terms contribute to updates of the state embedding and geometry-attention blocks.
-
-Training initializes a model with channel count $C$ and block count $B$, then optimizes all parameters with AdamW. The loader shuffles HDF5 chunks, reads the next chunk asynchronously while processing another chunk and independently shuffles rows within each loaded chunk.
-
-Let $N$ be the number of HDF5 rows and let $m$ be the minibatch size. The number of optimizer steps in one epoch is
+The nonnegative coefficient $w_V$ sets the contribution of the Value loss to the complete minibatch objective:
 
 $$
-S_{\mathrm{epoch}}=\left\lceil\frac Nm\right\rceil
+L_{\mathrm{sup}}^{(\mathcal B)}=
+L_{P,\mathrm{sup}}^{(\mathcal B)}
++w_VL_{V,\mathrm{sup}}^{(\mathcal B)}.
 $$
 
-Let $E$ be the positive epoch count and let $K_{\max}\in\mathbb N\cup\{\infty\}$ be the optimizer-step cap. The resulting number of steps and the warmup length are
+To specify how the two losses affect the shared network, partition the parameters as
 
 $$
-T=\min\left(K_{\max},E S_{\mathrm{epoch}}\right),
+\theta=(\theta_E,\theta_P,\theta_V),
+$$
+
+where $\theta_E$ contains the state-embedding and geometry-attention parameters, while $\theta_P$ and $\theta_V$ contain the parameters of the Policy and Value heads. The gradients of the complete objective satisfy
+
+$$
+\nabla_{\theta_P}L_{\mathrm{sup}}^{(\mathcal B)}
+=
+\nabla_{\theta_P}L_{P,\mathrm{sup}}^{(\mathcal B)},
 $$
 
 $$
-T_W=\min\left(T,2000,\max\left(100,\left\lfloor\frac{T}{100}\right\rfloor\right)\right).
+\nabla_{\theta_V}L_{\mathrm{sup}}^{(\mathcal B)}
+=
+w_V\nabla_{\theta_V}L_{V,\mathrm{sup}}^{(\mathcal B)},
 $$
 
-For peak learning rate $\eta_{\max}$, step $k\geq1$ uses
+$$
+\nabla_{\theta_E}L_{\mathrm{sup}}^{(\mathcal B)}
+=
+\nabla_{\theta_E}L_{P,\mathrm{sup}}^{(\mathcal B)}
++w_V\nabla_{\theta_E}L_{V,\mathrm{sup}}^{(\mathcal B)}.
+$$
+
+The Policy loss therefore updates the Policy head and shared encoder, and the Value loss updates the Value head and shared encoder. Their encoder gradients add according to the final equation.
+
+### 4.3 Parameter Optimization
+
+Parameter optimization arranges $\mathcal D_{\mathrm{sup}}$ into epochs, and each completed epoch uses every record exactly once. At the start of an epoch, the data loader randomizes the order of the storage chunks and then randomizes the records within each chunk. This two-level shuffle changes both the order and composition of successive minibatches, reducing the correlation that could otherwise arise from the fixed storage order.
+
+Let $B_{\mathrm{opt}}\geq1$ be the minibatch size, and suppose the stored dataset consists of $J$ chunks containing $n_1,\ldots,n_J$ records, where $\sum_{j=1}^{J}n_j=N$. Since each chunk is partitioned independently into minibatches, one complete epoch contains
+
+$$
+K_{\mathrm{epoch}}=
+\sum_{j=1}^{J}
+\left\lceil\frac{n_j}{B_{\mathrm{opt}}}\right\rceil
+$$
+
+optimizer steps. Let $E\geq1$ be the epoch count, and let $K_{\max}\in\mathbb N\cup\lbrace\infty\rbrace$ be the optimizer-step limit, with a nonpositive configured limit represented by $K_{\max}=\infty$. The complete optimization sequence contains
+
+$$
+K=\min\left(K_{\max},E K_{\mathrm{epoch}}\right)
+$$
+
+steps, whose minibatches are denoted by $\mathcal B_1,\ldots,\mathcal B_K$. Let $\theta^{(0)}$ be the initial parameters of a newly initialized Melano network with feature width $C$ and block count $B$, and let $\theta^{(k)}$ denote the parameters produced by optimizer step $k$. For $k<K$, $\theta^{(k)}$ is used to process $\mathcal B_{k+1}$, while $\theta^{(K)}$ is the final trained parameter set.
+
+The learning-rate schedule uses the nominal step horizon
+
+$$
+K_{\mathrm{sched}}=
+\min\left(
+K_{\max},
+E\left\lceil\frac{N}{B_{\mathrm{opt}}}\right\rceil
+\right).
+$$
+
+This horizon treats the $N$ records as one sequence of minibatches, while $K_{\mathrm{epoch}}$ counts the minibatches formed independently inside the storage chunks. The warmup length is
+
+$$
+K_W=
+\min\left(
+K_{\mathrm{sched}},
+2000,
+\max\left(
+100,
+\left\lfloor\frac{K_{\mathrm{sched}}}{100}\right\rfloor
+\right)
+\right).
+$$
+
+At optimizer step $k\in\lbrace1,\ldots,K\rbrace$, automatic differentiation computes
+
+$$
+g_k=
+\nabla_{\theta^{(k-1)}}
+L_{\mathrm{sup}}^{(\mathcal B_k)}.
+$$
+
+A positive global gradient-norm limit $g_{\max}$ rescales $g_k$ when its Euclidean norm exceeds $g_{\max}$. Denote the resulting gradient by $\overline g_k$. A nonpositive limit gives $\overline g_k=g_k$, while a positive limit also requires the measured norm to be finite.
+
+For peak learning rate $\eta_{\max}$, optimizer step $k\in\lbrace1,\ldots,K\rbrace$ uses
 
 $$
 \eta_k=
 \begin{cases}
-\eta_{\max}\dfrac{k}{T_W},&k\leq T_W,\\[6pt]
-\eta_{\max}\sqrt{\dfrac{T_W}{k}},&k>T_W.
+\eta_{\max}\dfrac{k}{K_W},&k\leq K_W,\\[6pt]
+\eta_{\max}\sqrt{\dfrac{K_W}{k}},&k>K_W.
 \end{cases}
 $$
 
-Thus the schedule uses linear warmup followed by inverse-square-root decay. A deterministic seed controls parameter initialization and both shuffle stages. Let $g_{\max}>0$ be the gradient-norm limit. Before each AdamW step, training clips the global gradient norm to $g_{\max}$ and terminates when that norm is nonfinite.
+The schedule therefore increases linearly to $\eta_{\max}$ during the warmup and then decays in inverse proportion to the square root of the step index.
 
-Let $K_{\mathrm{save}}>0$ be the periodic checkpoint interval. Training writes a checkpoint whenever the optimizer-step count is divisible by $K_{\mathrm{save}}$, after every processed epoch pass and after the final partial pass imposed by $K_{\max}$. The top-level archive contains `model` and `arch`. The architecture archive stores type identifier 2, $C$, $B$ and action size 4672 as integer tensors. Saving first writes a sibling `.tmp` file and then atomically replaces the destination. Loading validates every architecture field before constructing the model and restoring its parameters.
-
-## 6. Search
-
-### 6.1 Search Modes
-
-In `closed` mode, search evaluates the root once and derives its initial move ranking from $P_\theta(a\mid s)$. In `only-mcts` mode with a positive simulation cap, search evaluates exact-state leaves in neural batches and derives its initial ranking from the resulting MCTS root distribution. An `only-mcts` search with a zero simulation cap returns the same legal Policy distribution as `closed`. In either mode, search subsequently applies the enabled IMF and RPP decision components defined in Section 6.6.
-
-### 6.2 Neural Evaluation Representation
-
-For a neural batch $\mathbf s=(s_1,\ldots,s_n)$, let $L$ be the largest legal-move count in the batch. Search constructs the legal-action matrix $J\in\mathcal I_M^{n\times L}$ and a mask $M\in\{0,1\}^{n\times L}$. Entries with $M_{rj}=1$ identify legal actions, while entries with $M_{rj}=0$ pad shorter rows. The legal-action forward pass defined in Section 3.2 returns $\Lambda_\theta(\mathbf s,J)$ and $(V_\theta(s_1),\ldots,V_\theta(s_n))$. Search replaces padded logits with $-\infty$ and applies softmax across each row, so the resulting probabilities are normalized over the legal actions of each state.
-
-Selections from independent roots share neural batches. Duplicate selections of the same nonterminal leaf within one root batch are discarded before neural evaluation. The remaining requests are grouped by their 67-token encoded state, and all requests in one group share one network evaluation.
-
-Each evaluated state produces a compact record containing its legal moves, action indices, legal-move probabilities and $V_\theta(s)$. Root initialization and leaf expansion create one edge from each aligned legal-move entry without constructing a 4672-entry Policy vector.
-
-Let $p(a)$ denote the distribution supplied by direct Policy inference or by the MCTS root visit calculation. A final search result or progress snapshot materializes the public action-space representation
+AdamW maintains a first-moment estimate $u_k$ and a second-moment estimate $v_k$ of the gradients $\overline g_k$ supplied by the global-norm transformation. Both estimates have the same dimensions as $\theta$ and begin with $u_0=v_0=0$. With $\beta_1=0.9$ and $\beta_2=0.999$, their updates and bias corrections are
 
 $$
-p_{\mathrm{dense}}(i\mid s)=
-\begin{cases}
-p(a),&i=i_M(a)\text{ for }a\in\mathcal A(x),\\
-0,&i\notin\{i_M(a):a\in\mathcal A(x)\}.
-\end{cases}
-$$
-
-### 6.3 Evaluation Reuse
-
-Let $k(s)$ be the 67-byte state encoding defined in Section 2.1. A cached evaluation associates $k(s)$ with the compact record defined in Section 6.2. Equality of cache keys therefore means equality of every feature supplied to the network. Rule-terminal detection precedes neural evaluation, so a terminal leaf contributes its rule outcome without consulting the cache.
-
-Each search call creates a local evaluation cache. This cache removes repeated neural evaluations across batches and independent roots within that call. A positive cross-search capacity selects a persistent TLRU (trajectory-aware least-recently-used) cache instead. Setting the capacity to zero selects the local cache and discards its records when the search call returns.
-
-An exact lookup moves its entry to the most-recent end of the LRU order. When an evaluated transition connects cached parent key $k_p$ to cached child key $k_c$, TLRU records the directed relation $k_p\rightarrow k_c$ without changing the recency of either entry. For the root key $k_r$ of a search call, define
-
-$$
-\mathcal N_2(k_r)=
-\left\{k:\ d_C(k_r,k)\leq2\right\},
-$$
-
-where $d_C$ is the shortest directed-path length through recorded relations. Before root evaluation, TLRU moves entries in $\mathcal N_2(k_r)$ to the most-recent end in descending distance order. The resulting order places the root first, followed by its one-ply descendants and then its two-ply descendants. When the approximate byte capacity is exceeded, eviction removes entries from the least-recent end.
-
-The cache stores network Policy and Value outputs. Each search call creates an independent MCTS tree with zero visits, zero virtual visits and zero accumulated returns.
-
-### 6.4 PUCT Selection
-
-In `only-mcts` mode, search initializes the root with one outgoing edge $(s,a)$ for every legal action and stores $P_\theta(a\mid s)$ as the edge prior $P(s,a)$. The child edges of one node occupy one contiguous array whose capacity equals the legal-action count at expansion. The prior remains fixed throughout the search. Let $N(s,a)$ be the completed visit count of edge $(s,a)$ and let $N(s)=\sum_aN(s,a)$ be the completed visit count of node $s$.
-
-During batched selection, a virtual visit reserves every node on a selected path until the corresponding terminal or neural evaluation has been backed up. Let $N_v(s,a)$ be the virtual-visit count of edge $(s,a)$ and let $N_v(s)=\sum_aN_v(s,a)$. Selection uses the augmented counts
-
-$$
-\widetilde N(s,a)=N(s,a)+N_v(s,a),
+u_k=\beta_1u_{k-1}+(1-\beta_1)\overline g_k,
 \qquad
-\widetilde N(s)=N(s)+N_v(s).
+v_k=\beta_2v_{k-1}+(1-\beta_2)\overline g_k^2,
 $$
 
-Let $c_0$ be the initial exploration coefficient, let $b_0$ be its schedule base and let $f_0$ be its schedule factor. Define $b=\max(1,b_0)$ and $f=\max(0,f_0)$. The visit-dependent exploration coefficient is
-
 $$
-c_{\mathrm{puct}}(\widetilde N)=
-\max\left(0,c_0+f\log\left(\frac{\widetilde N+b+1}{b}\right)\right).
-$$
-
-Each tree node stores the mean backed-up return $Q(s)$ from the perspective of the player to move in state $s$. A nonterminal leaf contributes $V_\theta(s)$, while a terminal leaf contributes the exact side-to-move result in $\{-1,0,1\}$. Backup reverses the sign at every ply. For a visited edge that reaches child state $s_a$, the parent-perspective action value is
-
-$$
-Q(s,a)=-Q(s_a).
+\widehat u_k=\frac{u_k}{1-\beta_1^k},
+\qquad
+\widehat v_k=\frac{v_k}{1-\beta_2^k}.
 $$
 
-For an unvisited edge, First Play Urgency uses the parent value and the prior mass already visited. A node initializes this mass to zero and adds $P(s,a)$ when edge $(s,a)$ receives its first completed visit. Let $r_{\mathrm{FPU}}\geq0$ be the FPU reduction coefficient. The selection estimate is
+Let $\lambda\geq0$ be the weight-decay coefficient and let $\epsilon_A=10^{-8}$ prevent division by zero. AdamW updates the network parameters according to
 
 $$
-Q_{\mathrm{sel}}(s,a)=
+\theta^{(k)}=
+(1-\eta_k\lambda)\theta^{(k-1)}
+-\eta_k
+\frac{\widehat u_k}
+{\sqrt{\widehat v_k}+\epsilon_A}.
+$$
+
+The square in $\overline g_k^2$, the square root in $\sqrt{\widehat v_k}$ and the quotient involving $\widehat u_k$ are evaluated elementwise. In the update for $\theta^{(k)}$, the factor $(1-\eta_k\lambda)$ applies decoupled weight decay to $\theta^{(k-1)}$, and the remaining term applies the adaptive gradient step determined by $\widehat u_k$ and $\widehat v_k$.
+
+## 5. Search
+
+### 5.1 Root Initialization
+
+For a nonterminal complete state $x_0$, the MCTS procedure initializes a tree whose root corresponds to $x_0$. Each node corresponds to a complete state, and each edge leaving a node corresponding to state $x$ records a legal action $a\in\mathcal A(x)$ and leads to a child node corresponding to $T(x,a)$. A simulation follows selected edges from the root to a leaf, determines an evaluation for the leaf state and propagates that evaluation back along the selected path.
+
+The evaluator then obtains $P_\theta(\cdot\mid s_0)$ and $V_\theta(s_0)$ for $s_0=\phi_M(x_0)$. The scalar $V_\theta(s_0)$ provides the reported root evaluation when no simulation completes, while the number of completed visits and the sum of backed-up evaluations both begin at zero. For every legal action $a\in\mathcal A(x_0)$, root expansion creates an outgoing edge and a child node, and the Policy probability assigned to $a$ defines the prior of that edge:
+
+$$
+P(x_0,a)=P_\theta(a\mid s_0).
+$$
+
+A nonterminal node is unexpanded while it has no outgoing edges. When a simulation reaches an unexpanded node corresponding to state $x$, the evaluator obtains $P_\theta(\cdot\mid\phi_M(x))$ and $V_\theta(\phi_M(x))$. Node expansion uses the Policy distribution to create one outgoing edge and child node for every action $a\in\mathcal A(x)$, assigning $P_\theta(a\mid\phi_M(x))$ to the edge prior $P(x,a)$. The backup procedure defined in Section 5.4 propagates $V_\theta(\phi_M(x))$ along the selected path.
+
+### 5.2 Tree Statistics
+
+Every node maintains a completed-visit count and the sum of the evaluations propagated to that node. For a node representing $x$, let $N(x)$ denote its completed-visit count, let $W(x)$ denote its accumulated evaluation and define its empirical mean by
+
+$$
+Q(x)=
 \begin{cases}
-Q(s,a),&N(s,a)>0,\\[4pt]
-\mathrm{clip}\left(
-Q(s)-r_{\mathrm{FPU}}
-\sqrt{\displaystyle\sum_{a':N(s,a')>0}P(s,a')},-1,1
-\right),&N(s,a)=0.
+\dfrac{W(x)}{N(x)},&N(x)>0,\\[6pt]
+0,&N(x)=0.
 \end{cases}
 $$
 
-When node $s$ has no completed visit, its FPU baseline $Q(s)$ is 0. Let $l_v\geq0$ be the virtual-loss coefficient. The PUCT selection score is
+The value $Q(x)$ uses the perspective of the side to move in $x$. For an edge that applies action $a$ at $x$, the child node represents $T(x,a)$ and therefore uses the opponent's perspective. Once that child has been visited, the action evaluation in the parent perspective is
 
 $$
-S(s,a)=Q_{\mathrm{sel}}(s,a)
-+c_{\mathrm{puct}}(\widetilde N(s))P(s,a)
-\frac{\sqrt{\widetilde N(s)+1}}{1+\widetilde N(s,a)}
--l_vN_v(s,a).
+Q(x,a)=-Q(T(x,a)).
 $$
 
-Equal selection scores are ordered by descending $P(s,a)$ and then by descending $Q_{\mathrm{sel}}(s,a)$.
+Let $N(x,a)$ denote the completed-visit count of the child reached through action $a$. This count equals the number of completed simulations that traversed the edge from $x$ to $T(x,a)$. A node can be evaluated before any simulation traverses one of its outgoing edges, so $N(x)$ can exceed $\sum_{a\in\mathcal A(x)}N(x,a)$.
 
-When search ends, each legal root move receives weight $N(s,a)+P(s,a)$. Normalizing these weights gives
+### 5.3 PUCT Selection
+
+Each simulation uses Predictor + Upper Confidence bounds applied to Trees (PUCT) to descend through expanded nodes. The PUCT score combines the empirical evaluation of an action with an exploration term derived from its prior and visit count. Because an unvisited edge has no empirical action evaluation, First Play Urgency (FPU) supplies its initial selection value.
+
+The explored prior mass at node $x$ is
 
 $$
-P_{\mathrm{root}}(a\mid s)=
-\frac{N(s,a)+P(s,a)}
-{\displaystyle\sum_{a'\in\mathcal A(x)}\left(N(s,a')+P(s,a')\right)}.
+M_P(x)=
+\sum_{b\in\mathcal A(x):N(x,b)>0}P(x,b).
 $$
 
-### 6.5 Dynamic Simulation Budget
+For FPU reduction coefficient $r_{\mathrm{FPU}}\geq0$, the action evaluation used during selection is
 
-Let $N_{\mathrm{cap}}\geq0$ be the simulation cap, let $B_{\mathrm{batch}}\geq1$ be the neural batch capacity and let $N_{\mathrm{floor}}\geq0$ be the simulation-floor parameter. The nominal minimum simulation count is
+$$
+Q_{\mathrm{sel}}(x,a)=
+\begin{cases}
+Q(x,a),&N(x,a)>0,\\[4pt]
+\mathrm{clip}_{[-1,1]}\left(
+Q(x)-r_{\mathrm{FPU}}\sqrt{M_P(x)}
+\right),&N(x,a)=0.
+\end{cases}
+$$
+
+FPU starts from the empirical mean of the parent and subtracts a reduction proportional to the square root of its explored prior mass. An unvisited edge therefore receives a more conservative initial evaluation after the node has explored actions that the network considered probable.
+
+Several paths may be selected before their leaf states are evaluated together. A temporary virtual visit reserves every node on each selected path so that later selections in the same batch account for pending work. Let $N_v(x)$ be the number of active reservations through node $x$, and let $N_v(x,a)$ be the number through the child edge for action $a$. The augmented counts are
+
+$$
+\widetilde N(x)=N(x)+N_v(x),
+\qquad
+\widetilde N(x,a)=N(x,a)+N_v(x,a).
+$$
+
+The exploration coefficient follows a logarithmic schedule based on the augmented parent count. Let $c_0$ be its initial coefficient, let $b_0$ be its schedule base and let $f_0$ be its schedule factor. After defining $b=\max(1,b_0)$ and $f=\max(0,f_0)$, Melano computes
+
+$$
+c_{\mathrm{puct}}(n)=
+\max\left(
+0,
+c_0+f\log\left(\frac{n+b+1}{b}\right)
+\right).
+$$
+
+For virtual-loss coefficient $l_v\geq0$, the complete selection score is
+
+$$
+S(x,a)=
+Q_{\mathrm{sel}}(x,a)
++c_{\mathrm{puct}}\left(\widetilde N(x)\right)P(x,a)
+\frac{\sqrt{\widetilde N(x)+1}}
+{1+\widetilde N(x,a)}
+-l_vN_v(x,a).
+$$
+
+At each expanded node, the selector follows the action with the largest $S(x,a)$. Equal scores are resolved first by the larger prior $P(x,a)$ and then by the larger $Q_{\mathrm{sel}}(x,a)$. If all three quantities are equal, the selector follows the action that the rules engine enumerated first when the node was expanded. The selected path ends at a terminal state or at an unexpanded nonterminal node.
+
+### 5.4 Leaf Evaluation and Backup
+
+The rules engine determines whether the selected leaf state $x_d$ is terminal before neural evaluation. A terminal leaf receives the exact outcome $z(x_d)$. An unexpanded nonterminal leaf receives the network evaluation $V_\theta(\phi_M(x_d))$ together with the Policy probabilities required for expansion. Both scalar evaluations use the perspective of the side to move at the leaf:
+
+$$
+\rho_d=
+\begin{cases}
+z(x_d),&x_d\text{ is terminal},\\
+V_\theta(\phi_M(x_d)),&x_d\text{ is nonterminal}.
+\end{cases}
+$$
+
+Denote the selected path by $(x_0,x_1,\ldots,x_d)$, and let $a_k$ be the action that leads from $x_{k-1}$ to $x_k$. Alternating sides to move gives the evaluation at every node on the path:
+
+$$
+\rho_k=(-1)^{d-k}\rho_d.
+$$
+
+The backup operation removes the virtual reservation from the path and updates each selected node by
+
+$$
+N(x_k)\leftarrow N(x_k)+1,
+\qquad
+W(x_k)\leftarrow W(x_k)+\rho_k.
+$$
+
+These updates increase the completed count of every traversed child and therefore increase the corresponding edge count $N(x_{k-1},a_k)$. The empirical means $Q(x_k)$ and parent-perspective action evaluations $Q(x_{k-1},a_k)$ then follow from Section 5.2.
+
+### 5.5 Simulation Budget
+
+The simulation budget uses root uncertainty to choose a target between a required minimum and a configured soft cap. Let $N_{\mathrm{cap}}\geq0$ be the soft simulation cap, let $B_{\mathrm{batch}}\geq1$ be the neural batch capacity and let $N_{\mathrm{floor}}\geq0$ be an optional explicit minimum. The minimum number of completed simulations is
 
 $$
 N_{\min}=
@@ -489,135 +668,204 @@ N_{\min}=
 0,&N_{\mathrm{cap}}=0,\\
 \max\left(1,\min\left(N_{\mathrm{cap}},N_{\mathrm{floor}}\right)\right),
 &N_{\mathrm{cap}}>0\ \text{and}\ N_{\mathrm{floor}}>0,\\
-\max\left(1,\min\left(N_{\mathrm{cap}},
-\max\left(B_{\mathrm{batch}},\left\lfloor\dfrac{N_{\mathrm{cap}}}{4}\right\rfloor\right)
+\max\left(1,\min\left(
+N_{\mathrm{cap}},
+\max\left(
+B_{\mathrm{batch}},
+\left\lfloor\dfrac{N_{\mathrm{cap}}}{4}\right\rfloor
+\right)
 \right)\right),
 &N_{\mathrm{cap}}>0\ \text{and}\ N_{\mathrm{floor}}=0.
 \end{cases}
 $$
 
-An external deadline or cancellation signal may terminate search with fewer than $N_{\min}$ completed simulations. After $N_{\min}$ simulations have completed at a root with at least two legal actions, search forms the completed-visit distribution
+When $N_{\mathrm{cap}}>0$, selection-and-evaluation cycles continue until the root has completed at least $N_{\min}$ simulations. Its root-edge counts then define the empirical visit distribution
 
 $$
-v_a=\frac{N(s,a)}{\displaystyle\sum_{b\in\mathcal A(x)}N(s,b)}.
+\widehat P_N(a\mid x_0)=
+\frac{N(x_0,a)}
+{\displaystyle\sum_{b\in\mathcal A(x_0)}N(x_0,b)}.
 $$
 
-Let $a_1$ and $a_2$ be the two actions with the largest completed visit counts, using prior as their tie breaker. Write $N_i=N(s,a_i)$. Define $Q_i=Q(s,a_i)$ when $N_i>0$ and $Q_i=0$ otherwise. The normalized visit entropy, visit closeness and action-value closeness are
+For a root with at least two legal actions, sort the actions first by decreasing visit count $N(x_0,a)$. Among actions with equal visit counts, place the action with the larger prior $P(x_0,a)$ first. Denote the first two actions in this order by $a_1$ and $a_2$, and define $N_i=N(x_0,a_i)$. For each $a_i$, define $Q_i=Q(x_0,a_i)$ when $N_i>0$ and $Q_i=0$ when $N_i=0$. The normalized visit entropy $H_N$, visit-count proximity $U_N$ and action-evaluation proximity $U_Q$ are
 
 $$
-H_N=-\frac{\displaystyle\sum_{a\in\mathcal A(x)}v_a\log v_a}
-{\log|\mathcal A(x)|},
-$$
-
-where a term with $v_a=0$ contributes 0 to the entropy sum.
-
-$$
-U_N=1-\frac{|N_1-N_2|}{\max(1,N_1+N_2)},
+H_N=-
+\frac{\displaystyle\sum_{a\in\mathcal A(x_0)}
+\widehat P_N(a\mid x_0)\log\widehat P_N(a\mid x_0)}
+{\log|\mathcal A(x_0)|},
 $$
 
 $$
-U_Q=1-\min\left(1,\frac{|Q_1-Q_2|}{0.5}\right).
+U_N=
+1-\frac{|N_1-N_2|}{\max(1,N_1+N_2)},
 $$
 
-The combined uncertainty and dynamic target are
+$$
+U_Q=
+1-\min\left(1,\frac{|Q_1-Q_2|}{0.5}\right).
+$$
+
+The entropy summand for $\widehat P_N(a\mid x_0)=0$ equals zero by the limit $\lim_{p\to0^+}p\log p=0$. The three statistics lie in $[0,1]$, and their weighted sum defines the root uncertainty
 
 $$
-u=\mathrm{clip}(0.5H_N+0.35U_N+0.15U_Q,0,1),
+u=
+\mathrm{clip}_{[0,1]}
+\left(0.5H_N+0.35U_N+0.15U_Q\right).
 $$
+
+The current uncertainty determines the simulation target
 
 $$
 N_{\mathrm{target}}=
-N_{\min}+\left\lceil u(N_{\mathrm{cap}}-N_{\min})\right\rceil.
+N_{\min}
++\left\lceil
+u(N_{\mathrm{cap}}-N_{\min})
+\right\rceil.
 $$
 
-For a root with one legal action, search sets $u=0$ and $N_{\mathrm{target}}=N_{\min}$. The search loop checks $N_{\mathrm{cap}}$ and $N_{\mathrm{target}}$ between batch-construction passes. Work completed inside the current pass is included in the final statistics, which makes the reported simulation limit a batched soft cap.
+The MCTS procedure recalculates $N_{\mathrm{target}}$ after each selection-and-evaluation cycle once the root has reached $N_{\min}$. A new cycle starts for a root only while its completed count is smaller than both the current target and the soft cap. Terminal backups and neural evaluations already selected in that cycle are completed before the next stopping check, so they may carry the final count beyond either threshold. A root with one legal action uses $u=0$ and admits no new cycle after reaching $N_{\min}$. A zero cap sets both $N_{\min}$ and $N_{\mathrm{target}}$ to zero. A cancellation signal or an expired execution deadline stops further leaf selection, while leaves already selected still produce their completed backups.
 
-### 6.6 Final Decision Components
+### 5.6 Evaluation Reuse
 
-The optional IMF, or Instant Mate First, and RPP, or Repetition Policy Penalty, components modify the final ranking after Policy evaluation or MCTS. Before either component is applied, the ranking score is
+Repeated neural evaluation of the same `PackedState` produces the same compact Policy and Value record, so Melano stores each completed network evaluation in a cache indexed by its 67-byte `PackedState`. For a requested complete state, the rules engine checks for a terminal outcome before the cache is consulted. This order is required because `PackedState` omits move counters and repetition history. Exact rule outcomes therefore depend on the complete state, whereas cached network outputs depend only on the encoded state.
+
+One MCTS invocation receives one or more root states and constructs a separate tree for each root. All trees created by that invocation access the same evaluation cache, which allows simulations within one tree and simulations from different trees to reuse completed network records. Let $M_C\geq0$ be the configured memory capacity for records retained across invocations. When $M_C=0$, the cache exists only for the current invocation. When $M_C>0$, the cache persists across invocations and uses TLRU (trajectory-aware least-recently-used) to order its records. A successful lookup moves the accessed record to the most-recent end of this order, and inserting a new record places it at the same end.
+
+TLRU records a directed link when a cached nonterminal child is reached from a cached parent. Let $\mathcal C$ be the set of retained entries and let $E_C\subseteq\mathcal C\times\mathcal C$ be the set of recorded parent-child links. For a retained root entry $r\in\mathcal C$, the trajectory neighborhood of radius two is
 
 $$
-D_0(a)=
+\mathcal N_2(r)=
+\lbrace y\in\mathcal C:d_C(r,y)\leq2\rbrace,
+$$
+
+where $d_C(r,y)$ is the length of the shortest directed path from $r$ to $y$ in $(\mathcal C,E_C)$. Before evaluating a new root, TLRU touches the retained entries in $\mathcal N_2(r)$ in decreasing order of $d_C(r,y)$. Two-ply descendants are touched first, one-ply descendants next and the root last, leaving the root as the most-recent entry. Ordinary lookups and insertions then continue to update the same order.
+
+When the approximate memory use exceeds $M_C$, TLRU removes entries from the least-recent end until the retained records fit within the capacity. TLRU stores compact network records, whereas tree nodes and MCTS statistics belong to one invocation. Every invocation constructs fresh nodes with zero visits, zero accumulated evaluations and zero virtual reservations, initializes their network fields from cached records when available and computes their tree statistics through MCTS.
+
+### 5.7 Batched Evaluation
+
+When one invocation receives several root states, their initial evaluations from Section 5.1 pass through the evaluation-reuse mechanism together. Cached roots are resolved first, unresolved roots with the same `PackedState` share one request and the remaining unique roots are evaluated in one neural batch.
+
+After root initialization, one selection-and-evaluation cycle processes each tree whose root count $N(x_0)$ is smaller than both $N_{\mathrm{target}}$ and $N_{\mathrm{cap}}$. For each such tree, the requested number of distinct nonterminal leaves is
+
+$$
+m=
+\min\left(
+B_{\mathrm{batch}},
+N_{\mathrm{target}}-N(x_0),
+N_{\mathrm{cap}}-N(x_0)
+\right).
+$$
+
+The three terms limit the request by the neural batch capacity, the remaining count to the current target and the remaining count to the simulation cap, respectively.
+
+Each selection attempt starts at the root and uses PUCT to descend through expanded nodes until it reaches a terminal node or an unexpanded nonterminal node. A terminal node is evaluated and backed up immediately according to Section 5.4, which completes one simulation without adding a neural-evaluation request. An unexpanded nonterminal node enters the request list when the same tree has not already selected that node during the current cycle, and its virtual visits remain on the selected path until evaluation finishes. A repeated selection of an already reserved node releases the temporary virtual visits and contributes no request. The tree makes at most $\max(5m,m+8)$ selection attempts while collecting up to $m$ distinct nonterminal leaves.
+
+The requests collected from all trees are concatenated and partitioned into neural batches no larger than $B_{\mathrm{batch}}$. Within each batch, the evaluation-reuse mechanism described in Section 5.6 first resolves requests that already have cached records. The evaluator then groups the unresolved requests by `PackedState`. Every request in one group has the same network input, so one neural evaluation supplies the result for the entire group.
+
+For a representative leaf state $x$, let $L=|\mathcal A(x)|$, and write its ordered legal actions as $a_1,\ldots,a_L$. The compact evaluation record contains the three sequences
+
+$$
+(a_j)_{j=1}^{L},
+\qquad
+(i_M(a_j))_{j=1}^{L},
+\qquad
+(P_\theta(a_j\mid\phi_M(x)))_{j=1}^{L},
+$$
+
+together with the scalar $V_\theta(\phi_M(x))$. Entries with the same index $j$ describe the same legal action, which defines the alignment among the action, action-index and Policy sequences. Section 3.3 supplies these Policy probabilities by evaluating the selected legal-action logits.
+
+After neural evaluation, the evaluator stores the completed record through the evaluation-reuse mechanism and assigns it to every request in the matching `PackedState` group. For each requested leaf, tree expansion creates one outgoing edge for every $a_j$ and assigns $P_\theta(a_j\mid\phi_M(x))$ as that edge's prior. The scalar $V_\theta(\phi_M(x))$ is then backed up along the leaf's reserved path. The trees therefore share network records while retaining separate nodes, paths and MCTS statistics.
+
+### 5.8 Root Evaluation and Policy
+
+After the simulation phase, the root evaluation uses the network estimate when no simulation has completed and the empirical root mean otherwise:
+
+$$
+V_{\mathrm{root}}(x_0)=
 \begin{cases}
-P_\theta(a\mid s),&\texttt{closed},\\
-P_{\mathrm{root}}(a\mid s),&\texttt{only-mcts}.
+V_\theta(s_0),&N(x_0)=0,\\
+Q(x_0),&N(x_0)>0.
 \end{cases}
 $$
 
-Let $\mathcal M(x)$ be the set of legal actions that immediately checkmate the opponent. When this set is nonempty, IMF selects
+The completed root-edge visits and their priors define the root Policy distribution
 
 $$
-a_M=\arg\max_{a\in\mathcal M(x)}D_0(a)
+P_{\mathrm{root}}(a\mid s_0)=
+\frac{N(x_0,a)+P(x_0,a)}
+{\displaystyle\sum_{b\in\mathcal A(x_0)}
+\left(N(x_0,b)+P(x_0,b)\right)}.
 $$
 
-and defines
+The priors sum to one over $\mathcal A(x_0)$, so the added prior terms contribute total weight one to the root distribution. When $N_{\mathrm{cap}}=0$, every root-edge visit count remains zero and the formula reduces to
+
+$$
+P_{\mathrm{root}}(a\mid s_0)=P_\theta(a\mid s_0).
+$$
+
+The MCTS root Policy therefore coincides with the network Policy when the simulation cap is zero.
+
+When an output requires one probability for every index in $\mathcal I_M$, Melano expands the compact root distribution into
+
+$$
+P_{\mathrm{dense}}(i\mid s_0)=
+\begin{cases}
+P_{\mathrm{root}}(a\mid s_0),
+&i=i_M(a)\text{ for }a\in\mathcal A(x_0),\\
+0,&i\notin\lbrace i_M(a):a\in\mathcal A(x_0)\rbrace.
+\end{cases}
+$$
+
+This conversion is performed only when an output requires the fixed action-index set $\mathcal I_M$.
+
+### 5.9 Decision Components
+
+The decision layer can apply two optional transformations to the final move ordering. It begins with a copy of the root Policy distribution:
+
+$$
+D_0(a)=P_{\mathrm{root}}(a\mid s_0).
+$$
+
+IMF (Instant Mate First) examines the set $\mathcal M(x_0)$ of legal actions that immediately checkmate the opponent. When IMF is enabled and this set contains at least one action, it selects an action with the largest base score
+
+$$
+a_M=
+\arg\max_{a\in\mathcal M(x_0)}D_0(a).
+$$
+
+If several actions attain this maximum, IMF chooses the action that the rules engine enumerates first. Its output is
 
 $$
 D_I(a)=
 \begin{cases}
 1,&a=a_M,\\
-D_0(a),&a\in\mathcal A(x)\setminus\{a_M\}.
+D_0(a),&a\in\mathcal A(x_0)\setminus\lbrace a_M\rbrace.
 \end{cases}
 $$
 
-When $\mathcal M(x)$ is empty, $D_I(a)=D_0(a)$ for every legal action.
+If IMF is disabled or $\mathcal M(x_0)$ is empty, its output is $D_I(a)=D_0(a)$ for every legal action.
 
-Let $\lambda_R\in[0,1]$ be the repetition-penalty coefficient, and let $V_R$ be the root evaluation returned by search. The set $\mathcal R_3(x)$ contains legal moves that either make a threefold-repetition claim available immediately or allow the opponent to make one with a single reply. RPP computes
+RPP (Repetition Policy Penalty) applies when the root evaluation favors the side to move. Let $\lambda_R\in[0,1]$ be its penalty coefficient, where $\lambda_R=0$ disables the transformation, and let $\mathcal R_3(x_0)$ contain the legal actions that make a threefold-repetition claim available immediately or allow the opponent to make such a claim after one reply. RPP computes
 
 $$
-d_R=\lambda_R\mathrm{clip}(V_R,0,1)
+d_R=
+\lambda_R
+\mathrm{clip}_{[0,1]}
+\left(V_{\mathrm{root}}(x_0)\right)
 $$
 
-and produces
+and produces the final decision score
 
 $$
 D(a)=
 \begin{cases}
-\max(0,D_I(a)-d_R),&a\in\mathcal R_3(x),\\
-D_I(a),&a\in\mathcal A(x)\setminus\mathcal R_3(x).
+\max(0,D_I(a)-d_R),
+&a\in\mathcal R_3(x_0),\\
+D_I(a),
+&a\in\mathcal A(x_0)\setminus\mathcal R_3(x_0).
 \end{cases}
 $$
 
-The decision layer orders legal moves by descending $D(a)$, then by descending $D_0(a)$ and finally by descending coordinate move string. The first move in this order is selected. These components leave network logits, edge priors, visit counts and backed-up values unchanged.
-
-## 7. Arena
-
-The Melano arena loads the candidate and baseline checkpoints once and creates one searcher for each model. Both searchers receive the same search configuration. Let $N_G$ be the positive even number of games and let $K_G\geq1$ be the maximum number of active games. The arena advances at most $K_G$ games together, collects all current positions assigned to each model and calls that model's batched search once per turn.
-
-Each selected opening is played twice, once with the candidate as White and once with the candidate as Black. Let $T_G$ be the per-game ply cap. The rules engine adjudicates checkmate, stalemate, insufficient material, the fifty-move rule and threefold repetition. A game that reaches $T_G$ is recorded as a draw with termination `max plies`.
-
-Let $N_W$, $N_D$ and $N_L$ be the candidate's win, draw and loss counts, and let $N_G=N_W+N_D+N_L$. The candidate score and net wins are
-
-$$
-score=\frac{N_W+\frac12N_D}{N_G},
-\qquad
-net\_wins=N_W-N_L.
-$$
-
-Let $x_i\in\{0,\frac12,1\}$ be the candidate score in game $i$. The population variance is
-
-$$
-\sigma^2=\frac1{N_G}\sum_{i=1}^{N_G}(x_i-score)^2.
-$$
-
-The reported 95% normal-approximation interval is
-
-$$
-CI_{95\%}=\mathrm{clip}\left(
-score\pm1.96\sqrt{\frac{\sigma^2}{N_G}},0,1
-\right).
-$$
-
-For display, let $score_b=\mathrm{clip}(score,10^{-6},1-10^{-6})$. The reported Elo difference is
-
-$$
-\Delta Elo=400\log_{10}\left(\frac{score_b}{1-score_b}\right).
-$$
-
-Let $M_{\mathrm{gate}}$ be the minimum required net-win margin. The arena accepts the candidate when
-
-$$
-N_W-N_L\geq M_{\mathrm{gate}}.
-$$
-
-The arena returns the gate result and statistics as JSON. It can also write all games as 80-column SAN PGN with the starting FEN and termination reason. Checkpoint promotion belongs to the training procedure that invokes the arena, so arena evaluation itself does not replace either checkpoint.
+IMF and RPP transform a copy of $P_{\mathrm{root}}$, so the network probabilities, edge priors and tree statistics keep their computed values. The decision scores are ordering quantities rather than a probability distribution. Melano orders legal actions by decreasing $D(a)$, then by decreasing $D_0(a)$ and finally by decreasing coordinate move string in Universal Chess Interface (UCI) notation. The first action in this deterministic ordering becomes the selected move.

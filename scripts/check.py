@@ -24,17 +24,19 @@ ARCHITECTURES = {
     },
     3: {
         "name": "eleginus",
-        "heads": "value",
+        "heads": "policy, value",
         "fields": (
             "type_id",
             "feature_count",
             "feature_slots",
-            "accumulator",
-            "hidden",
-            "bottleneck",
+            "policy_accumulator",
+            "policy_hidden",
+            "value_accumulator",
+            "value_hidden",
+            "value_bottleneck",
             "action_size",
         ),
-        "model_children": ("encoder", "hidden", "bottleneck", "output"),
+        "model_children": ("policy", "value"),
     },
 }
 

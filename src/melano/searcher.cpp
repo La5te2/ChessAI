@@ -919,7 +919,7 @@ SearchResult Searcher::search(const chess::Board &board, const SearchProgressCal
 	return impl_->search_many({board}, progress, progress_interval_ms, cancel)[0];
 }
 
-// Search a batch without progress callbacks, as used by arena.
+// Search independent positions together so their leaf evaluations share neural batches.
 std::vector<SearchResult> Searcher::search_many(const std::vector<chess::Board> &boards) {
 	return impl_->search_many(boards);
 }

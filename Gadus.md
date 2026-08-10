@@ -1,41 +1,143 @@
 # Gadus
 
-Gadus is a residual policy-value network for chess with an AlphaZero-style action space.
+Gadus is a residual convolutional chess network that jointly predicts a move policy and a side-to-move position evaluation.
 
-## 1. Notations
+## 1. Notation
 
-- $\mathcal X$ is the set of complete game states. A state $x\in\mathcal X$ contains the board, side to move, castling rights, en passant state, halfmove clock and repetition history.
-- $\mathcal A(x)$ is the set of legal actions in $x$. An action is written as $a\in\mathcal A(x)$, and $T(x,a)$ is the deterministic successor state produced by the chess rules.
-- $z(x)\in\lbrace -1,0,1\rbrace$ is the outcome of a terminal state $x$ from the perspective of the side to move in $x$.
-- $\mathcal S_G$ is the Gadus encoded-state space. The map $\phi_G:\mathcal X\rightarrow\mathcal S_G$ is the Gadus state encoder, and $s=\phi_G(x)$ is the network input corresponding to $x$.
-- $\mathcal I_G$ is the Gadus action-index set, and $i_G(a)\in\mathcal I_G$ is the index assigned to action $a$.
-- $\theta$ denotes trainable network parameters. $\ell_\theta(s,i)$ is the policy logit for action index $i$, $P_\theta(a\mid s)$ is the policy probability assigned to legal move $a$, and $V_\theta(s)$ is the scalar evaluation that the model assigns to $s$.
-- $Q(s,a)$ denotes a scalar evaluation of legal move $a$ in encoded position $s$. A subscript on $Q$ identifies the estimator that supplies the evaluation.
-- A hat, as in $\widehat y$, denotes an estimate produced by finite data or finite search. A bar, as in $\overline y$, denotes a backed-up or aggregated quantity.
-- A target is a fixed scalar or distribution used as the comparison value in a loss. Automatic differentiation treats targets as constants.
-- $L_{\mathrm{CE}}(p,q)=-\sum_iq_i\log p_i$ is the cross-entropy from target distribution $q$ to predicted distribution $p$. $\mathrm{MSE}(u,v)$ is the mean squared error between corresponding elements.
-- $D_{\mathrm{KL}}(p\,\|\,q)=\sum_ip_i\log(p_i/q_i)$ is the Kullback-Leibler divergence from distribution $p$ to distribution $q$.
-- Subscripts `old` and `new` identify the frozen source model and the trainable candidate within one FCPI iteration. A superscript `+` identifies a policy target produced by local policy improvement.
+- $\mathcal X$ is the set of complete chess states maintained by the rules engine.
+- $x\in\mathcal X$ is a complete chess state containing the board, side to move, castling rights, en passant state, move counters and repetition history.
+- $\mathcal A(x)$ is the set of legal actions in state $x$.
+- $T(x,a)$ is the complete state reached by applying legal action $a\in\mathcal A(x)$ to state $x$.
+- $z(x)\in\lbrace-1,0,1\rbrace$ is the exact outcome of terminal state $x$ from the perspective of its side to move, with $1$, $0$ and $-1$ representing a win, draw and loss.
+- $\phi_G$ is the Gadus state encoder that maps a complete chess state to a network input.
+- $s=\phi_G(x)$ is the Gadus network input obtained from complete state $x$.
+- $\mathcal I_G=\lbrace0,\ldots,4671\rbrace$ is the fixed set of Gadus action indices.
+- $i_G(a)\in\mathcal I_G$ is the action index assigned to legal action $a$.
+- $\theta$ denotes the trainable network parameters.
+- $\ell_\theta(s)\in\mathbb R^{4672}$ is the complete vector of Policy logits produced by the network with parameters $\theta$ and $\ell_\theta(s,i)$ is its scalar component for action index $i\in\mathcal I_G$.
+- $\text{P}$, which stands for Policy, is the network output that assigns a probability distribution over the legal actions available in each encoded state.
+- $\text{V}$, which stands for Value, is a scalar network output in $[-1,1]$ that estimates the expected game result from the perspective of the side to move.
+- $Q$ denotes a state or action evaluation defined by a particular procedure. Each definition specifies its arguments and observation perspective.
+- $\mathrm{clip}_{[l,u]}(y)=\min(u,\max(l,y))$ restricts scalar $y$ to the closed interval $[l,u]$.
 
 ## 2. State and Action Encoding
 
-The `gadus_18_planes` state encoding uses planes 0 through 5 for White pawn, knight, bishop, rook, queen and king, followed by the corresponding six Black piece planes. Plane 12 is filled with ones when White is to move and zeros when Black is to move. Planes 13 through 16 represent White kingside, White queenside, Black kingside and Black queenside castling rights. Plane 17 marks the en passant file on every rank when an en passant square exists.
+### 2.1 State Encoding
 
-Squares use the order `a1` through `h8`. Within each plane, rank 1 is stored before rank 2 and so forth. Each rank occupies one byte whose most significant bit represents file `a` and whose least significant bit represents file `h`. This packing gives a fixed state representation of $18\times8=144$ bytes.
-
-The `alphazero_64x73` action encoding assigns 73 action planes to each source square. Its action index is $73q+p$, where $q\in\{0,\ldots,63\}$ is the source square and $p\in\{0,\ldots,72\}$ is the action plane. Planes 0 through 55 encode distances 1 through 7 in the ordered rank-file directions $(-1,-1)$, $(-1,0)$, $(-1,1)$, $(0,-1)$, $(0,1)$, $(1,-1)$, $(1,0)$ and $(1,1)$. Planes 56 through 63 encode knight offsets $(-2,-1)$, $(-2,1)$, $(-1,-2)$, $(-1,2)$, $(1,-2)$, $(1,2)$, $(2,-1)$ and $(2,1)$.
-
-Planes 64 through 72 encode underpromotions. They first order the destination-file offset as $-1$, $0$ and $1$, then order the promoted piece as knight, bishop and rook. Queen promotions use the corresponding one-square sliding plane. Castling uses the king destination square `g1`, `c1`, `g8` or `c8`, even when the chess-library move representation points to the rook square. The action-space size is
+The network requires a fixed numerical representation of each complete chess state. Gadus represents a state with 18 binary feature maps called planes. Each plane is an $8\times8$ grid aligned with the chessboard, and each square corresponds to one scalar entry in that grid. An entry equals $1$ when its plane marks the corresponding square and $0$ otherwise. The state encoder $\phi_G$ stacks the 18 planes into one tensor:
 
 $$
-|\mathcal I_G|=64\times(56+8+9)=4672.
+\phi_G:\mathcal X\rightarrow\lbrace0,1\rbrace^{18\times8\times8}.
 $$
 
-`PackedState` is the fixed byte representation produced by `gadus_18_planes`. Complete states with the same `PackedState` produce the same network input.
+The first tensor dimension identifies a plane, the second identifies a rank and the third identifies a file. Planes 0 through 5 represent White pawn, knight, bishop, rook, queen and king occupancy. Each entry in a piece plane equals $1$ exactly when the corresponding square contains the piece represented by that plane. For example, the `f3` entry in the White-knight plane equals $1$ exactly when a White knight occupies `f3`. Planes 6 through 11 represent the six Black piece types in the same order.
+
+The remaining six planes represent features that apply to the complete state or to one file. Plane 12 contains ones in all 64 entries when White is to move and zeros when Black is to move. Planes 13 through 16 represent White kingside, White queenside, Black kingside and Black queenside castling rights. Each castling plane contains ones in all 64 entries when its right is available and zeros otherwise. When an en passant square exists, plane 17 contains ones in the eight entries belonging to its file and zeros in all other entries. When no en passant square exists, plane 17 contains only zeros.
+
+For storage, Gadus packs the eight entries on one rank of one plane into one byte. Within each plane, the bytes appear in order from rank 1 through rank 8, and the planes appear in numerical order from 0 through 17. Within each byte, the bits represent files `a` through `h`, with file `a` in the most significant bit and file `h` in the least significant bit. One plane therefore requires eight bytes, and all 18 planes require $18\times8=144$ bytes. `PackedState` denotes this 144-byte representation, whose unpacked bits reproduce $\phi_G(x)$ exactly.
+
+The encoded tensor $\phi_G(x)$ records piece placement, side to move, castling rights and the en passant file. The complete state $x$ additionally records move counters and repetition history. Since $\phi_G$ omits move counters and repetition history, complete states that differ only in those fields produce the same network input.
+
+### 2.2 Action Encoding
+
+The legal-action set $\mathcal A(x)$ varies with the complete state $x$. To give actions a state-independent numerical representation, Gadus assigns each legal action $a\in\mathcal A(x)$ an index $i_G(a)$ in the fixed set $\mathcal I_G$.
+
+Every action index has two components. The source-square component $q$ identifies the square from which the move begins. The motion-pattern component $p$ describes the displacement from the source square to the destination square and, for an underpromotion, also identifies the promoted piece.
+
+The $8\times8$ board gives $q$ 64 possible values. The 73 possible values of $p$ consist of 56 patterns for motion along a rank, file or diagonal, 8 patterns for knight motion and 9 patterns for underpromotion. These counts satisfy
+
+$$
+73=(8\times7)+8+(3\times3).
+$$
+
+The following definitions specify the ordering of the 64 source squares and the 73 motion patterns.
+
+For the source square, let $r\in\lbrace0,\ldots,7\rbrace$ be its rank coordinate and let $f\in\lbrace0,\ldots,7\rbrace$ be its file coordinate. Rank 1 has coordinate $r=0$, and the coordinate increases toward rank 8. File `a` has coordinate $f=0$, and the coordinate increases toward file `h`. The source-square index is
+
+$$
+q=8r+f.
+$$
+
+To describe motion along a rank, file or diagonal, let $(r,f)$ and $(r',f')$ be the coordinates of the source and destination squares. Their displacement is
+
+$$
+(\Delta r,\Delta f)=(r'-r,f'-f).
+$$
+
+Gadus orders the eight possible directions as
+
+$$
+(-1,-1),\ (-1,0),\ (-1,1),\ (0,-1),\
+(0,1),\ (1,-1),\ (1,0),\ (1,1),
+$$
+
+Let $(u_d,v_d)$ be the direction at position $d\in\lbrace0,\ldots,7\rbrace$ in this list. If the move travels $m\in\lbrace1,\ldots,7\rbrace$ squares in that direction, then
+
+$$
+(\Delta r,\Delta f)=m(u_d,v_d),
+$$
+
+and its motion-pattern index is
+
+$$
+p=7d+(m-1).
+$$
+
+This construction assigns indices 0 through 55 to the $8\times7=56$ rank, file and diagonal patterns.
+
+A knight move uses one of the following eight displacements:
+
+$$
+(-2,-1),\ (-2,1),\ (-1,-2),\ (-1,2),\
+(1,-2),\ (1,2),\ (2,-1),\ (2,1).
+$$
+
+Let $k\in\lbrace0,\ldots,7\rbrace$ be the position of the knight displacement $(\Delta r,\Delta f)$ in this list. Its motion-pattern index is
+
+$$
+p=56+k.
+$$
+
+This construction assigns indices 56 through 63 to the eight knight patterns.
+
+An underpromotion always moves a pawn to the final rank, so its remaining choices are the destination file and the promoted piece. Let $\Delta f\in\lbrace-1,0,1\rbrace$ be the destination-file offset relative to the source file. Let $u=0$, $u=1$ and $u=2$ represent promotion to a knight, bishop and rook. The motion-pattern index is
+
+$$
+p=64+3(\Delta f+1)+u.
+$$
+
+This construction assigns indices 64 through 72 to the $3\times3=9$ underpromotion patterns. A queen promotion uses the corresponding one-square rank, file or diagonal pattern because the legal move itself records promotion to a queen.
+
+Castling also uses a rank displacement pattern. The rules library represents castling internally with the rook square as the destination of the king move. Before computing $p$, Gadus replaces that internal destination with the king destination `g1`, `c1`, `g8` or `c8`.
+
+Once $q$ and $p$ have been determined, the action index is
+
+$$
+i_G(a)=73q+p.
+$$
+
+Combining 64 source-square indices with 73 motion-pattern indices gives
+
+$$
+|\mathcal I_G|=64\times73=4672.
+$$
+
+For complete state $x$, the available action indices are
+
+$$
+\mathcal I_G(x)=
+\lbrace i_G(a)\mid a\in\mathcal A(x)\rbrace.
+$$
+
+To decode an available index, Gadus generates the legal-action set $\mathcal A(x)$ and selects the action whose encoding equals that index. The selected legal action contains the castling, en passant or promotion information required by the rules engine.
 
 ## 3. Network
 
-The Gadus network contains a ResNet trunk, a linear Policy head and an MLP Value head. Let $C$ be the channel count and let $B$ be the residual-block count. For encoded input $s\in\mathbb R^{18\times8\times8}$, the stem applies a bias-free $3\times3$ convolution from 18 input planes to $C$ channels, followed by BatchNorm and ReLU:
+### 3.1 Residual Trunk
+
+The Gadus network derives its $\text{P}$ and $\text{V}$ from a shared residual trunk composed of a convolutional stem followed by a sequence of residual blocks. Within the trunk, the stem produces the initial feature tensor $h_0$, and each residual block $j$ combines its input $h_j$ with a learned transformation $F_j(h_j)$ to produce the next tensor $h_{j+1}$. The following formulas define these computations.
+
+Let $C$ be the number of feature channels in the trunk and let $B$ be its number of residual blocks. The stem maps the 18 binary input planes to $C$ real-valued $8\times8$ feature maps. The symbol $\mathrm{Conv}^{C_{\mathrm{in}}\rightarrow C_{\mathrm{out}}}_{3\times3}$ denotes a bias-free convolution with $C_{\mathrm{in}}$ input channels, $C_{\mathrm{out}}$ output channels and one-square zero padding. The symbol $\mathrm{BN}$ denotes batch normalization applied independently to each output channel, and $\mathrm{ReLU}(z)=\max(0,z)$ is applied elementwise. The stem computes
 
 $$
 h_0=\mathrm{ReLU}\left(
@@ -45,7 +147,7 @@ h_0=\mathrm{ReLU}\left(
 \in\mathbb R^{C\times8\times8}.
 $$
 
-The tensor $h_0$ is the input to residual block 0. The residual transform in block $j$ is
+The first residual block receives the stem output $h_0$ as its input. The learned transformation in residual block $j$ is
 
 $$
 F_j(h)=\mathrm{BN}_{j,2}\left(
@@ -53,45 +155,74 @@ F_j(h)=\mathrm{BN}_{j,2}\left(
 \mathrm{ReLU}\left(
 \mathrm{BN}_{j,1}\left(
 \mathrm{Conv}^{C\rightarrow C}_{3\times3,j,1}(h)
-\right)\right)\right)\right),
+\right)\right)\right)\right).
 $$
 
-Residual block $j$ then produces
+Residual block $j$ evaluates $F_j(h_j)$, adds the transformed tensor to its input $h_j$ and then applies ReLU:
 
 $$
-h_{j+1}=\mathrm{ReLU}(h_j+F_j(h_j)),\qquad 0\leq j<B.
+h_{j+1}=\mathrm{ReLU}\left(h_j+F_j(h_j)\right),
+\qquad 0\leq j<B.
 $$
 
-For $j=0$, the recurrence computes $h_1$ from $h_0$. Repeating the recurrence through block $B-1$ produces the trunk output $h_B$. Every $3\times3$ convolution uses one-square padding and preserves the $8\times8$ spatial dimensions, so each tensor $h_j$ lies in $\mathbb R^{C\times8\times8}$.
-
-$h_B$ is used as the common input to both output heads. The policy head applies a bias-free $1\times1$ convolution from $C$ channels to 32 channels, followed by BatchNorm, ReLU, flattening and a linear map from 2048 features to 4672 logits. The value head has an independent $1\times1$ convolution from $C$ channels to 32 channels, followed by BatchNorm, ReLU, flattening, a 2048-to-256 linear layer, ReLU, a scalar output layer and a hyperbolic tangent.
-
-Writing $f_\theta$ for the complete network, its forward pass is
+The stem produces $C$ feature maps on the $8\times8$ board grid, and every residual block preserves both the channel count and the spatial dimensions. Consequently,
 
 $$
-(\ell_\theta(s),V_\theta(s))=f_\theta(s),\qquad
-\ell_\theta(s)\in\mathbb R^{4672},\quad V_\theta(s)\in[-1,1].
+h_j\in\mathbb R^{C\times8\times8},
+\qquad 0\leq j\leq B.
 $$
 
-For game state $x$ with $s=\phi_G(x)$, legal-move inference selects the corresponding logits and normalizes them with a softmax:
+After $B$ residual blocks, $h_B$ is the output of the residual trunk and serves as the shared input to the two output paths:
+
+$$
+s\longrightarrow\text{residual trunk}\longrightarrow h_B\longrightarrow
+\begin{cases}
+\text{Policy head}\longrightarrow\ell_\theta(s)
+\longrightarrow P_\theta(\cdot\mid s),\\
+\text{Value head}\longrightarrow V_\theta(s).
+\end{cases}
+$$
+
+Section 3.2 defines both heads and the legal-move normalization that converts $\ell_\theta(s)$ into $P_\theta(\cdot\mid s)$.
+
+### 3.2 Policy and Value Heads
+
+The Policy head assigns one unnormalized score, called a logit, to every action index in $\mathcal I_G$. It maps $h_B$ through a bias-free $1\times1$ convolution from $C$ channels to 32 channels, followed by batch normalization and ReLU. Flattening the resulting $32\times8\times8$ tensor produces a 2048-dimensional vector, and a linear map converts that vector into 4672 logits.
+
+The Value head produces an estimate of the expected game result from the perspective of the player to move. It maps $h_B$ through a separate bias-free $1\times1$ convolution from $C$ channels to 32 channels, followed by batch normalization, ReLU and flattening. A $2048\rightarrow256$ linear map and ReLU produce an intermediate vector. A final linear map produces one scalar, and the hyperbolic tangent restricts that scalar to $[-1,1]$.
+
+Writing $f_\theta$ for the complete network gives
+
+$$
+f_\theta(s)=\left(\ell_\theta(s),V_\theta(s)\right),
+\qquad
+\ell_\theta(s)\in\mathbb R^{4672},
+\quad
+V_\theta(s)\in[-1,1].
+$$
+
+The complete logit vector assigns a score to every index in $\mathcal I_G$. For $s=\phi_G(x)$, selecting the indices $i_G(a)$ for $a\in\mathcal A(x)$ and normalizing their logits with softmax produces the legal-move Policy:
 
 $$
 P_\theta(a\mid s)=
-\frac{\exp \ell_\theta(s,i_G(a))}
-{\displaystyle \sum_{b\in\mathcal A(x)}\exp \ell_\theta(s,i_G(b))}.
-$$
-
-The normalization above depends only on logits associated with legal moves. During inference, Gadus therefore evaluates only the rows of the final Policy linear map indexed by $i_G(a)$ for legal moves $a\in\mathcal A(x)$. Let $W_P\in\mathbb R^{4672\times2048}$ and $b_P\in\mathbb R^{4672}$ be the parameters of this map, and let $h_P(s)\in\mathbb R^{2048}$ be its input. The restricted projection is
-
-$$
-\ell_\theta(s,i_G(a))=
-W_{P,i_G(a)}h_P(s)+b_{P,i_G(a)},
+\frac{\exp\ell_\theta(s,i_G(a))}
+{\displaystyle\sum_{b\in\mathcal A(x)}\exp\ell_\theta(s,i_G(b))},
 \qquad a\in\mathcal A(x).
 $$
 
-Selecting these rows preserves every logit used to compute $P_\theta$.
+The denominator ranges over $\mathcal A(x)$, so $P_\theta(\cdot\mid s)$ is a probability distribution over the legal actions in complete state $x$.
 
-The inference model also replaces each convolution-and-BatchNorm pair with an equivalent convolution. For output channel $o$, let $W_o$ be the bias-free convolution weights, and let $\mu_o$, $\sigma_o^2$, $\gamma_o$, $\beta_o$ and $\epsilon$ be the frozen BatchNorm mean, variance, scale, offset and stability constant. The fused parameters are
+### 3.3 Inference Evaluation
+
+The final Policy layer contains one weight row and one bias value for each action index in $\mathcal I_G$. For complete state $x$, the legal-move distribution $P_\theta(\cdot\mid s)$ uses only the rows indexed by $i_G(a)$ for actions $a\in\mathcal A(x)$. Let $h_P(s)\in\mathbb R^{2048}$ be the flattened Policy features, and let $W_{P,i}$ and $b_{P,i}$ be the weight row and bias associated with action index $i$. The logit of legal action $a$ is
+
+$$
+\ell_\theta(s,i_G(a))=W_{P,i_G(a)}h_P(s)+b_{P,i_G(a)}.
+$$
+
+Evaluating the selected rows produces the same legal-action logits as evaluating the complete 4672-row linear map. For a batch of complete states, the inference path pads every legal-index array to the largest legal-action count in that batch. It evaluates that many selected rows for each state and masks the padded positions before applying softmax. The resulting distribution for each state contains exactly the probabilities of its legal actions.
+
+During inference, each batch-normalization layer uses a fixed running mean, running variance, learned scale and learned bias. These fixed quantities allow a convolution and its following batch-normalization layer to be replaced by one convolution with transformed weights and an added bias. For output channel $o$, let $W_o$ be the original bias-free convolution weights, $\mu_o$ and $\sigma_o^2$ be the stored batch-normalization mean and variance, $\gamma_o$ and $\beta_o$ be its learned scale and bias and let $\epsilon$ be its numerical constant. The equivalent convolution parameters are
 
 $$
 W'_o=\frac{\gamma_o}{\sqrt{\sigma_o^2+\epsilon}}W_o,
@@ -99,175 +230,249 @@ W'_o=\frac{\gamma_o}{\sqrt{\sigma_o^2+\epsilon}}W_o,
 b'_o=\beta_o-\frac{\gamma_o\mu_o}{\sqrt{\sigma_o^2+\epsilon}}.
 $$
 
-This substitution preserves the output of the convolution-and-BatchNorm pair in evaluation mode. Four-dimensional inference tensors use the channels-last memory format. Fusion and layout conversion affect only the in-memory inference graph; they neither rewrite the source checkpoint nor change the network function $f_\theta$.
+Substituting $W'_o$ and $b'_o$ preserves the evaluation-mode output of every convolution-batch-normalization pair. Batch-normalization fusion and selected-row Policy evaluation therefore reduce the computation performed during inference while preserving $P_\theta(\cdot\mid s)$ and $V_\theta(s)$.
 
-## 4. Preprocessing
+## 4. Supervised Training
 
-Gadus preprocessing writes the following HDF5 schema:
+### 4.1 Supervised Data
 
-```text
-states: uint8,  (N, 18, 8)
-moves:  uint16, (N,)
-values: float32, (N,)
-
-arch_type=gadus
-state_encoding=gadus_18_planes
-move_encoding=alphazero_64x73
-target_schema=pv_supervised
-has_cmt=0|1
-```
-
-Preprocessing can derive Value targets either from numerical PGN comments or from the final game result. When comments provide the targets, entries of the form `{+x}` and `{-x}` are interpreted as pawn-unit evaluations from White's perspective. At ply $t$, let $x_t$ be the game state before the recorded move and let $s_t=\phi_G(x_t)$. A comment attached to a PGN move describes the position produced by that move, so the comment on the preceding move supplies the target for $s_t$.
-
-Let $q_t$ be the White-perspective evaluation assigned to $x_t$ by the preceding move's comment. Define $\rho(x_t)=1$ when White is to move and $\rho(x_t)=-1$ when Black is to move. The corresponding side-to-move evaluation and value target are
+Let $\mathcal D_{\mathrm{sup}}$ be a supervised dataset containing $N$ records:
 
 $$
-q_{\mathrm{stm}}(s_t)=\rho(x_t)q_t,
+\mathcal D_{\mathrm{sup}}=
+\lbrace \xi_n\rbrace_{n=1}^{N}.
+$$
+
+Each record is associated with a complete pre-move state $x_n$ and a selected legal action $a_n\in\mathcal A(x_n)$. The record is
+
+$$
+\xi_n=(s_n,i_n,y_n),
+$$
+
+where
+
+$$
+s_n=\phi_G(x_n),
 \qquad
-V_{\mathrm{target}}(s_t)=\tanh\left(\frac{q_{\mathrm{stm}}(s_t)}{3}\right).
+i_n=i_G(a_n),
+\qquad
+y_n\in[-1,1].
 $$
 
-If the preceding comment contains no parseable evaluation, $q_{\mathrm{stm}}$ is set to 0 for that state. When comments provide the targets, preprocessing admits a game if at least one of its comments contains a parseable evaluation. When the final game result provides the targets, $V_{\mathrm{target}}\in\lbrace -1,0,1\rbrace$ represents that result from the perspective of the side to move.
+The encoded state $s_n$ is the network input, and the action index $i_n$ is the Policy target. The scalar $y_n$ is the Value target, expressed as an estimate of the expected game result from the perspective of the side to move in $x_n$. On this scale, $-1$ denotes a loss, $0$ denotes a draw and $1$ denotes a win, while intermediate values express expectations between these outcomes.
 
-## 5. Supervised Training
+### 4.2 Supervised Objective
 
-Let $a^{\ast}$ be the move recorded in the PGN, and let $i^{\ast}=i_G(a^{\ast})$ be its action index. For a network input $s$, the Policy head produces one logit $\ell_\theta(s,i)$ for every action index $i\in\mathcal I_G$. Applying softmax to all 4672 logits gives the supervised Policy distribution $R_\theta$:
-
+For network input $s$, the Policy head produces the 4672-dimensional logit vector
+$$
+\ell_\theta(s)=\left(\ell_\theta(s,i)\right)_{i\in\mathcal I_G}\in\mathbb R^{4672}.
+$$
+Its component $\ell_\theta(s,i)$ is the logit assigned to action index $i$. Supervised training applies softmax to all 4672 components of this vector, producing the supervised action-index distribution $R_\theta$:
 $$
 R_\theta(i\mid s)=
 \frac{\exp\ell_\theta(s,i)}
-{\displaystyle\sum_{j\in\mathcal I_G}\exp\ell_\theta(s,j)}.
+{\displaystyle\sum_{j\in\mathcal I_G}\exp\ell_\theta(s,j)},
+\qquad i\in\mathcal I_G.
 $$
 
-$R_\theta$ and the legal-move distribution $P_\theta$ defined in Section 3 use the same logits. $R_\theta$ normalizes over the complete action-index set during supervised training, whereas $P_\theta$ normalizes over the legal moves of the current game state during inference.
+Both $R_\theta(\cdot\mid s)$ and the legal-move distribution $P_\theta(\cdot\mid s)$ are derived from the same logit vector $\ell_\theta(s)$, but they differ in normalization domain. $R_\theta$ normalizes all 4672 components for supervised training, whereas $P_\theta$ selects the components indexed by legal actions in $\mathcal A(x)$ and normalizes those components during inference.
 
-Let $\delta_{i^{\ast}}$ be the one-hot target distribution that assigns probability 1 to $i^{\ast}$ and probability 0 to every other action index. The supervised Policy loss is
-
-$$
-L_{P,\mathrm{sup}}=
-L_{\mathrm{CE}}\left(R_\theta(\cdot\mid s),\delta_{i^{\ast}}\right)
-=-\log R_\theta(i^{\ast}\mid s).
-$$
-
-The Policy loss $L_{P,\mathrm{sup}}$ decreases as the probability assigned to the recorded move increases.
-
-The Value head predicts $V_\theta(s)$, and the preprocessing stage supplies $V_{\mathrm{target}}(s)$. Their mean-squared error defines the supervised Value loss:
+For minibatch $\mathcal B\subseteq\mathcal D_{\mathrm{sup}}$, the supervised Policy loss is the mean negative log-probability assigned to the target action indices:
 
 $$
-L_{V,\mathrm{sup}}=
-\mathrm{MSE}\left(V_\theta(s),V_{\mathrm{target}}(s)\right).
+L_{P,\mathrm{sup}}^{(\mathcal B)}=
+-\frac{1}{|\mathcal B|}
+\sum_{(s,i,y)\in\mathcal B}\log R_\theta(i\mid s).
 $$
 
-Let $w_V$ be the nonnegative Value-loss coefficient. The complete supervised objective is
+The supervised Value loss is the mean squared difference between the predicted and target expected results in the same minibatch:
 
 $$
-L_{\mathrm{sup}}=
-L_{P,\mathrm{sup}}+w_VL_{V,\mathrm{sup}}.
+L_{V,\mathrm{sup}}^{(\mathcal B)}=
+\frac{1}{|\mathcal B|}
+\sum_{(s,i,y)\in\mathcal B}
+\left(V_\theta(s)-y\right)^2.
 $$
 
-Each supervised run initializes a new Gadus model with dimensions $C$ and $B$. Let $E$ be the epoch count, let $m$ be the minibatch size, let $N$ be the number of training records and let $K_{\max}\in\mathbb N\cup\{\infty\}$ be the optimizer-step cap. The number of updates is
+The nonnegative coefficient $w_V$ sets the contribution of the supervised Value loss to the complete minibatch objective:
 
 $$
-K=\min\left(K_{\max},E\left\lceil\frac Nm\right\rceil\right).
+L_{\mathrm{sup}}^{(\mathcal B)}=
+L_{P,\mathrm{sup}}^{(\mathcal B)}+
+w_VL_{V,\mathrm{sup}}^{(\mathcal B)}.
 $$
 
-A deterministic random seed controls parameter initialization and dataset shuffling.
-
-Each checkpoint contains exactly two top-level keys:
-
-```text
-model #stores the network parameters
-arch  #stores the Gadus identifier and the dimensions required to reconstruct the network
-```
-
-## 6. Search
-
-### 6.1 Search Modes
-
-In `closed` mode, search derives its initial move ranking directly from the model Policy. In `only-mcts` mode, search evaluates leaf nodes in neural batches and derives its initial ranking from the resulting MCTS root distribution. Search then applies the enabled IMF (Instant Mate First) and RPP (Repetition Policy Penalty) decision components in either mode.
-
-Within `only-mcts` mode, expanding node $s$ creates one outgoing edge $(s,a)$ for each legal action $a$ and stores policy probability $P(s,a)$ as that edge's prior. Each prior remains fixed throughout the search. The completed visit counts of an edge and its parent node are denoted by $N(s,a)$ and $N(s)=\sum_aN(s,a)$. During batched selection, virtual visits reserve edges for concurrent paths and reduce repeated selection of the same edge. Their corresponding counts are $N_v(s,a)$ and $N_v(s)=\sum_aN_v(s,a)$. Selection combines completed and virtual visits into the augmented counts:
+To express how the two losses contribute gradients to the network, partition the network parameters as $\theta=(\theta_T,\theta_P,\theta_V)$, where $\theta_T$ contains the residual-trunk parameters and $\theta_P$ and $\theta_V$ contain the parameters of the two output heads. The gradient of the complete objective satisfies
 
 $$
-\widetilde N(s,a)=N(s,a)+N_v(s,a),
+\nabla_{\theta_P}L_{\mathrm{sup}}^{(\mathcal B)}=
+\nabla_{\theta_P}L_{P,\mathrm{sup}}^{(\mathcal B)},
+$$
+
+$$
+\nabla_{\theta_V}L_{\mathrm{sup}}^{(\mathcal B)}=
+w_V\nabla_{\theta_V}L_{V,\mathrm{sup}}^{(\mathcal B)},
+$$
+
+$$
+\nabla_{\theta_T}L_{\mathrm{sup}}^{(\mathcal B)}=
+\nabla_{\theta_T}L_{P,\mathrm{sup}}^{(\mathcal B)}+
+w_V\nabla_{\theta_T}L_{V,\mathrm{sup}}^{(\mathcal B)}.
+$$
+
+The Policy loss contributes gradients to the Policy head and the residual trunk, whereas the Value loss contributes gradients to the Value head and the residual trunk. Their contributions add in the shared trunk according to the final equation above.
+
+### 4.3 Parameter Optimization
+
+Parameter optimization processes $\mathcal D_{\mathrm{sup}}$ in epochs, each of which uses every record exactly once. At the start of an epoch, the data loader first randomizes the order of the HDF5 chunks and then randomizes the records within each chunk before forming minibatches. This two-level shuffle prevents the fixed storage order from repeatedly placing related positions in consecutive minibatches, a pattern that may produce excessive correlation between successive gradient estimates. The resulting minibatches are indexed by optimizer step as $\mathcal B_1,\mathcal B_2,\ldots,\mathcal B_n$.
+
+Let $\theta^{(0)}$ denote the initial parameters of a newly initialized network whose residual trunk has width $C$ and depth $B$. At optimizer step $k\geq1$, $\theta^{(k-1)}$ denotes the parameters available before the update. Automatic differentiation computes the gradient of the objective for $\mathcal B_k$ with respect to $\theta^{(k-1)}$:
+
+$$
+g_k=\nabla_{\theta^{(k-1)}}
+L_{\mathrm{sup}}^{(\mathcal B_k)}.
+$$
+
+AdamW combines $g_k$ with information accumulated from earlier optimizer steps. Its first-moment estimate $u_k$ is an exponential moving average of the gradients, while its second-moment estimate $v_k$ is an exponential moving average of the squared gradients. Both estimates have the same dimensions as $\theta$ and begin with $u_0=v_0=0$. Because this initialization draws their early magnitudes toward zero, AdamW corrects the resulting bias. With $\beta_1=0.9$ and $\beta_2=0.999$, the moment estimates and their bias-corrected forms are
+
+$$
+u_k=\beta_1u_{k-1}+(1-\beta_1)g_k,
 \qquad
-\widetilde N(s)=N(s)+N_v(s).
+v_k=\beta_2v_{k-1}+(1-\beta_2)g_k^2,
 $$
 
-### 6.2 PUCT Selection
-
-Let $c_0$ be the initial exploration coefficient, let $b_0$ be its schedule base and let $f_0$ be its schedule factor. Define $b=\max(1,b_0)$ and $f=\max(0,f_0)$. The visit-dependent exploration coefficient is
-
 $$
-c_{\mathrm{puct}}(\widetilde N)=
-\max\left(0,c_0+f\log\left(\frac{\widetilde N+b+1}{b}\right)\right).
+\widehat u_k=\frac{u_k}{1-\beta_1^k},
+\qquad
+\widehat v_k=\frac{v_k}{1-\beta_2^k}.
 $$
 
-A terminal leaf supplies the exact rule outcome $z(x)$, while a nonterminal leaf supplies the network evaluation $V_\theta(\phi_G(x))$. Denote either result by $V_{\mathrm{leaf}}$. MCTS backs up this value along the selected path and reverses its sign at every ply. Each completed backup increments $N(s,a)$ and updates the mean return $Q(s,a)$ from the perspective of the player at the parent node $s$.
-
-The selection estimate $Q_{\mathrm{sel}}(s,a)$ equals $Q(s,a)$ when $N(s,a)>0$. For an unvisited edge, $Q(s)$ denotes the mean return backed up to node $s$ from the perspective of the player to move at that node. First Play Urgency combines $Q(s)$ with the explored prior mass. Let $r_{\mathrm{FPU}}\geq0$ be the FPU reduction coefficient. The two cases are
+Let $\eta$ be the learning rate, let $\lambda$ be the weight-decay coefficient and let $\epsilon_A=10^{-8}$ prevent division by zero. AdamW updates the parameters according to
 
 $$
-Q_{\mathrm{sel}}(s,a)=
+\theta^{(k)}=
+(1-\eta\lambda)\theta^{(k-1)}-
+\eta\frac{\widehat u_k}{\sqrt{\widehat v_k}+\epsilon_A}.
+$$
+
+The square, square root and quotient in these equations are evaluated separately for each scalar parameter. In the update equation, the first term applies decoupled weight decay to $\theta^{(k-1)}$, and the second term applies the adaptive step determined by the corrected moment estimates. The resulting parameters $\theta^{(k)}$ become the starting point for the next minibatch. Optimization proceeds until the requested epochs are complete or the number of updates reaches a positive optimizer-step limit. In the absence of a positive limit, the epoch count alone determines completion.
+
+## 5. Search
+
+### 5.1 Root Initialization
+
+For a nonterminal complete state $x_0$, the MCTS procedure initializes a tree whose root corresponds to $x_0$. Each node corresponds to a complete state, and each edge leaving a node corresponding to state $x$ records a legal action $a\in\mathcal A(x)$ and leads to a child node corresponding to $T(x,a)$. A simulation follows selected edges from the root to a leaf, determines an evaluation for the leaf state and propagates that evaluation back along the selected path.
+
+The evaluator then obtains $P_\theta(\cdot\mid s_0)$ and $V_\theta(s_0)$ for $s_0=\phi_G(x_0)$. The scalar $V_\theta(s_0)$ provides the reported root evaluation when no simulation completes, while the number of completed visits and the sum of backed-up evaluations both begin at zero. For every legal action $a\in\mathcal A(x_0)$, root expansion creates an outgoing edge and a child node, and the Policy probability assigned to $a$ defines the prior of that edge:
+
+$$
+P(x_0,a)=P_\theta(a\mid s_0).
+$$
+
+A nonterminal node is unexpanded while it has no outgoing edges. When a simulation reaches an unexpanded node corresponding to state $x$, the evaluator obtains $P_\theta(\cdot\mid\phi_G(x))$ and $V_\theta(\phi_G(x))$. Node expansion uses the Policy distribution to create one outgoing edge and child node for every action $a\in\mathcal A(x)$, assigning $P_\theta(a\mid\phi_G(x))$ to the edge prior $P(x,a)$. The backup procedure defined in Section 5.4 propagates $V_\theta(\phi_G(x))$ along the selected path.
+
+### 5.2 Tree Statistics
+
+Every node maintains a completed-visit count and the sum of the evaluations propagated to that node. For a node representing $x$, let $N(x)$ denote its completed-visit count, let $W(x)$ denote its accumulated evaluation and define its empirical mean by
+
+$$
+Q(x)=
 \begin{cases}
-Q(s,a), & N(s,a)>0,\\[4pt]
-\mathrm{clip}\left(
-Q(s)-r_{\mathrm{FPU}}\sqrt{\displaystyle\sum_{a':N(s,a')>0}P(s,a')},-1,1
-\right), & N(s,a)=0.
+\dfrac{W(x)}{N(x)},&N(x)>0,\\[6pt]
+0,&N(x)=0.
 \end{cases}
 $$
 
-Let $l_v\geq0$ be the virtual-loss coefficient. The PUCT selection score is
+The value $Q(x)$ uses the perspective of the side to move in $x$. For an edge that applies $a$ at $x$, the child node represents $T(x,a)$ and therefore uses the opponent's perspective. Once that child has been visited, the action evaluation in the parent perspective is
 
 $$
-S(s,a)=Q_{\mathrm{sel}}(s,a)
-+c_{\mathrm{puct}}(\widetilde N(s))P(s,a)
-\frac{\sqrt{\widetilde N(s)+1}}{1+\widetilde N(s,a)}
--l_vN_v(s,a).
+Q(x,a)=-Q(T(x,a)).
 $$
 
-Equal selection scores are ordered by descending $P(s,a)$ and then by descending $Q_{\mathrm{sel}}(s,a)$.
+Let $N(x,a)$ denote the completed-visit count of the child reached through action $a$. This count equals the number of completed simulations that traversed the edge from $x$ to $T(x,a)$. A node can first be evaluated before any simulation traverses one of its outgoing edges, so its node count $N(x)$ can exceed $\sum_{a\in\mathcal A(x)}N(x,a)$.
 
-When search ends, each legal root move receives weight $N(s,a)+P(s,a)$. Their normalized weights form the root move distribution
+### 5.3 PUCT Selection
 
-$$
-P_{\mathrm{root}}(a\mid s)=
-\frac{N(s,a)+P(s,a)}
-{\displaystyle\sum_{a'\in\mathcal A(x)}\left(N(s,a')+P(s,a')\right)}.
-$$
+Each simulation uses Predictor + Upper Confidence bounds applied to Trees (PUCT) to descend through expanded nodes. The PUCT score combines the empirical evaluation of an action with an exploration term derived from its prior and visit count. Because an unvisited edge has no empirical action evaluation, First Play Urgency (FPU) supplies its initial selection value.
 
-### 6.3 Neural Evaluation Representation and Cache
-
-Evaluating a nonterminal state produces a compact record containing its legal moves, their action indices, the legal-move probabilities $P_\theta(a\mid s)$ and the state evaluation $V_\theta(s)$. The `closed` path and MCTS tree expansion consume the aligned legal-action arrays without constructing a 4672-entry Policy vector.
-
-Let $p(a)$ denote the legal distribution that supplies the result: $P_\theta(a\mid s)$ for direct Policy output and $P_{\mathrm{root}}(a\mid s)$ after MCTS. When search assembles its final result or a progress snapshot, it materializes the dense representation
+Let the explored prior mass at node $x$ be
 
 $$
-p_{\mathrm{dense}}(i\mid s)=
+M_P(x)=
+\sum_{b\in\mathcal A(x):N(x,b)>0}P(x,b).
+$$
+
+With FPU reduction coefficient $r_{\mathrm{FPU}}\geq0$, the action value used during selection is
+
+$$
+Q_{\mathrm{sel}}(x,a)=
 \begin{cases}
-p(a),&i=i_G(a)\text{ for }a\in\mathcal A(x),\\
-0,&i\notin\{i_G(a):a\in\mathcal A(x)\}.
+Q(x,a),&N(x,a)>0,\\[4pt]
+\mathrm{clip}_{[-1,1]}\left(
+Q(x)-r_{\mathrm{FPU}}\sqrt{M_P(x)}
+\right),&N(x,a)=0.
 \end{cases}
 $$
 
-Within one search call, inputs with the same Gadus `PackedState` share the compact record and therefore require one network evaluation. Different simulations can reuse the record when distinct tree nodes reach the same encoded state, while an expanded node reads its evaluation from the node itself. Search consults the cache only for root evaluation in `closed` mode and for both root and leaf evaluation in `only-mcts` mode.
+FPU uses the empirical mean of the parent node and subtracts a reduction proportional to the square root of its explored prior mass. An unvisited edge therefore receives a more conservative initial evaluation after the node has already explored actions that the network considered probable.
 
-When cross-search retention has positive capacity, the searcher retains compact evaluation records across successive search calls using TLRU (trajectory-aware least-recently-used). Each successful lookup moves the corresponding entry to the most-recent end of the recency order. When MCTS evaluates a child state whose parent evaluation is present in the cache, TLRU records a directed link from the parent entry to the child entry.
-
-Let $\mathcal C$ be the set of retained entries, and let $E_C\subseteq\mathcal C\times\mathcal C$ be the recorded parent-child links. For a new search root $r\in\mathcal C$, define its retained trajectory neighborhood as
+Several paths may be selected before their leaf states are evaluated together. A temporary virtual visit reserves every node on each selected path so that later selections in the same batch account for the pending work. Let $N_v(x)$ be the number of active reservations through node $x$, and let $N_v(x,a)$ be the number through the child edge for action $a$. The augmented counts are
 
 $$
-\mathcal N_2(r)=
-\left\{y\in\mathcal C:d_C(r,y)\leq2\right\},
+\widetilde N(x)=N(x)+N_v(x),
+\qquad
+\widetilde N(x,a)=N(x,a)+N_v(x,a).
 $$
 
-where $d_C(r,y)$ is the length of the shortest directed path from $r$ to $y$ through recorded links. At the beginning of a search call with root $r$, TLRU moves entries in $\mathcal N_2(r)$ to the most-recent end in descending distance order. The resulting order places the root first, followed by its one-ply descendants and then its two-ply descendants. Lookups and insertions update the same recency order. When the approximate memory ceiling is exceeded, TLRU removes entries from the least-recent end. Zero cross-search capacity creates a cache for one search call and discards it when that call ends.
+The exploration coefficient follows a logarithmic schedule based on the augmented parent count. Let $c_0$ be its initial coefficient, let $b_0$ be its schedule base and let $f_0$ be its schedule factor. After defining $b=\max(1,b_0)$ and $f=\max(0,f_0)$, Gadus computes
 
-Rule-terminal detection precedes every cache lookup, so an exact outcome determined by the current game history supplies the leaf value directly. Each search call constructs a new MCTS tree and initializes new visit counts, virtual visits and $Q$ estimates. The cache reuses network outputs without reusing search statistics.
+$$
+c_{\mathrm{puct}}(n)=
+\max\left(0,c_0+f\log\left(\frac{n+b+1}{b}\right)\right).
+$$
 
-### 6.4 Dynamic Simulation Budget
+With virtual-loss coefficient $l_v\geq0$, the complete PUCT score is
 
-Let $N_{\mathrm{cap}}\geq0$ be the simulation cap, let $B_{\mathrm{batch}}\geq1$ be the neural batch capacity and let $N_{\mathrm{floor}}\geq0$ be the simulation-floor parameter. The nominal minimum simulation count is
+$$
+S(x,a)=Q_{\mathrm{sel}}(x,a)
++c_{\mathrm{puct}}\left(\widetilde N(x)\right)P(x,a)
+\frac{\sqrt{\widetilde N(x)+1}}{1+\widetilde N(x,a)}
+-l_vN_v(x,a).
+$$
+
+At each expanded node, the selector follows the action with the largest $S(x,a)$. Equal PUCT scores are resolved first by the larger prior $P(x,a)$ and then by the larger $Q_{\mathrm{sel}}(x,a)$. If all three quantities are equal, the selector follows the action that the rules engine enumerated first when the node was expanded. The resulting path ends at a terminal state or at a nonterminal node that has not yet been expanded.
+
+### 5.4 Leaf Evaluation and Backup
+
+The rules engine determines whether the selected leaf state $x_d$ is terminal before neural evaluation. A terminal leaf receives the exact outcome $z(x_d)$. For an unexpanded nonterminal leaf, the network supplies the scalar evaluation $V_\theta(\phi_G(x_d))$ together with the Policy probabilities required for expansion. Both $z(x_d)$ and $V_\theta(\phi_G(x_d))$ use the perspective of the side to move at the leaf, so the scalar leaf evaluation is
+
+$$
+\rho_d=
+\begin{cases}
+z(x_d),&x_d\text{ is terminal},\\
+V_\theta(\phi_G(x_d)),&x_d\text{ is nonterminal}.
+\end{cases}
+$$
+
+To define the backup operation, denote the selected path by $(x_0,x_1,\ldots,x_d)$ and let $a_k$ be the action that leads from $x_{k-1}$ to $x_k$. For each node $x_k$ on this path, the evaluation in its side-to-move perspective is
+
+$$
+\rho_k=(-1)^{d-k}\rho_d.
+$$
+
+The backup operation removes the virtual reservation from the path and updates every selected node by
+
+$$
+N(x_k)\leftarrow N(x_k)+1,
+\qquad
+W(x_k)\leftarrow W(x_k)+\rho_k.
+$$
+
+These updates increase the completed count of each traversed child and thereby increase the corresponding edge count $N(x_{k-1},a_k)$. The empirical means $Q(x_k)$ and the parent-perspective action evaluations $Q(x_{k-1},a_k)$ then follow from the definitions in Section 5.2.
+
+### 5.5 Simulation Budget
+
+The simulation budget uses root uncertainty to choose a target between a required minimum and a fixed cap. Let $N_{\mathrm{cap}}\geq0$ be the simulation cap, let $B_{\mathrm{batch}}\geq1$ be the neural batch capacity and let $N_{\mathrm{floor}}\geq0$ be an optional explicit minimum. The minimum number of completed simulations is
 
 $$
 N_{\min}=
@@ -282,178 +487,248 @@ N_{\min}=
 \end{cases}
 $$
 
-An external deadline or cancellation signal may terminate search with fewer than $N_{\min}$ completed simulations. After $N_{\min}$ simulations have completed at a root with at least two legal actions, search forms the empirical visit distribution
+When $N_{\mathrm{cap}}>0$, the root first completes $N_{\min}$ simulations. Its root-edge counts then define the empirical visit distribution
 
 $$
-v_a=\frac{N(s,a)}{\displaystyle\sum_{b\in\mathcal A(x)}N(s,b)}.
+\widehat P_N(a\mid x_0)=
+\frac{N(x_0,a)}
+{\displaystyle\sum_{b\in\mathcal A(x_0)}N(x_0,b)}.
 $$
 
-Let $a_1$ and $a_2$ be the two actions with the largest completed visit counts, and write $N_i=N(s,a_i)$. Define $Q_i=Q(s,a_i)$ when $N_i>0$ and $Q_i=0$ when $N_i=0$. The normalized visit entropy $H_N$, visit closeness $U_N$ and $Q$ closeness $U_Q$ are
+For a root with at least two legal actions, sort the actions first by decreasing visit count $N(x_0,a)$. Among actions with equal visit counts, place the action with the larger prior $P(x_0,a)$ first. Denote the first two actions in this order by $a_1$ and $a_2$, and define $N_i=N(x_0,a_i)$. For each $a_i$, define $Q_i=Q(x_0,a_i)$ when $N_i>0$ and $Q_i=0$ when $N_i=0$. The normalized visit entropy $H_N$, visit-count proximity $U_N$ and action-evaluation proximity $U_Q$ are
 
 $$
-H_N=-\frac{\sum_{a\in\mathcal A(x)}v_a\log v_a}
-{\log|\mathcal A(x)|},
+H_N=-
+\frac{\displaystyle\sum_{a\in\mathcal A(x_0)}
+\widehat P_N(a\mid x_0)\log\widehat P_N(a\mid x_0)}
+{\log|\mathcal A(x_0)|},
 $$
 
 $$
-U_N=1-\frac{|N_1-N_2|}{\max(1,N_1+N_2)},
+U_N=1-
+\frac{|N_1-N_2|}{\max(1,N_1+N_2)},
 $$
 
 $$
-U_Q=1-\min\left(1,\frac{|Q_1-Q_2|}{0.5}\right).
+U_Q=1-
+\min\left(1,\frac{|Q_1-Q_2|}{0.5}\right).
 $$
 
-The combined uncertainty and resulting simulation target are
+The entropy summand for $\widehat P_N(a\mid x_0)=0$ equals zero by the limit $\lim_{p\to0^+}p\log p=0$. The three statistics lie in $[0,1]$, and their weighted sum defines the root uncertainty
 
 $$
-u=\mathrm{clip}(0.5H_N+0.35U_N+0.15U_Q,0,1),
+u=\mathrm{clip}_{[0,1]}\left(0.5H_N+0.35U_N+0.15U_Q\right).
 $$
+
+The current uncertainty determines the simulation target
 
 $$
 N_{\mathrm{target}}=
 N_{\min}+\left\lceil u(N_{\mathrm{cap}}-N_{\min})\right\rceil.
 $$
 
-For a root with one legal action, search sets $u=0$ and $N_{\mathrm{target}}=N_{\min}$.
+The MCTS procedure recalculates $N_{\mathrm{target}}$ after each selection-and-evaluation cycle once the root has reached $N_{\min}$. Simulations for that root end when its completed count reaches the current target or the cap. A root with one legal action uses $u=0$ and therefore stops at $N_{\min}$. A zero cap sets both $N_{\min}$ and $N_{\mathrm{target}}$ to zero. If the caller signals cancellation or the execution deadline expires, the procedure finishes the leaves already selected and returns the statistics produced by completed backups.
 
-### 6.5 Final Decision Components
+### 5.6 Evaluation Reuse
 
-The optional IMF (Instant Mate First) and RPP (Repetition Policy Penalty) rules operate on the final ranking rather than on the search tree. Before either rule is applied, the ranking score is
+Repeated neural evaluation of the same `PackedState` produces the same compact Policy and Value record, so Gadus stores each completed network evaluation in a cache indexed by its `PackedState`. For a requested complete state, the rules engine checks for a terminal outcome before consulting this cache. This order is required because `PackedState` omits move counters and repetition history. Exact rule outcomes therefore depend on the complete state, whereas cached network outputs depend only on the encoded state.
+
+One MCTS invocation receives one or more root states and constructs a separate search tree for each root. All trees created by that invocation access the same evaluation cache, which allows simulations within one tree and simulations from different trees to reuse completed network records. Let $M_C\geq0$ be the configured memory capacity for records retained across invocations. When $M_C=0$, the cache exists only for the current invocation and is discarded with its search trees. When $M_C>0$, the same cache persists across invocations and uses TLRU (trajectory-aware least-recently-used) to order its records. A successful lookup moves the accessed record to the most-recent end of this order, and inserting a new record places it at the same end.
+
+TLRU records a directed link when a cached nonterminal child is reached from a cached parent. Let $\mathcal C$ be the set of retained entries and let $E_C\subseteq\mathcal C\times\mathcal C$ be the set of recorded parent-child links. For a retained root entry $r\in\mathcal C$, the trajectory neighborhood of radius two is
 
 $$
-D_0(a)=
+\mathcal N_2(r)=
+\lbrace y\in\mathcal C:d_C(r,y)\leq2\rbrace,
+$$
+
+where $d_C(r,y)$ is the length of the shortest directed path from $r$ to $y$ in $(\mathcal C,E_C)$. Before evaluating a new root, TLRU touches the retained entries in $\mathcal N_2(r)$ in decreasing order of $d_C(r,y)$. Two-ply descendants are touched first, one-ply descendants next and the root last, leaving the root as the most-recent entry. Ordinary lookups and insertions then continue to update the same order.
+
+When the approximate memory use exceeds the configured capacity, TLRU removes entries from the least-recent end until the retained records fit within the limit. TLRU stores compact network records, whereas tree nodes and search statistics belong to one invocation. Every invocation therefore constructs fresh nodes with zero visits, zero accumulated evaluations and zero virtual reservations, initializes their network fields from cached records when available and computes their tree statistics through MCTS.
+
+### 5.7 Batched Evaluation
+
+During one selection-and-evaluation cycle, MCTS processes each search tree whose root count $N(x_0)$ is smaller than both $N_{\mathrm{target}}$ and $N_{\mathrm{cap}}$. For each such tree, the requested number of distinct nonterminal leaves is
+
+$$
+m=\min\left(
+B_{\mathrm{batch}},
+N_{\mathrm{target}}-N(x_0),
+N_{\mathrm{cap}}-N(x_0)
+\right).
+$$
+
+The three terms limit the request by the neural batch capacity, the remaining count to the current target and the remaining count to the simulation cap, respectively.
+
+Each selection attempt starts at the root and uses PUCT to descend through expanded nodes until it reaches either a terminal node or an unexpanded nonterminal node. A terminal node is evaluated and backed up immediately according to Section 5.4, which completes one simulation without adding a neural-evaluation request. An unexpanded nonterminal node enters the request list when the same tree has not already selected that node during the current cycle, and its virtual visits remain on the selected path until evaluation finishes. A repeated selection of an already reserved node releases the temporary virtual visits and contributes no request. The tree makes at most $\max(5m,m+8)$ selection attempts while collecting up to $m$ distinct nonterminal leaves.
+
+The requests collected from all search trees are concatenated and partitioned into neural batches no larger than the neural batch capacity. Within each batch, the evaluation-reuse mechanism described in Section 5.6 first resolves requests that already have cached records. The evaluator then groups the unresolved requests by `PackedState`. Every request in one group has the same network input, so one neural evaluation supplies the result for the entire group.
+
+For a representative leaf state $x$, let $L=|\mathcal A(x)|$, and write its ordered legal actions as $a_1,\ldots,a_L$. The compact evaluation record contains the three sequences
+
+$$
+(a_j)_{j=1}^{L},\qquad
+(i_G(a_j))_{j=1}^{L},\qquad
+(P_\theta(a_j\mid\phi_G(x)))_{j=1}^{L},
+$$
+
+together with the scalar $V_\theta(\phi_G(x))$. Entries with the same index $j$ describe the same legal action, which defines the alignment among the action, action-index and Policy sequences.
+
+After neural evaluation, the evaluator stores the completed record through the evaluation-reuse mechanism and assigns it to every request in the matching `PackedState` group. For each requested leaf, tree expansion creates one outgoing edge for every $a_j$ and assigns $P_\theta(a_j\mid\phi_G(x))$ as that edge's prior. The scalar $V_\theta(\phi_G(x))$ is then backed up along the leaf's reserved path. The trees therefore share network evaluation records while retaining separate nodes, paths and search statistics.
+
+### 5.8 Root Evaluation and Policy
+
+After the simulation phase, the root evaluation uses the network estimate when no simulation has completed and the empirical root mean otherwise:
+
+$$
+V_{\mathrm{root}}(x_0)=
 \begin{cases}
-P_\theta(a\mid s),&\texttt{closed},\\
-P_{\mathrm{root}}(a\mid s),&\texttt{only-mcts}.
+V_\theta(s_0),&N(x_0)=0,\\
+Q(x_0),&N(x_0)>0.
 \end{cases}
 $$
 
-Let $\mathcal M(x)$ be the set of legal actions that immediately checkmate the opponent. If this set is nonempty, IMF selects
+The completed root-edge visits and their priors define the root Policy distribution
 
 $$
-a_M=\arg\max_{a\in\mathcal M(x)}D_0(a).
+P_{\mathrm{root}}(a\mid s_0)=
+\frac{N(x_0,a)+P(x_0,a)}
+{\displaystyle\sum_{b\in\mathcal A(x_0)}
+\left(N(x_0,b)+P(x_0,b)\right)}.
 $$
 
-IMF then defines
+The priors sum to one over $\mathcal A(x_0)$, so the added prior terms contribute total weight one to the root distribution. When $N_{\mathrm{cap}}=0$, every root-edge visit count remains zero and the formula reduces to
+
+$$
+P_{\mathrm{root}}(a\mid s_0)=P_\theta(a\mid s_0).
+$$
+
+The MCTS root Policy therefore coincides with the direct network Policy when the simulation cap is zero.
+
+When an output requires one probability for every index in $\mathcal I_G$, Gadus expands the compact root distribution into
+
+$$
+P_{\mathrm{dense}}(i\mid s_0)=
+\begin{cases}
+P_{\mathrm{root}}(a\mid s_0),
+&i=i_G(a)\text{ for }a\in\mathcal A(x_0),\\
+0,&i\notin\lbrace i_G(a):a\in\mathcal A(x_0)\rbrace.
+\end{cases}
+$$
+
+This conversion is performed only for a final result or a progress report that requires the fixed action-index space $\mathcal I_G$.
+
+### 5.9 Decision Components
+
+The decision layer can apply two optional transformations to the final move ordering. It begins with a copy of the root Policy distribution:
+
+$$
+D_0(a)=P_{\mathrm{root}}(a\mid s_0).
+$$
+
+When enabled, IMF (Instant Mate First) examines the set $\mathcal M(x_0)$ of legal actions that immediately checkmate the opponent. When this set contains at least one action, IMF selects an action with the largest base score
+
+$$
+a_M=\arg\max_{a\in\mathcal M(x_0)}D_0(a)
+$$
+
+If several actions attain this maximum, IMF chooses the action that the rules engine enumerates first. IMF then defines
 
 $$
 D_I(a)=
 \begin{cases}
 1,&a=a_M,\\
-D_0(a),&a\in\mathcal A(x)\setminus\lbrace a_M\rbrace.
+D_0(a),&a\in\mathcal A(x_0)\setminus\lbrace a_M\rbrace.
 \end{cases}
 $$
 
-When $\mathcal M(x)$ is empty, $D_I(a)$ equals $D_0(a)$ for every legal action.
+If IMF is disabled or $\mathcal M(x_0)$ is empty, its output is $D_I(a)=D_0(a)$ for every legal action.
 
-Let $\lambda_R\in[0,1]$ be the repetition-penalty coefficient, and let $V_R$ be the $V$ returned for the root by search. The set $\mathcal R_3(x)$ contains legal moves that either make a threefold-repetition claim available immediately or allow the opponent to do so with one reply. RPP computes
+RPP (Repetition Policy Penalty) applies when the root evaluation favors the side to move. Let $\lambda_R\in[0,1]$ be its penalty coefficient, where $\lambda_R=0$ disables the transformation, and let $\mathcal R_3(x_0)$ contain the legal actions that make a threefold-repetition claim available immediately or allow the opponent to make such a claim after one reply. RPP computes the deduction
 
 $$
-d_R=\lambda_R\mathrm{clip}(V_R,0,1).
+d_R=\lambda_R\mathrm{clip}_{[0,1]}\left(V_{\mathrm{root}}(x_0)\right)
 $$
 
-RPP then produces the final decision score
+and produces the final decision score
 
 $$
 D(a)=
 \begin{cases}
-\max(0,D_I(a)-d_R),&a\in\mathcal R_3(x),\\
-D_I(a),&a\in\mathcal A(x)\setminus\mathcal R_3(x).
+\max(0,D_I(a)-d_R),&a\in\mathcal R_3(x_0),\\
+D_I(a),&a\in\mathcal A(x_0)\setminus\mathcal R_3(x_0).
 \end{cases}
 $$
 
-The decision layer sorts legal moves by descending $D(a)$, then by descending $D_0(a)$ and finally by descending coordinate move string. The first move in this order is selected.
+IMF and RPP transform a copy of $P_{\mathrm{root}}$, so the network probabilities, edge priors and tree statistics keep their computed values. The decision scores are ordering quantities rather than a probability distribution. Gadus orders legal actions by decreasing $D(a)$, then by decreasing $D_0(a)$ and finally by decreasing coordinate move string in Universal Chess Interface (UCI) notation. The first action in this deterministic ordering becomes the selected move.
 
-## 7. Arena
+## 6. FCPI
 
-The Gadus arena loads both checkpoints once and advances games concurrently. Let $N_G$ be the positive even number of games and let $K_G\geq1$ be the maximum number of active games. Positions evaluated by the same checkpoint are combined into inference batches. Each sampled opening is played once with the candidate as White and once with the candidate as Black.
+### 6.1 Iteration Framework
 
-Let $N_W$, $N_D$ and $N_L$ be the candidate's win, draw and loss counts, and let $N_{\mathrm{games}}=N_W+N_D+N_L$. The candidate score and net wins are
+Folded Counterfactual Policy Iteration (FCPI) is the self-learning procedure used by Gadus. One iteration starts from a current model, uses that model to generate fixed training targets, optimizes a candidate from the same initial parameters and compares the candidate with the current model in Arena.
 
-$$
-score=\frac{N_W+\frac12N_D}{N_{\mathrm{games}}},
-\qquad
-net\_wins=N_W-N_L.
-$$
-
-Let $x_i\in\lbrace 0,\frac12,1\rbrace$ be the candidate score in game $i$. The population variance of these scores is
-
-$$
-\sigma^2=\frac1{N_{\mathrm{games}}}\sum_{i=1}^{N_{\mathrm{games}}}(x_i-score)^2.
-$$
-
-The implementation reports the clipped 95% normal-approximation interval
-
-$$
-CI_{95\%}=\mathrm{clip}\left(
-score\pm1.96\sqrt{\frac{\sigma^2}{N_{\mathrm{games}}}},0,1
-\right).
-$$
-
-For display, define $score_b=\mathrm{clip}(score,10^{-6},1-10^{-6})$. The reported Elo difference is
-
-$$
-\Delta Elo=400\log_{10}\left(\frac{score_b}{1-score_b}\right).
-$$
-
-Let $M_{\mathrm{gate}}$ be the minimum required net-win margin. The arena accepts the candidate when
-
-$$
-N_W-N_L\geq M_{\mathrm{gate}}.
-$$
-
-## 8. FCPI
-
-### 8.1 Iteration Framework
-
-FCPI stands for Folded Counterfactual Policy Iteration.
-
-Let $C_r$ be the current model at the start of FCPI iteration $r$, with parameters $\theta_{old}$. FCPI freezes $\theta_{old}$ while constructing the training set. For encoded position $s$, the source model returns $P_{old}(\cdot\mid s)$ and $V_{old}(s)$.
-
-FCPI initializes a trainable parameter sequence from the source parameters:
+Let $C_r$ be the current model at the beginning of iteration $r$, and denote its parameters by $\theta_{old}$. FCPI holds $\theta_{old}$ fixed while generating targets, and the resulting source model outputs are denoted by $P_{old}(\cdot\mid s)$ and $V_{old}(s)$. Candidate optimization begins from the same parameters:
 
 $$
 \theta^{(0)}=\theta_{old}.
 $$
 
-During optimization, $P_{new}(\cdot\mid s)$ and $V_{new}(s)$ denote the outputs of the current trainable parameter state. Section 8.8 defines the update sequence. After update $K$, FCPI sets $\theta_{new}=\theta^{(K)}$ and calls the model parameterized by $\theta_{new}$ the candidate.
+At optimizer step $k$, the symbols $P_{new}$ and $V_{new}$ denote the outputs parameterized by $\theta^{(k-1)}$. Together with the fixed targets, these outputs determine the minibatch loss whose parameter update produces $\theta^{(k)}$. After $K$ updates, $\theta_{new}=\theta^{(K)}$ parameterizes the candidate.
 
-FCPI constructs targets from completed self-play trajectories and finite counterfactual trees. A completed trajectory assigns terminal return $G_t$ to each recorded position and MC advantage coefficient $A_{\mathrm{MC}}(s_t,a_t)$ to the move selected there. A counterfactual tree computes $Q_{\mathrm{CF}}(s,a)$ for legal moves and then derives $\pi^+(\cdot\mid s)$ and $\overline V_{\mathrm{CF}}(s)$.
+Self-play controlled by the frozen source model produces the positions from which FCPI constructs two forms of supervision. For positions in completed trajectories, the terminal result determines the realized game returns $G_t$ and action coefficients $A_{\mathrm{MC}}(s_t,a_t)$. At recorded positions from completed and truncated trajectories, finite counterfactual trees evaluate played and alternative moves to obtain $Q_{\mathrm{CF}}(s,a)$, $\pi^+(\cdot\mid s)$ and $\overline V_{\mathrm{CF}}(s)$.
 
-After aggregating these targets, FCPI forms the objective defined in Section 8.7 and applies the parameter updates defined in Section 8.8. A paired-game arena then compares the candidate with $C_r$ and returns the acceptance result. FCPI atomically replaces `current.pth` when that result meets the promotion threshold.
+Several target records may share the same encoded input, although one deterministic network produces only one Policy and one Value for that input. Section 6.6 therefore aggregates records by encoded input before candidate optimization. Section 6.7 defines the resulting minibatch objective, and Section 6.8 defines the updates from $\theta^{(0)}$ to $\theta_{new}$. Arena then compares the candidate with $C_r$ under paired starting positions, and the promotion rule in Section 6.9 determines $C_{r+1}$.
 
-### 8.2 Self-Play Trajectories
+### 6.2 Self-Play Trajectories
 
-Let $\mathcal O_r$ be the finite pool of reachable nonterminal starting states available in iteration $r$. FCPI draws distinct members of $\mathcal O_r$ without replacement for its self-play games. The pool may contain positions from arbitrary plies, including the standard initial position. When no external pool is supplied, every game begins from the standard initial position. A deterministic seed derived from $r$ controls the order of the supplied pool.
+Self-play produces the trajectories from which both forms of FCPI supervision are derived. At every ply, the frozen source model controls the side to move. Let $\mathcal O_r$ be a supplied pool of reachable nonterminal starting states. FCPI assigns distinct pool states to the games in iteration $r$; these states may occur at any ply, including the standard initial position. If no pool is supplied, every game starts from the standard initial position. A seed derived from $r$ determines the pool order.
 
-Self-play uses the frozen `closed` policy of $C_r$. Let $T_b\geq0$ be the behavior temperature, and define the effective temperature
+Move selection begins with the source model's legal-move Policy $P_{old}(\cdot\mid s)$. Let $T_b\geq0$ be the behavior temperature, and define its numerically bounded value by
 
 $$
 \widetilde T_b=\max(T_b,10^{-4}).
 $$
 
-The behavior distribution over legal actions is
+The clipped behavior weight of legal move $a$ is
+
+$$
+\widetilde P_b(a\mid s)=
+\mathrm{clip}_{[10^{-12},1]}(P_{old}(a\mid s)).
+$$
+
+Raising these weights to reciprocal temperature and renormalizing gives the behavior distribution
 
 $$
 \mu_{old}(a\mid s)=
-\frac{P_{old}(a\mid s)^{1/\widetilde T_b}}
-{\sum_{b\in\mathcal A(x)}P_{old}(b\mid s)^{1/\widetilde T_b}}.
+\frac{\widetilde P_b(a\mid s)^{1/\widetilde T_b}}
+{\sum_{b\in\mathcal A(x)}\widetilde P_b(b\mid s)^{1/\widetilde T_b}}.
 $$
 
-Values $T_b<1$ concentrate probability on moves favored by the source policy, while values $T_b>1$ flatten the distribution.
+The resulting behavior distribution is more concentrated than $P_{old}$ when $T_b<1$ and flatter when $T_b>1$. At $T_b=1$, it equals $P_{old}$ up to the probability clipping used by the implementation.
 
-FCPI tracks cumulative move counts for each Gadus `PackedState` throughout an iteration. Suppose encoded position $s$ is encountered for the $n$-th time, and let $N_{n-1}(s,a)$ count how often move $a$ was chosen during the preceding $n-1$ encounters. The behavior distribution assigns desired cumulative count $n\mu_{old}(a\mid s)$ to move $a$. FCPI chooses the move with the largest deficit between desired and observed counts:
+FCPI realizes this distribution through cumulative probability deficits rather than independent random draws. For every Gadus `PackedState`, it counts the moves selected during the entire iteration. Suppose encoded position $s$ is encountered for the $n$-th time, and let $N_{n-1}(s,a)$ be the number of preceding encounters that selected $a$. The behavior distribution assigns desired cumulative count $n\mu_{old}(a\mid s)$ after the current encounter. The selected move has the largest deficit between desired and observed counts:
 
 $$
 a_n=\arg\max_{a\in\mathcal A(x)}
 \left[n\mu_{old}(a\mid s)-N_{n-1}(s,a)\right].
 $$
 
-The legal-move array determines the tie-break order. Before playing $a_t$, FCPI records the FEN of $x_t$, encoded position $s_t$, $V_{old}(s_t)$, legal action indices, $P_{old}(\cdot\mid s_t)$ and selected move $a_t$. Let $T_{\max}$ be the trajectory-length cap. The trajectory ends at a terminal state or after $T_{\max}$ recorded plies.
+The order of the legal-action list resolves equal deficits. Before applying the selected action $a_t$ in complete state $x_t$, FCPI creates one trajectory record. Let $a_{t,1},\ldots,a_{t,L_t}$ be the ordered legal actions in $x_t$. The record contains the FEN serialization of $x_t$, the encoded input $s_t$, the source evaluation $V_{old}(s_t)$, the two aligned sequences
 
-### 8.3 Monte Carlo Targets
+$$
+\left(i_G(a_{t,j})\right)_{j=1}^{L_t}
+\quad\text{and}\quad
+\left(P_{old}(a_{t,j}\mid s_t)\right)_{j=1}^{L_t},
+$$
 
-Consider a completed trajectory containing pre-move states $x_0,\ldots,x_{T_{\mathrm{traj}}-1}$. Its final move reaches terminal state $x_{T_{\mathrm{traj}}}$. Starting from terminal outcome $z(x_{T_{\mathrm{traj}}})$, FCPI reverses perspective at each ply:
+and the selected action $a_t$. Entries with the same index $j$ refer to the same legal action.
+
+Let $T_{\max}$ be the configured maximum number of pre-move records in one trajectory. After creating the record for $x_t$, the rules engine applies $a_t$ to obtain $x_{t+1}=T(x_t,a_t)$. A terminal successor completes the trajectory. If the successor is nonterminal and the number of records has reached or exceeded $T_{\max}$, the trajectory is truncated. Otherwise, $x_{t+1}$ becomes the next pre-move state.
+
+### 6.3 Monte Carlo Targets
+
+Monte Carlo (MC) supervision assigns the realized terminal result to every decision that preceded it. Consider a completed trajectory with pre-move states $x_0,\ldots,x_{T_{\mathrm{traj}}-1}$. Its final move reaches terminal state $x_{T_{\mathrm{traj}}}$. Starting from $z(x_{T_{\mathrm{traj}}})$, the recurrence reverses perspective at each ply:
 
 $$
 G_{T_{\mathrm{traj}}-1}=-z(x_{T_{\mathrm{traj}}}),
@@ -461,15 +736,15 @@ G_{T_{\mathrm{traj}}-1}=-z(x_{T_{\mathrm{traj}}}),
 G_t=-G_{t+1}\quad(0\leq t<T_{\mathrm{traj}}-1).
 $$
 
-Thus $G_t\in\lbrace -1,0,1\rbrace$ is the game outcome from the perspective of the player to move in $x_t$. Completed trajectories assign each recorded state weight
+The resulting $G_t\in\lbrace-1,0,1\rbrace$ is the final result from the perspective of the player to move in $x_t$. Every recorded state in a completed trajectory receives MC Value weight
 
 $$
 w_{\mathrm{MC}}(s_t)=1.
 $$
 
-Each state in a truncated trajectory receives $w_{\mathrm{MC}}(s_t)=0$ because the trajectory supplies no terminal outcome.
+A truncated trajectory ends at a nonterminal state and therefore supplies no realized terminal return. Each of its recorded states receives MC Value weight $0$, and every state-action pair from that trajectory receives MC Policy sample weight $0$.
 
-For a completed trajectory, the selected move receives MC advantage coefficient
+For a completed trajectory, the discrepancy between $G_t$ and the source Value determines the coefficient assigned to selected move $a_t$:
 
 $$
 A_{\mathrm{MC}}(s_t,a_t)=
@@ -477,17 +752,19 @@ A_{\mathrm{MC}}(s_t,a_t)=
 \left(\frac{G_t-V_{old}(s_t)}{2}\right).
 $$
 
-The selected move $a_t$ is the sole action with MC policy weight one in this record, and its signed coefficient is $A_{\mathrm{MC}}(s_t,a_t)$.
+Since both $G_t$ and $V_{old}(s_t)$ belong to $[-1,1]$, division by $2$ maps their difference to $[-1,1]$. A positive $A_{\mathrm{MC}}$ means that the realized result exceeded the source Value, and a negative value means that it fell below the source Value. The MC Policy record assigns this coefficient and sample weight $1$ to $a_t$. The other legal moves receive sample weight $0$.
 
-### 8.4 Counterfactual Trees
+### 6.4 Counterfactual Trees
 
-Before constructing counterfactual trees, FCPI deduplicates each trajectory by Gadus `PackedState` and keeps the first occurrence of each encoded position. Occurrences with the same `PackedState` produce the same network input, so this step prevents that input from generating multiple trees and receiving repeated weight within one trajectory. Each retained occurrence supplies the FEN that initializes the root of a separate tree, regardless of whether the trajectory ended naturally or reached the ply limit. Reconstructing the root from this FEN restores the board, side to move, castling rights, en passant state and move counters. The FEN does not contain positions visited earlier in the trajectory, so the reconstructed root begins with an empty repetition history. Tree construction records every move played after the root and applies the chess termination rules to each resulting descendant. It can therefore only detect a threefold repetition when all three occurrences of the repeated position lie on the path from the root to the current node.
+Each recorded self-play decision identifies one legal move as the action that was actually played. A counterfactual tree rooted at such a position evaluates the played move together with alternative legal moves under a finite edge budget. These local evaluations produce counterfactual Policy and Value targets for both completed and truncated trajectories.
 
-Let $B_{\mathrm{CF}}\geq0$ be the counterfactual edge budget. This budget limits the number of edges evaluated below the root of each tree. An edge evaluation plays one legal move and assigns the successor either its exact terminal outcome or $V_{old}$ from the frozen source model.
+Before constructing the trees, FCPI deduplicates the records within each trajectory by Gadus `PackedState` and retains the first occurrence of each encoded position. Every retained record becomes one tree root. Since equal packed states produce equal network inputs, this rule prevents one trajectory from assigning repeated tree weight to the same input. Completed and truncated trajectories use the same root-selection rule.
 
-FCPI evaluates every legal root move outside this budget. Consequently, $B_{\mathrm{CF}}=0$ yields a complete one-ply evaluation at the root, while $B_{\mathrm{CF}}>0$ permits further expansion of selected descendants.
+The recorded FEN reconstructs the board, side to move, castling rights, en passant state and move counters at each selected root. Repetition history begins at this root because FEN contains no earlier positions. Tree transitions append later positions along each branch, so the rules engine detects a threefold repetition whose three occurrences all lie between the root and the current node. A repetition claim that also depends on an occurrence before the root lies outside this reconstructed history.
 
-Let $B_{\mathrm{rem}}$ be the number of evaluations from $B_{\mathrm{CF}}$ that remain when FCPI expands non-root node $x$. For $B_{\mathrm{rem}}>0$, the expansion width is
+FCPI evaluates every legal edge from the root before spending any deeper-edge budget. Let $B_{\mathrm{CF}}\geq0$ be the additional edge budget for deeper nodes. A zero budget produces a complete one-ply tree, and a positive budget distributes deeper evaluations through the frontier procedure below.
+
+Suppose $B_{\mathrm{rem}}>0$ deeper edge evaluations remain when non-root node $x$ is selected for expansion. The number of its legal moves to evaluate is
 
 $$
 w(x)=\min\left(
@@ -497,37 +774,37 @@ B_{\mathrm{rem}},
 \right).
 $$
 
-The expansion set always includes the move with highest source-policy probability. Gumbel top-k samples the remaining $w(x)-1$ moves without replacement. For each remaining legal move, define
+The expansion set first receives the legal move with the largest source Policy probability. Removing that move from the sampling pool leaves the actions eligible for the remaining $w(x)-1$ places. For every action $a$ in this remaining pool, define its Gumbel sampling score by
 
 $$
-k(a)=\log\left(
-\mathrm{clip}(P_{old}(a\mid s),10^{-12},1)
+\kappa(a)=\log\left(
+\mathrm{clip}_{[10^{-12},1]}(P_{old}(a\mid s))
 \right)+g_a,
 \qquad
-g_a=-\log(-\log u_a),
-\quad u_a\sim U(0,1).
+g_a=-\log(-\log \xi_a),
+\quad \xi_a\sim U(0,1).
 $$
 
-FCPI selects the highest $k(a)$ values until the expansion set reaches width $w(x)$. An independent deterministic random stream supplies the Gumbel variates.
+Here each $\xi_a$ is an independent sample from the uniform distribution on $(0,1)$, and $g_a$ is its Gumbel transform. The moves with the largest $\kappa(a)$ values fill the remaining slots. A separate seeded random stream supplies these samples, which makes the tree selection reproducible for a fixed seed.
 
-Each node in a counterfactual tree stores one environment state. For a given tree, let $\mathcal X_T$ be the set of terminal states stored in its nodes and let $\mathcal X_O$ be the set of stored nonterminal states that have legal moves. The leaf-evaluation function assigns the rule outcome to a state in $\mathcal X_T$ and the frozen source-model evaluation to a state in $\mathcal X_O$:
+Each evaluated edge from state $x$ through action $a$ creates the child state $x'=T(x,a)$. Let $\mathcal X_T$ contain the terminal child states reached by the tree, and let $\mathcal X_O$ contain its nonterminal child states. Before backward recursion, the initial evaluation assigned to a child state $y\in\mathcal X_T\cup\mathcal X_O$ is
 
 $$
-v_{\mathrm{leaf}}(x)=
+v_{\mathrm{leaf}}(y)=
 \begin{cases}
-z(x),&x\in\mathcal X_T,\\
-V_{old}(\phi_G(x)),&x\in\mathcal X_O.
+z(y),&y\in\mathcal X_T,\\
+V_{old}(\phi_G(y)),&y\in\mathcal X_O.
 \end{cases}
 $$
 
-The reach probability of the root is $1$. If edge $(x,a)$ leads to child state $x'=T(x,a)$, the child's reach probability is
+The frontier priority uses the probability that the source Policy would follow the branch. The root has reach probability $1$. For the child state $x'$, this probability is propagated by
 
 $$
 p_{\mathrm{reach}}(x')=
 p_{\mathrm{reach}}(x)P_{old}(a\mid\phi_G(x)).
 $$
 
-Let $d(x')$ be the ply depth of $x'$ relative to the root. A newly created nonterminal child receives priority
+Let $d(x')$ be the depth of $x'$ in plies from the root. Negating $v_{\mathrm{leaf}}(x')$ expresses the child evaluation from the parent perspective. The absolute difference between this value and $V_{old}(\phi_G(x))$ measures local disagreement with the source Value. A nonterminal child enters the frontier with priority
 
 $$
 priority(x')=p_{\mathrm{reach}}(x')
@@ -537,55 +814,55 @@ priority(x')=p_{\mathrm{reach}}(x')
 \right).
 $$
 
-The frontier contains the nonterminal nodes eligible for further expansion. FCPI repeatedly expands the highest-priority node until the tree has spent $B_{\mathrm{CF}}$ edge evaluations or the frontier is empty.
+The reach factor favors branches that the source Policy considers plausible, the disagreement term favors branches that challenge the source Value and the depth term favors shorter branches when the other factors are similar. FCPI repeatedly expands the highest-priority frontier node until it spends $B_{\mathrm{CF}}$ deeper edge evaluations or exhausts the frontier.
 
-Backup jointly computes edge values $Q_{\mathrm{CF}}$ and node values $\overline V_{\mathrm{CF}}$ from deeper nodes toward the root. A nonterminal frontier node $x'$ without evaluated descendants is initialized by the source model:
+### 6.5 Counterfactual Targets
+
+After tree construction, a backward recursion converts leaf evaluations into action values and state targets. Processing nodes from greatest depth toward the root ensures that every evaluated child has a backed evaluation before its parent is processed. A terminal child contributes its exact rules outcome, while a nonterminal frontier node $x'$ with no evaluated children begins with
 
 $$
 \overline V_{\mathrm{CF}}(\phi_G(x'))=V_{old}(\phi_G(x')).
 $$
 
-Let $E(x)\subseteq\mathcal A(x)$ be the moves evaluated explicitly at node $x$. Once the backed-up values of its evaluated children are available, define the edge values at $x$ using $s=\phi_G(x)$ and $x_a'=T(x,a)$:
+For an expanded node $x$, let $\mathcal E(x)\subseteq\mathcal A(x)$ contain the moves evaluated by the tree. Set $s=\phi_G(x)$ and $x_a'=T(x,a)$. Once every child reached through an action in $\mathcal E(x)$ has either an exact terminal outcome or a backed-up nonterminal evaluation, define the counterfactual action value by
 
 $$
 Q_{\mathrm{CF}}(s,a)=
 \begin{cases}
--z(x_a'),&a\in E(x),\ x_a'\in\mathcal X_T,\\
+-z(x_a'),&a\in\mathcal E(x),\ x_a'\in\mathcal X_T,\\
 -\overline V_{\mathrm{CF}}(\phi_G(x_a')),
-&a\in E(x),\ x_a'\in\mathcal X_O,\\
-V_{old}(s),&a\in\mathcal A(x)\setminus E(x).
+&a\in\mathcal E(x),\ x_a'\in\mathcal X_O,\\
+V_{old}(s),&a\in\mathcal A(x)\setminus\mathcal E(x).
 \end{cases}
 $$
 
-An evaluated move that ends the game receives the exact terminal outcome from the parent's perspective. An evaluated nonterminal move receives the negated value backed up from its child. The final branch of the definition assigns $Q_{\mathrm{CF}}(s,a)=V_{old}(s)$ to every unevaluated move. Section 8.5 defines the backed-up value of an expanded node from its completed set of edge values.
+An evaluated move receives the negated child result because the side to move changes after the action. An unevaluated move receives $V_{old}(s)$. This baseline confines the difference between the tree target and the source Value to the explicitly evaluated alternatives.
 
-### 8.5 Counterfactual Targets
-
-At an expanded node, the $P_{old}$-weighted mean of $Q_{\mathrm{CF}}$ is
+The local Policy update uses the source-Policy expectation of the counterfactual action values as its centering term:
 
 $$
-m(s)=\sum_{a\in\mathcal A(x)}
+c_{\mathrm{CF}}(s)=\sum_{a\in\mathcal A(x)}
 P_{old}(a\mid s)Q_{\mathrm{CF}}(s,a).
 $$
 
-The clipped source-policy weight is defined by
+The source probability of each legal move is also clipped to a positive lower bound:
 
 $$
 \widetilde p(a\mid s)=
-\mathrm{clip}(P_{old}(a\mid s),10^{-12},1).
+\mathrm{clip}_{[10^{-12},1]}(P_{old}(a\mid s)).
 $$
 
-FCPI uses counterfactual-policy temperature $T_{\mathrm{CF}}=1$. The resulting target distribution is
+At unit temperature, the Policy target is obtained by multiplying each source weight by the exponentiated centered action value and normalizing the products:
 
 $$
 \pi^+(a\mid s)=
 \frac{\widetilde p(a\mid s)
-\exp\left(Q_{\mathrm{CF}}(s,a)-m(s)\right)}
+\exp\left(Q_{\mathrm{CF}}(s,a)-c_{\mathrm{CF}}(s)\right)}
 {\displaystyle\sum_{b\in\mathcal A(x)}\widetilde p(b\mid s)
-\exp\left(Q_{\mathrm{CF}}(s,b)-m(s)\right)}.
+\exp\left(Q_{\mathrm{CF}}(s,b)-c_{\mathrm{CF}}(s)\right)}.
 $$
 
-The common factor $\exp[-m(s)]$ cancels during normalization. The normalized source-policy weights define the reference distribution
+Subtracting $c_{\mathrm{CF}}(s)$ improves numerical centering and leaves the normalized distribution unchanged because the common factor $\exp[-c_{\mathrm{CF}}(s)]$ cancels. Normalizing the clipped source weights alone gives the reference Policy
 
 $$
 p_\varepsilon(a\mid s)=
@@ -593,7 +870,14 @@ p_\varepsilon(a\mid s)=
 {\displaystyle\sum_{b\in\mathcal A(x)}\widetilde p(b\mid s)}.
 $$
 
-Among all probability distributions $\pi(\cdot\mid s)$ over $\mathcal A(x)$, the same $\pi^+$ uniquely maximizes the following local objective with KL-regularization coefficient equal to 1:
+For distributions $p$ and $q$ on the same finite action set, define
+
+$$
+D_{\mathrm{KL}}(p\,\|\,q)=
+\sum_a p(a)\log\frac{p(a)}{q(a)}.
+$$
+
+The relation between the reference Policy and the target Policy can be stated as a regularized optimization problem. Among all probability distributions over $\mathcal A(x)$, $\pi^+$ uniquely maximizes
 
 $$
 \pi^+=\arg\max_\pi
@@ -605,7 +889,9 @@ $$
 \right].
 $$
 
-$\overline V_{\mathrm{CF}}(s)$ is the expectation of $Q_{\mathrm{CF}}(s,a)$ under $\pi^+(\cdot\mid s)$:
+The first term rewards probability assigned to larger counterfactual action values. The KL term has coefficient $1$ and penalizes departure from the reference Policy.
+
+The same improved Policy combines the action values into the counterfactual Value target:
 
 $$
 \overline V_{\mathrm{CF}}(s)=
@@ -616,48 +902,54 @@ $$
 \right).
 $$
 
-Define the correction relative to $V_{old}(s)$ as
+Since every $Q_{\mathrm{CF}}(s,a)$ belongs to $[-1,1]$ and $\pi^+(\cdot\mid s)$ is a probability distribution, their weighted mean also belongs to $[-1,1]$. The clipping operation therefore leaves the exact mathematical value unchanged.
+
+The difference between this target and the source Value is the counterfactual correction
 
 $$
 \delta_{\mathrm{CF}}(s)=
 \overline V_{\mathrm{CF}}(s)-V_{old}(s).
 $$
 
-Every unevaluated move satisfies $Q_{\mathrm{CF}}(s,a)=V_{old}(s)$, so the correction reduces to a sum over explicitly evaluated moves:
+Every unevaluated move contributes zero after $V_{old}(s)$ is subtracted from its action value. The correction can consequently be expressed using the evaluated moves alone:
 
 $$
 \delta_{\mathrm{CF}}(s)=
-\sum_{a\in E(x)}
+\sum_{a\in\mathcal E(x)}
 \pi^+(a\mid s)
 \left(Q_{\mathrm{CF}}(s,a)-V_{old}(s)\right).
 $$
 
-Substituting $\delta_{\mathrm{CF}}(s)$ gives:
+Equivalently, the target adds this correction to the source Value:
 
 $$
 \overline V_{\mathrm{CF}}(s)=V_{old}(s)+\delta_{\mathrm{CF}}(s).
 $$
 
-Let $\mathcal T_{\mathrm{exp}}$ contain every expanded decision node in a tree, including its root. Suppose the tree evaluates $N_E$ edges in total, of which $n(x)=|E(x)|$ originate at node $x\in\mathcal T_{\mathrm{exp}}$. FCPI assigns weights $w_P(x)$ and $w_T(x)$ to that node:
+One tree can produce targets at several expanded nodes. Let $\mathcal T_{\mathrm{exp}}$ contain these nodes, including the root, and let $n(x)=|\mathcal E(x)|$ be the number of evaluated edges originating at $x$. The total number of evaluated edges in the tree is
 
 $$
-w_P(x)=w_T(x)=\frac{n(x)}{N_E},
-\qquad
-N_E=\sum_{u\in\mathcal T_{\mathrm{exp}}}n(u).
+N_{\mathcal E}=\sum_{u\in\mathcal T_{\mathrm{exp}}}n(u).
 $$
 
-Root and descendant edges both contribute to $N_E$, and the weights within each tree sum to one:
+The Policy and Value targets at node $x$ receive equal within-tree weights
+
+$$
+w_P(x)=w_T(x)=\frac{n(x)}{N_{\mathcal E}}.
+$$
+
+Thus a node receives weight proportional to the number of tree evaluations performed there, and each tree contributes one unit of total Policy weight and one unit of total Value weight:
 
 $$
 \sum_{x\in\mathcal T_{\mathrm{exp}}}w_P(x)
 =\sum_{x\in\mathcal T_{\mathrm{exp}}}w_T(x)=1.
 $$
 
-### 8.6 Target Aggregation
+### 6.6 Target Aggregation
 
-Each expanded decision node produces one training record. Records at tree roots include the MC targets inherited from self-play, and records below the root contain counterfactual targets. FCPI groups records with identical Gadus `PackedState` encodings across the iteration and verifies that every member of a group has the same legal-move list.
+Each expanded decision node produces one training record containing its counterfactual targets and within-tree weights. A root record associated with a completed trajectory position also contains its MC targets and MC weight. FCPI groups records with identical Gadus `PackedState` encodings across the iteration and verifies that the records in each group share one legal-move list.
 
-Let $\mathcal S_{\mathrm{agg}}$ be the set of encoded positions represented after grouping, let $\mathcal R(s)$ be the group associated with $s\in\mathcal S_{\mathrm{agg}}$ and let $\mathcal A_s$ be its legal-move set. Record $i\in\mathcal R(s)$ carries counterfactual policy weight $w_{P,i}$, MC value weight $w_{\mathrm{MC},i}$, counterfactual value weight $w_{T,i}$ and corresponding targets $\pi_i^+(\cdot\mid s)$, $G_i$ and $\overline V_{\mathrm{CF},i}(s)$.
+Let $\mathcal S_{\mathrm{agg}}$ be the encoded positions that remain after grouping. For each $s\in\mathcal S_{\mathrm{agg}}$, let $\mathcal R(s)$ be its record group and let $\mathcal A_s$ be its legal-move set. Each record $i\in\mathcal R(s)$ associates the counterfactual Policy target $\pi_i^+(\cdot\mid s)$ with weight $w_{P,i}$, the MC Value target $G_i$ with weight $w_{\mathrm{MC},i}$ and the counterfactual Value target $\overline V_{\mathrm{CF},i}(s)$ with weight $w_{T,i}$.
 
 The total counterfactual policy weight is
 
@@ -672,7 +964,7 @@ $$
 \frac{\sum_{i\in\mathcal R(s)}w_{P,i}\pi_i^+(a\mid s)}{W_P(s)}.
 $$
 
-$\Pi^+(\cdot\mid s)$ is the weighted mean of the counterfactual policy targets associated with encoded position $s$. FCPI renormalizes this distribution after aggregation to correct floating-point error in the probability sum.
+$\Pi^+(\cdot\mid s)$ is the weighted mean of the counterfactual Policy targets for $s$. A final normalization corrects floating-point error in its probability sum.
 
 The total MC value weight is
 
@@ -687,7 +979,7 @@ $$
 \frac{\sum_{i\in\mathcal R(s)}w_{\mathrm{MC},i}G_i}{W_{\mathrm{MC}}(s)}.
 $$
 
-$\overline G(s)$ is the weighted mean of the terminal-return targets associated with encoded position $s$.
+$\overline G(s)$ is the weighted mean of the terminal-return targets for $s$.
 
 The total counterfactual value weight is
 
@@ -702,7 +994,7 @@ $$
 \frac{\sum_{i\in\mathcal R(s)}w_{T,i}\overline V_{\mathrm{CF},i}(s)}{W_T(s)}.
 $$
 
-$\overline V_T(s)$ is the weighted mean of the counterfactual value targets associated with encoded position $s$.
+$\overline V_T(s)$ is the weighted mean of the counterfactual Value targets for $s$.
 
 The support sets for the three aggregated targets are
 
@@ -716,9 +1008,9 @@ $$
 \mathcal S_T=\lbrace s\in\mathcal S_{\mathrm{agg}}:W_T(s)>0\rbrace.
 $$
 
-All three aggregate weights are nonnegative. Each target enters its corresponding loss on the support set where that target is defined.
+All three aggregate weights are nonnegative. The support sets identify the encoded positions on which each aggregated target contributes to its corresponding loss.
 
-The three weighted means above aggregate targets defined for an entire encoded position. The MC policy data are action-specific because each trajectory selects one move at that position. Let $a_i$ and $A_{\mathrm{MC},i}$ denote the selected move and its MC advantage coefficient in record $i$. The indicator $\mathbf 1[a_i=a]$ selects records associated with move $a$. The aggregate signed coefficient and sample weight for pair $(s,a)$ are
+The counterfactual Policy, MC Value and counterfactual Value targets are aggregated by encoded state. MC Policy supervision requires state-action aggregation because each trajectory record assigns its signed coefficient to one selected action. Let $a_i$ and $A_{\mathrm{MC},i}$ be the selected action and its coefficient in record $i$. For each pair $(s,a)$, define the aggregated signed coefficient and sample weight by
 
 $$
 S_A(s,a)=\sum_{i\in\mathcal R(s)}
@@ -730,11 +1022,11 @@ W_A(s,a)=\sum_{i\in\mathcal R(s)}
 w_{\mathrm{MC},i}\mathbf 1[a_i=a].
 $$
 
-$S_A(s,a)$ is the weighted sum of MC advantage coefficients for selected move $a$ at encoded position $s$. $W_A(s,a)$ is the corresponding sample weight. The HDF5 datasets `mc_policy_advantage_sums` and `mc_policy_weights` store these two quantities.
+$S_A(s,a)$ accumulates the signed MC coefficients assigned to move $a$ at $s$, and $W_A(s,a)$ records their total sample weight.
 
-### 8.7 Training Objective
+### 6.7 Training Objective
 
-Let $\ell_{new}(s,i_G(a))$ be the trainable model's logit for legal move $a$. The resulting legal-move policy is
+At optimizer step $k$, let $\ell_{new}(s,i_G(a))$ be the logit of legal move $a$ produced by the current parameters $\theta^{(k-1)}$. Normalizing these logits over $\mathcal A_s$ gives the current legal-move Policy:
 
 $$
 P_{new}(a\mid s)=
@@ -742,7 +1034,7 @@ P_{new}(a\mid s)=
 {\sum_{b\in\mathcal A_s}\exp\ell_{new}(s,i_G(b))}.
 $$
 
-To obtain the distribution $\mu_{new}(a\mid s)$ used by $L_{P,\mathrm{MC}}^{(\mathcal B)}$, FCPI applies the self-play behavior temperature to the trainable logits:
+Applying the self-play behavior temperature to the same logits gives
 
 $$
 \mu_{new}(a\mid s)=
@@ -750,7 +1042,13 @@ $$
 {\sum_{b\in\mathcal A_s}\exp(\ell_{new}(s,i_G(b))/\widetilde T_b)}.
 $$
 
-At one optimizer step, let $\mathcal B\subseteq\mathcal S_{\mathrm{agg}}$ be the current minibatch. The counterfactual Policy loss normalizes its weights within $\mathcal B$:
+For distributions $p$ and $q$ on the same finite action set, define their cross-entropy as
+
+$$
+L_{\mathrm{CE}}(p,q)=-\sum_a q(a)\log p(a).
+$$
+
+Let $\mathcal B\subseteq\mathcal S_{\mathrm{agg}}$ be the minibatch used at this optimizer step. The counterfactual Policy loss is the weighted cross-entropy between $P_{new}$ and $\Pi^+$:
 
 $$
 L_{P,\mathrm{CF}}^{(\mathcal B)}=
@@ -761,7 +1059,7 @@ L_{P,\mathrm{CF}}^{(\mathcal B)}=
 {\max\left(\sum_{s\in\mathcal B}W_P(s),10^{-8}\right)}.
 $$
 
-The MC Policy loss uses the same minibatch and normalizes by the corresponding action weights:
+The MC Policy loss applies the aggregated signed coefficients to the log probabilities under $\mu_{new}$:
 
 $$
 L_{P,\mathrm{MC}}^{(\mathcal B)}=
@@ -774,17 +1072,17 @@ S_A(s,a)\log\mu_{new}(a\mid s)
 \right)}.
 $$
 
-For a single unmerged record from a completed trajectory, $S_A(s_t,a_t)=A_{\mathrm{MC}}(s_t,a_t)$ and $W_A(s_t,a_t)=1$. Gradient descent therefore raises the probability of a move with positive MC advantage and lowers the probability of a move with negative MC advantage. The two policy terms contribute additively:
+For an unmerged record from a completed trajectory, $S_A(s_t,a_t)=A_{\mathrm{MC}}(s_t,a_t)$ and $W_A(s_t,a_t)=1$. A positive coefficient directs gradient descent toward a larger probability for $a_t$, and a negative coefficient directs it toward a smaller probability. At optimizer step $k$, both Policy losses act on the same logits and current parameters $\theta^{(k-1)}$, so their total gradient is
 
 $$
-\nabla_{\theta_{new}}
+\nabla_{\theta^{(k-1)}}
 \left(L_{P,\mathrm{CF}}^{(\mathcal B)}+L_{P,\mathrm{MC}}^{(\mathcal B)}\right)
 =
-\nabla_{\theta_{new}}L_{P,\mathrm{CF}}^{(\mathcal B)}
-+\nabla_{\theta_{new}}L_{P,\mathrm{MC}}^{(\mathcal B)}.
+\nabla_{\theta^{(k-1)}}L_{P,\mathrm{CF}}^{(\mathcal B)}
++\nabla_{\theta^{(k-1)}}L_{P,\mathrm{MC}}^{(\mathcal B)}.
 $$
 
-For scalar prediction error $e$, the terms involving $\overline G(s)$ and $\overline V_T(s)$ use the SmoothL1 penalty with threshold one:
+For scalar prediction error $e$, define the SmoothL1 penalty with threshold $1$ by
 
 $$
 \mathrm{SL1}(e)=
@@ -794,7 +1092,7 @@ $$
 \end{cases}
 $$
 
-The Value loss combines the two weighted error sums within the same minibatch:
+The Value loss combines terminal-return supervision and counterfactual-tree supervision:
 
 $$
 L_V^{(\mathcal B)}=
@@ -810,7 +1108,7 @@ L_V^{(\mathcal B)}=
 \right)}.
 $$
 
-The objective evaluated for minibatch $\mathcal B$ is the unweighted sum of these three components:
+The complete minibatch objective is
 
 $$
 L^{(\mathcal B)}=
@@ -819,25 +1117,25 @@ L_{P,\mathrm{MC}}^{(\mathcal B)}+
 L_V^{(\mathcal B)}.
 $$
 
-Every minibatch supplies its own weight denominators, so minibatches with different total weights are normalized independently. Section 8.8 defines the parameter updates obtained from this objective.
+Each denominator is computed from the current minibatch. The resulting objective is therefore a minibatch-normalized estimator of the weighted training criterion.
 
-### 8.8 Parameter Optimization
+### 6.8 Parameter Optimization
 
-Let $\mathcal D$ be the aggregated training set defined in Section 8.6. The source model that generated $\mathcal D$ remains fixed at $\theta_{old}$ while the trainable parameter sequence begins at $\theta^{(0)}$ as defined in Section 8.1.
+Let $\mathcal D=\mathcal S_{\mathrm{agg}}$ be the aggregated training set. Target generation has already completed with the fixed source parameters $\theta_{old}$, and optimization begins from $\theta^{(0)}=\theta_{old}$.
 
-Let $E$ be the number of epochs, let $M$ be the minibatch size and let $K_{\max}\in\mathbb N\cup\{\infty\}$ be the update cap. At the beginning of each epoch, a seeded random generator permutes $\mathcal D$, and the resulting order is partitioned into minibatches. Concatenating these minibatch sequences and applying the update cap gives $\mathcal B_1,\ldots,\mathcal B_K$, where
+Let $E_{\mathrm{opt}}$ be the epoch count, $B_{\mathrm{opt}}$ the minibatch size and $K_{\max}\in\mathbb N\cup\lbrace\infty\rbrace$ the update cap. A seeded random generator permutes $\mathcal D$ at the beginning of each epoch, after which the records are partitioned into minibatches. Applying the update cap to the concatenated epoch sequence gives $\mathcal B_1,\ldots,\mathcal B_K$, where
 
 $$
-K=\min\left(K_{\max},E\left\lceil\frac{|\mathcal D|}{M}\right\rceil\right).
+K=\min\left(K_{\max},E_{\mathrm{opt}}\left\lceil\frac{|\mathcal D|}{B_{\mathrm{opt}}}\right\rceil\right).
 $$
 
-For update $k$, the objective $L^{(\mathcal B_k)}$ is the sum defined in Section 8.7, and its parameter gradient is
+For update $k$, the parameter gradient of the minibatch objective is
 
 $$
 g_k=\nabla_{\theta^{(k-1)}}L^{(\mathcal B_k)}.
 $$
 
-FCPI clips the global Euclidean norm of this gradient to one. With $\varepsilon_c=10^{-6}$, the gradient supplied to the optimizer is
+FCPI clips the global Euclidean norm of this gradient at $1$. With $\varepsilon_c=10^{-6}$, the gradient supplied to AdamW is
 
 $$
 \overline g_k=\alpha_k g_k,
@@ -845,25 +1143,27 @@ $$
 \alpha_k=\min\left(1,\frac{1}{\lVert g_k\rVert_2+\varepsilon_c}\right).
 $$
 
-BatchNorm layers use the running means $\mu_{j,old}$ and variances $\sigma^2_{j,old}$ stored by the source model. These statistics remain fixed throughout the update sequence, while the affine scale $\gamma_j^{(k)}$ and bias $\beta_j^{(k)}$ remain trainable. With $\varepsilon_{\mathrm{BN}}=10^{-5}$, layer $j$ therefore maps activation $u$ to
+Each BatchNorm layer separates fixed running statistics from trainable affine parameters. During the forward pass for update $k$, layer $j$ uses the running mean $\mu_{j,old}$ and running variance $\sigma^2_{j,old}$ stored by the source model. Its scale $\gamma_j^{(k-1)}$ and bias $\beta_j^{(k-1)}$ belong to $\theta^{(k-1)}$. With $\varepsilon_{\mathrm{BN}}=10^{-5}$, the layer maps activation $u$ to
 
 $$
-\mathrm{BN}_j^{(k)}(u)=
-\gamma_j^{(k)}\odot
+\mathrm{BN}_j^{(k-1)}(u)=
+\gamma_j^{(k-1)}\odot
 \frac{u-\mu_{j,old}}{\sqrt{\sigma^2_{j,old}+\varepsilon_{\mathrm{BN}}}}
-+\beta_j^{(k)}.
++\beta_j^{(k-1)}.
 $$
 
-The optimizer is AdamW with $\beta_1=0.9$, $\beta_2=0.999$, $\varepsilon_A=10^{-8}$ and weight-decay coefficient $\lambda=10^{-4}$. Starting from $m_0=v_0=0$, update $k$ computes
+Fixing $\mu_{j,old}$ and $\sigma^2_{j,old}$ preserves the source model's normalization reference during candidate optimization. The clipped gradient $\overline g_k$ contains derivatives with respect to $\gamma_j^{(k-1)}$, $\beta_j^{(k-1)}$ and every other trainable component of $\theta^{(k-1)}$. The AdamW update below uses these derivatives to produce $\theta^{(k)}$.
+
+AdamW converts $\overline g_k$ into the parameter update. Let $u_k$ and $v_k$ denote its first- and second-moment estimates. With $\beta_1=0.9$, $\beta_2=0.999$, $\varepsilon_A=10^{-8}$, weight-decay coefficient $\lambda=10^{-4}$ and initial values $u_0=v_0=0$, update $k$ computes
 
 $$
-m_k=\beta_1m_{k-1}+(1-\beta_1)\overline g_k,
+u_k=\beta_1u_{k-1}+(1-\beta_1)\overline g_k,
 \qquad
 v_k=\beta_2v_{k-1}+(1-\beta_2)\overline g_k^2,
 $$
 
 $$
-\widehat m_k=\frac{m_k}{1-\beta_1^k},
+\widehat u_k=\frac{u_k}{1-\beta_1^k},
 \qquad
 \widehat v_k=\frac{v_k}{1-\beta_2^k},
 $$
@@ -873,24 +1173,52 @@ and, for learning rate $\eta$,
 $$
 \theta^{(k)}=
 (1-\eta\lambda)\theta^{(k-1)}
--\eta\frac{\widehat m_k}{\sqrt{\widehat v_k}+\varepsilon_A}.
+-\eta\frac{\widehat u_k}{\sqrt{\widehat v_k}+\varepsilon_A}.
 $$
 
-The square, division and square root in the AdamW equations act componentwise. After $K$ updates, the candidate parameters are $\theta_{new}=\theta^{(K)}$.
+The square, division and square root act component-wise. After $K$ updates, $\theta_{new}=\theta^{(K)}$ parameterizes the candidate.
 
-### 8.9 Acceptance and Promotion
+### 6.9 Arena and Promotion
 
-The iteration arena compares the candidate with the `current.pth` that generated its targets. If the candidate records $N_W$ wins, $N_D$ draws and $N_L$ losses, promotion occurs when
+Arena compares two Gadus models through direct play. During iteration $r$, one model is the candidate with parameters $\theta_{new}$ and the other is the current model $C_r$ with parameters $\theta_{old}$. Both models use the same decision procedure, so the comparison isolates the difference between their network parameters.
+
+Let $\mathcal O_A$ be a finite pool of reachable nonterminal starting states, and let $N_G$ be a positive even number of games. Arena selects $N_G/2$ states from $\mathcal O_A$ and plays two games from each selected state. The candidate controls White in one game and Black in the other, giving both models one game with each color from the same state.
+
+Arena may advance at most $K_G\geq1$ games concurrently. At each batched step, positions awaiting a move from the candidate are evaluated together, and positions awaiting a move from the current model are evaluated together. This arrangement shares neural forward passes across games and keeps a separate complete state and outcome for every game.
+
+Let $N_W$, $N_D$ and $N_L$ be the candidate's win, draw and loss counts, where $N_G=N_W+N_D+N_L$. Its mean score and net-win margin are
 
 $$
-N_W-N_L\geq M_{\mathrm{gate}}.
+S=\frac{N_W+\frac12N_D}{N_G},
+\qquad
+M=N_W-N_L.
 $$
 
-An accepted candidate atomically replaces the run's `current.pth`. A rejected candidate leaves that file unchanged, so the same current model generates the next iteration's targets.
+To quantify the sampling uncertainty in $S$, let $X_i\in\lbrace0,\frac12,1\rbrace$ be the candidate's score in game $i$. Arena computes the population variance
 
-### 8.10 Idealized Policy Shift
+$$
+\sigma^2=\frac1{N_G}\sum_{i=1}^{N_G}(X_i-S)^2
+$$
 
-Let the clipping floor $10^{-12}$ tend to zero, and suppose the candidate fits $\pi^+$ exactly. For two actions $a$ and $b$ at the same state,
+and the clipped 95% normal-approximation interval
+
+$$
+CI_{95\%}=\mathrm{clip}_{[0,1]}\left(
+S\pm1.96\sqrt{\frac{\sigma^2}{N_G}}
+\right).
+$$
+
+Let $M_{\mathrm{gate}}$ be the required net-win margin for promotion. FCPI applies the criterion
+
+$$
+M\geq M_{\mathrm{gate}}.
+$$
+
+When the criterion is satisfied, FCPI sets $C_{r+1}$ to the candidate model. When the criterion is not satisfied, FCPI sets $C_{r+1}=C_r$.
+
+### 6.10 Idealized Policy Shift
+
+Consider one encoded state $s$ and two legal actions $a,b\in\mathcal A(x)$. The following idealized analysis examines how repeated exact fits to the local target $\pi^+(\cdot\mid s)$ change the Policy log odds between these actions. Let the clipping floor $10^{-12}$ tend to zero, and suppose one candidate update fits $\pi^+(\cdot\mid s)$ exactly. The resulting log-odds relation is
 
 $$
 \log\frac{\pi^+(a\mid s)}{\pi^+(b\mid s)}
@@ -905,11 +1233,20 @@ $$
 \Delta=Q_{\mathrm{CF}}(s,a)-Q_{\mathrm{CF}}(s,b)>0.
 $$
 
-If each ideal fit becomes the reference policy for the next update, then after $k$ fits the log odds of $a$ relative to $b$ have increased by $k\Delta$. Starting from policy $P_0$, the action order reverses when
+Let $P_0$ be the legal-move Policy before the first ideal fit, and let $P_k$ be the Policy after $k$ consecutive fits. If the target fitted at each step becomes the reference Policy for the next step, then
+
+$$
+\log\frac{P_k(a\mid s)}{P_k(b\mid s)}
+=
+\log\frac{P_0(a\mid s)}{P_0(b\mid s)}
++k\Delta.
+$$
+
+For $P_0(a\mid s)<P_0(b\mid s)$, action $a$ overtakes action $b$ when
 
 $$
 k>
 \frac{\log P_0(b\mid s)-\log P_0(a\mid s)}{\Delta}.
 $$
 
-This statement applies to one fixed state, one fixed action pair and a constant $\Delta$.
+This conclusion applies to one fixed state, one fixed action pair and a constant positive $\Delta$.

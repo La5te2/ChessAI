@@ -1352,7 +1352,8 @@ void run_fcpi(const FcpiOptions &options) {
 		arena_options.search.precision = options.precision;
 		arena_options.seed = options.seed + iteration;
 		auto arena_summary = evaluate_models(arena_options);
-		const bool accepted = arena_summary["accepted"].get<bool>();
+		const int net_wins = arena_summary.at("net_wins").get<int>();
+		const bool accepted = net_wins >= options.min_net_wins;
 		if (accepted) {
 			atomic_copy(candidate, current);
 			std::cout << "fcpi promoted: " << current.string() << std::endl;
@@ -1366,6 +1367,7 @@ void run_fcpi(const FcpiOptions &options) {
 			{"data", data_summary},
 			{"train", train_summary},
 			{"arena", arena_summary},
+			{"min_net_wins", options.min_net_wins},
 			{"accepted", accepted},
 		});
 		std::ofstream summary_file(data_dir / "summary.json");

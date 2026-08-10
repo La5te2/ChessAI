@@ -23,11 +23,15 @@ int encoded_destination(const chess::Move &move) {
 	return rank * 8 + (move.to().index() > from ? 6 : 2);
 }
 
+int oriented_square(int square, chess::Color side_to_move) {
+	return side_to_move == chess::Color::WHITE ? square : square ^ 56;
+}
+
 } // namespace
 
-int move_to_index(const chess::Move &move) {
-	const int from = move.from().index();
-	const int to = encoded_destination(move);
+int move_to_index(const chess::Move &move, chess::Color side_to_move) {
+	const int from = oriented_square(move.from().index(), side_to_move);
+	const int to = oriented_square(encoded_destination(move), side_to_move);
 	if (move.typeOf() == chess::Move::PROMOTION &&
 		move.promotionType() != chess::PieceType::QUEEN) {
 		const int direction = to % 8 - from % 8 + 1;
@@ -47,7 +51,7 @@ chess::Move index_to_move(int index, const chess::Board &board) {
 		return chess::Move(chess::Move::NO_MOVE);
 	}
 	for (const auto &move : legal_moves(board)) {
-		if (move_to_index(move) == index) {
+		if (move_to_index(move, board.sideToMove()) == index) {
 			return move;
 		}
 	}

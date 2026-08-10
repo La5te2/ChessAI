@@ -1,10 +1,9 @@
 #pragma once
 
-// Melano chess rules, square-token state codec, source-destination move codec, and openings.
+// Melano chess rules, square-token state codec, and source-destination move codec.
 
 #include <array>
 #include <cstdint>
-#include <random>
 #include <string>
 #include <vector>
 #include <torch/types.h>
@@ -65,18 +64,5 @@ std::vector<float> normalize_legal_policy(const std::vector<float> &policy,
 
 /// Resolves auto/cpu/cuda while rejecting unavailable CUDA requests.
 torch::Device resolve_device(const std::string &requested);
-
-struct OpeningSpec {
-	std::string fen;
-	bool candidate_white = true;
-};
-
-/// Expands a Polyglot book into unique FENs at the requested ply depth.
-std::vector<std::string> load_opening_positions(const std::string &path, int book_plies,
-												int max_positions, std::uint64_t seed);
-
-/// Creates paired arena starts so candidate and baseline receive both colors per position.
-std::vector<OpeningSpec> make_arena_specs(int games, const std::string &opening_book,
-										  int book_plies, int max_positions, std::uint64_t seed);
 
 } // namespace melano

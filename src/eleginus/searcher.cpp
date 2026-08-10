@@ -1,4 +1,4 @@
-// Read-only command-line analysis with the embedded Eleginus Value model.
+// Read-only command-line analysis with embedded independent Policy/Value models.
 
 #include "eleginus/runtime.hpp"
 #include "eleginus/search.hpp"
@@ -6,6 +6,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 int main(int argc, char **argv) {
 	try {
@@ -28,16 +29,19 @@ int main(int argc, char **argv) {
 			else
 				throw std::invalid_argument("unknown argument: " + argument);
 		}
-		eleginus::CpuValue value(eleginus::load_embedded_runtime_model());
+		auto weights = eleginus::load_embedded_runtime_model();
+		eleginus::CpuPolicy policy(std::move(weights.policy));
+		eleginus::CpuValue value(std::move(weights.value));
 		eleginus::SearchOptions options;
 		options.expansions = expansions;
 		const chess::Board board = fen == "startpos" ? chess::Board() : chess::Board(fen);
-		const auto result = eleginus::Searcher(value, options).search(board);
+		const auto result = eleginus::Searcher(policy, value, options).search(board);
 		std::cout << "bestmove " << eleginus::move_uci(result.move) << " value=" << result.value
 				  << " expanded=" << result.expanded_nodes
 				  << " evaluated=" << result.evaluated_nodes << '\n';
 		for (const auto &root : result.root) {
-			std::cout << eleginus::move_uci(root.move) << " v=" << root.value
+			std::cout << eleginus::move_uci(root.move) << " p=" << root.prior
+					  << " v=" << root.value
 					  << " nodes=" << root.subtree_nodes << '\n';
 		}
 		return 0;

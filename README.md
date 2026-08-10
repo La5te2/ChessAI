@@ -80,15 +80,14 @@ Build on Linux with:
 bash scripts/build.sh
 ```
 
-A command-line-only Linux server can install and build with graphics disabled:
+A command-line-only Linux server selects `GADIDAE_BUILD_GRAPHICS=0` during installation and build:
 
 ```bash
 GADIDAE_BUILD_GRAPHICS=0 bash api/setup.sh
 GADIDAE_BUILD_GRAPHICS=0 bash scripts/build.sh
 ```
 
-The same switches select any subset on Linux. Disabled components are not rebuilt, published, or
-removed from `build/`.
+The same switches select any subset on Linux. Disabled components are not rebuilt, published, or removed from `build/`.
 
 The build scripts use CMake and Ninja to produce the following command-line executables:
 
@@ -103,7 +102,6 @@ build/gadus/uci
 build/melano/preprocess
 build/melano/train
 build/melano/search
-build/melano/arena
 build/melano/uci
 
 build/eleginus/preprocess
@@ -221,7 +219,6 @@ build/gadus/arena \
 	--virtual-loss 0.0 \
 	--repetition-policy-penalty 0.0 \
 	--instant-mate-first 0 \
-	--min-net-wins 4 \
 	--pgn-output data/gadus-arena.pgn \
 	--log-every 1
 ```
@@ -317,38 +314,6 @@ build/melano/search \
 
 `--fen` accepts a complete FEN or the value `startpos`, which selects the standard initial position.
 
-Run a paired Melano arena with:
-
-```bash
-build/melano/arena \
-	--candidate models/melano/candidate.pth \
-	--baseline models/melano/melano.pth \
-	--device cuda \
-	--precision bf16 \
-	--games 400 \
-	--games-in-flight 32 \
-	--max-plies 240 \
-	--opening-book data/openings.gen.bin \
-	--book-plies 8 \
-	--max-book-positions 50000 \
-	--search-type only-mcts \
-	--sims 64 \
-	--mcts-min-sims 32 \
-	--mcts-batch-size 32 \
-	--c-puct 0.5 \
-	--c-puct-base 19652 \
-	--c-puct-factor 1.0 \
-	--fpu-reduction 0.15 \
-	--virtual-loss 0.0 \
-	--repetition-policy-penalty 0.0 \
-	--instant-mate-first 0 \
-	--min-net-wins 4 \
-	--pgn-output data/melano-arena.pgn \
-	--log-every 1
-```
-
-Passing an empty value to `--opening-book` starts every game from the standard initial position.
-
 Launch the Melano UCI engine on Windows with:
 
 ```powershell
@@ -373,7 +338,7 @@ The [UCI](#uci) section describes runtime options, output fields and time manage
 
 ### Eleginus
 
-Preprocess a PGN into the architecture-locked Eleginus Value schema with:
+Preprocess a PGN into the architecture-locked Eleginus Policy/Value schema with:
 
 ```bash
 build/eleginus/preprocess \
@@ -386,11 +351,13 @@ build/eleginus/preprocess \
 
 The HDF5 file uses the same `states`, `moves` and `values` dataset names as Gadus and Melano, but
 its root metadata identifies `arch_type=eleginus` together with Eleginus-specific state, move and
-target encodings. Every reader rejects a dataset produced for either of the other architectures.
+target encodings. Eleginus moves use side-to-move-relative coordinates, and the reader accepts only
+`target_schema=policy_value_supervised_v1`. Generate the HDF5 file with the Eleginus preprocessor
+before training.
 With `--has-cmt 1`, numerical pawn evaluations in PGN comments become side-to-move targets in `[0,1]`;
 with `--has-cmt 0`, completed game results supply targets in `{0, 0.5, 1}`.
 
-Train a new Eleginus Value network with:
+Train independent Eleginus Policy and Value networks with:
 
 ```bash
 build/eleginus/train \
@@ -405,9 +372,10 @@ build/eleginus/train \
 
 Eleginus uses the same `--max-steps` convention: a positive value caps optimizer updates, while `0` lets `--epochs` determine the training length.
 
-This command trains the sole Eleginus Value network. Supplying `--model existing.pth` initializes
-the training run from those parameters, while omitting it initializes a new Value model. Each run
-constructs an AdamW optimizer with fresh state. Eleginus training consists of supervised optimization.
+The Policy network learns the recorded PGN moves, while the Value network learns the selected
+comment- or result-derived targets. Their parameter sets and AdamW states are independent. Supplying
+`--model existing.pth` initializes both networks from that checkpoint, while omitting it initializes
+a new model. Every training invocation constructs fresh optimizer state.
 
 The `.pth` checkpoint is the only standalone Eleginus weight file. Like the other architecture
 checkpoints, its top level contains `model` and `arch`; the latter identifies Eleginus with
@@ -431,9 +399,9 @@ models/eleginus/eleginus \
 	--expansions 32
 ```
 
-`--fen` accepts `startpos` or one quoted six-field FEN. The embedded search program uses the
-statically linked float32 NNUE evaluator and therefore has no model path, device argument or
-LibTorch runtime dependency.
+`--fen` accepts `startpos` or one quoted six-field FEN. The embedded search program uses statically
+linked float32 Policy and Value evaluators. Policy orders the BFM frontier, while Value supplies leaf
+evaluations and minimax backup. The resulting executable contains its model parameters and all inference code required for search.
 
 Create and launch the Eleginus UCI engine on Windows with:
 
@@ -457,14 +425,13 @@ build/eleginus/embed \
 models/eleginus/eleginus --expansions 32
 ```
 
-The final Eleginus UCI and standalone search executables require neither an external weight file nor
-`torch.dll` or `c10.dll`. The `train` and `embed` tools remain training-side LibTorch programs.
+The final Eleginus UCI and standalone search executables are self-contained. The `train` and `embed` tools use LibTorch during model production.
 
 ## UCI
 
 ### Gadus and Melano
 
-The Gadus and Melano UCI executables load their checkpoints when `isready` or `go` first requires neural evaluation. An explicit `--model` argument selects the checkpoint. Without that argument, Gadus reads `gadus.pth` and Melano reads `melano.pth` beside the executable. Each process retains the loaded model across positions and evaluates it in FP32. Changing `ModelPath` or `Device` reloads the model before the next search.
+The Gadus and Melano UCI executables load their checkpoints when `isready` or `go` first requires neural evaluation. An explicit `--model` argument selects the checkpoint. The default path is `gadus.pth` beside the Gadus executable or `melano.pth` beside the Melano executable. Each process retains the loaded model across positions and evaluates it in FP32. Changing `ModelPath` or `Device` reloads the model before the next search.
 
 Search runs on a worker thread so the protocol loop can process `stop`. A `position`, `setoption` or `ucinewgame` command first stops and joins an active search before changing engine state. Closing the UCI process also joins the worker.
 
@@ -476,7 +443,7 @@ c_s\,\mathrm{clip}(q_{\mathrm{line}},-0.999,0.999)
 \right).
 $$
 
-The score is expressed from the root side-to-move perspective. The `nodes` field reports completed simulations and represents the initial neural evaluation as one node when no simulation has completed. For reported node count $n$, both `depth` and `seldepth` equal
+The score is expressed from the root side-to-move perspective. The `nodes` field reports completed simulations and represents the initial neural evaluation as one node until the first simulation completes. For reported node count $n$, both `depth` and `seldepth` equal
 
 $$
 \max\left(1,\left\lfloor\log_2\max(1,n)\right\rfloor+1\right).
@@ -490,7 +457,7 @@ $$
 t_0=\frac{t_{\mathrm{remain}}}{30}+0.75t_{\mathrm{inc}}-t_{\mathrm{overhead}}.
 $$
 
-It clamps $t_0$ to 50 through 10000 milliseconds and then limits the allocation to $\max(1,t_{\mathrm{remain}}-t_{\mathrm{overhead}})$. A `go` command without `movetime` or the active clock supplies no wall-clock deadline. `go nodes <n>` overrides the current MCTS simulation cap, and `stop` requests early termination.
+It clamps $t_0$ to 50 through 10000 milliseconds and then limits the allocation to $\max(1,t_{\mathrm{remain}}-t_{\mathrm{overhead}})$. A wall-clock deadline is active only when `go` supplies `movetime` or the active side's clock. `go nodes <n>` overrides the current MCTS simulation cap, and `stop` requests early termination.
 
 Gadus and Melano expose these shared options:
 
@@ -529,7 +496,9 @@ All commands above apply to Gadus and Melano.
 
 ### Eleginus
 
-An embedded Eleginus UCI executable reads its Value parameters from its own file at startup. It exposes `BFMExpansions`, with default value `32` and range 1 through 1,000,000. Each `go` command performs one synchronous best-first minimax search. UCI time, depth and node fields do not alter the expansion budget.
+An embedded Eleginus UCI executable reads its independent Policy and Value parameters from its own
+file at startup. It exposes `BFMExpansions`, with default value `32` and range 1 through 1,000,000.
+Each `go` command performs one synchronous Policy-guided best-first minimax search. `BFMExpansions` alone determines the expansion budget, while UCI time, depth and node fields retain their protocol-level reporting roles.
 
 For root value $\overline v(x)$, Eleginus reports
 
@@ -545,11 +514,11 @@ setoption name BFMExpansions value 128
 
 ## Opening Books
 
-Gadus and Melano arenas read Polyglot books by traversing legal book moves breadth-first from the standard initial position. The effective depth is at least one ply. The reader ignores Polyglot weight and learn fields, randomizes outgoing move order from the selected seed and emits unique nonterminal frontier positions. Position identity includes piece placement, side to move, castling rights and the en-passant field but excludes move counters.
+Gadus Arena reads Polyglot books by traversing legal book moves breadth-first from the standard initial position. The effective depth is at least one ply. The reader treats each outgoing legal book move uniformly, randomizes their order from the selected seed and emits unique nonterminal frontier positions. Position identity is the tuple of piece placement, side to move, castling rights and the en-passant field.
 
 An empty arena book path starts every game from the standard initial position and alternates the candidate's color. A nonempty book must provide at least one unique position for each game pair. The arena shuffles the available positions, selects one position per pair and plays both color assignments.
 
-Gadus FCPI reads a sampling book as a randomized traversal in which every reachable nonterminal position may enter the starting-state pool, including the standard initial position. It removes transpositions using the same position identity and limits the resulting pool to the requested size. Polyglot weights do not affect this traversal.
+Gadus FCPI reads a sampling book as a randomized traversal in which every reachable nonterminal position may enter the starting-state pool, including the standard initial position. It removes transpositions using the same position identity, limits the resulting pool to the requested size and treats outgoing Polyglot moves uniformly.
 
 `scripts/opening_book.py` creates two kinds of Polyglot books. A sampling book supplies arbitrary-ply positions to Gadus FCPI. The `--sampling-source` option accepts a PGN or an existing Polyglot book. The following command creates a pool of at least 10,000 positions from an existing book:
 

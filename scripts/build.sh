@@ -141,7 +141,7 @@ fi
 if [[ "${BUILD_MELANO}" == "ON" ]]; then
 	rm -rf -- "${PUBLISH_DIR}/melano"
 	mkdir -p "${PUBLISH_DIR}/melano"
-	for executable in preprocess train search arena uci; do
+	for executable in preprocess train search uci; do
 		test -x "${WORK_DIR}/melano/${executable}"
 		cp "${WORK_DIR}/melano/${executable}" "${PUBLISH_DIR}/melano/"
 	done

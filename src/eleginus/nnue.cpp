@@ -1,9 +1,10 @@
-// Implements Eleginus feature refresh/deltas and the custom incremental Value forward path.
+// Implements sparse feature deltas and independent incremental Policy/Value inference.
 
 #include "eleginus/nnue.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -60,13 +61,13 @@ void add_feature(std::vector<float> &accumulator, const std::vector<float> &tabl
 }
 
 FloatAccumulator refresh_accumulator(const chess::Board &board, const std::vector<float> &table,
-									 int width) {
+									 const std::vector<float> &bias, int width) {
 	const auto encoded = encode_features(board);
 	FloatAccumulator result;
 	result.white_to_move = encoded.white_to_move;
 	for (int perspective = 0; perspective < kPerspectiveCount; ++perspective) {
 		auto &values = result.perspective[static_cast<std::size_t>(perspective)];
-		values.assign(static_cast<std::size_t>(width), 0.0F);
+		values = bias;
 		for (const int feature : encoded.perspective[static_cast<std::size_t>(perspective)]) {
 			if (feature != kPaddingFeature) {
 				add_feature(values, table, width, feature, 1.0F);
@@ -135,6 +136,37 @@ std::vector<float> linear_relu(const std::vector<float> &input,
 	return output;
 }
 
+std::vector<float> legal_softmax(const std::vector<float> &hidden,
+								 const PolicyWeights &weights,
+								 const std::vector<chess::Move> &moves,
+								 chess::Color side_to_move) {
+	if (moves.empty()) {
+		return {};
+	}
+	std::vector<float> logits(moves.size());
+	float maximum = -std::numeric_limits<float>::infinity();
+	for (std::size_t move_index = 0; move_index < moves.size(); ++move_index) {
+		const int action = move_to_index(moves[move_index], side_to_move);
+		float logit = weights.output_bias[static_cast<std::size_t>(action)];
+		const auto offset = static_cast<std::size_t>(action) * kPolicyHiddenWidth;
+		for (int channel = 0; channel < kPolicyHiddenWidth; ++channel) {
+			logit += weights.output_weight[offset + static_cast<std::size_t>(channel)] *
+				hidden[static_cast<std::size_t>(channel)];
+		}
+		logits[move_index] = logit;
+		maximum = std::max(maximum, logit);
+	}
+	float denominator = 0.0F;
+	for (float &logit : logits) {
+		logit = std::exp(logit - maximum);
+		denominator += logit;
+	}
+	for (float &probability : logits) {
+		probability /= denominator;
+	}
+	return logits;
+}
+
 } // namespace
 
 EncodedFeatures encode_features(const chess::Board &board) {
@@ -166,10 +198,47 @@ EncodedFeatures encode_features(const chess::Board &board) {
 	return result;
 }
 
+CpuPolicy::CpuPolicy(PolicyWeights weights) : weights_(std::move(weights)) {
+	require_size(weights_.feature_table,
+		static_cast<std::size_t>(kFeatureVocabulary) * kPolicyAccumulatorWidth,
+		"Policy feature table");
+	require_size(weights_.accumulator_bias, kPolicyAccumulatorWidth,
+		"Policy accumulator bias");
+	require_size(weights_.hidden_weight,
+		static_cast<std::size_t>(kPolicyHiddenWidth) * kPolicyAccumulatorWidth * 2,
+		"Policy hidden weight");
+	require_size(weights_.hidden_bias, kPolicyHiddenWidth, "Policy hidden bias");
+	require_size(weights_.output_weight,
+		static_cast<std::size_t>(kActionSize) * kPolicyHiddenWidth,
+		"Policy output weight");
+	require_size(weights_.output_bias, kActionSize, "Policy output bias");
+}
+
+FloatAccumulator CpuPolicy::refresh(const chess::Board &board) const {
+	return refresh_accumulator(board, weights_.feature_table, weights_.accumulator_bias,
+		kPolicyAccumulatorWidth);
+}
+
+FloatAccumulator CpuPolicy::update(const FloatAccumulator &current, const chess::Board &before,
+								   const chess::Board &after) const {
+	return update_accumulator(current, before, after, weights_.feature_table,
+		kPolicyAccumulatorWidth);
+}
+
+std::vector<float> CpuPolicy::evaluate(const FloatAccumulator &accumulator,
+									   const std::vector<chess::Move> &moves) const {
+	const auto input = oriented_input(accumulator, kPolicyAccumulatorWidth);
+	const auto hidden =
+		linear_relu(input, weights_.hidden_weight, weights_.hidden_bias, kPolicyHiddenWidth);
+	return legal_softmax(hidden, weights_, moves,
+		accumulator.white_to_move ? chess::Color::WHITE : chess::Color::BLACK);
+}
+
 CpuValue::CpuValue(ValueWeights weights) : weights_(std::move(weights)) {
 	require_size(weights_.feature_table,
 		static_cast<std::size_t>(kFeatureVocabulary) * kValueAccumulatorWidth,
 		"Value feature table");
+	require_size(weights_.accumulator_bias, kValueAccumulatorWidth, "Value accumulator bias");
 	require_size(weights_.hidden_weight,
 		static_cast<std::size_t>(kValueHiddenWidth) * kValueAccumulatorWidth * 2,
 		"Value hidden weight");
@@ -183,7 +252,8 @@ CpuValue::CpuValue(ValueWeights weights) : weights_(std::move(weights)) {
 }
 
 FloatAccumulator CpuValue::refresh(const chess::Board &board) const {
-	return refresh_accumulator(board, weights_.feature_table, kValueAccumulatorWidth);
+	return refresh_accumulator(board, weights_.feature_table, weights_.accumulator_bias,
+		kValueAccumulatorWidth);
 }
 
 FloatAccumulator CpuValue::update(const FloatAccumulator &current, const chess::Board &before,

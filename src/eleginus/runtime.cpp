@@ -1,4 +1,4 @@
-// Implements the Torch-free representation embedded in an Eleginus executable.
+// Implements the Torch-free Policy/Value representation embedded in an executable.
 
 #include "eleginus/runtime.hpp"
 
@@ -11,6 +11,7 @@
 #include <string>
 #include <system_error>
 #include <type_traits>
+#include <utility>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -78,10 +79,46 @@ std::vector<float> read_vector(std::ifstream &input, const std::filesystem::path
 	return values;
 }
 
+void write_policy(std::ofstream &output, const PolicyWeights &weights) {
+	write_vector(output, weights.feature_table,
+		static_cast<std::size_t>(kFeatureVocabulary) * kPolicyAccumulatorWidth,
+		"Policy feature table");
+	write_vector(output, weights.accumulator_bias, kPolicyAccumulatorWidth,
+		"Policy accumulator bias");
+	write_vector(output, weights.hidden_weight,
+		static_cast<std::size_t>(kPolicyHiddenWidth) * kPolicyAccumulatorWidth * 2,
+		"Policy hidden weight");
+	write_vector(output, weights.hidden_bias, kPolicyHiddenWidth, "Policy hidden bias");
+	write_vector(output, weights.output_weight,
+		static_cast<std::size_t>(kActionSize) * kPolicyHiddenWidth,
+		"Policy output weight");
+	write_vector(output, weights.output_bias, kActionSize, "Policy output bias");
+}
+
+PolicyWeights read_policy(std::ifstream &input, const std::filesystem::path &path) {
+	PolicyWeights weights;
+	weights.feature_table = read_vector(input, path,
+		static_cast<std::size_t>(kFeatureVocabulary) * kPolicyAccumulatorWidth,
+		"Policy feature table");
+	weights.accumulator_bias = read_vector(input, path, kPolicyAccumulatorWidth,
+		"Policy accumulator bias");
+	weights.hidden_weight = read_vector(input, path,
+		static_cast<std::size_t>(kPolicyHiddenWidth) * kPolicyAccumulatorWidth * 2,
+		"Policy hidden weight");
+	weights.hidden_bias = read_vector(input, path, kPolicyHiddenWidth, "Policy hidden bias");
+	weights.output_weight = read_vector(input, path,
+		static_cast<std::size_t>(kActionSize) * kPolicyHiddenWidth,
+		"Policy output weight");
+	weights.output_bias = read_vector(input, path, kActionSize, "Policy output bias");
+	return weights;
+}
+
 void write_value(std::ofstream &output, const ValueWeights &weights) {
 	write_vector(output, weights.feature_table,
 		static_cast<std::size_t>(kFeatureVocabulary) * kValueAccumulatorWidth,
 		"Value feature table");
+	write_vector(output, weights.accumulator_bias, kValueAccumulatorWidth,
+		"Value accumulator bias");
 	write_vector(output, weights.hidden_weight,
 		static_cast<std::size_t>(kValueHiddenWidth) * kValueAccumulatorWidth * 2,
 		"Value hidden weight");
@@ -101,6 +138,8 @@ ValueWeights read_value(std::ifstream &input, const std::filesystem::path &path)
 	weights.feature_table = read_vector(input, path,
 		static_cast<std::size_t>(kFeatureVocabulary) * kValueAccumulatorWidth,
 		"Value feature table");
+	weights.accumulator_bias = read_vector(input, path, kValueAccumulatorWidth,
+		"Value accumulator bias");
 	weights.hidden_weight = read_vector(input, path,
 		static_cast<std::size_t>(kValueHiddenWidth) * kValueAccumulatorWidth * 2,
 		"Value hidden weight");
@@ -153,7 +192,7 @@ std::filesystem::path current_executable_path() {
 
 void embed_runtime_model_atomic(const std::filesystem::path &input,
 								const std::filesystem::path &output_path,
-								const ValueWeights &value) {
+								const RuntimeWeights &weights) {
 	if (!std::filesystem::is_regular_file(input))
 		throw std::runtime_error("Eleginus executable template not found: " + input.string());
 	const auto source = std::filesystem::weakly_canonical(input);
@@ -179,10 +218,13 @@ void embed_runtime_model_atomic(const std::filesystem::path &input,
 		write_scalar(output, static_cast<std::uint32_t>(kEleginusCheckpointType));
 		write_scalar(output, static_cast<std::uint32_t>(kActionSize));
 		write_scalar(output, static_cast<std::uint32_t>(kFeatureVocabulary));
+		write_scalar(output, static_cast<std::uint32_t>(kPolicyAccumulatorWidth));
+		write_scalar(output, static_cast<std::uint32_t>(kPolicyHiddenWidth));
 		write_scalar(output, static_cast<std::uint32_t>(kValueAccumulatorWidth));
 		write_scalar(output, static_cast<std::uint32_t>(kValueHiddenWidth));
 		write_scalar(output, static_cast<std::uint32_t>(kValueBottleneckWidth));
-		write_value(output, value);
+		write_policy(output, weights.policy);
+		write_value(output, weights.value);
 		const auto payload_end = output.tellp();
 		if (payload_begin < 0 || payload_end < payload_begin)
 			throw std::runtime_error("cannot measure embedded Eleginus weights");
@@ -207,7 +249,7 @@ void embed_runtime_model_atomic(const std::filesystem::path &input,
 	}
 }
 
-ValueWeights load_embedded_runtime_model(const std::filesystem::path &executable) {
+RuntimeWeights load_embedded_runtime_model(const std::filesystem::path &executable) {
 	const auto path = executable.empty() ? current_executable_path() : executable;
 	std::ifstream input(path, std::ios::binary);
 	if (!input)
@@ -236,20 +278,24 @@ ValueWeights load_embedded_runtime_model(const std::filesystem::path &executable
 	const auto architecture = read_scalar<std::uint32_t>(input, path);
 	const auto action_size = read_scalar<std::uint32_t>(input, path);
 	const auto feature_count = read_scalar<std::uint32_t>(input, path);
+	const auto policy_accumulator = read_scalar<std::uint32_t>(input, path);
+	const auto policy_hidden = read_scalar<std::uint32_t>(input, path);
 	const auto value_accumulator = read_scalar<std::uint32_t>(input, path);
 	const auto value_hidden = read_scalar<std::uint32_t>(input, path);
 	const auto value_bottleneck = read_scalar<std::uint32_t>(input, path);
 	if (endian != kEndianMarker || architecture != kEleginusCheckpointType ||
 		action_size != kActionSize || feature_count != kFeatureVocabulary ||
+		policy_accumulator != kPolicyAccumulatorWidth || policy_hidden != kPolicyHiddenWidth ||
 		value_accumulator != kValueAccumulatorWidth || value_hidden != kValueHiddenWidth ||
 		value_bottleneck != kValueBottleneckWidth) {
 		throw std::runtime_error("embedded Eleginus model does not match this build: " +
 			path.string());
 	}
+	auto policy = read_policy(input, path);
 	auto value = read_value(input, path);
 	if (input.tellg() != file_end - footer_size)
 		throw std::runtime_error("embedded Eleginus model length does not match its executable");
-	return value;
+	return RuntimeWeights{std::move(policy), std::move(value)};
 }
 
 } // namespace eleginus

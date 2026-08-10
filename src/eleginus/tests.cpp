@@ -1,6 +1,4 @@
-// CTest entrypoint for Eleginus invariants. It covers move codecs, sparse features, full and
-// incremental accumulators, agreement between LibTorch and scalar evaluation, checkpoint and
-// embedded-runtime round trips, HDF5 perspective order, expansion budgeting, terminal scoring and BFM search.
+// CTest entrypoint for codecs, independent Policy/Value inference, storage and BFM invariants.
 
 #include "eleginus/checkpoint.hpp"
 #include "eleginus/dataset.hpp"
@@ -10,6 +8,7 @@
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <utility>
 
 namespace {
 
@@ -21,7 +20,7 @@ void require(bool condition, const char *message) {
 
 void require_codec(const chess::Board &board) {
 	for (const auto &move : eleginus::legal_moves(board)) {
-		const int action = eleginus::move_to_index(move);
+		const int action = eleginus::move_to_index(move, board.sideToMove());
 		require(action >= 0 && action < eleginus::kActionSize, "action index out of range");
 		require(eleginus::index_to_move(action, board) == move, "move codec round trip failed");
 	}
@@ -54,21 +53,46 @@ int main() {
 
 		auto model = eleginus::make_model(torch::Device(torch::kCPU), 7);
 		model->eval();
-		eleginus::CpuValue value = eleginus::snapshot_value(model);
+		eleginus::CpuPolicy policy = eleginus::snapshot_policy(model->policy);
+		eleginus::CpuValue value = eleginus::snapshot_value(model->value);
 		const auto moves = eleginus::legal_moves(board);
+		const auto policy_accumulator = policy.refresh(board);
 		const auto value_accumulator = value.refresh(board);
 		std::vector<eleginus::EncodedFeatures> batch{encoded};
 		auto [features, side] =
 			eleginus::encode_feature_batch(batch, torch::Device(torch::kCPU));
-		const float torch_value = model->forward(features, side).item<float>();
+		const float torch_value = model->value->forward(features, side).item<float>();
 		require(std::abs(value.evaluate(value_accumulator) - torch_value) < 1.0e-5F,
 				"custom Value inference differs from LibTorch");
+		std::vector<std::int64_t> action_indices;
+		action_indices.reserve(moves.size());
+		for (const auto &move : moves)
+			action_indices.push_back(eleginus::move_to_index(move, board.sideToMove()));
+		auto indices = torch::tensor(action_indices, torch::TensorOptions().dtype(torch::kInt64));
+		auto torch_policy = model->policy->forward(features, side)
+			.index_select(1, indices).softmax(1).squeeze(0).contiguous();
+		const auto native_policy = policy.evaluate(policy_accumulator, moves);
+		const std::vector<float> torch_policy_values(
+			torch_policy.data_ptr<float>(), torch_policy.data_ptr<float>() + torch_policy.numel());
+		require(max_difference(native_policy, torch_policy_values) < 1.0e-5F,
+			"custom Policy inference differs from LibTorch");
 
 		auto after = board;
 		after.makeMove(chess::uci::uciToMove(after, "e2e4"));
+		const auto black_e5 = chess::uci::uciToMove(after, "e7e5");
+		require(eleginus::move_to_index(chess::uci::uciToMove(board, "e2e4"),
+					board.sideToMove()) ==
+				eleginus::move_to_index(black_e5, after.sideToMove()),
+			"side-relative move encoding differs between colors");
+		const auto policy_updated = policy.update(policy_accumulator, board, after);
+		const auto policy_refreshed = policy.refresh(after);
 		const auto value_updated = value.update(value_accumulator, board, after);
 		const auto value_refreshed = value.refresh(after);
 		for (int perspective = 0; perspective < eleginus::kPerspectiveCount; ++perspective) {
+			require(max_difference(
+						policy_updated.perspective[static_cast<std::size_t>(perspective)],
+						policy_refreshed.perspective[static_cast<std::size_t>(perspective)]) < 1.0e-5F,
+					"incremental Policy accumulator differs from refresh");
 			require(max_difference(
 						value_updated.perspective[static_cast<std::size_t>(perspective)],
 						value_refreshed.perspective[static_cast<std::size_t>(perspective)]) < 1.0e-5F,
@@ -77,7 +101,7 @@ int main() {
 
 		eleginus::SearchOptions search_options;
 		search_options.expansions = 2;
-		const auto search = eleginus::Searcher(value, search_options).search(board);
+		const auto search = eleginus::Searcher(policy, value, search_options).search(board);
 		require(search.move.move() != chess::Move::NO_MOVE, "BFM returned no move");
 		require(search.expanded_nodes == 2, "BFM expansion budget mismatch");
 		require(search.root.size() == moves.size(), "BFM root move count mismatch");
@@ -91,13 +115,19 @@ int main() {
 			output << "Eleginus executable template";
 		}
 		eleginus::embed_checkpoint_atomic(checkpoint, executable, embedded);
-		eleginus::CpuValue runtime_value(eleginus::load_embedded_runtime_model(embedded));
+		auto runtime_weights = eleginus::load_embedded_runtime_model(embedded);
+		eleginus::CpuPolicy runtime_policy(std::move(runtime_weights.policy));
+		eleginus::CpuValue runtime_value(std::move(runtime_weights.value));
 		require(std::abs(runtime_value.evaluate(runtime_value.refresh(board)) - torch_value) < 1.0e-5F,
 				"native runtime checkpoint changed Value output");
+		require(max_difference(runtime_policy.evaluate(runtime_policy.refresh(board), moves),
+			native_policy) < 1.0e-5F, "native runtime checkpoint changed Policy output");
 		auto loaded = eleginus::load_checkpoint(checkpoint, torch::Device(torch::kCPU));
-		auto loaded_output = loaded->forward(features, side);
-		require(torch::allclose(loaded_output, model->forward(features, side)),
+		auto loaded_value = loaded->value->forward(features, side);
+		require(torch::allclose(loaded_value, model->value->forward(features, side)),
 				"checkpoint changed Value output");
+		require(torch::allclose(loaded->policy->forward(features, side),
+			model->policy->forward(features, side)), "checkpoint changed Policy output");
 		std::filesystem::remove(checkpoint);
 		std::filesystem::remove(executable);
 		std::filesystem::remove(embedded);
@@ -107,23 +137,26 @@ int main() {
 		const auto after_encoded = eleginus::encode_features(after);
 		const auto black_move = chess::uci::uciToMove(after, "e7e5");
 		{
-			eleginus::ValueWriterOptions writer_options;
+			eleginus::WriterOptions writer_options;
 			writer_options.output = dataset_path;
 			writer_options.compression_level = 0;
 			writer_options.source = "unit_test";
-			eleginus::ValueH5Writer writer(writer_options);
+			eleginus::H5Writer writer(writer_options);
 			writer.append({encoded, after_encoded},
-				{static_cast<std::uint16_t>(eleginus::move_to_index(moves.front())),
-				 static_cast<std::uint16_t>(eleginus::move_to_index(black_move))},
+				{static_cast<std::uint16_t>(eleginus::move_to_index(
+					 moves.front(), board.sideToMove())),
+				 static_cast<std::uint16_t>(eleginus::move_to_index(
+					 black_move, after.sideToMove()))},
 				{0.75F, 0.25F});
 			writer.flush();
 		}
 		{
-			eleginus::ValueH5 dataset(dataset_path);
+			eleginus::H5Dataset dataset(dataset_path);
 			require(dataset.info().length == 2, "Eleginus HDF5 row count mismatch");
 			require(dataset.info().source == "unit_test", "Eleginus HDF5 source mismatch");
 			auto stored = dataset.read_contiguous(0, 2);
-			require(stored.moves[1].item<std::int64_t>() == eleginus::move_to_index(black_move),
+			require(stored.moves[1].item<std::int64_t>() ==
+				eleginus::move_to_index(black_move, after.sideToMove()),
 				"Eleginus HDF5 move mismatch");
 			require(std::abs(stored.values[0].item<float>() - 0.75F) < 1.0e-6F,
 				"Eleginus HDF5 Value mismatch");
@@ -131,9 +164,12 @@ int main() {
 				{encoded, after_encoded}, torch::Device(torch::kCPU));
 			auto [stored_features, stored_side] =
 				eleginus::encode_feature_batch(stored.features, torch::Device(torch::kCPU));
-			require(torch::allclose(model->forward(original_features, original_side),
-				model->forward(stored_features, stored_side)),
+			require(torch::allclose(model->value->forward(original_features, original_side),
+				model->value->forward(stored_features, stored_side)),
 				"Eleginus HDF5 side-to-move orientation changed Value input");
+			require(torch::allclose(model->policy->forward(original_features, original_side),
+				model->policy->forward(stored_features, stored_side)),
+				"Eleginus HDF5 side-to-move orientation changed Policy input");
 		}
 		std::filesystem::remove(dataset_path);
 

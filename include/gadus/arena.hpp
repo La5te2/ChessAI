@@ -1,6 +1,6 @@
 #pragma once
 
-// Paired, batched Gadus-vs-Gadus evaluation with a result-only acceptance gate.
+// Paired, batched Gadus-vs-Gadus evaluation that reports match statistics.
 
 #include <cstdint>
 #include <filesystem>
@@ -21,13 +21,12 @@ struct ArenaOptions {
 	int book_plies = 8;
 	int max_book_positions = 50000;
 	std::uint64_t seed = 2026;
-	int min_net_wins = 0;
 	int log_every = 1;
 	std::filesystem::path pgn_output;
 	SearchOptions search;
 };
 
-/// Plays a color-balanced match and returns result statistics and acceptance state as JSON.
+/// Plays a color-balanced match and returns result statistics as JSON.
 nlohmann::json evaluate_models(const ArenaOptions &options);
 
 } // namespace gadus

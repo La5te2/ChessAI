@@ -1,6 +1,6 @@
 #pragma once
 
-// Eleginus sparse Value datasets, PGN preprocessing, and supervised Value fitting.
+// Eleginus sparse supervised datasets, PGN preprocessing, and joint Policy/Value fitting.
 
 #include <cstdint>
 #include <filesystem>
@@ -14,40 +14,40 @@
 
 namespace eleginus {
 
-inline constexpr const char *kValueStateEncoding = "eleginus_sparse_features_v1";
-inline constexpr const char *kValueTargetSchema = "side_to_move_expectation_01_v1";
+inline constexpr const char *kStateEncoding = "eleginus_sparse_features_v1";
+inline constexpr const char *kTargetSchema = "policy_value_supervised_v1";
 
-struct ValueDatasetInfo {
+struct DatasetInfo {
 	std::int64_t length = 0;
 	int has_comments = 0;
 	std::string source;
 };
 
-struct ValueBatch {
+struct Batch {
 	std::vector<EncodedFeatures> features;
 	torch::Tensor moves;
 	torch::Tensor values;
 };
 
-class ValueH5 {
+class H5Dataset {
 	public:
-	explicit ValueH5(const std::filesystem::path &path);
-	~ValueH5();
+	explicit H5Dataset(const std::filesystem::path &path);
+	~H5Dataset();
 
-	ValueH5(const ValueH5 &) = delete;
-	ValueH5 &operator=(const ValueH5 &) = delete;
-	ValueH5(ValueH5 &&) noexcept;
-	ValueH5 &operator=(ValueH5 &&) noexcept;
+	H5Dataset(const H5Dataset &) = delete;
+	H5Dataset &operator=(const H5Dataset &) = delete;
+	H5Dataset(H5Dataset &&) noexcept;
+	H5Dataset &operator=(H5Dataset &&) noexcept;
 
-	const ValueDatasetInfo &info() const noexcept;
-	ValueBatch read_contiguous(std::int64_t begin, std::int64_t count) const;
+	const DatasetInfo &info() const noexcept;
+	Batch read_contiguous(std::int64_t begin, std::int64_t count) const;
 
 	private:
 	struct Impl;
 	std::unique_ptr<Impl> impl_;
 };
 
-struct ValueWriterOptions {
+struct WriterOptions {
 	std::filesystem::path output;
 	int has_comments = 0;
 	int chunk_size = 4096;
@@ -55,15 +55,15 @@ struct ValueWriterOptions {
 	std::string source = "supervised";
 };
 
-class ValueH5Writer {
+class H5Writer {
 	public:
-	explicit ValueH5Writer(const ValueWriterOptions &options);
-	~ValueH5Writer();
+	explicit H5Writer(const WriterOptions &options);
+	~H5Writer();
 
-	ValueH5Writer(const ValueH5Writer &) = delete;
-	ValueH5Writer &operator=(const ValueH5Writer &) = delete;
-	ValueH5Writer(ValueH5Writer &&) noexcept;
-	ValueH5Writer &operator=(ValueH5Writer &&) noexcept;
+	H5Writer(const H5Writer &) = delete;
+	H5Writer &operator=(const H5Writer &) = delete;
+	H5Writer(H5Writer &&) noexcept;
+	H5Writer &operator=(H5Writer &&) noexcept;
 
 	void append(const std::vector<EncodedFeatures> &features,
 				const std::vector<std::uint16_t> &moves, const std::vector<float> &values);
@@ -87,7 +87,7 @@ struct PreprocessOptions {
 
 void preprocess_pgn(const PreprocessOptions &options);
 
-struct ValueTrainOptions {
+struct TrainOptions {
 	std::filesystem::path data;
 	int epochs = 1;
 	int batch_size = 512;
@@ -98,13 +98,14 @@ struct ValueTrainOptions {
 	std::uint64_t seed = 2026;
 };
 
-struct ValueTrainStats {
+struct TrainStats {
 	std::int64_t steps = 0;
 	std::int64_t samples = 0;
+	double mean_policy_loss = 0.0;
+	double mean_value_loss = 0.0;
 	double mean_loss = 0.0;
 };
 
-ValueTrainStats train_value_from_h5(ValueNetwork &value, const ValueTrainOptions &options,
-									const torch::Device &device);
+TrainStats train_from_h5(Model &model, const TrainOptions &options, const torch::Device &device);
 
 } // namespace eleginus

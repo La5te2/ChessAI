@@ -262,7 +262,6 @@ nlohmann::json evaluate_models(const ArenaOptions &options) {
 	const double low = std::clamp(score - margin, 0.0, 1.0);
 	const double high = std::clamp(score + margin, 0.0, 1.0);
 	const int net_wins = wins - losses;
-	const bool accepted = net_wins >= options.min_net_wins;
 
 	nlohmann::json summary = {
 		{"candidate", options.candidate.string()},
@@ -284,9 +283,6 @@ nlohmann::json evaluate_models(const ArenaOptions &options) {
 		{"mcts_batch_size", options.search.mcts_batch_size},
 		{"paired_openings", true},
 		{"unique_start_positions", (options.games + 1) / 2},
-		{"result_ok", accepted},
-		{"accepted", accepted},
-		{"min_net_wins", options.min_net_wins},
 	};
 	write_pgn(options.pgn_output, records, options.candidate.filename().string(),
 			  options.baseline.filename().string());

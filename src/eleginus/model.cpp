@@ -1,4 +1,4 @@
-// Implements the trainable sparse Value network and its incremental CPU snapshot.
+// Implements independent trainable sparse Policy/Value networks and CPU snapshots.
 
 #include "eleginus/model.hpp"
 
@@ -56,6 +56,10 @@ SparseEncoderImpl::SparseEncoderImpl(int width_value) : width(width_value) {
 	table = register_module(
 		"table", torch::nn::Embedding(torch::nn::EmbeddingOptions(kFeatureVocabulary, width)
 									 .padding_idx(kPaddingFeature)));
+	bias = register_parameter("bias", torch::full({width}, 0.5F));
+	torch::NoGradGuard no_grad;
+	table->weight.normal_(0.0, 0.01);
+	table->weight.index_put_({kPaddingFeature}, 0.0);
 }
 
 torch::Tensor SparseEncoderImpl::forward(torch::Tensor features, torch::Tensor white_to_move) {
@@ -63,13 +67,31 @@ torch::Tensor SparseEncoderImpl::forward(torch::Tensor features, torch::Tensor w
 		features.size(2) != kFeatureSlots) {
 		throw std::runtime_error("expected Eleginus sparse features [batch, 2, 34]");
 	}
-	auto accumulator = table->forward(features.to(torch::kInt64)).sum(2).clamp(0.0, 1.0);
+	auto accumulator =
+		(table->forward(features.to(torch::kInt64)).sum(2) + bias.view({1, 1, width}))
+			.clamp(0.0, 1.0);
 	auto white = accumulator.index({torch::indexing::Slice(), 0});
 	auto black = accumulator.index({torch::indexing::Slice(), 1});
 	auto mask = white_to_move.to(torch::kBool).unsqueeze(1);
 	auto first = torch::where(mask, white, black);
 	auto second = torch::where(mask, black, white);
 	return torch::cat({first, second}, 1);
+}
+
+PolicyNetworkImpl::PolicyNetworkImpl() {
+	encoder = register_module("encoder", SparseEncoder(kPolicyAccumulatorWidth));
+	hidden = register_module("hidden", torch::nn::Linear(kPolicyAccumulatorWidth * 2,
+		kPolicyHiddenWidth));
+	output = register_module("output", torch::nn::Linear(kPolicyHiddenWidth, kActionSize));
+}
+
+torch::Tensor PolicyNetworkImpl::hidden_state(torch::Tensor features,
+										   torch::Tensor white_to_move) {
+	return torch::relu(hidden->forward(encoder->forward(features, white_to_move)));
+}
+
+torch::Tensor PolicyNetworkImpl::forward(torch::Tensor features, torch::Tensor white_to_move) {
+	return output->forward(hidden_state(features, white_to_move));
 }
 
 ValueNetworkImpl::ValueNetworkImpl() {
@@ -94,6 +116,25 @@ torch::Tensor ValueNetworkImpl::forward(torch::Tensor features, torch::Tensor wh
 	return torch::sigmoid(output->forward(value));
 }
 
+ModelImpl::ModelImpl() {
+	policy = register_module("policy", PolicyNetwork());
+	value = register_module("value", ValueNetwork());
+}
+
+CpuPolicy snapshot_policy(const PolicyNetwork &model) {
+	if (!model) {
+		throw std::invalid_argument("cannot snapshot an empty Eleginus Policy");
+	}
+	return CpuPolicy(PolicyWeights{
+		tensor_vector(model->encoder->table->weight),
+		tensor_vector(model->encoder->bias),
+		tensor_vector(model->hidden->weight),
+		tensor_vector(model->hidden->bias),
+		tensor_vector(model->output->weight),
+		tensor_vector(model->output->bias),
+	});
+}
+
 CpuValue snapshot_value(const ValueNetwork &model) {
 	if (!model) {
 		throw std::invalid_argument("cannot snapshot an empty Eleginus Value");
@@ -101,6 +142,7 @@ CpuValue snapshot_value(const ValueNetwork &model) {
 	const auto output_bias = tensor_vector(model->output->bias);
 	return CpuValue(ValueWeights{
 		tensor_vector(model->encoder->table->weight),
+		tensor_vector(model->encoder->bias),
 		tensor_vector(model->hidden->weight),
 		tensor_vector(model->hidden->bias),
 		tensor_vector(model->bottleneck->weight),
@@ -110,12 +152,26 @@ CpuValue snapshot_value(const ValueNetwork &model) {
 	});
 }
 
+void restore_policy(const PolicyNetwork &model, const PolicyWeights &weights) {
+	if (!model) {
+		throw std::invalid_argument("cannot restore an empty Eleginus Policy");
+	}
+	torch::NoGradGuard no_grad;
+	copy_tensor(model->encoder->table->weight, weights.feature_table, "Policy feature table");
+	copy_tensor(model->encoder->bias, weights.accumulator_bias, "Policy accumulator bias");
+	copy_tensor(model->hidden->weight, weights.hidden_weight, "Policy hidden weight");
+	copy_tensor(model->hidden->bias, weights.hidden_bias, "Policy hidden bias");
+	copy_tensor(model->output->weight, weights.output_weight, "Policy output weight");
+	copy_tensor(model->output->bias, weights.output_bias, "Policy output bias");
+}
+
 void restore_value(const ValueNetwork &model, const ValueWeights &weights) {
 	if (!model) {
 		throw std::invalid_argument("cannot restore an empty Eleginus Value");
 	}
 	torch::NoGradGuard no_grad;
 	copy_tensor(model->encoder->table->weight, weights.feature_table, "Value feature table");
+	copy_tensor(model->encoder->bias, weights.accumulator_bias, "Value accumulator bias");
 	copy_tensor(model->hidden->weight, weights.hidden_weight, "Value hidden weight");
 	copy_tensor(model->hidden->bias, weights.hidden_bias, "Value hidden bias");
 	copy_tensor(model->bottleneck->weight, weights.bottleneck_weight,

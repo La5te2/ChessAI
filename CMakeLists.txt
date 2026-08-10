@@ -224,7 +224,6 @@ add_library(melano
 	src/melano/args.cpp
 	src/melano/dataset.cpp
 	src/melano/game.cpp
-	src/melano/match.cpp
 	src/melano/model.cpp
 	src/melano/searcher.cpp
 )
@@ -236,10 +235,9 @@ set_target_properties(melano PROPERTIES
 target_include_directories(melano PUBLIC "${CMAKE_SOURCE_DIR}/include")
 target_include_directories(melano SYSTEM PUBLIC
 	"${GADIDAE_API_DIR}/chess"
-	"${GADIDAE_API_DIR}/nlohmann/include"
 	${HDF5_INCLUDE_DIRS}
 )
-target_precompile_headers(melano PRIVATE <chess.hpp> <nlohmann/json.hpp>)
+target_precompile_headers(melano PRIVATE <chess.hpp>)
 if(MSVC)
 	target_link_libraries(
 		melano
@@ -271,7 +269,6 @@ endfunction()
 melanoexecutable(preprocess src/melano/preprocess.cpp)
 melanoexecutable(train src/melano/train.cpp)
 melanoexecutable(search src/melano/search.cpp)
-melanoexecutable(arena src/melano/arena.cpp)
 melanoexecutable(uci src/melano/uci.cpp)
 
 add_executable(melanotests src/melano/tests.cpp)

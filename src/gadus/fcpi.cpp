@@ -65,7 +65,7 @@ int main(int argc, char **argv) {
 		arena.book_plies = args.get_int("eval-book-plies", arena.book_plies);
 		arena.max_book_positions =
 			args.get_int("eval-max-book-positions", arena.max_book_positions);
-		arena.min_net_wins = args.get_int("eval-min-net-wins", 4);
+		options.min_net_wins = args.get_int("eval-min-net-wins", options.min_net_wins);
 		arena.log_every = options.log_every;
 		auto &search = arena.search;
 		search.type = gadus::parse_search_type(args.get("eval-search-type", "closed"));

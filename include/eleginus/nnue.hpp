@@ -1,6 +1,6 @@
 #pragma once
 
-// Eleginus sparse chess features and incrementally maintained Value accumulator state.
+// Eleginus sparse chess features and independent incremental Policy/Value evaluators.
 
 #include <array>
 #include <cstdint>
@@ -18,6 +18,8 @@ inline constexpr int kFeatureCount = kEnPassantFeatureBase + 9;
 inline constexpr int kFeatureSlots = 34; // 32 pieces plus castling and en-passant context.
 inline constexpr int kPaddingFeature = kFeatureCount;
 inline constexpr int kFeatureVocabulary = kFeatureCount + 1;
+inline constexpr int kPolicyAccumulatorWidth = 128;
+inline constexpr int kPolicyHiddenWidth = 128;
 inline constexpr int kValueAccumulatorWidth = 256;
 inline constexpr int kValueHiddenWidth = 64;
 inline constexpr int kValueBottleneckWidth = 32;
@@ -38,8 +40,18 @@ struct FloatAccumulator {
 	bool white_to_move = true;
 };
 
+struct PolicyWeights {
+	std::vector<float> feature_table;
+	std::vector<float> accumulator_bias;
+	std::vector<float> hidden_weight;
+	std::vector<float> hidden_bias;
+	std::vector<float> output_weight;
+	std::vector<float> output_bias;
+};
+
 struct ValueWeights {
 	std::vector<float> feature_table;
+	std::vector<float> accumulator_bias;
 	std::vector<float> hidden_weight;
 	std::vector<float> hidden_bias;
 	std::vector<float> bottleneck_weight;
@@ -48,7 +60,22 @@ struct ValueWeights {
 	float output_bias = 0.0F;
 };
 
-/// Immutable, Torch-free evaluator for the shared Value network.
+/// Immutable, Torch-free evaluator for the independent Policy network.
+class CpuPolicy {
+	public:
+	explicit CpuPolicy(PolicyWeights weights);
+	FloatAccumulator refresh(const chess::Board &board) const;
+	FloatAccumulator update(const FloatAccumulator &current, const chess::Board &before,
+							const chess::Board &after) const;
+	std::vector<float> evaluate(const FloatAccumulator &accumulator,
+							const std::vector<chess::Move> &moves) const;
+	const PolicyWeights &weights() const noexcept { return weights_; }
+
+	private:
+	PolicyWeights weights_;
+};
+
+/// Immutable, Torch-free evaluator for the independent Value network.
 class CpuValue {
 	public:
 	explicit CpuValue(ValueWeights weights);

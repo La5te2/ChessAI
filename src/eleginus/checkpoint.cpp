@@ -1,4 +1,4 @@
-// Implements the sole Eleginus Value checkpoint and executable embedding bridge.
+// Implements Eleginus Policy/Value checkpoints and executable embedding.
 
 #include "eleginus/checkpoint.hpp"
 
@@ -35,9 +35,11 @@ void write_architecture(torch::serialize::OutputArchive &archive) {
 	archive.write("type_id", scalar(kEleginusCheckpointType), true);
 	archive.write("feature_count", scalar(kFeatureVocabulary), true);
 	archive.write("feature_slots", scalar(kFeatureSlots), true);
-	archive.write("accumulator", scalar(kValueAccumulatorWidth), true);
-	archive.write("hidden", scalar(kValueHiddenWidth), true);
-	archive.write("bottleneck", scalar(kValueBottleneckWidth), true);
+	archive.write("policy_accumulator", scalar(kPolicyAccumulatorWidth), true);
+	archive.write("policy_hidden", scalar(kPolicyHiddenWidth), true);
+	archive.write("value_accumulator", scalar(kValueAccumulatorWidth), true);
+	archive.write("value_hidden", scalar(kValueHiddenWidth), true);
+	archive.write("value_bottleneck", scalar(kValueBottleneckWidth), true);
 	archive.write("action_size", scalar(kActionSize), true);
 }
 
@@ -45,9 +47,11 @@ void validate_architecture(torch::serialize::InputArchive &archive) {
 	require_scalar(archive, "type_id", kEleginusCheckpointType);
 	require_scalar(archive, "feature_count", kFeatureVocabulary);
 	require_scalar(archive, "feature_slots", kFeatureSlots);
-	require_scalar(archive, "accumulator", kValueAccumulatorWidth);
-	require_scalar(archive, "hidden", kValueHiddenWidth);
-	require_scalar(archive, "bottleneck", kValueBottleneckWidth);
+	require_scalar(archive, "policy_accumulator", kPolicyAccumulatorWidth);
+	require_scalar(archive, "policy_hidden", kPolicyHiddenWidth);
+	require_scalar(archive, "value_accumulator", kValueAccumulatorWidth);
+	require_scalar(archive, "value_hidden", kValueHiddenWidth);
+	require_scalar(archive, "value_bottleneck", kValueBottleneckWidth);
 	require_scalar(archive, "action_size", kActionSize);
 }
 
@@ -64,14 +68,14 @@ void replace_file(const std::filesystem::path &temporary, const std::filesystem:
 
 } // namespace
 
-ValueNetwork make_model(const torch::Device &device, std::uint64_t seed) {
+Model make_model(const torch::Device &device, std::uint64_t seed) {
 	torch::manual_seed(static_cast<std::int64_t>(seed));
-	auto model = ValueNetwork();
+	auto model = Model();
 	model->to(device);
 	return model;
 }
 
-void save_checkpoint_atomic(const std::filesystem::path &path, const ValueNetwork &model) {
+void save_checkpoint_atomic(const std::filesystem::path &path, const Model &model) {
 	if (!model)
 		throw std::invalid_argument("cannot save an empty Eleginus model");
 	if (path.extension() != ".pth")
@@ -96,7 +100,7 @@ void save_checkpoint_atomic(const std::filesystem::path &path, const ValueNetwor
 	}
 }
 
-ValueNetwork load_checkpoint(const std::filesystem::path &path, const torch::Device &device) {
+Model load_checkpoint(const std::filesystem::path &path, const torch::Device &device) {
 	if (path.extension() != ".pth")
 		throw std::invalid_argument("Eleginus training checkpoint must use the .pth extension");
 	if (!std::filesystem::is_regular_file(path))
@@ -122,7 +126,10 @@ void embed_checkpoint_atomic(const std::filesystem::path &model_path,
 							 const std::filesystem::path &input,
 							 const std::filesystem::path &output) {
 	auto model = load_checkpoint(model_path, torch::Device(torch::kCPU));
-	embed_runtime_model_atomic(input, output, snapshot_value(model).weights());
+	embed_runtime_model_atomic(input, output, RuntimeWeights{
+		snapshot_policy(model->policy).weights(),
+		snapshot_value(model->value).weights(),
+	});
 }
 
 } // namespace eleginus

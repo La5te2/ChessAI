@@ -18,7 +18,7 @@ int main(int argc, char **argv) {
 				<< "  --mcts-batch-size <n> --c-puct <x> --c-puct-base <x>\n"
 				<< "  --c-puct-factor <x> --fpu-reduction <x> --virtual-loss <x>\n"
 				<< "  --repetition-policy-penalty <x> --instant-mate-first <0|1>\n"
-				<< "  --min-net-wins <n> --pgn-output <path> --seed <n> --log-every <games>\n";
+				<< "  --pgn-output <path> --seed <n> --log-every <games>\n";
 			return 0;
 		}
 		gadus::ArenaOptions options;
@@ -32,7 +32,6 @@ int main(int argc, char **argv) {
 		options.book_plies = args.get_int("book-plies", options.book_plies);
 		options.max_book_positions = args.get_int("max-book-positions", options.max_book_positions);
 		options.seed = static_cast<std::uint64_t>(args.get_int64("seed", options.seed));
-		options.min_net_wins = args.get_int("min-net-wins", options.min_net_wins);
 		options.log_every = args.get_int("log-every", options.log_every);
 		options.pgn_output = args.get("pgn-output", options.pgn_output.string());
 

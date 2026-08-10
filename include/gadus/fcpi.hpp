@@ -31,11 +31,12 @@ struct FcpiOptions {
 	int batch_size = 256;
 	double learning_rate = 2e-5;
 	ArenaOptions arena;
+	int min_net_wins = 4;
 	int log_every = 50;
 	std::uint64_t seed = 2026;
 };
 
-/// Runs all configured FCPI iterations and advances current.pth only after arena acceptance.
+/// Runs all configured FCPI iterations and promotes candidates that meet the match threshold.
 void run_fcpi(const FcpiOptions &options);
 
 } // namespace gadus

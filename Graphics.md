@@ -50,7 +50,7 @@ Simulator accepts any executable that implements the UCI protocol. The `--uci` a
 
 Stadium manages multiple independent games. `Tools > Matches` creates games, selects the game shown in the active view and closes games. Games outside the active view continue in the background, including while Simulator is visible. Each seat requires a participant name. A Human seat accepts moves from the board. An engine seat requires a UCI executable and stores its own UCI option values and launch arguments.
 
-Match settings define the initial clock, increment, display delay, maximum ply count and starting position in Forsyth-Edwards Notation (FEN). An initial clock of zero disables clock timing. `Run > Start`, `Run > Pause` and `Run > Stop` control the active game. Closing Gadidae terminates every UCI subprocess owned by every open match.
+Match settings define the initial clock, increment, display delay, maximum ply count and starting position in Forsyth-Edwards Notation (FEN). An initial clock of zero selects untimed play. `Run > Start`, `Run > Pause` and `Run > Stop` control the active game. Closing Gadidae terminates every UCI subprocess owned by every open match.
 
 The following command opens Stadium with a Gadus-versus-Stockfish game:
 

@@ -1,4 +1,4 @@
-// Implements the architecture-locked Eleginus Value HDF5 format and supervised fitting.
+// Implements the architecture-locked HDF5 format and joint Policy/Value fitting.
 
 #include "eleginus/dataset.hpp"
 
@@ -160,7 +160,7 @@ struct StopPgnParsing {};
 
 class PreprocessVisitor : public chess::pgn::Visitor {
 	public:
-	PreprocessVisitor(const PreprocessOptions &options, ValueH5Writer &writer)
+	PreprocessVisitor(const PreprocessOptions &options, H5Writer &writer)
 		: options_(options), writer_(writer) {}
 
 	void startPgn() override {
@@ -188,7 +188,8 @@ class PreprocessVisitor : public chess::pgn::Visitor {
 		try {
 			const auto parsed = chess::uci::parseSan(board_, san);
 			game_features_.push_back(encode_features(board_));
-			game_moves_.push_back(static_cast<std::uint16_t>(move_to_index(parsed)));
+			game_moves_.push_back(
+				static_cast<std::uint16_t>(move_to_index(parsed, board_.sideToMove())));
 			game_values_.push_back(options_.has_comments
 				? comment_value(previous_comment_, board_.sideToMove())
 				: result_value(result_, board_.sideToMove()));
@@ -224,7 +225,7 @@ class PreprocessVisitor : public chess::pgn::Visitor {
 
 	private:
 	PreprocessOptions options_;
-	ValueH5Writer &writer_;
+	H5Writer &writer_;
 	chess::Board board_;
 	std::string result_;
 	std::string previous_comment_;
@@ -239,8 +240,8 @@ class PreprocessVisitor : public chess::pgn::Visitor {
 
 } // namespace
 
-struct ValueH5Writer::Impl {
-	explicit Impl(const ValueWriterOptions &writer_options) : options(writer_options) {
+struct H5Writer::Impl {
+	explicit Impl(const WriterOptions &writer_options) : options(writer_options) {
 		if (options.output.empty())
 			throw std::invalid_argument("Eleginus HDF5 output path is empty");
 		if (options.has_comments != 0 && options.has_comments != 1)
@@ -253,9 +254,9 @@ struct ValueH5Writer::Impl {
 		file = require_id(H5Fcreate(options.output.string().c_str(), H5F_ACC_TRUNC,
 			H5P_DEFAULT, H5P_DEFAULT), "create Eleginus HDF5 file");
 		write_string_attribute(file, "arch_type", kArchType);
-		write_string_attribute(file, "state_encoding", kValueStateEncoding);
+		write_string_attribute(file, "state_encoding", kStateEncoding);
 		write_string_attribute(file, "move_encoding", kMoveEncoding);
-		write_string_attribute(file, "target_schema", kValueTargetSchema);
+		write_string_attribute(file, "target_schema", kTargetSchema);
 		write_string_attribute(file, "value_perspective", "side_to_move");
 		write_string_attribute(file, "source", options.source);
 		write_int_attribute(file, "has_cmt", options.has_comments);
@@ -286,7 +287,7 @@ struct ValueH5Writer::Impl {
 			H5Fclose(file);
 	}
 
-	ValueWriterOptions options;
+	WriterOptions options;
 	hid_t file = -1;
 	hid_t states = -1;
 	hid_t moves = -1;
@@ -294,14 +295,14 @@ struct ValueH5Writer::Impl {
 	std::int64_t length = 0;
 };
 
-ValueH5Writer::ValueH5Writer(const ValueWriterOptions &options)
+H5Writer::H5Writer(const WriterOptions &options)
 	: impl_(std::make_unique<Impl>(options)) {}
 
-ValueH5Writer::~ValueH5Writer() = default;
-ValueH5Writer::ValueH5Writer(ValueH5Writer &&) noexcept = default;
-ValueH5Writer &ValueH5Writer::operator=(ValueH5Writer &&) noexcept = default;
+H5Writer::~H5Writer() = default;
+H5Writer::H5Writer(H5Writer &&) noexcept = default;
+H5Writer &H5Writer::operator=(H5Writer &&) noexcept = default;
 
-void ValueH5Writer::append(const std::vector<EncodedFeatures> &features,
+void H5Writer::append(const std::vector<EncodedFeatures> &features,
 						   const std::vector<std::uint16_t> &moves,
 						   const std::vector<float> &target_values) {
 	if (features.size() != moves.size() || features.size() != target_values.size())
@@ -344,22 +345,22 @@ void ValueH5Writer::append(const std::vector<EncodedFeatures> &features,
 	impl_->length += static_cast<std::int64_t>(features.size());
 }
 
-std::int64_t ValueH5Writer::size() const noexcept { return impl_->length; }
+std::int64_t H5Writer::size() const noexcept { return impl_->length; }
 
-void ValueH5Writer::flush() {
+void H5Writer::flush() {
 	require_h5(H5Fflush(impl_->file, H5F_SCOPE_GLOBAL), "flush Eleginus HDF5 file");
 }
 
-struct ValueH5::Impl {
+struct H5Dataset::Impl {
 	explicit Impl(const std::filesystem::path &path) {
 		file = require_id(H5Fopen(path.string().c_str(), H5F_ACC_RDONLY, H5P_DEFAULT),
 			"open Eleginus HDF5 file");
 		if (read_string_attribute(file, "arch_type") != kArchType ||
-			read_string_attribute(file, "state_encoding") != kValueStateEncoding ||
+			read_string_attribute(file, "state_encoding") != kStateEncoding ||
 			read_string_attribute(file, "move_encoding") != kMoveEncoding ||
-			read_string_attribute(file, "target_schema") != kValueTargetSchema ||
+			read_string_attribute(file, "target_schema") != kTargetSchema ||
 			read_string_attribute(file, "value_perspective") != "side_to_move")
-			throw std::runtime_error("HDF5 file is not an Eleginus Value dataset");
+			throw std::runtime_error("HDF5 file is not an Eleginus supervised dataset");
 		info.has_comments = static_cast<int>(read_int_attribute(file, "has_cmt"));
 		info.source = read_optional_string_attribute(file, "source");
 		states = require_id(H5Dopen2(file, "states", H5P_DEFAULT), "open Eleginus states");
@@ -403,20 +404,20 @@ struct ValueH5::Impl {
 	hid_t states = -1;
 	hid_t moves = -1;
 	hid_t values = -1;
-	ValueDatasetInfo info;
+	DatasetInfo info;
 };
 
-ValueH5::ValueH5(const std::filesystem::path &path) : impl_(std::make_unique<Impl>(path)) {}
-ValueH5::~ValueH5() = default;
-ValueH5::ValueH5(ValueH5 &&) noexcept = default;
-ValueH5 &ValueH5::operator=(ValueH5 &&) noexcept = default;
+H5Dataset::H5Dataset(const std::filesystem::path &path) : impl_(std::make_unique<Impl>(path)) {}
+H5Dataset::~H5Dataset() = default;
+H5Dataset::H5Dataset(H5Dataset &&) noexcept = default;
+H5Dataset &H5Dataset::operator=(H5Dataset &&) noexcept = default;
 
-const ValueDatasetInfo &ValueH5::info() const noexcept { return impl_->info; }
+const DatasetInfo &H5Dataset::info() const noexcept { return impl_->info; }
 
-ValueBatch ValueH5::read_contiguous(std::int64_t begin, std::int64_t count) const {
+Batch H5Dataset::read_contiguous(std::int64_t begin, std::int64_t count) const {
 	if (begin < 0 || count < 0 || begin + count > impl_->info.length)
 		throw std::out_of_range("Eleginus HDF5 read range is out of bounds");
-	ValueBatch batch;
+	Batch batch;
 	batch.features.resize(static_cast<std::size_t>(count));
 	batch.moves = torch::empty({count}, torch::TensorOptions().dtype(torch::kInt64));
 	batch.values = torch::empty({count}, torch::TensorOptions().dtype(torch::kFloat32));
@@ -450,13 +451,13 @@ void preprocess_pgn(const PreprocessOptions &options) {
 	std::ifstream input(options.input);
 	if (!input)
 		throw std::runtime_error("PGN not found: " + options.input.string());
-	ValueWriterOptions writer_options;
+	WriterOptions writer_options;
 	writer_options.output = options.output;
 	writer_options.has_comments = options.has_comments;
 	writer_options.chunk_size = options.chunk_size;
 	writer_options.compression_level = options.compression_level;
 	writer_options.source = options.has_comments ? "pgn_comments" : "pgn_result";
-	ValueH5Writer writer(writer_options);
+	H5Writer writer(writer_options);
 	PreprocessVisitor visitor(options, writer);
 	std::cout << "Eleginus preprocess start: input=" << options.input.string()
 			  << " output=" << options.output.string()
@@ -476,22 +477,24 @@ void preprocess_pgn(const PreprocessOptions &options) {
 			  << " output=" << options.output.string() << std::endl;
 }
 
-ValueTrainStats train_value_from_h5(ValueNetwork &value, const ValueTrainOptions &options,
-									const torch::Device &device) {
-	if (!value)
-		throw std::invalid_argument("cannot train an empty Eleginus Value network");
+TrainStats train_from_h5(Model &model, const TrainOptions &options,
+						 const torch::Device &device) {
+	if (!model)
+		throw std::invalid_argument("cannot train an empty Eleginus model");
 	if (options.data.empty() || options.epochs <= 0 || options.batch_size <= 0 ||
 		options.max_steps < 0 || options.learning_rate <= 0.0 || options.weight_decay < 0.0)
-		throw std::invalid_argument("invalid Eleginus Value training options");
-	ValueH5 data(options.data);
+		throw std::invalid_argument("invalid Eleginus training options");
+	H5Dataset data(options.data);
 	if (data.info().length <= 0)
-		throw std::runtime_error("Eleginus Value dataset is empty: " + options.data.string());
+		throw std::runtime_error("Eleginus supervised dataset is empty: " + options.data.string());
 	torch::manual_seed(static_cast<std::int64_t>(options.seed));
 	std::mt19937_64 rng(options.seed);
-	torch::optim::AdamW optimizer(value->parameters(),
+	torch::optim::AdamW policy_optimizer(model->policy->parameters(),
 		torch::optim::AdamWOptions(options.learning_rate).weight_decay(options.weight_decay));
-	value->train();
-	ValueTrainStats stats;
+	torch::optim::AdamW value_optimizer(model->value->parameters(),
+		torch::optim::AdamWOptions(options.learning_rate).weight_decay(options.weight_decay));
+	model->train();
+	TrainStats stats;
 	const std::int64_t chunk_rows =
 		std::max<std::int64_t>(4096, static_cast<std::int64_t>(options.batch_size) * 16);
 	std::vector<std::int64_t> chunks;
@@ -507,6 +510,7 @@ ValueTrainStats train_value_from_h5(ValueNetwork &value, const ValueTrainOptions
 			std::iota(order.begin(), order.end(), 0);
 			std::shuffle(order.begin(), order.end(), rng);
 			const auto *chunk_targets = chunk.values.data_ptr<float>();
+			const auto *chunk_moves = chunk.moves.data_ptr<std::int64_t>();
 			for (std::int64_t offset = 0; offset < chunk_count; offset += options.batch_size) {
 				if (options.max_steps > 0 && stats.steps >= options.max_steps) {
 					stop = true;
@@ -515,36 +519,58 @@ ValueTrainStats train_value_from_h5(ValueNetwork &value, const ValueTrainOptions
 				const auto count = std::min<std::int64_t>(options.batch_size, chunk_count - offset);
 				std::vector<EncodedFeatures> encoded;
 				encoded.reserve(static_cast<std::size_t>(count));
-				auto targets = torch::empty({count, 1}, torch::TensorOptions().dtype(torch::kFloat32));
-				auto *target_data = targets.data_ptr<float>();
+				auto value_targets =
+					torch::empty({count, 1}, torch::TensorOptions().dtype(torch::kFloat32));
+				auto move_targets =
+					torch::empty({count}, torch::TensorOptions().dtype(torch::kInt64));
+				auto *value_data = value_targets.data_ptr<float>();
+				auto *move_data = move_targets.data_ptr<std::int64_t>();
 				for (std::int64_t row = 0; row < count; ++row) {
 					const auto source = order[static_cast<std::size_t>(offset + row)];
 					encoded.push_back(chunk.features[static_cast<std::size_t>(source)]);
-					target_data[row] = chunk_targets[source];
+					value_data[row] = chunk_targets[source];
+					move_data[row] = chunk_moves[source];
 				}
 				auto [features, side] = encode_feature_batch(encoded, device);
-				targets = targets.to(device);
-				optimizer.zero_grad();
-				auto prediction = value->forward(features, side);
-				auto loss = torch::mse_loss(prediction, targets);
+				value_targets = value_targets.to(device);
+				move_targets = move_targets.to(device);
+				policy_optimizer.zero_grad();
+				value_optimizer.zero_grad();
+				auto logits = model->policy->forward(features, side);
+				auto value_prediction = model->value->forward(features, side);
+				auto policy_loss = torch::nn::functional::cross_entropy(logits, move_targets);
+				auto value_loss = torch::mse_loss(value_prediction, value_targets);
+				auto loss = policy_loss + value_loss;
 				loss.backward();
-				torch::nn::utils::clip_grad_norm_(value->parameters(), 1.0);
-				optimizer.step();
+				torch::nn::utils::clip_grad_norm_(model->policy->parameters(), 1.0);
+				torch::nn::utils::clip_grad_norm_(model->value->parameters(), 1.0);
+				policy_optimizer.step();
+				value_optimizer.step();
+				const double policy_loss_value = policy_loss.item<double>();
+				const double value_loss_value = value_loss.item<double>();
 				const double loss_value = loss.item<double>();
 				++stats.steps;
 				stats.samples += count;
+				stats.mean_policy_loss += policy_loss_value;
+				stats.mean_value_loss += value_loss_value;
 				stats.mean_loss += loss_value;
 				if (options.log_every > 0 && stats.steps % options.log_every == 0)
-					std::cout << "Eleginus Value training: epoch=" << (epoch + 1)
-							  << " step=" << stats.steps << " loss=" << loss_value << std::endl;
+					std::cout << "Eleginus training: epoch=" << (epoch + 1)
+							  << " step=" << stats.steps
+							  << " policy=" << policy_loss_value
+							  << " value=" << value_loss_value
+							  << " loss=" << loss_value << std::endl;
 			}
 			if (stop)
 				break;
 		}
 	}
-	value->eval();
-	if (stats.steps > 0)
+	model->eval();
+	if (stats.steps > 0) {
+		stats.mean_policy_loss /= static_cast<double>(stats.steps);
+		stats.mean_value_loss /= static_cast<double>(stats.steps);
 		stats.mean_loss /= static_cast<double>(stats.steps);
+	}
 	return stats;
 }
 
