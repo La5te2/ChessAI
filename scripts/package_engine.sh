@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 2 ]]; then
-	echo "Usage: bash scripts/package_engine.sh <gadus|melano> <model.pth>"
+if [[ $# -lt 2 || $# -gt 3 ]]; then
+	echo "Usage: bash scripts/package_engine.sh <gadus|melano|eleginus> <model.pth> [uci|search]"
 	echo "Example: bash scripts/package_engine.sh gadus models/gadus/candidate3.pth"
+	echo "Example: bash scripts/package_engine.sh eleginus models/eleginus/eleginus.pth uci"
 	exit 1
 fi
 
@@ -11,7 +12,7 @@ ARCH="$1"
 MODEL_ARG="$2"
 
 case "$ARCH" in
-	gadus|melano)
+	gadus|melano|eleginus)
 		;;
 	*)
 		echo "Unsupported architecture: $ARCH" >&2
@@ -25,6 +26,31 @@ if [[ ! -f "$MODEL_ARG" ]]; then
 	exit 3
 fi
 MODEL="$(realpath "$MODEL_ARG")"
+if [[ "$ARCH" == "eleginus" ]]; then
+	TYPE="${3:-uci}"
+	if [[ "$TYPE" != "uci" && "$TYPE" != "search" ]]; then
+		echo "Eleginus package type must be uci or search: $TYPE" >&2
+		exit 2
+	fi
+	EMBED="$ROOT/build/eleginus/embed"
+	if [[ ! -x "$EMBED" ]]; then
+		echo "Eleginus embed executable not found: $EMBED" >&2
+		echo "Build first with: bash scripts/build.sh" >&2
+		exit 4
+	fi
+	if [[ "$TYPE" == "uci" ]]; then
+		ENGINE="$ROOT/models/eleginus/eleginus"
+	else
+		ENGINE="$ROOT/models/eleginus/eleginus_search"
+	fi
+	mkdir -p "$ROOT/models/eleginus"
+	"$EMBED" --model "$MODEL" --type "$TYPE" --output "$ENGINE"
+	chmod +x "$ENGINE"
+	echo "Gadidae Eleginus executable packaged"
+	echo "type=$TYPE"
+	echo "executable=$ENGINE"
+	exit 0
+fi
 UCI="$ROOT/build/$ARCH/uci"
 OUTPUT="$ROOT/models/$ARCH"
 LIB_OUTPUT="$OUTPUT/lib"

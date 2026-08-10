@@ -319,7 +319,7 @@ void H5Writer::append(const std::vector<EncodedFeatures> &features,
 			const auto &perspective =
 				features[row].perspective[static_cast<std::size_t>(perspective_index)];
 			for (const int feature : perspective) {
-				if (feature < 0 || feature >= kFeatureVocabulary)
+				if (feature < 0 || feature >= kEncodedFeatureVocabulary)
 					throw std::invalid_argument("Eleginus HDF5 feature index is out of range");
 				packed[cursor++] = static_cast<std::uint16_t>(feature);
 			}
@@ -375,7 +375,7 @@ struct H5Dataset::Impl {
 		if (state_dimensions[1] != kPerspectiveCount || state_dimensions[2] != kFeatureSlots)
 			throw std::runtime_error("Eleginus state dimensions do not match [N,2,34]");
 		info.length = static_cast<std::int64_t>(state_dimensions[0]);
-		for (const auto [dataset, name] : {
+		for (const auto &[dataset, name] : {
 				 std::pair<hid_t, const char *>{moves, "moves"},
 				 std::pair<hid_t, const char *>{values, "values"}}) {
 			const hid_t space = require_id(H5Dget_space(dataset), std::string("get ") + name);
@@ -520,7 +520,7 @@ TrainStats train_from_h5(Model &model, const TrainOptions &options,
 				std::vector<EncodedFeatures> encoded;
 				encoded.reserve(static_cast<std::size_t>(count));
 				auto value_targets =
-					torch::empty({count, 1}, torch::TensorOptions().dtype(torch::kFloat32));
+					torch::empty({count}, torch::TensorOptions().dtype(torch::kFloat32));
 				auto move_targets =
 					torch::empty({count}, torch::TensorOptions().dtype(torch::kInt64));
 				auto *value_data = value_targets.data_ptr<float>();
@@ -534,14 +534,31 @@ TrainStats train_from_h5(Model &model, const TrainOptions &options,
 				auto [features, side] = encode_feature_batch(encoded, device);
 				value_targets = value_targets.to(device);
 				move_targets = move_targets.to(device);
+				if (value_targets.dim() != 1 || value_targets.size(0) != count) {
+					throw std::runtime_error("Eleginus Value target must have shape [batch]");
+				}
 				policy_optimizer.zero_grad();
 				value_optimizer.zero_grad();
 				auto logits = model->policy->forward(features, side);
 				auto value_prediction = model->value->forward(features, side);
+				if (value_prediction.dim() != 1 || value_prediction.size(0) != count) {
+					throw std::runtime_error("Eleginus Value output must have shape [batch]");
+				}
 				auto policy_loss = torch::nn::functional::cross_entropy(logits, move_targets);
-				auto value_loss = torch::mse_loss(value_prediction, value_targets);
+				// The targets are expected scores in [0,1]. BCEWithLogits supplies the
+				// proper Bernoulli loss directly on the raw Value logit and avoids the
+				// extra sigmoid derivative that weakened corrections under squared error.
+				auto value_loss = torch::nn::functional::binary_cross_entropy_with_logits(
+					value_prediction, value_targets);
 				auto loss = policy_loss + value_loss;
 				loss.backward();
+				for (const auto &parameter : model->named_parameters()) {
+					if (parameter.value().grad().defined() &&
+						parameter.value().grad().sizes() != parameter.value().sizes()) {
+						throw std::runtime_error("Eleginus gradient shape mismatch: " +
+							parameter.key());
+					}
+				}
 				torch::nn::utils::clip_grad_norm_(model->policy->parameters(), 1.0);
 				torch::nn::utils::clip_grad_norm_(model->value->parameters(), 1.0);
 				policy_optimizer.step();

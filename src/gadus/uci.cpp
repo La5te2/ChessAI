@@ -21,16 +21,11 @@
 
 namespace {
 
-inline constexpr int kMinimumMoveTimeMs = 50;
-inline constexpr int kMaximumMoveTimeMs = 10000;
-inline constexpr double kTimeDivisor = 30.0;
-inline constexpr double kIncrementFraction = 0.75;
-
 struct EngineOptions {
 	std::filesystem::path model_path;
 	std::string device = "auto";
 	gadus::SearchOptions search;
-	int move_overhead_ms = 50;
+	int move_overhead_ms = 10;
 	int progress_interval_ms = 750;
 	int multipv = 5;
 	int score_scale = 1000;
@@ -138,6 +133,7 @@ class UciEngine {
 				} else if (command == "ucinewgame") {
 					stop_and_join();
 					board_ = chess::Board();
+					original_time_adjust_ = -1.0;
 					if (searcher_) {
 						searcher_->clear_evaluation_cache();
 					}
@@ -203,8 +199,8 @@ class UciEngine {
 			  std::to_string(options_.search.mcts_min_sims) + " min 0 max 1000000");
 		print("option name MCTSBatchSize type spin default " +
 			  std::to_string(options_.search.mcts_batch_size) + " min 1 max 4096");
-		print("option name MoveOverheadMS type spin default " +
-			  std::to_string(options_.move_overhead_ms) + " min 0 max 60000");
+		print("option name Move Overhead type spin default " +
+			  std::to_string(options_.move_overhead_ms) + " min 0 max 5000");
 		print("option name CPuct type string default " + std::to_string(options_.search.c_puct));
 		print("option name CPuctBase type string default " +
 			  std::to_string(options_.search.c_puct_base));
@@ -277,8 +273,9 @@ class UciEngine {
 			options_.search.mcts_min_sims = std::max(0, parse_int(value, options_.search.mcts_min_sims));
 		} else if (key == "mctsbatchsize") {
 			options_.search.mcts_batch_size = std::max(1, parse_int(value, options_.search.mcts_batch_size));
-		} else if (key == "moveoverheadms") {
-			options_.move_overhead_ms = std::max(0, parse_int(value, options_.move_overhead_ms));
+		} else if (key == "moveoverhead") {
+			options_.move_overhead_ms =
+				std::clamp(parse_int(value, options_.move_overhead_ms), 0, 5000);
 		} else if (key == "cpuct") {
 			options_.search.c_puct = std::max(0.0, parse_double(value, options_.search.c_puct));
 		} else if (key == "cpuctbase") {
@@ -351,16 +348,22 @@ class UciEngine {
 			if (tokens[index] == "infinite" || tokens[index] == "ponder") {
 				values[tokens[index]] = "1";
 			} else if (index + 1 < tokens.size()) {
-				values[tokens[index]] = tokens[++index];
+				const auto key = tokens[index];
+				values[key] = tokens[index + 1];
+				++index;
 			}
 		}
 		return values;
 	}
 
-	// Derive a bounded per-move budget from movetime or the active side's clock and increment.
-	int movetime_for(const std::unordered_map<std::string, std::string> &go) const {
+	// Apply Stockfish's optimum-time allocation to the active side's UCI clock fields.
+	int movetime_for(const std::unordered_map<std::string, std::string> &go) {
+		if (go.contains("infinite")) {
+			return 0;
+		}
 		if (const auto found = go.find("movetime"); found != go.end()) {
-			return std::max(0, parse_int(found->second, 0));
+			const int requested = std::max(0, parse_int(found->second, 0));
+			return requested > 0 ? std::max(1, requested - options_.move_overhead_ms) : 0;
 		}
 		const bool white = board_.sideToMove() == chess::Color::WHITE;
 		const auto time_key = white ? "wtime" : "btime";
@@ -370,12 +373,40 @@ class UciEngine {
 			const int increment = go.contains(increment_key)
 								  ? std::max(0, parse_int(go.at(increment_key), 0))
 								  : 0;
-			double budget = remaining / kTimeDivisor + increment * kIncrementFraction -
-							options_.move_overhead_ms;
-			budget = std::clamp(budget, static_cast<double>(kMinimumMoveTimeMs),
-							static_cast<double>(kMaximumMoveTimeMs));
-			budget = std::min(budget, static_cast<double>(std::max(1, remaining - options_.move_overhead_ms)));
-			return std::max(0, static_cast<int>(budget));
+			if (remaining == 0) {
+				return 1;
+			}
+			const int requested_moves = go.contains("movestogo")
+				? std::max(1, parse_int(go.at("movestogo"), 1))
+				: 0;
+			int moves_to_go = requested_moves > 0 ? std::min(requested_moves, 50) : 50;
+			if (remaining < 1000) {
+				moves_to_go = std::max(1, static_cast<int>(remaining * 0.05));
+			}
+			const double time_left = std::max(1.0,
+				static_cast<double>(remaining) + static_cast<double>(increment) * (moves_to_go - 1) -
+					static_cast<double>(options_.move_overhead_ms) * (2 + moves_to_go));
+			const int game_ply = 2 * (static_cast<int>(board_.fullMoveNumber()) - 1) +
+				(board_.sideToMove() == chess::Color::BLACK ? 1 : 0);
+			double optimum_scale = 0.0;
+			if (requested_moves == 0) {
+				if (original_time_adjust_ < 0.0) {
+					original_time_adjust_ = 0.3272 * std::log10(time_left) - 0.4141;
+				}
+				const double log_seconds =
+					std::log10(std::max(1.0, static_cast<double>(remaining)) / 1000.0);
+				const double optimum_constant =
+					std::min(0.0029869 + 0.00033554 * log_seconds, 0.004905);
+				optimum_scale = std::min(
+					0.012112 + std::pow(game_ply + 3.22713, 0.46866) * optimum_constant,
+					0.19404 * remaining / time_left) * original_time_adjust_;
+			} else {
+				optimum_scale = std::min(
+					(0.88 + game_ply / 116.4) / moves_to_go,
+					0.88 * remaining / time_left);
+			}
+			const int optimum = static_cast<int>(std::max(1.0, optimum_scale * time_left));
+			return std::min(optimum, std::max(1, remaining - options_.move_overhead_ms));
 		}
 		return 0;
 	}
@@ -454,6 +485,7 @@ class UciEngine {
 	std::string loaded_device_;
 	std::thread search_thread_;
 	std::atomic_bool stop_requested_{false};
+	double original_time_adjust_ = -1.0;
 };
 
 // Convert process arguments to initial UCI options before entering the protocol loop.

@@ -115,43 +115,52 @@ PolicyWeights read_policy(std::ifstream &input, const std::filesystem::path &pat
 
 void write_value(std::ofstream &output, const ValueWeights &weights) {
 	write_vector(output, weights.feature_table,
-		static_cast<std::size_t>(kFeatureVocabulary) * kValueAccumulatorWidth,
+		static_cast<std::size_t>(kFeatureVocabulary) * kValueFeatureWidth,
 		"Value feature table");
-	write_vector(output, weights.accumulator_bias, kValueAccumulatorWidth,
+	write_vector(output, weights.accumulator_bias, kValueFeatureWidth,
 		"Value accumulator bias");
 	write_vector(output, weights.hidden_weight,
-		static_cast<std::size_t>(kValueHiddenWidth) * kValueAccumulatorWidth * 2,
+		static_cast<std::size_t>(kValueBucketCount) * kValueHiddenWidth *
+			kValueAccumulatorWidth * 2,
 		"Value hidden weight");
-	write_vector(output, weights.hidden_bias, kValueHiddenWidth, "Value hidden bias");
+	write_vector(output, weights.hidden_bias, kValueBucketCount * kValueHiddenWidth,
+		"Value hidden bias");
 	write_vector(output, weights.bottleneck_weight,
-		static_cast<std::size_t>(kValueBottleneckWidth) * kValueHiddenWidth,
+		static_cast<std::size_t>(kValueBucketCount) * kValueBottleneckWidth *
+			kValueHiddenWidth,
 		"Value bottleneck weight");
-	write_vector(output, weights.bottleneck_bias, kValueBottleneckWidth,
+	write_vector(output, weights.bottleneck_bias, kValueBucketCount * kValueBottleneckWidth,
 		"Value bottleneck bias");
-	write_vector(output, weights.output_weight, kValueBottleneckWidth,
+	write_vector(output, weights.output_weight,
+		kValueBucketCount * kValueBottleneckWidth,
 		"Value output weight");
-	write_scalar(output, weights.output_bias);
+	write_vector(output, weights.output_bias, kValueBucketCount, "Value output bias");
 }
 
 ValueWeights read_value(std::ifstream &input, const std::filesystem::path &path) {
 	ValueWeights weights;
 	weights.feature_table = read_vector(input, path,
-		static_cast<std::size_t>(kFeatureVocabulary) * kValueAccumulatorWidth,
+		static_cast<std::size_t>(kFeatureVocabulary) * kValueFeatureWidth,
 		"Value feature table");
-	weights.accumulator_bias = read_vector(input, path, kValueAccumulatorWidth,
+	weights.accumulator_bias = read_vector(input, path, kValueFeatureWidth,
 		"Value accumulator bias");
 	weights.hidden_weight = read_vector(input, path,
-		static_cast<std::size_t>(kValueHiddenWidth) * kValueAccumulatorWidth * 2,
+		static_cast<std::size_t>(kValueBucketCount) * kValueHiddenWidth *
+			kValueAccumulatorWidth * 2,
 		"Value hidden weight");
-	weights.hidden_bias = read_vector(input, path, kValueHiddenWidth, "Value hidden bias");
+	weights.hidden_bias = read_vector(input, path, kValueBucketCount * kValueHiddenWidth,
+		"Value hidden bias");
 	weights.bottleneck_weight = read_vector(input, path,
-		static_cast<std::size_t>(kValueBottleneckWidth) * kValueHiddenWidth,
+		static_cast<std::size_t>(kValueBucketCount) * kValueBottleneckWidth *
+			kValueHiddenWidth,
 		"Value bottleneck weight");
-	weights.bottleneck_bias = read_vector(input, path, kValueBottleneckWidth,
+	weights.bottleneck_bias = read_vector(input, path,
+		kValueBucketCount * kValueBottleneckWidth,
 		"Value bottleneck bias");
-	weights.output_weight = read_vector(input, path, kValueBottleneckWidth,
+	weights.output_weight = read_vector(input, path,
+		kValueBucketCount * kValueBottleneckWidth,
 		"Value output weight");
-	weights.output_bias = read_scalar<float>(input, path);
+	weights.output_bias = read_vector(input, path, kValueBucketCount, "Value output bias");
 	return weights;
 }
 
@@ -223,6 +232,7 @@ void embed_runtime_model_atomic(const std::filesystem::path &input,
 		write_scalar(output, static_cast<std::uint32_t>(kValueAccumulatorWidth));
 		write_scalar(output, static_cast<std::uint32_t>(kValueHiddenWidth));
 		write_scalar(output, static_cast<std::uint32_t>(kValueBottleneckWidth));
+		write_scalar(output, static_cast<std::uint32_t>(kValueBucketCount));
 		write_policy(output, weights.policy);
 		write_value(output, weights.value);
 		const auto payload_end = output.tellp();
@@ -283,11 +293,12 @@ RuntimeWeights load_embedded_runtime_model(const std::filesystem::path &executab
 	const auto value_accumulator = read_scalar<std::uint32_t>(input, path);
 	const auto value_hidden = read_scalar<std::uint32_t>(input, path);
 	const auto value_bottleneck = read_scalar<std::uint32_t>(input, path);
+	const auto value_buckets = read_scalar<std::uint32_t>(input, path);
 	if (endian != kEndianMarker || architecture != kEleginusCheckpointType ||
 		action_size != kActionSize || feature_count != kFeatureVocabulary ||
 		policy_accumulator != kPolicyAccumulatorWidth || policy_hidden != kPolicyHiddenWidth ||
 		value_accumulator != kValueAccumulatorWidth || value_hidden != kValueHiddenWidth ||
-		value_bottleneck != kValueBottleneckWidth) {
+		value_bottleneck != kValueBottleneckWidth || value_buckets != kValueBucketCount) {
 		throw std::runtime_error("embedded Eleginus model does not match this build: " +
 			path.string());
 	}

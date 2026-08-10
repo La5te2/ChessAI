@@ -40,6 +40,7 @@ void write_architecture(torch::serialize::OutputArchive &archive) {
 	archive.write("value_accumulator", scalar(kValueAccumulatorWidth), true);
 	archive.write("value_hidden", scalar(kValueHiddenWidth), true);
 	archive.write("value_bottleneck", scalar(kValueBottleneckWidth), true);
+	archive.write("value_buckets", scalar(kValueBucketCount), true);
 	archive.write("action_size", scalar(kActionSize), true);
 }
 
@@ -52,6 +53,7 @@ void validate_architecture(torch::serialize::InputArchive &archive) {
 	require_scalar(archive, "value_accumulator", kValueAccumulatorWidth);
 	require_scalar(archive, "value_hidden", kValueHiddenWidth);
 	require_scalar(archive, "value_bottleneck", kValueBottleneckWidth);
+	require_scalar(archive, "value_buckets", kValueBucketCount);
 	require_scalar(archive, "action_size", kActionSize);
 }
 

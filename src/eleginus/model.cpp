@@ -26,6 +26,27 @@ void copy_tensor(const torch::Tensor &target, const std::vector<float> &source,
 	target.copy_(tensor.view(target.sizes()).to(target.device()));
 }
 
+torch::Tensor value_bucket_indices(const torch::Tensor &features) {
+	auto piece_count = features.index({torch::indexing::Slice(), 0})
+		.ne(kPaddingFeature)
+		.sum(1) - 2;
+	return torch::floor((piece_count.to(torch::kFloat32) - 1.0F) / 4.0F)
+		.clamp(0, kValueBucketCount - 1)
+		.to(torch::kInt64);
+}
+
+torch::Tensor select_bucket(torch::Tensor values, const torch::Tensor &buckets, int width) {
+	const auto rows = torch::arange(values.size(0), buckets.options()) * kValueBucketCount +
+		buckets;
+	return values.view({values.size(0) * kValueBucketCount, width}).index_select(0, rows);
+}
+
+torch::Tensor select_bucket_scalar(torch::Tensor values, const torch::Tensor &buckets) {
+	const auto rows = torch::arange(values.size(0), buckets.options()) * kValueBucketCount +
+		buckets;
+	return values.reshape({values.size(0) * kValueBucketCount}).index_select(0, rows);
+}
+
 } // namespace
 
 std::pair<torch::Tensor, torch::Tensor>
@@ -40,7 +61,8 @@ encode_feature_batch(const std::vector<EncodedFeatures> &positions, const torch:
 	std::size_t cursor = 0;
 	for (std::size_t position = 0; position < positions.size(); ++position) {
 		for (const auto &perspective : positions[position].perspective) {
-			for (const int feature : perspective) {
+			const auto canonical = canonicalize_features(perspective);
+			for (const int feature : canonical) {
 				feature_data[cursor++] = feature;
 			}
 		}
@@ -62,14 +84,16 @@ SparseEncoderImpl::SparseEncoderImpl(int width_value) : width(width_value) {
 	table->weight.index_put_({kPaddingFeature}, 0.0);
 }
 
-torch::Tensor SparseEncoderImpl::forward(torch::Tensor features, torch::Tensor white_to_move) {
+torch::Tensor SparseEncoderImpl::accumulate(torch::Tensor features) {
 	if (features.dim() != 3 || features.size(1) != kPerspectiveCount ||
 		features.size(2) != kFeatureSlots) {
 		throw std::runtime_error("expected Eleginus sparse features [batch, 2, 34]");
 	}
-	auto accumulator =
-		(table->forward(features.to(torch::kInt64)).sum(2) + bias.view({1, 1, width}))
-			.clamp(0.0, 1.0);
+	return table->forward(features.to(torch::kInt64)).sum(2) + bias.view({1, 1, width});
+}
+
+torch::Tensor SparseEncoderImpl::forward(torch::Tensor features, torch::Tensor white_to_move) {
+	auto accumulator = accumulate(features).clamp(0.0, 1.0);
 	auto white = accumulator.index({torch::indexing::Slice(), 0});
 	auto black = accumulator.index({torch::indexing::Slice(), 1});
 	auto mask = white_to_move.to(torch::kBool).unsqueeze(1);
@@ -95,25 +119,48 @@ torch::Tensor PolicyNetworkImpl::forward(torch::Tensor features, torch::Tensor w
 }
 
 ValueNetworkImpl::ValueNetworkImpl() {
-	encoder = register_module("encoder", SparseEncoder(kValueAccumulatorWidth));
+	encoder = register_module("encoder", SparseEncoder(kValueFeatureWidth));
 	hidden = register_module("hidden", torch::nn::Linear(kValueAccumulatorWidth * 2,
-											  kValueHiddenWidth));
+		kValueBucketCount * kValueHiddenWidth));
 	bottleneck = register_module(
-		"bottleneck", torch::nn::Linear(kValueHiddenWidth, kValueBottleneckWidth));
-	output = register_module("output", torch::nn::Linear(kValueBottleneckWidth, 1));
+		"bottleneck", torch::nn::Linear(kValueHiddenWidth,
+			kValueBucketCount * kValueBottleneckWidth));
+	output = register_module(
+		"output", torch::nn::Linear(kValueBottleneckWidth, kValueBucketCount));
 	torch::nn::init::zeros_(output->weight);
 	torch::nn::init::zeros_(output->bias);
-}
-
-torch::Tensor ValueNetworkImpl::hidden_state(torch::Tensor features,
-										 torch::Tensor white_to_move) {
-	return torch::relu(hidden->forward(encoder->forward(features, white_to_move)));
+	torch::NoGradGuard no_grad;
+	encoder->table->weight.index_put_(
+		{torch::indexing::Slice(),
+		 torch::indexing::Slice(kValueAccumulatorWidth, kValueFeatureWidth)}, 0.0F);
+	encoder->bias.index_put_(
+		{torch::indexing::Slice(kValueAccumulatorWidth, kValueFeatureWidth)}, 0.0F);
 }
 
 torch::Tensor ValueNetworkImpl::forward(torch::Tensor features, torch::Tensor white_to_move) {
-	auto value = hidden_state(features, white_to_move);
-	value = torch::relu(bottleneck->forward(value));
-	return torch::sigmoid(output->forward(value));
+	const auto buckets = value_bucket_indices(features);
+	auto accumulator = encoder->accumulate(features);
+	auto white = accumulator.index({torch::indexing::Slice(), 0});
+	auto black = accumulator.index({torch::indexing::Slice(), 1});
+	auto mask = white_to_move.to(torch::kBool).unsqueeze(1);
+	auto first = torch::where(mask, white, black);
+	auto second = torch::where(mask, black, white);
+	auto dense = torch::cat({
+		first.index({torch::indexing::Slice(),
+			torch::indexing::Slice(0, kValueAccumulatorWidth)}).clamp(0.0, 1.0).square(),
+		second.index({torch::indexing::Slice(),
+			torch::indexing::Slice(0, kValueAccumulatorWidth)}).clamp(0.0, 1.0).square()}, 1);
+	auto hidden_value = torch::relu(select_bucket(
+		hidden->forward(dense), buckets, kValueHiddenWidth));
+	auto value = torch::relu(select_bucket(
+		bottleneck->forward(hidden_value), buckets, kValueBottleneckWidth));
+	auto network = select_bucket_scalar(output->forward(value), buckets);
+	auto psqt = 0.5F * select_bucket_scalar(
+		first.index({torch::indexing::Slice(),
+			torch::indexing::Slice(kValueAccumulatorWidth, kValueFeatureWidth)}) -
+		second.index({torch::indexing::Slice(),
+			torch::indexing::Slice(kValueAccumulatorWidth, kValueFeatureWidth)}), buckets);
+	return network + psqt;
 }
 
 ModelImpl::ModelImpl() {
@@ -139,7 +186,6 @@ CpuValue snapshot_value(const ValueNetwork &model) {
 	if (!model) {
 		throw std::invalid_argument("cannot snapshot an empty Eleginus Value");
 	}
-	const auto output_bias = tensor_vector(model->output->bias);
 	return CpuValue(ValueWeights{
 		tensor_vector(model->encoder->table->weight),
 		tensor_vector(model->encoder->bias),
@@ -148,7 +194,7 @@ CpuValue snapshot_value(const ValueNetwork &model) {
 		tensor_vector(model->bottleneck->weight),
 		tensor_vector(model->bottleneck->bias),
 		tensor_vector(model->output->weight),
-		output_bias.front(),
+		tensor_vector(model->output->bias),
 	});
 }
 
@@ -179,8 +225,7 @@ void restore_value(const ValueNetwork &model, const ValueWeights &weights) {
 	copy_tensor(model->bottleneck->bias, weights.bottleneck_bias,
 		"Value bottleneck bias");
 	copy_tensor(model->output->weight, weights.output_weight, "Value output weight");
-	copy_tensor(model->output->bias, std::vector<float>{weights.output_bias},
-		"Value output bias");
+	copy_tensor(model->output->bias, weights.output_bias, "Value output bias");
 }
 
 std::int64_t parameter_count(const torch::nn::Module &model) {

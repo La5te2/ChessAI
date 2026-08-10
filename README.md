@@ -385,33 +385,32 @@ checkpoints, its top level contains `model` and `arch`; the latter identifies El
 python scripts/check.py --model models/eleginus/eleginus.pth
 ```
 
-Search and UCI are built first as weightless, Torch-free executable templates. Embed the checkpoint
-into a copy of the standalone search template and analyze one position:
+Search and UCI are built first as weightless, Torch-free executable templates. Select the standalone search template while embedding the checkpoint, then analyze one position:
 
 ```bash
 build/eleginus/embed \
 	--model models/eleginus/eleginus.pth \
-	--input build/eleginus/search \
+	--type search \
 	--output models/eleginus/eleginus
 
 models/eleginus/eleginus \
 	--fen startpos \
-	--expansions 32
+	--depth 4
 ```
 
 `--fen` accepts `startpos` or one quoted six-field FEN. The embedded search program uses statically
-linked float32 Policy and Value evaluators. Policy orders the BFM frontier, while Value supplies leaf
-evaluations and minimax backup. The resulting executable contains its model parameters and all inference code required for search.
+linked float32 Policy and Value evaluators. Policy orders legal actions, while Value supplies the
+static scores used by iterative deepening, PVS and quiescence search. The resulting executable contains its model parameters and all inference code required for search.
 
 Create and launch the Eleginus UCI engine on Windows with:
 
 ```powershell
 build\eleginus\embed.exe `
 	--model models\eleginus\eleginus.pth `
-	--input build\eleginus\uci.exe `
+	--type uci `
 	--output models\eleginus\eleginus.exe
 
-models\eleginus\eleginus.exe --expansions 32
+models\eleginus\eleginus.exe --depth 4
 ```
 
 The corresponding Linux command is:
@@ -419,15 +418,50 @@ The corresponding Linux command is:
 ```bash
 build/eleginus/embed \
 	--model models/eleginus/eleginus.pth \
-	--input build/eleginus/uci \
+	--type uci \
 	--output models/eleginus/eleginus
 
-models/eleginus/eleginus --expansions 32
+models/eleginus/eleginus --depth 4
 ```
 
 The final Eleginus UCI and standalone search executables are self-contained. The `train` and `embed` tools use LibTorch during model production.
 
 ## UCI
+
+Each architecture implements UCI time management within its own engine code. The three engines accept `go wtime`, `btime`, `winc`, `binc` and `movestogo`, and their allocation equations follow the optimum-time calculation in Stockfish's [Time Management](https://github.com/official-stockfish/Stockfish/blob/master/src/timeman.cpp). Let $t$ be the active side's remaining time in milliseconds, $i$ its increment, $o$ the `Move Overhead`, $p$ the number of plies played and $m$ the move horizon. An explicit `movestogo` sets $m$ up to a maximum of 50; otherwise $m=50$. When $t<1000$, the engines replace $m$ by $max(1,\lfloor0.05t\rfloor)$. They then compute
+
+$$
+T=\max\left(1,t+i(m-1)-o(2+m)\right).
+$$
+
+Without an explicit `movestogo`, the first clock-managed search after `ucinewgame` initializes
+
+$$
+r=0.3272\log_{10}T-0.4141,
+\qquad
+c=\min\left(0.0029869+0.00033554\log_{10}\frac{t}{1000},0.004905\right),
+$$
+
+and later moves in the game reuse $r$. The optimum-time scale is
+
+$$
+q=\min\left(0.012112+(p+3.22713)^{0.46866}c,\frac{0.19404t}{T}\right)r.
+$$
+
+With an explicit `movestogo`, the scale is
+
+$$
+q=\min\left(\frac{0.88+p/116.4}{m},\frac{0.88t}{T}\right).
+$$
+
+The resulting search budget is
+
+$$
+t_{\mathrm{search}}=
+\min\left(\max(1,\lfloor qT\rfloor),\max(1,t-o)\right).
+$$
+
+`go movetime <milliseconds>` sets the internal budget to the requested duration minus `Move Overhead`, with a lower bound of one millisecond. `go infinite` disables the clock deadline. `Move Overhead` defaults to 10 milliseconds and reserves time for protocol communication and move submission.
 
 ### Gadus and Melano
 
@@ -451,13 +485,7 @@ $$
 
 These depth fields summarize search effort rather than maximum tree depth. NPS is $1000n/t$, where $t$ is elapsed time in milliseconds with a denominator of at least one millisecond. The engines emit the initial root result, periodic MCTS updates and one final result before `bestmove`. `ProgressIntervalMS=0` suppresses periodic updates.
 
-`go movetime <ms>` supplies the wall-clock budget directly. When `go` instead supplies the active side's remaining time $t_{\mathrm{remain}}$ and increment $t_{\mathrm{inc}}$, the engine computes
-
-$$
-t_0=\frac{t_{\mathrm{remain}}}{30}+0.75t_{\mathrm{inc}}-t_{\mathrm{overhead}}.
-$$
-
-It clamps $t_0$ to 50 through 10000 milliseconds and then limits the allocation to $\max(1,t_{\mathrm{remain}}-t_{\mathrm{overhead}})$. A wall-clock deadline is active only when `go` supplies `movetime` or the active side's clock. `go nodes <n>` overrides the current MCTS simulation cap, and `stop` requests early termination.
+The MCTS deadline uses the time allocation defined above. `go nodes <n>` overrides the current simulation cap, and `stop` requests early termination.
 
 Gadus and Melano expose these shared options:
 
@@ -467,7 +495,7 @@ Gadus and Melano expose these shared options:
 - `MCTSSims` sets the simulation cap and defaults to `100`.
 - `MCTSMinSims` sets the nominal simulation floor and defaults to `0`, which activates the dynamic floor described in each architecture's search specification.
 - `MCTSBatchSize` sets the neural leaf-batch capacity and defaults to `32`.
-- `MoveOverheadMS` reserves time for communication and move submission and defaults to `50`.
+- `Move Overhead` reserves time for communication and move submission and defaults to `10`.
 - `CPuct`, `CPuctBase` and `CPuctFactor` configure the visit-dependent exploration coefficient and default to `0.5`, `19652` and `1.0`.
 - `FPUReduction` sets the First Play Urgency reduction and defaults to `0.15`.
 - `VirtualLoss` sets the repeated-path penalty used during batched selection and defaults to `0.0`.
@@ -496,20 +524,20 @@ All commands above apply to Gadus and Melano.
 
 ### Eleginus
 
-An embedded Eleginus UCI executable reads its independent Policy and Value parameters from its own
-file at startup. It exposes `BFMExpansions`, with default value `32` and range 1 through 1,000,000.
-Each `go` command performs one synchronous Policy-guided best-first minimax search. `BFMExpansions` alone determines the expansion budget, while UCI time, depth and node fields retain their protocol-level reporting roles.
+An embedded Eleginus UCI executable loads its independent Policy and Value parameters when `isready` or `go` first requires them. `Depth` sets the default iterative-deepening limit, `Hash` sets the transposition-table capacity, `Threads` sets the number of root PVS workers and `MultiPV` sets the number of reported principal variations. Their defaults are 4 plies, 64 MiB, one worker and five variations. `Move Overhead` uses the common UCI time-allocation rule above.
 
-For root value $\overline v(x)$, Eleginus reports
+Each `go` command starts iterative deepening on a worker thread, allowing the UCI loop to process `stop`, a replacement position or `quit` while PVS is running. `go depth <n>` overrides `Depth` for one search, `go nodes <n>` sets a cumulative node limit and the standard clock fields activate the deadline described above. Policy orders legal actions, and PVS uses the Value network to establish static centipawn scores at quiescent leaves. Exact terminal scores use the range near $\pm30000$, while ongoing static scores use $150v_{\theta_V}(s)$. The reported `score cp` is expressed from the root side-to-move perspective.
 
-$$
-\text{score cp}=\mathrm{round}\left(2000\left(\overline v(x)-\frac12\right)\right).
-$$
+With `MultiPV=1`, the first root action establishes the principal-variation bound and the remaining actions use null-window probes followed by full-window re-search when they exceed that bound. With `MultiPV=k>1`, every root action receives a full-window score so the engine can identify and report the best $k$ variations. Root actions are distributed among at most `Threads` workers, and the configured `Hash` capacity is divided among their transposition tables.
 
-The score uses the root side-to-move perspective. `depth` reports the number of expanded parents, `nodes` reports the number of generated and evaluated children and the one-move principal variation contains the selected root move. `bestmove` reports the same move.
+The engine emits one numbered `info` row for each requested variation after every completed depth. `depth` reports the completed principal depth, `seldepth` reports the greatest ply reached by PVS or quiescence search and `nodes` includes visits made by all root workers during every completed iteration. Cancellation discards an incomplete iteration and returns the selected action from the latest completed depth.
 
 ```text
-setoption name BFMExpansions value 128
+setoption name Depth value 6
+setoption name Hash value 256
+setoption name Threads value 2
+setoption name MultiPV value 3
+setoption name Move Overhead value 10
 ```
 
 ## Opening Books
@@ -612,19 +640,21 @@ Running `build/gadus/fcpi` directly executes FCPI and its per-iteration promotio
 
 ### Engine Packaging
 
-`scripts/package_engine.bat` and `scripts/package_engine.sh` package a Gadus or Melano checkpoint with the corresponding UCI executable and runtime libraries. The first argument selects the architecture, and the second supplies the source checkpoint.
+`scripts/package_engine.bat` and `scripts/package_engine.sh` package a checkpoint for its architecture. The first argument selects the architecture, and the second supplies the source checkpoint. For Eleginus, an optional third argument selects the embedded `uci` or `search` executable and defaults to `uci`.
 
 ```powershell
 scripts\package_engine.bat gadus models\gadus\gadus.pth
 scripts\package_engine.bat melano models\melano\melano.pth
+scripts\package_engine.bat eleginus models\eleginus\eleginus.pth uci
 ```
 
 ```bash
 bash scripts/package_engine.sh gadus models/gadus/candidate.pth
 bash scripts/package_engine.sh melano models/melano/candidate.pth
+bash scripts/package_engine.sh eleginus models/eleginus/eleginus.pth uci
 ```
 
-On Windows, each package is written to `models/<architecture>/` as `<architecture>.exe`, `<architecture>.pth` and the required DLLs. On Linux, the same directory contains an `<architecture>` launcher, an `<architecture>.bin` executable, `<architecture>.pth` and a private `lib/` directory. Repackaging an architecture updates these files in place.
+Gadus and Melano packages contain the UCI executable, checkpoint and required runtime libraries under `models/<architecture>/`. An Eleginus package is a single self-contained executable named `eleginus` for UCI or `eleginus_search` for standalone analysis, with the platform executable suffix where applicable.
 
 ### Checkpoint Inspection
 

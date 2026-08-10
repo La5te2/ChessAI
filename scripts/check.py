@@ -34,6 +34,7 @@ ARCHITECTURES = {
             "value_accumulator",
             "value_hidden",
             "value_bottleneck",
+            "value_buckets",
             "action_size",
         ),
         "model_children": ("policy", "value"),

@@ -2,8 +2,6 @@
 
 #include "eleginus/game.hpp"
 
-#include <limits>
-
 namespace eleginus {
 
 std::vector<chess::Move> legal_moves(const chess::Board &board) {
@@ -62,17 +60,6 @@ std::string move_uci(const chess::Move &move) { return chess::uci::moveToUci(mov
 
 bool game_is_over(const chess::Board &board) {
 	return board.isGameOver().first != chess::GameResultReason::NONE;
-}
-
-float terminal_score_side_to_move(const chess::Board &board) {
-	const auto outcome = board.isGameOver();
-	if (outcome.first == chess::GameResultReason::NONE) {
-		return std::numeric_limits<float>::quiet_NaN();
-	}
-	if (outcome.second == chess::GameResult::DRAW) {
-		return 0.5F;
-	}
-	return outcome.second == chess::GameResult::WIN ? 1.0F : 0.0F;
 }
 
 } // namespace eleginus

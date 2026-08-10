@@ -527,7 +527,7 @@ N_{\mathrm{target}}=
 N_{\min}+\left\lceil u(N_{\mathrm{cap}}-N_{\min})\right\rceil.
 $$
 
-The MCTS procedure recalculates $N_{\mathrm{target}}$ after each selection-and-evaluation cycle once the root has reached $N_{\min}$. Simulations for that root end when its completed count reaches the current target or the cap. A root with one legal action uses $u=0$ and therefore stops at $N_{\min}$. A zero cap sets both $N_{\min}$ and $N_{\mathrm{target}}$ to zero. If the caller signals cancellation or the execution deadline expires, the procedure finishes the leaves already selected and returns the statistics produced by completed backups.
+The MCTS procedure recalculates $N_{\mathrm{target}}$ after each selection-and-evaluation cycle once the root has reached $N_{\min}$. A new cycle starts for a root only while its completed count is smaller than both the current target and the cap. The target and cap are checked between cycles, so backups completed within the final cycle may carry the final count beyond either threshold. A root with one legal action uses $u=0$ and admits no new cycle after reaching $N_{\min}$. A zero cap sets both $N_{\min}$ and $N_{\mathrm{target}}$ to zero. A cancellation signal or an expired execution deadline stops further leaf selection and the submission of neural-evaluation requests. Completed backups remain in the tree, while virtual visits attached to unevaluated requests are released as described in Section 5.7.
 
 ### 5.6 Evaluation Reuse
 
@@ -548,21 +548,74 @@ When the approximate memory use exceeds the configured capacity, TLRU removes en
 
 ### 5.7 Batched Evaluation
 
-During one selection-and-evaluation cycle, MCTS processes each search tree whose root count $N(x_0)$ is smaller than both $N_{\mathrm{target}}$ and $N_{\mathrm{cap}}$. For each such tree, the requested number of distinct nonterminal leaves is
+One MCTS invocation may receive several root states. The evaluator first resolves every initial request whose `PackedState` has a cached record, then groups the remaining requests by `PackedState`. When uncached requests remain, their unique states form one neural batch. Each cached or computed record initializes every root tree with the corresponding `PackedState`.
+
+The batching scheduler retains a latency estimate $\tau$, measured in milliseconds, from one invocation to the next. The estimate begins at zero. Let $\Delta t$ be the measured duration of a neural call that evaluates exactly one uncached state. Such a call supplies the sample
+
+$$
+\tau'=\max(0.05,\Delta t).
+$$
+
+The first sample sets $\tau=\tau'$, and each later sample updates the estimate by
+
+$$
+\tau\leftarrow\max\left(\tau',0.8\tau+0.2\tau'\right).
+$$
+
+For a capacity upper bound $B$ and $R$ milliseconds of remaining time, the deadline-limited capacity is
+
+$$
+D(R,B)=
+\min\left(
+B,
+\max\left(
+0,
+\left\lfloor
+\frac{R-2}{1.25\max(1,\tau)}
+\right\rfloor
+\right)
+\right).
+$$
+
+The subtraction of 2 milliseconds and the factor 1.25 provide fixed and proportional timing margins. At the beginning of each selection-and-evaluation cycle, the available capacity is
+
+$$
+B_{\mathrm{cycle}}=
+\begin{cases}
+B_{\mathrm{batch}},&\text{if the invocation has no deadline},\\
+D(R_{\mathrm{cycle}},B_{\mathrm{batch}}),&\text{if a deadline is active},
+\end{cases}
+$$
+
+where $R_{\mathrm{cycle}}$ is the remaining time at the start of the cycle. If $B_{\mathrm{cycle}}=0$, the invocation ends before the cycle selects any leaves.
+
+For $B_{\mathrm{cycle}}>0$, the cycle processes each search tree whose root count $N(x_0)$ is smaller than both $N_{\mathrm{target}}$ and $N_{\mathrm{cap}}$. The maximum number of distinct nonterminal leaves requested from one such tree is
 
 $$
 m=\min\left(
-B_{\mathrm{batch}},
+B_{\mathrm{cycle}},
 N_{\mathrm{target}}-N(x_0),
 N_{\mathrm{cap}}-N(x_0)
 \right).
 $$
 
-The three terms limit the request by the neural batch capacity, the remaining count to the current target and the remaining count to the simulation cap, respectively.
+The three terms limit the request by the available cycle capacity, the remaining count to the current target and the remaining count to the simulation cap, respectively.
 
-Each selection attempt starts at the root and uses PUCT to descend through expanded nodes until it reaches either a terminal node or an unexpanded nonterminal node. A terminal node is evaluated and backed up immediately according to Section 5.4, which completes one simulation without adding a neural-evaluation request. An unexpanded nonterminal node enters the request list when the same tree has not already selected that node during the current cycle, and its virtual visits remain on the selected path until evaluation finishes. A repeated selection of an already reserved node releases the temporary virtual visits and contributes no request. The tree makes at most $\max(5m,m+8)$ selection attempts while collecting up to $m$ distinct nonterminal leaves.
+To build this request set, each selection attempt starts at the root and follows PUCT through expanded nodes until it reaches a terminal node or an unexpanded nonterminal node. A terminal node receives its exact rule outcome, and immediate backup completes one simulation without adding a neural-evaluation request. An unexpanded nonterminal node enters the request set when that tree has not reserved the node earlier in the same cycle, and its selected path retains one virtual visit until the request is resolved. If another attempt from the same tree reaches an already reserved node, the selector removes the virtual visits introduced by that attempt and adds no request. The tree performs at most $\max(5m,m+8)$ attempts while collecting up to $m$ distinct nonterminal leaves.
 
-The requests collected from all search trees are concatenated and partitioned into neural batches no larger than the neural batch capacity. Within each batch, the evaluation-reuse mechanism described in Section 5.6 first resolves requests that already have cached records. The evaluator then groups the unresolved requests by `PackedState`. Every request in one group has the same network input, so one neural evaluation supplies the result for the entire group.
+The requests collected from all trees form one list. Before each evaluation submission, the scheduler computes
+
+$$
+B_{\mathrm{call}}=
+\begin{cases}
+B_{\mathrm{cycle}},&\text{if the invocation has no deadline},\\
+D(R_{\mathrm{call}},B_{\mathrm{cycle}}),&\text{if a deadline is active},
+\end{cases}
+$$
+
+where $R_{\mathrm{call}}$ is the remaining time before that submission. The next submission contains at most $B_{\mathrm{call}}$ requests. If this capacity is zero or cancellation has been requested, the scheduler releases the virtual visits attached to all remaining requests and ends batch submission.
+
+For each submitted group, the evaluation-reuse mechanism from Section 5.6 resolves cache hits before the evaluator groups the unresolved requests by `PackedState`. When unresolved requests remain, their unique states form one neural batch, and one computed record serves every request in the corresponding group.
 
 For a representative leaf state $x$, let $L=|\mathcal A(x)|$, and write its ordered legal actions as $a_1,\ldots,a_L$. The compact evaluation record contains the three sequences
 
@@ -574,7 +627,9 @@ $$
 
 together with the scalar $V_\theta(\phi_G(x))$. Entries with the same index $j$ describe the same legal action, which defines the alignment among the action, action-index and Policy sequences.
 
-After neural evaluation, the evaluator stores the completed record through the evaluation-reuse mechanism and assigns it to every request in the matching `PackedState` group. For each requested leaf, tree expansion creates one outgoing edge for every $a_j$ and assigns $P_\theta(a_j\mid\phi_G(x))$ as that edge's prior. The scalar $V_\theta(\phi_G(x))$ is then backed up along the leaf's reserved path. The trees therefore share network evaluation records while retaining separate nodes, paths and search statistics.
+After the neural batch returns, each newly computed record enters the active cache. The evaluator then assigns a cached or computed record to every request with the matching `PackedState`. For each requested leaf, tree expansion creates one outgoing edge for every $a_j$ and assigns $P_\theta(a_j\mid\phi_G(x))$ as that edge's prior. The scalar $V_\theta(\phi_G(x))$ is then backed up along the leaf's reserved path, so different trees can share a network record while retaining separate nodes, paths and search statistics.
+
+After the submitted leaves complete their backups, every root that has reached $N_{\min}$ receives a recalculated dynamic target. Another cycle begins only when at least one tree remains below both its target and $N_{\mathrm{cap}}$ and the preceding cycle completed at least one backup.
 
 ### 5.8 Root Evaluation and Policy
 

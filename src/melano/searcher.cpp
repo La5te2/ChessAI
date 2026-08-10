@@ -604,6 +604,35 @@ struct Searcher::Impl {
 		return std::max(minimum, std::min(cap, desired));
 	}
 
+	// Track the cost of one uncached neural evaluation for deadline-aware batching.
+	void observe_evaluation(const std::vector<CompactEvaluation> &rows,
+							Clock::time_point started) {
+		const auto fresh = std::count_if(rows.begin(), rows.end(),
+			[](const CompactEvaluation &row) { return !row.reused; });
+		if (fresh != 1) {
+			return;
+		}
+		const double sample = std::max(0.05,
+			std::chrono::duration<double, std::milli>(Clock::now() - started).count());
+		single_evaluation_ms = single_evaluation_ms <= 0.0
+			? sample
+			: std::max(sample, 0.8 * single_evaluation_ms + 0.2 * sample);
+	}
+
+	// Reserve enough time to finish an in-flight neural call and shrink the final batches.
+	int deadline_batch_size(const std::optional<Clock::time_point> &deadline,
+							int configured) const {
+		configured = std::max(1, configured);
+		if (!deadline.has_value()) {
+			return configured;
+		}
+		const double remaining =
+			std::chrono::duration<double, std::milli>(*deadline - Clock::now()).count();
+		const double row_budget = std::max(1.0, 1.25 * std::max(1.0, single_evaluation_ms));
+		const int rows = static_cast<int>(std::floor((remaining - 2.0) / row_budget));
+		return std::clamp(rows, 0, configured);
+	}
+
 	// Convert root visits to legal move probabilities; priors keep zero-visit moves representable.
 	std::vector<float> root_policy(const TreeState &state) const {
 		std::vector<float> policy(kActionSize, 0.0F);
@@ -777,7 +806,9 @@ struct Searcher::Impl {
 					encode_state(board), kTrajectoryNeighborhoodRadius);
 			}
 		}
+		const auto root_evaluation_started = Clock::now();
 		auto roots = evaluate_compact(boards, evaluation_cache);
+		observe_evaluation(roots, root_evaluation_started);
 		const int minimum = minimum_simulations();
 		for (std::size_t index = 0; index < states.size(); ++index) {
 			states[index].network_value = roots[index].value;
@@ -797,8 +828,12 @@ struct Searcher::Impl {
 		}
 
 		if (options.type == SearchType::OnlyMcts && options.mcts_sims > 0) {
-			const int batch_size = std::max(1, options.mcts_batch_size);
+			const int configured_batch_size = std::max(1, options.mcts_batch_size);
 			while (!deadline_reached(deadline) && !(cancel && cancel())) {
+				const int batch_size = deadline_batch_size(deadline, configured_batch_size);
+				if (batch_size == 0) {
+					break;
+				}
 				bool active = false;
 				bool progressed = false;
 				std::vector<SelectedLeaf> selected;
@@ -839,14 +874,25 @@ struct Searcher::Impl {
 					}
 				}
 
-				for (std::size_t begin = 0; begin < selected.size(); begin += batch_size) {
-					const auto end = std::min(selected.size(), begin + batch_size);
+				std::size_t begin = 0;
+				while (begin < selected.size()) {
+					const int allowed = deadline_batch_size(deadline, batch_size);
+					if (allowed == 0 || (cancel && cancel())) {
+						for (std::size_t index = begin; index < selected.size(); ++index) {
+							clear_virtual(selected[index].path);
+						}
+						break;
+					}
+					const auto end = std::min(
+						selected.size(), begin + static_cast<std::size_t>(allowed));
 					std::vector<chess::Board> leaf_boards;
 					leaf_boards.reserve(end - begin);
 					for (std::size_t index = begin; index < end; ++index) {
 						leaf_boards.push_back(std::move(selected[index].board));
 					}
+					const auto evaluation_started = Clock::now();
 					auto evaluation = evaluate_compact(leaf_boards, evaluation_cache);
+					observe_evaluation(evaluation, evaluation_started);
 					std::unordered_set<std::size_t> evaluated_states;
 					evaluated_states.reserve(end - begin);
 					for (std::size_t index = begin; index < end; ++index) {
@@ -876,6 +922,7 @@ struct Searcher::Impl {
 					for (const auto state_index : evaluated_states) {
 						states[state_index].nn_batches += 1;
 					}
+					begin = end;
 				}
 
 				for (auto &state : states) {
@@ -907,6 +954,7 @@ struct Searcher::Impl {
 	SearchOptions options;
 	TrajectoryLruCache persistent_evaluation_cache{0};
 	int active_cpu_threads = 0;
+	double single_evaluation_ms = 0.0;
 };
 
 // Construct the public value-type wrapper around the shared implementation.

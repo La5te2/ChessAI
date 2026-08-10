@@ -17,6 +17,7 @@ encode_feature_batch(const std::vector<EncodedFeatures> &positions, const torch:
 
 struct SparseEncoderImpl : torch::nn::Module {
 	explicit SparseEncoderImpl(int width);
+	torch::Tensor accumulate(torch::Tensor features);
 	torch::Tensor forward(torch::Tensor features, torch::Tensor white_to_move);
 
 	int width;
@@ -38,7 +39,6 @@ TORCH_MODULE(PolicyNetwork);
 
 struct ValueNetworkImpl : torch::nn::Module {
 	ValueNetworkImpl();
-	torch::Tensor hidden_state(torch::Tensor features, torch::Tensor white_to_move);
 	torch::Tensor forward(torch::Tensor features, torch::Tensor white_to_move);
 
 	SparseEncoder encoder{nullptr};

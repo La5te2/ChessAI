@@ -27,7 +27,5 @@ std::string move_uci(const chess::Move &move);
 
 /// Applies every terminal rule implemented by chess-library.
 bool game_is_over(const chess::Board &board);
-/// Returns the terminal score in {0, 0.5, 1} from the current side-to-move perspective.
-float terminal_score_side_to_move(const chess::Board &board);
 
 } // namespace eleginus

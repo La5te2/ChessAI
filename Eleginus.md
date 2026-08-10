@@ -1,41 +1,41 @@
 # Eleginus
 
-Eleginus is a sparse chess architecture in which independent Policy and Value networks use king-conditioned features and incrementally maintained accumulators.
+> **Development status:** Eleginus is under active architectural, training and search experimentation. This document records the current implementation at a practical level and may change with debugging results. It is not yet a stable technical specification.
+
+Eleginus combines an independently trained sparse Policy network with an NNUE-style Value network, using Policy to order a Value-driven principal-variation search.
 
 ## 1. Notation
 
 - $\mathcal X$ is the set of complete chess states maintained by the rules engine.
-- $x\in\mathcal X$ is a complete chess state containing piece placement, side to move, castling rights, en passant state, move counters and repetition history.
-- $\mathcal A(x)$ is the set of legal actions in complete state $x$.
-- $T(x,a)$ is the complete state reached by applying legal action $a\in\mathcal A(x)$ to complete state $x$.
-- $c_x$ is the side to move in complete state $x$, and $\bar c_x$ is the opposing color.
-- $g(x,c)\in\lbrace0,\frac12,1\rbrace$ is the exact score of color $c$ in terminal state $x$, with $1$, $\frac12$ and $0$ representing a win, draw and loss.
+- $x\in\mathcal X$ is a complete state containing piece placement, side to move, castling rights, en passant state, move counters and repetition history.
+- $\mathcal A(x)$ is the set of legal actions in state $x$.
+- $T(x,a)$ is the state reached by applying legal action $a\in\mathcal A(x)$ to state $x$.
+- $c_x$ is the side to move in state $x$, and $\bar c_x$ is the opposing color.
 - $\mathbf 1[A]$ equals $1$ when statement $A$ is true and $0$ otherwise.
-- $\phi_E$ is the Eleginus state encoder that maps a complete chess state to a sparse network input.
-- $s=\phi_E(x)$ is the Eleginus network input obtained from complete state $x$.
+- $\phi_E$ is the Eleginus state encoder, and $s=\phi_E(x)$ is the encoded state supplied to both neural networks.
 - $\mathcal I_E=\lbrace0,\ldots,4671\rbrace$ is the fixed set of Eleginus action indices.
-- $i_E(x,a)\in\mathcal I_E$ is the action index assigned to legal action $a$ after orienting complete state $x$ for its side to move.
-- $\text{P}$, which stands for Policy, is the network output that assigns a probability distribution over the legal actions available in a complete state.
-- $\text{V}$, which stands for Value, is a scalar network output in $[0,1]$ that estimates the expected game score from the perspective of the side to move.
-- $\theta_P$ is the parameter set of the Eleginus Policy network.
-- $\theta_V$ is the parameter set of the Eleginus Value network.
-- $\ell_{\theta_P}(s,i)$ is the Policy logit assigned to action index $i\in\mathcal I_E$ for network input $s$.
-- $P_{\theta_P}(a\mid s)$ is the Policy probability assigned to legal action $a$ for network input $s$.
-- $V_{\theta_V}(s)\in[0,1]$ is the Value prediction for network input $s$.
+- $i_E(x,a)\in\mathcal I_E$ is the index assigned to legal action $a$ in state $x$.
+- $\text{P}$, which stands for Policy, is a probability distribution over the legal actions of a state.
+- $\text{V}$, which stands for Value, is the expected game score in $[0,1]$ from the perspective of the side to move.
+- $\theta_P$ and $\theta_V$ are the disjoint parameter sets of the Policy and Value networks.
+- $\ell_{\theta_P}(s,i)$ is the Policy logit assigned to action index $i$ for encoded state $s$.
+- $P_{\theta_P}(a\mid s)$ is the Policy probability assigned to legal action $a$.
+- $v_{\theta_V}(s)\in\mathbb R$ is the raw Value score used by tree search.
+- $V_{\theta_V}(s)=\sigma(v_{\theta_V}(s))$ is the expected score used by supervised Value training, where $\sigma$ is the sigmoid function.
 
 ## 2. State and Action Encoding
 
-The Eleginus state encoder and action codec both express board coordinates from the perspective of the side to move. The state encoder maps a complete state to the sparse network input $s=\phi_E(x)$, and the action codec maps each legal action to the fixed action-index set $\mathcal I_E$.
+The state encoder describes a position with sparse features from both color perspectives. The action codec uses a fixed side-relative index space, allowing the same Policy output layer to represent legal actions in every state.
 
 ### 2.1 State Encoding
 
-Eleginus first assigns an absolute index to every board square. Let $r,f\in\lbrace0,\ldots,7\rbrace$ be the rank and file coordinates, with $(r,f)=(0,0)$ representing `a1` and $(7,7)$ representing `h8`. The absolute square index is
+Let $r,f\in\lbrace0,\ldots,7\rbrace$ denote rank and file coordinates, with $(0,0)$ representing `a1` and $(7,7)$ representing `h8`. Their absolute square index is
 
 $$
 q(r,f)=8r+f.
 $$
 
-The feature representation describes the board separately from the perspective of each color $c\in\lbrace\mathrm W,\mathrm B\rbrace$. Its orientation map is
+For color perspective $c\in\lbrace\mathrm W,\mathrm B\rbrace$, the vertical orientation map is
 
 $$
 \omega_c(q(r,f))=
@@ -45,51 +45,43 @@ q(7-r,f),&c=\mathrm B.
 \end{cases}
 $$
 
-White-oriented features retain the absolute square indices, whereas Black-oriented features reflect the board across its horizontal centre and preserve the file coordinates. In either orientation, the perspective color is treated as the friendly side.
+This transformation places the home rank of the perspective color at the bottom of the oriented board. Let $\kappa_c(x)\in\lbrace0,\ldots,63\rbrace$ be the oriented square occupied by its king.
 
-The six piece types use the order pawn, knight, bishop, rook, queen and king. Let $\tau(p)\in\lbrace0,\ldots,5\rbrace$ be the type index of piece $p$. Relative to perspective $c$, the piece-category index is
+The six piece types use the order pawn, knight, bishop, rook, queen and king. Let $\tau(p)\in\lbrace0,\ldots,5\rbrace$ be the type index of piece $p$. Relative to perspective $c$, its category is
 
 $$
 \rho_c(p)=
 \tau(p)+6\mathbf 1[\mathrm{color}(p)\ne c].
 $$
 
-The range $\rho_c(p)\in\lbrace0,\ldots,11\rbrace$ therefore contains six friendly categories followed by six opposing categories. Let $\kappa_c(x)$ be the oriented square occupied by the king of color $c$. A piece $p$ on absolute square $q$ activates the king-conditioned feature identifier
+The first six categories contain friendly pieces, and the remaining six contain opposing pieces. A piece $p$ on absolute square $q$ activates the identifier
 
 $$
 \iota_c(x,p,q)=
 768\kappa_c(x)+64\rho_c(p)+\omega_c(q).
 $$
 
-The three terms distinguish 64 possible king squares, 12 perspective-relative piece categories and 64 possible piece squares. Consequently, $\iota_c(x,p,q)$ belongs to $\lbrace0,\ldots,49151\rbrace$. Changing the king square changes every piece identifier in that color perspective, which allows the sparse features to condition the entire piece configuration on king location.
+The three terms distinguish 64 oriented king squares, 12 perspective-relative piece categories and 64 oriented piece squares. Piece identifiers consequently occupy the range $0$ through $49151$.
 
-Piece identifiers describe board occupancy but do not encode castling rights or en passant availability. Eleginus therefore adds one castling identifier and one en passant identifier to each color perspective.
-
-For perspective $c$, the castling mask is
+Castling rights and en passant availability use additional sparse identifiers. For perspective $c$, let $K_c$ and $Q_c$ denote its kingside and queenside castling indicators, and let $K_{\bar c}$ and $Q_{\bar c}$ denote those of the opponent. The castling mask is
 
 $$
-m_c(x)=
-\mathbf 1[c\text{ has kingside castling rights}]
-+2\mathbf 1[c\text{ has queenside castling rights}]
-+4\mathbf 1[\bar c\text{ has kingside castling rights}]
-+8\mathbf 1[\bar c\text{ has queenside castling rights}].
+m_c(x)=K_c+2Q_c+4K_{\bar c}+8Q_{\bar c},
 $$
 
-The 16 possible masks activate identifiers $49152+m_c(x)$ in the range $49152$ through $49167$. The en passant code is
+which activates identifier $49152+m_c(x)$ in the range $49152$ through $49167$. The en passant code is
 
 $$
 e(x)=
 \begin{cases}
-0,&\text{no en passant square exists},\\
-1+f_{\mathrm{ep}},&\text{the en passant square lies on file }f_{\mathrm{ep}},
+0,&\text{when no en passant square exists},\\
+1+f_{\mathrm{ep}},&\text{otherwise},
 \end{cases}
 $$
 
-where $f_{\mathrm{ep}}\in\lbrace0,\ldots,7\rbrace$. The nine possible codes activate identifiers $49168+e(x)$ in the range $49168$ through $49176$. Because the orientation map preserves files, the same en passant code applies to both color perspectives.
+where $f_{\mathrm{ep}}$ is the absolute en passant file. Vertical orientation preserves file coordinates, so both perspectives use the same code. It activates identifier $49168+e(x)$ in the range $49168$ through $49176$.
 
-The feature vocabulary contains 49,152 king-conditioned piece identifiers, 16 castling identifiers and 9 en passant identifiers. Identifier $49177$ is reserved for padding, giving a total vocabulary size of 49,178.
-
-For perspective $c$, let $\mathcal F_c(x)$ contain the active piece identifiers together with the castling and en passant identifiers. Eleginus orders the piece identifiers by ascending absolute square, appends the two rule-context identifiers and pads the resulting list to 34 entries with identifier $49177$. Denote this fixed-length sequence by $F_c(x)$. The state encoder places the side-to-move perspective first:
+For perspective $c$, let $\mathcal F_c(x)$ contain the active piece identifiers and the two rule-context identifiers. Eleginus orders the piece identifiers by absolute square, appends the castling and en passant identifiers and pads the sequence to 34 entries with identifier $49177$. Denote the resulting sequence by $F_c(x)$. The state encoder places the side-to-move perspective first:
 
 $$
 s=\phi_E(x)=
@@ -97,11 +89,13 @@ s=\phi_E(x)=
 \in\lbrace0,\ldots,49177\rbrace^{2\times34}.
 $$
 
-Both networks receive this encoded state. The complete state $x$ additionally contains move counters and repetition history, so complete states that differ only in those fields produce the same $s$ while retaining their distinct rule histories.
+The complete state $x$ also retains move counters and repetition history. These rule fields can distinguish complete states that share the same encoded state $s$.
 
 ### 2.2 Action Encoding
 
-The action codec uses the orientation map $\omega_{c_x}$ to express every legal action from the perspective of the side to move. Let $q_{\mathrm{from}}(a)$ be the absolute source square of action $a$. Let $q_{\mathrm{to}}(a)$ be its absolute destination square, except that castling uses the king destination `g1`, `c1`, `g8` or `c8` when the rules library represents the internal move with the rook square. The oriented source and destination indices are
+The action codec applies the vertical orientation $\omega_{c_x}$ to express every legal action from the perspective of the side to move. Its fixed action space preserves distinct kingside and queenside moves.
+
+Let $q_{\mathrm{from}}(a)$ be the absolute source square of action $a$. Let $q_{\mathrm{to}}(a)$ be its absolute destination square, except that castling uses the king destination `g1`, `c1`, `g8` or `c8` when the rules library internally stores the rook square. The oriented squares are
 
 $$
 \widetilde q_{\mathrm{from}}(x,a)=
@@ -140,75 +134,116 @@ i_E(x,a)=
 +r(a).
 $$
 
-The source-destination block contains $64\times64=4096$ indices, and the underpromotion block contains $64\times9=576$ indices. Their union is the fixed action-index set
+The source-destination block contains $64\times64=4096$ indices, and the underpromotion block contains $64\times9=576$ indices. Their union is
 
 $$
 \mathcal I_E=\lbrace0,\ldots,4671\rbrace,
 \qquad
-|\mathcal I_E|=4096+576=4672.
+|\mathcal I_E|=4672.
 $$
 
-To decode an index for complete state $x$, the action codec generates $\mathcal A(x)$ and returns the legal action whose side-relative encoding equals that index. The returned legal action retains the castling, en passant or promotion information required by the rules engine.
+To decode an index for state $x$, the action codec generates $\mathcal A(x)$ and returns the legal action whose side-relative encoding equals that index. The returned action retains the castling, en passant or promotion information required by the rules engine.
 
 ## 3. Network
 
-Eleginus comprises two neural networks that receive the same encoded state $s$. The Policy network uses parameters $\theta_P$ to produce $\text{P}$, and the Value network uses parameters $\theta_V$ to produce $\text{V}$. Their feature tables, accumulator biases and dense layers are separate, so $\theta_P\cap\theta_V=\varnothing$. Both networks begin by summing the embeddings of active sparse features, after which different dense mappings produce their respective outputs.
+The Policy and Value networks receive the same encoded state and use separate parameters, allowing either objective to improve its own network without changing the other. Both networks begin with incrementally maintained sparse accumulators, after which their dense layers serve different roles.
 
 ### 3.1 Sparse Accumulators
 
-Let $H\in\lbrace\mathrm P,\mathrm V\rbrace$ identify one of the two networks, and let $d_H$ be its accumulator width:
+Before table lookup, Eleginus maps each 64-king-square feature sequence to a horizontally canonical 32-bucket sequence. Write the oriented king square as $\kappa_c(x)=q(r_c,f_c)$, and define
 
 $$
-d_{\mathrm P}=128,
-\qquad
-d_{\mathrm V}=256.
+\chi_c(q(r,f))=
+\begin{cases}
+q(r,7-f),&f_c<4,\\
+q(r,f),&f_c\geq4.
+\end{cases}
 $$
 
-Network $H$ has a feature table $E_H\in\mathbb R^{49178\times d_H}$ and an accumulator bias $\beta_H\in\mathbb R^{d_H}$. For color perspective $c$, summing the table rows selected by the active feature set $\mathcal F_c(x)$ gives the unclipped accumulator
+The canonical king lies on files `e` through `h`, giving bucket
 
 $$
-u_{H,c}(x)=
-\beta_H+
-\sum_{j\in\mathcal F_c(x)}E_{H,j}.
+\widehat\kappa_c(x)=
+4r_c+\bigl(\chi_c(\kappa_c(x))\bmod8\bigr)-4
+\in\lbrace0,\ldots,31\rbrace.
 $$
 
-The padding row $E_{H,49177}$ is the zero vector, so summing the fixed-length sequence $F_c(x)$ produces the same accumulator. Each coordinate is then restricted to $[0,1]$:
+The corresponding piece feature is
 
 $$
-z_{H,c}(x)=
-\mathrm{clip}_{[0,1]}\left(u_{H,c}(x)\right).
+\widehat\iota_c(x,p,q)=
+768\widehat\kappa_c(x)
++64\rho_c(p)
++\chi_c\left(\omega_c(q)\right),
 $$
 
-The dense portion of network $H$ receives the side-to-move perspective followed by the opposing perspective:
+which occupies the range $0$ through $24575$. When $f_c<4$, the same reflection exchanges the kingside and queenside castling indicators and maps en passant file $f_{\mathrm{ep}}$ to $7-f_{\mathrm{ep}}$. The transformed castling mask activates identifiers $24576$ through $24591$, and the transformed en passant code activates identifiers $24592$ through $24600$. Raw padding identifier $49177$ maps to network padding identifier $24601$.
+
+Let $\widehat{\mathcal F}_c(x)$ contain the resulting network identifiers. This deterministic mapping allows the stable encoded state in Section 2.1 to feed the smaller mirrored feature tables and makes horizontally reflected positions share their sparse network representation.
+
+The Policy feature table is $E_P\in\mathbb R^{24602\times128}$, and its accumulator bias is $\beta_P\in\mathbb R^{128}$. For perspective $c$, the unclipped Policy accumulator is
 
 $$
-h_H(s)=
-z_{H,c_x}(x)\mathbin\Vert z_{H,\bar c_x}(x)
-\in\mathbb R^{2d_H},
-\qquad s=\phi_E(x).
+u_{P,c}(x)=
+\beta_P+
+\sum_{j\in\widehat{\mathcal F}_c(x)}E_{P,j}.
 $$
+
+After clipping each coordinate to $[0,1]$, the side-to-move accumulator and the opposing accumulator are concatenated:
+
+$$
+h_P(s)=
+\mathrm{clip}_{[0,1]}\left(u_{P,c_x}(x)\right)
+\mathbin\Vert
+\mathrm{clip}_{[0,1]}\left(u_{P,\bar c_x}(x)\right)
+\in\mathbb R^{256}.
+$$
+
+The Value feature table is $E_V\in\mathbb R^{24602\times520}$, and its accumulator bias is $\beta_V\in\mathbb R^{520}$. Its unclipped accumulator is
+
+$$
+u_{V,c}(x)=
+\beta_V+
+\sum_{j\in\widehat{\mathcal F}_c(x)}E_{V,j}.
+$$
+
+The first 512 coordinates supply the dense Value network. Eleginus applies the squared clipped rectifier
+
+$$
+\mathrm{SCReLU}(z)=\mathrm{clip}_{[0,1]}(z)^2
+$$
+
+coordinatewise and forms
+
+$$
+h_V(s)=
+\mathrm{SCReLU}\left(u_{V,c_x}(x)_{0:512}\right)
+\mathbin\Vert
+\mathrm{SCReLU}\left(u_{V,\bar c_x}(x)_{0:512}\right)
+\in\mathbb R^{1024}.
+$$
+
+The final eight coordinates of each Value accumulator provide one direct sparse score for each material bucket. Section 3.3 combines the selected direct score with the dense Value output.
 
 ### 3.2 Policy Network
 
-The Policy network applies a rectified affine map to its $256$-dimensional accumulator input:
+The Policy network applies a rectified affine map to its accumulator input:
 
 $$
 y_P(s)=
-\mathrm{ReLU}\left(W_{P,1}h_{\mathrm P}(s)+b_{P,1}\right)
+\mathrm{ReLU}\left(W_{P,1}h_P(s)+b_{P,1}\right)
 \in\mathbb R^{128},
 $$
 
-where $W_{P,1}\in\mathbb R^{128\times256}$, $b_{P,1}\in\mathbb R^{128}$ and $\mathrm{ReLU}(z)=\max(0,z)$ for each coordinate of $z$. A second affine map produces one logit for every action index:
+where $W_{P,1}\in\mathbb R^{128\times256}$ and $b_{P,1}\in\mathbb R^{128}$. A second affine map produces the complete logit vector
 
 $$
 \ell_{\theta_P}(s)=
 W_{P,2}y_P(s)+b_{P,2}
-\in\mathbb R^{4672},
+\in\mathbb R^{4672}.
 $$
 
-where $W_{P,2}\in\mathbb R^{4672\times128}$ and $b_{P,2}\in\mathbb R^{4672}$. The component at index $i\in\mathcal I_E$ is the logit $\ell_{\theta_P}(s,i)$ defined in Section 1.
-
-For an ongoing complete state $x$ with $s=\phi_E(x)$, normalizing the logits assigned to its legal actions gives
+For an ongoing state $x$ with $s=\phi_E(x)$, normalizing the logits indexed by legal actions gives
 
 $$
 P_{\theta_P}(a\mid s)=
@@ -219,65 +254,93 @@ P_{\theta_P}(a\mid s)=
 \qquad a\in\mathcal A(x).
 $$
 
-The output affine map mathematically defines all 4672 logits. During legal-action evaluation, the network evaluates only the rows of $W_{P,2}$ and $b_{P,2}$ selected by $\lbrace i_E(x,a):a\in\mathcal A(x)\rbrace$. This restricted projection produces the same legal-action logits and probabilities as the complete affine map.
+Legal-action inference evaluates only the rows of $W_{P,2}$ and $b_{P,2}$ selected by the current legal-action indices. This restricted projection produces the same logits and probabilities as selecting those entries from the complete 4672-dimensional output.
 
 ### 3.3 Value Network
 
-The Value network applies a rectified affine map to its $512$-dimensional accumulator input:
+Let $n(x)$ be the number of pieces on the board. The material bucket is
 
 $$
-y_V(s)=
-\mathrm{ReLU}\left(W_{V,1}h_{\mathrm V}(s)+b_{V,1}\right)
-\in\mathbb R^{64},
+b(x)=
+\min\left(
+7,
+\max\left(0,\left\lfloor\frac{n(x)-1}{4}\right\rfloor\right)
+\right).
 $$
 
-where $W_{V,1}\in\mathbb R^{64\times512}$ and $b_{V,1}\in\mathbb R^{64}$. A second rectified affine map produces a $32$-dimensional bottleneck:
+Each bucket $b$ has its own two-layer dense mapping and scalar output. For the selected bucket,
 
 $$
-r_V(s)=
-\mathrm{ReLU}\left(W_{V,2}y_V(s)+b_{V,2}\right)
+y_{V,b}(s)=
+\mathrm{ReLU}\left(W_{V,1}^{(b)}h_V(s)+b_{V,1}^{(b)}\right)
 \in\mathbb R^{32},
 $$
 
-where $W_{V,2}\in\mathbb R^{32\times64}$ and $b_{V,2}\in\mathbb R^{32}$. An affine scalar output followed by the sigmoid function gives
+$$
+r_{V,b}(s)=
+\mathrm{ReLU}\left(W_{V,2}^{(b)}y_{V,b}(s)+b_{V,2}^{(b)}\right)
+\in\mathbb R^{32}.
+$$
+
+The direct sparse score for the same bucket is the difference between the two perspective accumulators:
+
+$$
+d_{V,b}(s)=
+\frac12\left(
+u_{V,c_x}(x)_{512+b}
+-u_{V,\bar c_x}(x)_{512+b}
+\right).
+$$
+
+The raw Value score combines the dense and direct paths:
+
+$$
+v_{\theta_V}(s)=
+\left(w_V^{(b)}\right)^\top r_{V,b}(s)
++b_V^{(b)}
++d_{V,b}(s),
+\qquad b=b(x).
+$$
+
+Supervised training maps this score to an expected game score:
 
 $$
 V_{\theta_V}(s)=
-\sigma\left(w_V^\top r_V(s)+b_V\right)
-\in[0,1],
-\qquad
-\sigma(z)=\frac{1}{1+\exp(-z)},
+\sigma\left(v_{\theta_V}(s)\right)
+=
+\frac{1}{1+\exp\left(-v_{\theta_V}(s)\right)}
+\in[0,1].
 $$
 
-with $w_V\in\mathbb R^{32}$ and $b_V\in\mathbb R$. The resulting scalar estimates the expected game score from the perspective of the side to move represented in $s$.
+The eight material-dependent mappings allow the Value network to assign different dense transformations to crowded middlegames and sparse endgames. The direct path gives every sparse feature an additive route to the final score, while the dense path models interactions among the active features.
 
 ### 3.4 Incremental Evaluation
 
-A full refresh computes the two unclipped accumulators of network $H$ from the active feature sets in Section 3.1. When legal action $a\in\mathcal A(x)$ produces the successor $x'=T(x,a)$, the accumulator for color perspective $c$ is updated by
+A full refresh sums the active feature rows for both perspectives. When legal action $a\in\mathcal A(x)$ produces $x'=T(x,a)$, the accumulator of network $H\in\lbrace P,V\rbrace$ and perspective $c$ is updated by
 
 $$
 u_{H,c}(x')=
 u_{H,c}(x)
--\sum_{j\in\mathcal F_c(x)\setminus\mathcal F_c(x')}E_{H,j}
-+\sum_{j\in\mathcal F_c(x')\setminus\mathcal F_c(x)}E_{H,j}.
+-\sum_{j\in\widehat{\mathcal F}_c(x)\setminus\widehat{\mathcal F}_c(x')}E_{H,j}
++\sum_{j\in\widehat{\mathcal F}_c(x')\setminus\widehat{\mathcal F}_c(x)}E_{H,j}.
 $$
 
-The first sum removes features that cease to be active, and the second adds features that become active. Every feature shared by $\mathcal F_c(x)$ and $\mathcal F_c(x')$ remains in the accumulator, so the update gives the same $u_{H,c}(x')$ as a full refresh.
+The first sum removes inactive features, and the second adds newly active features. Features shared by the two states remain in the accumulator, so the update produces the same result as a full refresh.
 
-Most actions alter only a few feature identifiers. For a king move by color $c$, $\kappa_c(x')\ne\kappa_c(x)$, so every king-conditioned piece identifier in perspective $c$ is replaced. After either a full refresh or an incremental update, clipping and side-to-move ordering produce $h_H\left(\phi_E(x')\right)$ for the dense layers.
+Most actions change only a small number of identifiers. A king move can change the king bucket or horizontal reflection of its color perspective, in which case every piece identifier in that perspective is replaced. The dense layers receive the clipped or squared-clipped representation constructed from the updated accumulators.
 
 ## 4. Supervised Training
 
 ### 4.1 Supervised Data
 
-Let $\mathcal D_{\mathrm{sup}}$ be a supervised dataset containing $N$ records:
+Let $\mathcal D_{\mathrm{sup}}$ contain $N$ records:
 
 $$
 \mathcal D_{\mathrm{sup}}=
 \lbrace\xi_n\rbrace_{n=1}^{N}.
 $$
 
-Each record is associated with a complete pre-move state $x_n$ and a selected legal action $a_n\in\mathcal A(x_n)$. The record is
+Each record is associated with a complete pre-move state $x_n$ and a selected legal action $a_n\in\mathcal A(x_n)$. Its stored form is
 
 $$
 \xi_n=(s_n,i_n,y_n),
@@ -293,11 +356,11 @@ i_n=i_E(x_n,a_n),
 y_n\in[0,1].
 $$
 
-The encoded state $s_n$ is the common input to the two networks, and the action index $i_n$ is the Policy target. The scalar $y_n$ is the Value target, expressed as an estimate of the expected game score from the perspective of the side to move in $x_n$. On this scale, $0$ denotes a loss, $\frac12$ denotes a draw and $1$ denotes a win, while intermediate values express expectations between these outcomes.
+The action index $i_n$ is the Policy target. The scalar $y_n$ is the expected-score target from the perspective of the side to move in $x_n$, with $0$, $\frac12$ and $1$ representing a loss, draw and win. Intermediate values represent expectations between these outcomes.
 
 ### 4.2 Supervised Objective
 
-For network input $s$, softmax over the complete action-index set converts the Policy logit vector into the supervised action-index distribution
+Softmax over the complete action-index set converts the Policy logit vector into the supervised distribution
 
 $$
 R_{\theta_P}(i\mid s)=
@@ -308,9 +371,9 @@ R_{\theta_P}(i\mid s)=
 \qquad i\in\mathcal I_E.
 $$
 
-The supervised distribution $R_{\theta_P}(\cdot\mid s)$ and the legal-action distribution $P_{\theta_P}(\cdot\mid s)$ are derived from the same logits. The former normalizes all 4672 components, whereas the latter selects and normalizes the components indexed by the legal-action set of a complete state.
+The supervised distribution $R_{\theta_P}$ and the legal-action distribution $P_{\theta_P}$ are derived from the same logits, but they use different normalization domains. The former normalizes all 4672 action indices during training, whereas the latter normalizes the legal-action indices of the current state during inference.
 
-For minibatch $\mathcal B\subseteq\mathcal D_{\mathrm{sup}}$, the supervised Policy loss is the mean negative log-probability assigned to the target action indices:
+For minibatch $\mathcal B\subseteq\mathcal D_{\mathrm{sup}}$, the supervised Policy loss is
 
 $$
 L_{P,\mathrm{sup}}^{(\mathcal B)}=
@@ -319,201 +382,161 @@ L_{P,\mathrm{sup}}^{(\mathcal B)}=
 \log R_{\theta_P}(i\mid s).
 $$
 
-The supervised Value loss is the mean squared difference between the Value predictions and targets in the same minibatch:
+The supervised Value loss treats the expected-score target as a soft Bernoulli label and applies binary cross-entropy to the raw Value logit:
 
 $$
 L_{V,\mathrm{sup}}^{(\mathcal B)}=
-\frac{1}{|\mathcal B|}
+-\frac{1}{|\mathcal B|}
 \sum_{(s,i,y)\in\mathcal B}
-\left(V_{\theta_V}(s)-y\right)^2.
+\left[
+y\log V_{\theta_V}(s)
++(1-y)\log\left(1-V_{\theta_V}(s)\right)
+\right].
 $$
+
+The implementation evaluates this expression with a numerically stable binary-cross-entropy-with-logits operator. Its derivative with respect to the raw logit is proportional to $V_{\theta_V}(s)-y$, so corrections near either end of the expected-score range retain their gradient strength.
 
 Their sum defines the complete supervised objective:
 
 $$
 L_{\mathrm{sup}}^{(\mathcal B)}=
 L_{P,\mathrm{sup}}^{(\mathcal B)}
-+
-L_{V,\mathrm{sup}}^{(\mathcal B)}.
++L_{V,\mathrm{sup}}^{(\mathcal B)}.
 $$
 
-Because $\theta_P$ and $\theta_V$ are disjoint, each loss contributes gradients only to its corresponding network:
+The disjoint parameter sets separate the two gradient paths:
 
 $$
-\nabla_{\theta_P}
-L_{\mathrm{sup}}^{(\mathcal B)}
+\nabla_{\theta_P}L_{\mathrm{sup}}^{(\mathcal B)}
 =
-\nabla_{\theta_P}
-L_{P,\mathrm{sup}}^{(\mathcal B)},
+\nabla_{\theta_P}L_{P,\mathrm{sup}}^{(\mathcal B)},
 \qquad
-\nabla_{\theta_V}
-L_{\mathrm{sup}}^{(\mathcal B)}
+\nabla_{\theta_V}L_{\mathrm{sup}}^{(\mathcal B)}
 =
-\nabla_{\theta_V}
-L_{V,\mathrm{sup}}^{(\mathcal B)}.
+\nabla_{\theta_V}L_{V,\mathrm{sup}}^{(\mathcal B)}.
 $$
 
 For a fixed distribution of supervised records, the population minimizers are
 
 $$
 R^*(i\mid s)=
-\Pr\left(i_n=i\mid s_n=s\right),
-$$
-
-$$
+\Pr(i_n=i\mid s_n=s),
+\qquad
 V^*(s)=
-\mathbb E\left(y_n\mid s_n=s\right).
+\mathbb E(y_n\mid s_n=s).
 $$
 
-The Policy objective therefore fits the conditional distribution of supervised action indices, and the Value objective fits the conditional mean expected score. Records whose complete states share the same encoding contribute to the same conditional quantities, including records that differ only in move counters or repetition history.
+The Policy objective fits the conditional distribution of recorded action indices, and the Value objective fits the conditional mean expected score.
 
 ### 4.3 Parameter Optimization
 
-For minibatch size $B$, the data loader reads $\mathcal D_{\mathrm{sup}}$ in contiguous chunks of
+For minibatch size $B$, the data loader reads contiguous chunks of
 
 $$
 C=\max(4096,16B)
 $$
 
-records. A completed epoch visits every record once after randomizing the chunk order and then the record order within each loaded chunk. This two-level shuffle prevents the fixed storage order from repeatedly concentrating related positions in consecutive minibatches, a pattern that may create excessive correlation between successive gradient estimates. The resulting minibatches are indexed by optimizer step as $\mathcal B_1,\mathcal B_2,\ldots$.
+records. Each epoch visits every record once after randomizing the chunk order and the record order within each loaded chunk. This two-level shuffle prevents the fixed storage order from repeatedly concentrating related states in consecutive minibatches, which could increase correlation between successive gradient estimates.
 
-For each network label $H\in\lbrace\mathrm P,\mathrm V\rbrace$, let $\theta_H^{(0)}$ denote its parameters before the first optimizer step. In a newly constructed network, every nonpadding row of $E_H$ is sampled independently from $\mathcal N(0,0.01^2)$, the padding row is set to zero and every coordinate of $\beta_H$ is set to $\frac12$. The weights and biases of each dense layer with fan-in $n$ are sampled from $U(-n^{-1/2},n^{-1/2})$. The final Value weight $w_V$ and bias $b_V$ are set to zero, so a newly constructed Value network satisfies $V_{\theta_V^{(0)}}(s)=\frac12$ for every input $s$.
-
-At optimizer step $k\geq1$, automatic differentiation computes the raw gradient of the corresponding supervised loss:
+The two networks use separate AdamW optimizers. For each network label $H\in\lbrace P,V\rbrace$, automatic differentiation computes
 
 $$
 g_{H,k}=
 \nabla_{\theta_H^{(k-1)}}
-L_{H,\mathrm{sup}}^{(\mathcal B_k)}.
+L_{H,\mathrm{sup}}^{(\mathcal B_k)}
 $$
 
-The Policy and Value gradients are clipped independently to a maximum Euclidean norm of $1$. With $\epsilon_c=10^{-6}$, the gradient passed to optimizer $H$ is
-
-$$
-\overline g_{H,k}=
-\alpha_{H,k}g_{H,k},
-\qquad
-\alpha_{H,k}=
-\min\left(
-1,
-\frac{1}{\lVert g_{H,k}\rVert_2+\epsilon_c}
-\right).
-$$
-
-The two networks use separate AdamW optimizers with a common learning rate $\eta$ and weight-decay coefficient $\lambda$. For each optimizer, the first-moment estimate $m_{H,k}$ and second-moment estimate $v_{H,k}$ begin at zero. With $\beta_1=0.9$, $\beta_2=0.999$ and $\epsilon_A=10^{-8}$, update $k$ computes
+at optimizer step $k$. Each gradient is independently rescaled to a maximum Euclidean norm of $1$ before its optimizer updates the corresponding parameter set. With learning rate $\eta$, weight-decay coefficient $\lambda$, $\beta_1=0.9$, $\beta_2=0.999$ and $\epsilon_A=10^{-8}$, AdamW maintains
 
 $$
 m_{H,k}=
-\beta_1m_{H,k-1}
-+(1-\beta_1)\overline g_{H,k},
-\qquad
-v_{H,k}=
-\beta_2v_{H,k-1}
-+(1-\beta_2)\overline g_{H,k}^2,
+\beta_1m_{H,k-1}+(1-\beta_1)\overline g_{H,k},
 $$
+
+$$
+n_{H,k}=
+\beta_2n_{H,k-1}+(1-\beta_2)\overline g_{H,k}^{,2},
+$$
+
+where $\overline g_{H,k}$ is the clipped gradient. The bias-corrected moments are
 
 $$
 \widehat m_{H,k}=
 \frac{m_{H,k}}{1-\beta_1^k},
 \qquad
-\widehat v_{H,k}=
-\frac{v_{H,k}}{1-\beta_2^k}.
+\widehat n_{H,k}=
+\frac{n_{H,k}}{1-\beta_2^k},
 $$
 
-The bias-corrected moments determine the parameter update
+and the parameter update is
 
 $$
 \theta_H^{(k)}=
 (1-\eta\lambda)\theta_H^{(k-1)}
 -\eta
 \frac{\widehat m_{H,k}}
-{\sqrt{\widehat v_{H,k}}+\epsilon_A}.
+{\sqrt{\widehat n_{H,k}}+\epsilon_A}.
 $$
 
-The square, square root and quotient in these equations act coordinatewise on tensors with the same shapes as $\theta_H$. Optimization proceeds until the requested epochs are complete or the number of updates reaches a positive step limit. When the step limit is zero, the epoch count is the sole stopping condition. A common random seed controls the initialization of newly constructed networks and both levels of data shuffling.
+All squares, square roots and divisions in these equations act coordinatewise. Optimization ends after the requested epochs or a positive optimizer-step limit. A zero step limit allows the epoch count to determine the training length.
+
+The nonpadding feature rows begin with independent samples from $\mathcal N(0,0.01^2)$, and the accumulator biases begin at $\frac12$. The final eight coordinates of the Value feature rows and bias begin at zero, as do the dense Value output weights and biases. A newly initialized Value network therefore satisfies $v_{\theta_V}(s)=0$ and $V_{\theta_V}(s)=\frac12$ for every encoded state.
 
 ## 5. Search
 
-Eleginus combines its two networks through Policy-guided best-first minimax (BFM). The Policy network determines the order in which boundary nodes are expanded, and the Value network evaluates ongoing boundary states. Exact terminal scores and minimax backup propagate the resulting evaluations through the explicit game tree.
+Eleginus applies iterative deepening and principal-variation search to a negamax tree. The Value network supplies static leaf scores, while the Policy network orders legal actions so that promising branches establish alpha-beta bounds early.
 
-### 5.1 Tree Nodes
+### 5.1 Scores and Move Order
 
-For a terminal root state $x_0$, the rules engine returns $g(x_0,c_{x_0})$. For an ongoing root state, the BFM procedure constructs a tree rooted at $x_0$. Each node corresponds to one complete state $x$, and an edge labelled by legal action $a\in\mathcal A(x)$ leads to a child corresponding to $T(x,a)$. The tree creates a separate child node for every reached path, and the complete state stored in that node retains the path's move counters and repetition history. Nodes may therefore share the same network encoding while retaining distinct rule histories.
-
-A node carries separate Policy and Value accumulators. The root accumulators are computed by a full refresh, while each child obtains its accumulators from the incremental update in Section 3.4. The boundary value of a node is
+For an ongoing state $x$, the static score in centipawns is
 
 $$
-v_0(x)=
-\begin{cases}
-g(x,c_x),&x\text{ is terminal},\\
-V_{\theta_V}\left(\phi_E(x)\right),&x\text{ is ongoing}.
-\end{cases}
+E_{\theta_V}(x)=
+\mathrm{clip}_{[-25000,25000]}
+\left(
+\mathrm{round}\left(150v_{\theta_V}(\phi_E(x))\right)
+\right).
 $$
 
-The rules engine supplies $g(x,c_x)$ for checkmate, stalemate, insufficient material, the fifty-move rule and threefold repetition. When a node is created, its backed value is initialized as
+The scale follows the annotation transformation used by supervised Value targets. If a pawn-unit annotation $z$ produces target $y=(\tanh(z/3)+1)/2$, then the ideal raw score is $v=2z/3$, and $150v$ equals $100z$ centipawns.
+
+The rules engine evaluates terminal states before neural evaluation. A draw receives score $0$. At search ply $p$, a win for the side to move receives $30000-p$, and a loss receives $-30000+p$. The ply adjustment prefers faster wins and slower losses.
+
+At every ongoing state, legal actions are sorted by decreasing $P_{\theta_P}(a\mid\phi_E(x))$. Equal probabilities are ordered by their coordinate move strings. When a shallower completed iteration has identified a best action for the same board hash, that action is moved to the front of the ordered list. Policy and iterative-deepening information therefore determine search order, while returned action scores come from the Value-driven negamax tree.
+
+### 5.2 Quiescence Search
+
+At the nominal depth boundary, quiescence search replaces an immediate static evaluation. In a state where the side to move is not in check, the static score acts as the stand-pat value. A stand-pat score at least $\beta$ produces a beta cutoff, and a larger stand-pat score raises $\alpha$. The node returns after this update when its remaining quiescence depth is zero.
+
+Quiescence search otherwise examines captures and promotions in decreasing order of captured-piece gain, with promotion value included in the ordering score. A checked state examines every legal evasion because stand pat is invalid while the king is in check. The default quiescence allowance is eight plies, and checked continuations may extend by four additional plies before static evaluation terminates the branch. A nonchecking capture is skipped when its stand-pat score plus the captured-piece value and a 120-centipawn margin remains below $\alpha$. Every searched child uses the negated window $[-\beta,-\alpha]$ and returns the negative of its child score.
+
+### 5.3 Principal-Variation Search
+
+Let the ordered legal actions at state $x$ be $a_1,\ldots,a_m$. At remaining principal depth $d>0$, the first action is searched with the full negated alpha-beta window:
 
 $$
-\overline v(x)=v_0(x).
+q_1=-\mathrm{PVS}\left(T(x,a_1),d-1,-\beta,-\alpha\right).
 $$
 
-### 5.2 Expansion
-
-Expanding an ongoing node corresponding to state $x$ evaluates $P_{\theta_P}\left(\cdot\mid\phi_E(x)\right)$ over $\mathcal A(x)$ and creates one child for every legal action. For child state $x'=T(x,a)$, the Policy probability
+After updating $\alpha$, each later action is first tested with a null window of width one centipawn:
 
 $$
-p(x,a)=
-P_{\theta_P}\left(a\mid\phi_E(x)\right)
+q_j=-\mathrm{PVS}\left(T(x,a_j),d-1,-\alpha-1,-\alpha\right),
+\qquad j>1.
 $$
 
-is stored on the connecting edge. The child receives incrementally updated Policy and Value accumulators, the boundary value $v_0(x')$ and its initial backed value $\overline v(x')=v_0(x')$. Each ongoing child below the depth limit then enters the global frontier.
+A null-window result satisfying $\alpha<q_j<\beta$ proves that the action improves the current bound but does not determine its exact score. The procedure then repeats that child with the full window $[-\beta,-\alpha]$. A score satisfying $q_j\geq\beta$ produces a beta cutoff, and the remaining actions at that node do not affect the current bound.
 
-The root is refreshed and expanded before any node is removed from the frontier. Every later expansion follows the same procedure.
+Late-move reduction applies to a quiet, nonchecking action after the first three ordered actions when the remaining depth is at least three. The reduced null-window search removes one ply, with one further ply removed at depth six and another after the first eight actions. A reduced result above $\alpha$ is repeated at full depth before it can raise the node bound.
 
-### 5.3 Frontier Priority
+Depth zero invokes the quiescence procedure in Section 5.2. Terminal scores and static scores use the perspective of the side to move at their own nodes, and negation converts each child result to the parent perspective.
 
-Let $\mathcal P(x)$ be the sequence of state-action pairs on the tree path from the root to node $x$. Its frontier priority is the logarithm of the Policy probability of that path:
+### 5.4 Transposition Table
 
-$$
-F(x)=
-\sum_{(y,a)\in\mathcal P(x)}
-\log\max\left(p(y,a),10^{-12}\right),
-\qquad
-F(x_0)=0.
-$$
+A direct-mapped transposition table stores the position key, searched depth, score bound and best action. A stored entry may return an exact score or tighten $\alpha$ or $\beta$ when its depth covers the current request. Shallower entries still supply their best actions for move ordering. Rule-terminal states are resolved before table lookup, and the table key combines the board hash with the halfmove clock and current repetition status.
 
-A maximum-priority queue contains the ongoing, unexpanded nodes whose depths are below the depth limit. The node with the greatest $F$ receives the next expansion, so a path with greater Policy probability is explored earlier. Equal priorities are resolved in favor of the node created earlier. Frontier order is determined by Policy path probabilities, while Value enters the procedure through the minimax backup defined next.
+### 5.5 Iterative Deepening and Root Decision
 
-### 5.4 Minimax Backup
+For requested principal depth $D$, Eleginus completes searches at depths $1,2,\ldots,D$. Each iteration starts with the full root window $[-32000,32000]$. Best actions recorded at internal states become ordering hints for later iterations, allowing shallow tactical information to supplement the learned Policy order.
 
-After a node is expanded, its backed value and the backed values of its ancestors are recomputed by
-
-$$
-\overline v(x)=
-\begin{cases}
-v_0(x),
-&x\text{ is terminal or unexpanded},\\[4pt]
-\displaystyle
-\max_{a\in\mathcal A(x)}
-\left(1-\overline v\left(T(x,a)\right)\right),
-&x\text{ is expanded}.
-\end{cases}
-$$
-
-Each child value uses the perspective of the side to move in the child state. The complement $1-\overline v(T(x,a))$ converts that value to the perspective of the player choosing action $a$ in state $x$. Replacing a boundary estimate with backed values from deeper nodes may therefore raise or lower the backed values of its ancestors.
-
-### 5.5 Root Decision
-
-For root state $x_0$ and legal action $a$, define the backed action value
-
-$$
-Q_B(x_0,a)=
-1-\overline v\left(T(x_0,a)\right).
-$$
-
-The selected action maximizes $Q_B(x_0,a)$. Equal backed action values are resolved by the larger edge probability $p(x_0,a)$ and then by the lexicographically smaller coordinate move string. The reported root evaluation is $\overline v(x_0)$.
-
-### 5.6 Search Limits
-
-One expansion generates the complete legal child set of one parent node. The expansion count therefore increases by one, while the evaluated-node count increases by the number of generated children. The BFM procedure stops when it reaches the expansion limit or when the frontier is empty. The frontier admits newly created nodes only when their depths are smaller than the depth limit.
-
-Because the root is expanded first, an expansion limit of one evaluates every legal successor of the root. For fixed network parameters, root state, expansion limit and depth limit, the frontier priorities and all tie-breaking rules determine a unique result.
+The final iteration determines the selected root action. Actions are ranked first by their PVS scores, then by exact bounds, Policy probabilities and coordinate move strings. The reported root score is the selected action's exact PVS score. Node counts include principal and quiescence nodes visited across all completed iterations, while the selective depth is the greatest ply reached by either procedure.

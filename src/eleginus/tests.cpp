@@ -1,4 +1,4 @@
-// CTest entrypoint for codecs, independent Policy/Value inference, storage and BFM invariants.
+// CTest entrypoint for codecs, independent Policy/Value inference, storage and PVS invariants.
 
 #include "eleginus/checkpoint.hpp"
 #include "eleginus/dataset.hpp"
@@ -46,9 +46,22 @@ int main() {
 		const auto encoded = eleginus::encode_features(board);
 		for (const auto &perspective : encoded.perspective) {
 			for (const int feature : perspective) {
-				require(feature >= 0 && feature <= eleginus::kPaddingFeature,
+				require(feature >= 0 && feature <= eleginus::kEncodedPaddingFeature,
 						"feature index out of range");
 			}
+			for (const int feature : eleginus::canonicalize_features(perspective)) {
+				require(feature >= 0 && feature <= eleginus::kPaddingFeature,
+					"canonical feature index out of range");
+			}
+		}
+		const auto left = eleginus::encode_features(
+			chess::Board("4k3/8/8/8/8/2N5/8/2K5 w - - 0 1"));
+		const auto right = eleginus::encode_features(
+			chess::Board("3k4/8/8/8/8/5N2/8/5K2 w - - 0 1"));
+		for (int perspective = 0; perspective < eleginus::kPerspectiveCount; ++perspective) {
+			require(eleginus::canonicalize_features(left.perspective[perspective]) ==
+					eleginus::canonicalize_features(right.perspective[perspective]),
+				"horizontal feature canonicalization mismatch");
 		}
 
 		auto model = eleginus::make_model(torch::Device(torch::kCPU), 7);
@@ -61,6 +74,11 @@ int main() {
 		std::vector<eleginus::EncodedFeatures> batch{encoded};
 		auto [features, side] =
 			eleginus::encode_feature_batch(batch, torch::Device(torch::kCPU));
+		auto [value_batch_features, value_batch_side] =
+			eleginus::encode_feature_batch({encoded, encoded}, torch::Device(torch::kCPU));
+		auto torch_values = model->value->forward(value_batch_features, value_batch_side);
+		require(torch_values.dim() == 1 && torch_values.size(0) == 2,
+			"Value batch output shape mismatch");
 		const float torch_value = model->value->forward(features, side).item<float>();
 		require(std::abs(value.evaluate(value_accumulator) - torch_value) < 1.0e-5F,
 				"custom Value inference differs from LibTorch");
@@ -100,11 +118,40 @@ int main() {
 		}
 
 		eleginus::SearchOptions search_options;
-		search_options.expansions = 2;
+		search_options.depth = 1;
+		search_options.quiescence_depth = 1;
+		search_options.hash_mb = 1;
 		const auto search = eleginus::Searcher(policy, value, search_options).search(board);
-		require(search.move.move() != chess::Move::NO_MOVE, "BFM returned no move");
-		require(search.expanded_nodes == 2, "BFM expansion budget mismatch");
-		require(search.root.size() == moves.size(), "BFM root move count mismatch");
+		require(search.move.move() != chess::Move::NO_MOVE, "PVS returned no move");
+		require(search.depth == 1, "PVS depth mismatch");
+		require(search.nodes >= moves.size(), "PVS node count mismatch");
+		require(search.root.size() == moves.size(), "PVS root move count mismatch");
+		search_options.depth = 4;
+		int completed_depths = 0;
+		const auto cancelled = eleginus::Searcher(policy, value, search_options).search(
+			board,
+			[&](const eleginus::SearchResult &) { ++completed_depths; },
+			[&] { return completed_depths >= 1; });
+		require(cancelled.depth == 1 && completed_depths == 1,
+			"PVS cancellation did not preserve the last completed iteration");
+		search_options.depth = 2;
+		search_options.threads = 1;
+		const auto serial_search = eleginus::Searcher(policy, value, search_options).search(board);
+		search_options.threads = 2;
+		const auto parallel_search = eleginus::Searcher(policy, value, search_options).search(board);
+		require(parallel_search.move == serial_search.move &&
+			parallel_search.score_cp == serial_search.score_cp,
+			"parallel root PVS changed the completed search result");
+		require(parallel_search.root.size() == serial_search.root.size(),
+			"parallel root PVS omitted legal root moves");
+		search_options.depth = 1;
+		search_options.multipv = 3;
+		const auto multipv_search = eleginus::Searcher(policy, value, search_options).search(board);
+		require(multipv_search.root.size() == moves.size(),
+			"MultiPV root search omitted legal root moves");
+		require(std::all_of(multipv_search.root.begin(), multipv_search.root.end(),
+			[](const eleginus::RootMove &move) { return move.exact_score; }),
+			"MultiPV root search returned bounded rather than exact scores");
 
 		const auto checkpoint = std::filesystem::temp_directory_path() / "eleginus-test.pth";
 		const auto executable = std::filesystem::temp_directory_path() / "eleginus-template.bin";
@@ -171,12 +218,26 @@ int main() {
 				model->policy->forward(stored_features, stored_side)),
 				"Eleginus HDF5 side-to-move orientation changed Policy input");
 		}
+		auto training_model = eleginus::make_model(torch::Device(torch::kCPU), 11);
+		eleginus::TrainOptions training_options;
+		training_options.data = dataset_path;
+		training_options.epochs = 1;
+		training_options.batch_size = 2;
+		training_options.max_steps = 1;
+		training_options.log_every = 0;
+		const auto training_stats = eleginus::train_from_h5(
+			training_model, training_options, torch::Device(torch::kCPU));
+		require(training_stats.steps == 1 && training_stats.samples == 2,
+			"Eleginus training batch mismatch");
+		require(std::isfinite(training_stats.mean_policy_loss) &&
+				std::isfinite(training_stats.mean_value_loss),
+			"Eleginus training loss is not finite");
 		std::filesystem::remove(dataset_path);
 
 		chess::Board mate("7k/6Q1/6K1/8/8/8/8/8 b - - 0 1");
 		require(eleginus::game_is_over(mate), "checkmate not detected");
-		require(eleginus::terminal_score_side_to_move(mate) == 0.0F,
-				"checkmate score mismatch");
+		const auto mate_search = eleginus::Searcher(policy, value, search_options).search(mate);
+		require(mate_search.score_cp < -29000, "checkmate score mismatch");
 		std::cout << "eleginustests passed\n";
 		return 0;
 	} catch (const std::exception &error) {
