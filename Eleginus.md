@@ -213,14 +213,53 @@ $$
 \mathrm{SCReLU}(z)=\mathrm{clip}_{[0,1]}(z)^2
 $$
 
-coordinatewise and forms
+coordinatewise.
+
+Let $\mathcal P_c(x)\subset\widehat{\mathcal F}_c(x)$ contain the canonical piece identifiers, excluding the castling, en passant and padding identifiers. A second Value table $A_V\in\mathbb R^{24602\times48}$ assigns three 16-dimensional vectors to each identifier $j$ through its row
+
+$$
+A_{V,j}=
+q_{V,j}\mathbin\Vert k_{V,j}\mathbin\Vert m_{V,j}
+\in\mathbb R^{48}.
+$$
+
+For distinct ordered identifiers $i,j\in\mathcal P_c(x)$, the learned signed relation coefficient is
+
+$$
+\alpha_V(i,j)=
+2\sigma\left(
+\mathrm{clip}_{[-8,8]}
+\left(\frac{q_{V,i}^{\mathsf T}k_{V,j}}{\sqrt{16}}\right)
+\right)-1
+\in[-1,1].
+$$
+
+A zero query-key score gives $\alpha_V(i,j)=0$. Positive and negative scores respectively add or subtract the message associated with identifier $j$, so the relation term can represent both supporting and opposing interactions.
+
+Let $n(x)=|\mathcal P_c(x)|$ be the number of pieces on the board. The unnormalized relation state and its normalized representation are
+
+$$
+z_{V,c}(x)=
+\sum_{i\in\mathcal P_c(x)}
+\sum_{\substack{j\in\mathcal P_c(x)\\j\ne i}}
+\alpha_V(i,j)m_{V,j},
+\qquad
+\bar z_{V,c}(x)=
+\frac{z_{V,c}(x)}
+{\max(1,n(x))}
+\in\mathbb R^{16}.
+$$
+
+For each source identifier, the inner sum aggregates the messages contributed by all other pieces. Dividing the total by the number of source pieces produces the average aggregated relation per source and retains the magnitude of interactions that would be attenuated by averaging over every ordered pair. The dense Value input places each perspective's relation representation beside its sparse accumulator:
 
 $$
 h_V(s)=
 \mathrm{SCReLU}\left(u_{V,c_x}(x)_{0:512}\right)
+\mathbin\Vert \bar z_{V,c_x}(x)
 \mathbin\Vert
 \mathrm{SCReLU}\left(u_{V,\bar c_x}(x)_{0:512}\right)
-\in\mathbb R^{1024}.
+\mathbin\Vert \bar z_{V,\bar c_x}(x)
+\in\mathbb R^{1056}.
 $$
 
 The final eight coordinates of each Value accumulator provide one direct sparse score for each material bucket. Section 3.3 combines the selected direct score with the dense Value output.
@@ -258,7 +297,7 @@ Legal-action inference evaluates only the rows of $W_{P,2}$ and $b_{P,2}$ select
 
 ### 3.3 Value Network
 
-Let $n(x)$ be the number of pieces on the board. The material bucket is
+The piece count $n(x)$ defined in Section 3.1 selects the material bucket
 
 $$
 b(x)=
@@ -312,7 +351,7 @@ V_{\theta_V}(s)=
 \in[0,1].
 $$
 
-The eight material-dependent mappings allow the Value network to assign different dense transformations to crowded middlegames and sparse endgames. The direct path gives every sparse feature an additive route to the final score, while the dense path models interactions among the active features.
+The eight material-dependent mappings allow the Value network to assign different dense transformations to crowded middlegames and sparse endgames. The direct path gives every sparse feature an additive route to the final score. The dense path combines squared sparse activations with the learned relation representation, allowing the score to depend on both individual features and ordered piece pairs.
 
 ### 3.4 Incremental Evaluation
 
@@ -327,7 +366,38 @@ $$
 
 The first sum removes inactive features, and the second adds newly active features. Features shared by the two states remain in the accumulator, so the update produces the same result as a full refresh.
 
-Most actions change only a small number of identifiers. A king move can change the king bucket or horizontal reflection of its color perspective, in which case every piece identifier in that perspective is replaced. The dense layers receive the clipped or squared-clipped representation constructed from the updated accumulators.
+The relation update is determined by changes in the canonical piece identifiers. Define the removed and added identifiers by
+
+$$
+\mathcal R_c=\mathcal P_c(x)\setminus\mathcal P_c(x'),
+\qquad
+\mathcal N_c=\mathcal P_c(x')\setminus\mathcal P_c(x).
+$$
+
+The affected old and new ordered-pair sets are
+
+$$
+\mathcal D_c^-=
+\left\{(i,j)\in\mathcal P_c(x)^2
+\mid i\ne j\ \text{and}\ (i\in\mathcal R_c\ \text{or}\ j\in\mathcal R_c)\right\},
+$$
+
+$$
+\mathcal D_c^+=
+\left\{(i,j)\in\mathcal P_c(x')^2
+\mid i\ne j\ \text{and}\ (i\in\mathcal N_c\ \text{or}\ j\in\mathcal N_c)\right\}.
+$$
+
+Removing the first set and adding the second updates the unnormalized relation state exactly:
+
+$$
+z_{V,c}(x')=
+z_{V,c}(x)
+-\sum_{(i,j)\in\mathcal D_c^-}\alpha_V(i,j)m_{V,j}
++\sum_{(i,j)\in\mathcal D_c^+}\alpha_V(i,j)m_{V,j}.
+$$
+
+Dividing the updated state by $\max(1,n(x'))$ produces $\bar z_{V,c}(x')$. Most actions change only a small number of identifiers, so their relation update evaluates only pairs incident to those identifiers. A king move can change the king bucket or horizontal reflection of its color perspective, in which case every piece identifier in that perspective is replaced. The dense layers receive the representations constructed from the updated sparse and relation states.
 
 ## 4. Supervised Training
 
@@ -498,7 +568,7 @@ $$
 
 All squares, square roots and divisions in these equations act coordinatewise. Optimization ends after the requested epochs or a positive optimizer-step limit. A zero step limit allows the epoch count to determine the training length.
 
-The nonpadding feature rows begin with independent samples from $\mathcal N(0,0.01^2)$, and the accumulator biases begin at $\frac12$. The final eight coordinates of the Value feature rows and bias begin at zero, as do the dense Value output weights and biases. A newly initialized Value network therefore satisfies $v_{\theta_V}(s)=0$ and $V_{\theta_V}(s)=\frac12$ for every encoded state.
+The nonpadding sparse-feature rows begin with independent samples from $\mathcal N(0,0.01^2)$, and the accumulator biases begin at $\frac12$. The final eight coordinates of the Value feature rows and bias begin at zero. In the relation table, query and key coordinates are sampled from $\mathcal N(0,1)$, while message coordinates are sampled from $\mathcal N(0,0.1^2)$. The dense Value output weights are sampled from $\mathcal N(0,0.01^2)$ and their biases begin at zero. These scales give the initial relation coefficients a nondegenerate distribution and allow the Value loss to propagate gradients through the entire Value network from the first minibatch.
 
 ## 5. Search
 

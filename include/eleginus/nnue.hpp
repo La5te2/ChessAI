@@ -29,6 +29,10 @@ inline constexpr int kFeatureVocabulary = kFeatureCount + 1;
 inline constexpr int kPolicyAccumulatorWidth = 128;
 inline constexpr int kPolicyHiddenWidth = 128;
 inline constexpr int kValueAccumulatorWidth = 512;
+inline constexpr int kValueAttentionWidth = 16;
+inline constexpr int kValueAttentionTableWidth = kValueAttentionWidth * 3;
+inline constexpr int kValueRelationFormula = 2;
+inline constexpr int kValueDenseWidth = kValueAccumulatorWidth + kValueAttentionWidth;
 inline constexpr int kValueHiddenWidth = 32;
 inline constexpr int kValueBottleneckWidth = 32;
 inline constexpr int kValueBucketCount = 8;
@@ -53,6 +57,17 @@ struct FloatAccumulator {
 	int piece_count = 0;
 };
 
+/// Incrementally maintained sum of gated ordered-piece-pair messages.
+struct RelationAccumulator {
+	std::array<std::array<float, kValueAttentionWidth>, kPerspectiveCount> perspective{};
+};
+
+/// Complete incremental state consumed by the Value network.
+struct ValueAccumulator {
+	FloatAccumulator features;
+	RelationAccumulator relations;
+};
+
 struct PolicyWeights {
 	std::vector<float> feature_table;
 	std::vector<float> accumulator_bias;
@@ -65,6 +80,7 @@ struct PolicyWeights {
 struct ValueWeights {
 	std::vector<float> feature_table;
 	std::vector<float> accumulator_bias;
+	std::vector<float> attention_table;
 	std::vector<float> hidden_weight;
 	std::vector<float> hidden_bias;
 	std::vector<float> bottleneck_weight;
@@ -95,10 +111,10 @@ class CpuPolicy {
 class CpuValue {
 	public:
 	explicit CpuValue(ValueWeights weights);
-	FloatAccumulator refresh(const chess::Board &board) const;
-	FloatAccumulator update(const FloatAccumulator &current, const chess::Board &before,
+	ValueAccumulator refresh(const chess::Board &board) const;
+	ValueAccumulator update(const ValueAccumulator &current, const chess::Board &before,
 							const chess::Board &after) const;
-	float evaluate(const FloatAccumulator &accumulator) const;
+	float evaluate(const ValueAccumulator &accumulator) const;
 	const ValueWeights &weights() const noexcept { return weights_; }
 
 	private:

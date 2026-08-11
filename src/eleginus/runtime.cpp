@@ -24,6 +24,7 @@ namespace {
 constexpr std::array<char, 8> kMagic{'E', 'L', 'E', 'G', 'I', 'N', 'U', 'S'};
 constexpr std::array<char, 8> kFooterMagic{'E', 'L', 'E', 'G', 'E', 'M', 'B', 'D'};
 constexpr std::uint32_t kEndianMarker = 0x01020304U;
+constexpr std::uint32_t kRuntimeFormat = 3U;
 
 static_assert(std::endian::native == std::endian::little,
 	"Eleginus native weights currently require a little-endian target");
@@ -119,9 +120,12 @@ void write_value(std::ofstream &output, const ValueWeights &weights) {
 		"Value feature table");
 	write_vector(output, weights.accumulator_bias, kValueFeatureWidth,
 		"Value accumulator bias");
+	write_vector(output, weights.attention_table,
+		static_cast<std::size_t>(kFeatureVocabulary) * kValueAttentionTableWidth,
+		"Value attention table");
 	write_vector(output, weights.hidden_weight,
 		static_cast<std::size_t>(kValueBucketCount) * kValueHiddenWidth *
-			kValueAccumulatorWidth * 2,
+			kValueDenseWidth * 2,
 		"Value hidden weight");
 	write_vector(output, weights.hidden_bias, kValueBucketCount * kValueHiddenWidth,
 		"Value hidden bias");
@@ -144,9 +148,12 @@ ValueWeights read_value(std::ifstream &input, const std::filesystem::path &path)
 		"Value feature table");
 	weights.accumulator_bias = read_vector(input, path, kValueFeatureWidth,
 		"Value accumulator bias");
+	weights.attention_table = read_vector(input, path,
+		static_cast<std::size_t>(kFeatureVocabulary) * kValueAttentionTableWidth,
+		"Value attention table");
 	weights.hidden_weight = read_vector(input, path,
 		static_cast<std::size_t>(kValueBucketCount) * kValueHiddenWidth *
-			kValueAccumulatorWidth * 2,
+			kValueDenseWidth * 2,
 		"Value hidden weight");
 	weights.hidden_bias = read_vector(input, path, kValueBucketCount * kValueHiddenWidth,
 		"Value hidden bias");
@@ -224,12 +231,15 @@ void embed_runtime_model_atomic(const std::filesystem::path &input,
 		const auto payload_begin = output.tellp();
 		output.write(kMagic.data(), static_cast<std::streamsize>(kMagic.size()));
 		write_scalar(output, kEndianMarker);
+		write_scalar(output, kRuntimeFormat);
 		write_scalar(output, static_cast<std::uint32_t>(kEleginusCheckpointType));
 		write_scalar(output, static_cast<std::uint32_t>(kActionSize));
 		write_scalar(output, static_cast<std::uint32_t>(kFeatureVocabulary));
 		write_scalar(output, static_cast<std::uint32_t>(kPolicyAccumulatorWidth));
 		write_scalar(output, static_cast<std::uint32_t>(kPolicyHiddenWidth));
 		write_scalar(output, static_cast<std::uint32_t>(kValueAccumulatorWidth));
+		write_scalar(output, static_cast<std::uint32_t>(kValueAttentionWidth));
+		write_scalar(output, static_cast<std::uint32_t>(kValueRelationFormula));
 		write_scalar(output, static_cast<std::uint32_t>(kValueHiddenWidth));
 		write_scalar(output, static_cast<std::uint32_t>(kValueBottleneckWidth));
 		write_scalar(output, static_cast<std::uint32_t>(kValueBucketCount));
@@ -285,19 +295,25 @@ RuntimeWeights load_embedded_runtime_model(const std::filesystem::path &executab
 		throw std::runtime_error("embedded data is not an Eleginus model: " + path.string());
 	}
 	const auto endian = read_scalar<std::uint32_t>(input, path);
+	const auto format = read_scalar<std::uint32_t>(input, path);
 	const auto architecture = read_scalar<std::uint32_t>(input, path);
 	const auto action_size = read_scalar<std::uint32_t>(input, path);
 	const auto feature_count = read_scalar<std::uint32_t>(input, path);
 	const auto policy_accumulator = read_scalar<std::uint32_t>(input, path);
 	const auto policy_hidden = read_scalar<std::uint32_t>(input, path);
 	const auto value_accumulator = read_scalar<std::uint32_t>(input, path);
+	const auto value_attention = read_scalar<std::uint32_t>(input, path);
+	const auto value_relation_formula = read_scalar<std::uint32_t>(input, path);
 	const auto value_hidden = read_scalar<std::uint32_t>(input, path);
 	const auto value_bottleneck = read_scalar<std::uint32_t>(input, path);
 	const auto value_buckets = read_scalar<std::uint32_t>(input, path);
-	if (endian != kEndianMarker || architecture != kEleginusCheckpointType ||
+	if (endian != kEndianMarker || format != kRuntimeFormat ||
+		architecture != kEleginusCheckpointType ||
 		action_size != kActionSize || feature_count != kFeatureVocabulary ||
 		policy_accumulator != kPolicyAccumulatorWidth || policy_hidden != kPolicyHiddenWidth ||
-		value_accumulator != kValueAccumulatorWidth || value_hidden != kValueHiddenWidth ||
+		value_accumulator != kValueAccumulatorWidth || value_attention != kValueAttentionWidth ||
+		value_relation_formula != kValueRelationFormula ||
+		value_hidden != kValueHiddenWidth ||
 		value_bottleneck != kValueBottleneckWidth || value_buckets != kValueBucketCount) {
 		throw std::runtime_error("embedded Eleginus model does not match this build: " +
 			path.string());

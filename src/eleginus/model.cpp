@@ -2,6 +2,7 @@
 
 #include "eleginus/model.hpp"
 
+#include <cmath>
 #include <cstring>
 #include <stdexcept>
 
@@ -120,21 +121,63 @@ torch::Tensor PolicyNetworkImpl::forward(torch::Tensor features, torch::Tensor w
 
 ValueNetworkImpl::ValueNetworkImpl() {
 	encoder = register_module("encoder", SparseEncoder(kValueFeatureWidth));
-	hidden = register_module("hidden", torch::nn::Linear(kValueAccumulatorWidth * 2,
+	attention = register_module("attention", torch::nn::Embedding(
+		torch::nn::EmbeddingOptions(kFeatureVocabulary, kValueAttentionTableWidth)
+			.padding_idx(kPaddingFeature)));
+	hidden = register_module("hidden", torch::nn::Linear(kValueDenseWidth * 2,
 		kValueBucketCount * kValueHiddenWidth));
 	bottleneck = register_module(
 		"bottleneck", torch::nn::Linear(kValueHiddenWidth,
 			kValueBucketCount * kValueBottleneckWidth));
 	output = register_module(
 		"output", torch::nn::Linear(kValueBottleneckWidth, kValueBucketCount));
-	torch::nn::init::zeros_(output->weight);
-	torch::nn::init::zeros_(output->bias);
 	torch::NoGradGuard no_grad;
 	encoder->table->weight.index_put_(
 		{torch::indexing::Slice(),
 		 torch::indexing::Slice(kValueAccumulatorWidth, kValueFeatureWidth)}, 0.0F);
 	encoder->bias.index_put_(
 		{torch::indexing::Slice(kValueAccumulatorWidth, kValueFeatureWidth)}, 0.0F);
+	attention->weight.index({torch::indexing::Slice(),
+		torch::indexing::Slice(0, kValueAttentionWidth)}).normal_(0.0, 1.0);
+	attention->weight.index({torch::indexing::Slice(),
+		torch::indexing::Slice(kValueAttentionWidth, 2 * kValueAttentionWidth)})
+		.normal_(0.0, 1.0);
+	attention->weight.index({torch::indexing::Slice(),
+		torch::indexing::Slice(2 * kValueAttentionWidth, kValueAttentionTableWidth)})
+		.normal_(0.0, 0.1);
+	attention->weight.index_put_({kPaddingFeature}, 0.0F);
+	output->weight.normal_(0.0, 0.01);
+	output->bias.zero_();
+}
+
+torch::Tensor ValueNetworkImpl::relation_state(torch::Tensor features) {
+	if (features.dim() != 3 || features.size(1) != kPerspectiveCount ||
+		features.size(2) != kFeatureSlots) {
+		throw std::runtime_error("expected Eleginus sparse features [batch, 2, 34]");
+	}
+
+	// A centered query-key coefficient weights each directed piece-pair message.
+	// Averaging by source-piece count preserves interaction scale across game phases.
+	auto piece_mask = features.lt(kPieceFeatureCount);
+	auto piece_features = torch::where(piece_mask, features,
+		torch::full_like(features, kPaddingFeature));
+	auto qkv = attention->forward(piece_features.to(torch::kInt64));
+	auto chunks = qkv.split(kValueAttentionWidth, -1);
+	auto query = chunks[0];
+	auto key = chunks[1];
+	auto value = chunks[2];
+	auto score = torch::matmul(query, key.transpose(-1, -2)) /
+		std::sqrt(static_cast<double>(kValueAttentionWidth));
+	auto slots = torch::arange(kFeatureSlots, features.options()).view(
+		{1, 1, kFeatureSlots});
+	auto pair_mask = piece_mask.unsqueeze(-1).logical_and(piece_mask.unsqueeze(-2))
+		.logical_and(slots.unsqueeze(-1).ne(slots.unsqueeze(-2)));
+	auto coefficients = (2.0 * torch::sigmoid(score.clamp(-8.0, 8.0)) - 1.0) *
+		pair_mask.to(score.scalar_type());
+	auto total = torch::matmul(coefficients, value).sum(-2);
+	auto count = piece_mask.sum(-1).to(score.scalar_type());
+	auto denominator = count.clamp_min(1.0).unsqueeze(-1);
+	return total / denominator;
 }
 
 torch::Tensor ValueNetworkImpl::forward(torch::Tensor features, torch::Tensor white_to_move) {
@@ -145,11 +188,18 @@ torch::Tensor ValueNetworkImpl::forward(torch::Tensor features, torch::Tensor wh
 	auto mask = white_to_move.to(torch::kBool).unsqueeze(1);
 	auto first = torch::where(mask, white, black);
 	auto second = torch::where(mask, black, white);
+	auto relations = relation_state(features);
+	auto white_relation = relations.index({torch::indexing::Slice(), 0});
+	auto black_relation = relations.index({torch::indexing::Slice(), 1});
+	auto first_relation = torch::where(mask, white_relation, black_relation);
+	auto second_relation = torch::where(mask, black_relation, white_relation);
 	auto dense = torch::cat({
 		first.index({torch::indexing::Slice(),
 			torch::indexing::Slice(0, kValueAccumulatorWidth)}).clamp(0.0, 1.0).square(),
+		first_relation,
 		second.index({torch::indexing::Slice(),
-			torch::indexing::Slice(0, kValueAccumulatorWidth)}).clamp(0.0, 1.0).square()}, 1);
+			torch::indexing::Slice(0, kValueAccumulatorWidth)}).clamp(0.0, 1.0).square(),
+		second_relation}, 1);
 	auto hidden_value = torch::relu(select_bucket(
 		hidden->forward(dense), buckets, kValueHiddenWidth));
 	auto value = torch::relu(select_bucket(
@@ -189,6 +239,7 @@ CpuValue snapshot_value(const ValueNetwork &model) {
 	return CpuValue(ValueWeights{
 		tensor_vector(model->encoder->table->weight),
 		tensor_vector(model->encoder->bias),
+		tensor_vector(model->attention->weight),
 		tensor_vector(model->hidden->weight),
 		tensor_vector(model->hidden->bias),
 		tensor_vector(model->bottleneck->weight),
@@ -218,6 +269,7 @@ void restore_value(const ValueNetwork &model, const ValueWeights &weights) {
 	torch::NoGradGuard no_grad;
 	copy_tensor(model->encoder->table->weight, weights.feature_table, "Value feature table");
 	copy_tensor(model->encoder->bias, weights.accumulator_bias, "Value accumulator bias");
+	copy_tensor(model->attention->weight, weights.attention_table, "Value attention table");
 	copy_tensor(model->hidden->weight, weights.hidden_weight, "Value hidden weight");
 	copy_tensor(model->hidden->bias, weights.hidden_bias, "Value hidden bias");
 	copy_tensor(model->bottleneck->weight, weights.bottleneck_weight,

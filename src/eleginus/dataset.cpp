@@ -132,19 +132,86 @@ void read_slice(hid_t dataset, hid_t type, void *data, const std::vector<hsize_t
 	H5Sclose(file_space);
 }
 
-std::optional<double> comment_score_white(const std::string &comment) {
+std::optional<double> comment_score(const std::string &comment) {
+	// CCRL comments begin with an optional principal move followed by either a
+	// pawn score or a mate score. Anchoring the expression prevents depth and
+	// elapsed-time fields from being interpreted as evaluations.
 	static const std::regex score_pattern(
-		R"((^|[^[:alnum:]_.])([+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+))(?=$|[^[:alnum:]_.]))");
+		R"(^[[:space:]]*(?:\([^)]*\)[[:space:]]*)?([+-]?)(?:([Mm#])([0-9]+)|((?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)))(?=$|[[:space:]/]))");
 	std::smatch match;
 	if (!std::regex_search(comment, match, score_pattern))
 		return std::nullopt;
-	return std::stod(match[2].str());
+	const double sign = match[1].str() == "-" ? -1.0 : 1.0;
+	if (match[2].matched)
+		return 12.0 * sign;
+	return sign * std::stod(match[4].str());
 }
 
-float comment_value(const std::string &comment, chess::Color turn) {
-	const double white = comment_score_white(comment).value_or(0.0);
-	const double side = turn == chess::Color::WHITE ? white : -white;
-	return static_cast<float>((std::tanh(side / 3.0) + 1.0) * 0.5);
+float expected_score(double side_score) {
+	return static_cast<float>((std::tanh(side_score / 3.0) + 1.0) * 0.5);
+}
+
+enum class CommentPerspective {
+	white,
+	mover,
+};
+
+double white_score(double raw_score, bool mover_is_white,
+				   CommentPerspective perspective) {
+	if (perspective == CommentPerspective::white || mover_is_white)
+		return raw_score;
+	return -raw_score;
+}
+
+std::optional<double> result_score_white(const std::string &result) {
+	if (result == "1-0")
+		return 1.0;
+	if (result == "0-1")
+		return -1.0;
+	if (result == "1/2-1/2")
+		return 0.0;
+	return std::nullopt;
+}
+
+double perspective_cost(const std::vector<std::optional<double>> &scores,
+						const std::vector<bool> &movers_are_white,
+						const std::string &result, CommentPerspective perspective) {
+	double transition_error = 0.0;
+	std::int64_t transitions = 0;
+	std::optional<double> previous;
+	for (std::size_t index = 0; index < scores.size(); ++index) {
+		if (!scores[index])
+			continue;
+		const double current = std::tanh(
+			white_score(*scores[index], movers_are_white[index], perspective) / 3.0);
+		if (previous) {
+			const double difference = current - *previous;
+			transition_error += difference * difference;
+			++transitions;
+		}
+		previous = current;
+	}
+
+	double cost = transitions > 0
+		? transition_error / static_cast<double>(transitions)
+		: 0.0;
+	if (previous) {
+		if (const auto outcome = result_score_white(result)) {
+			const double difference = *previous - *outcome;
+			cost += difference * difference;
+		}
+	}
+	return cost;
+}
+
+CommentPerspective infer_comment_perspective(
+	const std::vector<std::optional<double>> &scores,
+	const std::vector<bool> &movers_are_white, const std::string &result) {
+	const double white_cost = perspective_cost(
+		scores, movers_are_white, result, CommentPerspective::white);
+	const double mover_cost = perspective_cost(
+		scores, movers_are_white, result, CommentPerspective::mover);
+	return mover_cost < white_cost ? CommentPerspective::mover : CommentPerspective::white;
 }
 
 float result_value(const std::string &result, chess::Color turn) {
@@ -168,11 +235,16 @@ class PreprocessVisitor : public chess::pgn::Visitor {
 			throw StopPgnParsing{};
 		board_ = chess::Board();
 		result_ = "*";
-		previous_comment_.clear();
+		root_score_.reset();
 		game_has_eval_ = false;
+		game_invalid_ = false;
 		game_features_.clear();
 		game_moves_.clear();
 		game_values_.clear();
+		game_comment_scores_.clear();
+		game_movers_are_white_.clear();
+		detached_comment_.clear();
+		collecting_detached_comment_ = false;
 	}
 
 	void header(std::string_view key, std::string_view value) override {
@@ -185,57 +257,136 @@ class PreprocessVisitor : public chess::pgn::Visitor {
 	void startMoves() override {}
 
 	void move(std::string_view san, std::string_view comment) override {
+		if (san.empty()) {
+			if (options_.has_comments)
+				attach_detached_comment(comment);
+			return;
+		}
+		if (consume_detached_comment(san))
+			return;
+		if (game_invalid_)
+			return;
 		try {
 			const auto parsed = chess::uci::parseSan(board_, san);
 			game_features_.push_back(encode_features(board_));
 			game_moves_.push_back(
 				static_cast<std::uint16_t>(move_to_index(parsed, board_.sideToMove())));
-			game_values_.push_back(options_.has_comments
-				? comment_value(previous_comment_, board_.sideToMove())
-				: result_value(result_, board_.sideToMove()));
-			if (comment_score_white(std::string(comment)).has_value())
-				game_has_eval_ = true;
+			const auto score = comment_score(std::string(comment));
+			game_comment_scores_.push_back(score);
+			game_movers_are_white_.push_back(board_.sideToMove() == chess::Color::WHITE);
+			game_has_eval_ = game_has_eval_ || score.has_value();
 			board_.makeMove(parsed);
-			previous_comment_ = std::string(comment);
-		} catch (const std::exception &) {
-			++skipped_moves_;
+		} catch (const std::exception &error) {
+			game_invalid_ = true;
+			if (parse_warning_count_ < 8) {
+				std::cerr << "Eleginus preprocess rejected game after SAN '" << san
+						  << "': " << error.what() << std::endl;
+				++parse_warning_count_;
+			}
 		}
 	}
 
 	void endPgn() override {
+		if (game_invalid_) {
+			++invalid_games_;
+			return;
+		}
 		if ((options_.has_comments && !game_has_eval_) ||
 			(!options_.has_comments && result_ != "1-0" && result_ != "0-1" &&
 			 result_ != "1/2-1/2")) {
-			++skipped_games_;
+			++missing_target_games_;
 			return;
+		}
+		game_values_.resize(game_features_.size(), 0.5F);
+		if (options_.has_comments) {
+			const auto perspective = infer_comment_perspective(
+				game_comment_scores_, game_movers_are_white_, result_);
+			if (root_score_ && !game_features_.empty()) {
+				const double side = game_features_.front().white_to_move
+					? *root_score_
+					: -*root_score_;
+				game_values_.front() = expected_score(side);
+			}
+			for (std::size_t state = 1; state < game_features_.size(); ++state) {
+				const auto &score = game_comment_scores_[state - 1];
+				if (!score)
+					continue;
+				const double white = white_score(
+					*score, game_movers_are_white_[state - 1], perspective);
+				const double side = game_features_[state].white_to_move ? white : -white;
+				game_values_[state] = expected_score(side);
+			}
+		} else {
+			for (std::size_t state = 0; state < game_features_.size(); ++state) {
+				const auto turn = game_features_[state].white_to_move
+					? chess::Color::WHITE
+					: chess::Color::BLACK;
+				game_values_[state] = result_value(result_, turn);
+			}
 		}
 		writer_.append(game_features_, game_moves_, game_values_);
 		++games_;
 		if (options_.log_every > 0 && games_ % options_.log_every == 0) {
 			std::cout << "preprocess progress: games=" << games_
 					  << " positions=" << writer_.size()
-					  << " skipped_moves=" << skipped_moves_
-					  << " skipped_games=" << skipped_games_ << std::endl;
+					  << " invalid_games=" << invalid_games_
+					  << " missing_target_games=" << missing_target_games_ << std::endl;
 		}
 	}
 
 	std::int64_t games() const noexcept { return games_; }
-	std::int64_t skipped_moves() const noexcept { return skipped_moves_; }
-	std::int64_t skipped_games() const noexcept { return skipped_games_; }
+	std::int64_t invalid_games() const noexcept { return invalid_games_; }
+	std::int64_t missing_target_games() const noexcept { return missing_target_games_; }
 
 	private:
+	void attach_detached_comment(std::string_view comment) {
+		const auto score = comment_score(std::string(comment));
+		if (!score)
+			return;
+		if (game_comment_scores_.empty())
+			root_score_ = score;
+		else
+			game_comment_scores_.back() = score;
+		game_has_eval_ = true;
+	}
+
+	bool consume_detached_comment(std::string_view token) {
+		if (!collecting_detached_comment_ &&
+			(token.empty() || token.front() != '{'))
+			return false;
+		if (!detached_comment_.empty())
+			detached_comment_.push_back(' ');
+		detached_comment_.append(token);
+		collecting_detached_comment_ = detached_comment_.find('}') == std::string::npos;
+		if (collecting_detached_comment_)
+			return true;
+
+		const auto open = detached_comment_.find('{');
+		const auto close = detached_comment_.rfind('}');
+		attach_detached_comment(std::string_view(detached_comment_).substr(
+			open + 1, close - open - 1));
+		detached_comment_.clear();
+		return true;
+	}
+
 	PreprocessOptions options_;
 	H5Writer &writer_;
 	chess::Board board_;
 	std::string result_;
-	std::string previous_comment_;
+	std::optional<double> root_score_;
 	bool game_has_eval_ = false;
+	bool game_invalid_ = false;
 	std::vector<EncodedFeatures> game_features_;
 	std::vector<std::uint16_t> game_moves_;
 	std::vector<float> game_values_;
+	std::vector<std::optional<double>> game_comment_scores_;
+	std::vector<bool> game_movers_are_white_;
+	std::string detached_comment_;
+	bool collecting_detached_comment_ = false;
 	std::int64_t games_ = 0;
-	std::int64_t skipped_moves_ = 0;
-	std::int64_t skipped_games_ = 0;
+	std::int64_t invalid_games_ = 0;
+	std::int64_t missing_target_games_ = 0;
+	int parse_warning_count_ = 0;
 };
 
 } // namespace
@@ -261,7 +412,8 @@ struct H5Writer::Impl {
 		write_string_attribute(file, "source", options.source);
 		write_int_attribute(file, "has_cmt", options.has_comments);
 		if (options.has_comments) {
-			write_string_attribute(file, "comment_eval_perspective", "white");
+			write_string_attribute(file, "comment_eval_perspective",
+				"per_game_white_or_mover_resolved_to_side_to_move");
 			write_string_attribute(file, "comment_value_transform",
 				"(tanh(side_to_move_pawn_score/3)+1)/2");
 		}
@@ -472,8 +624,8 @@ void preprocess_pgn(const PreprocessOptions &options) {
 	writer.flush();
 	std::cout << "Eleginus preprocess summary: games=" << visitor.games()
 			  << " positions=" << writer.size()
-			  << " skipped_moves=" << visitor.skipped_moves()
-			  << " skipped_games=" << visitor.skipped_games()
+			  << " invalid_games=" << visitor.invalid_games()
+			  << " missing_target_games=" << visitor.missing_target_games()
 			  << " output=" << options.output.string() << std::endl;
 }
 
@@ -495,16 +647,6 @@ TrainStats train_from_h5(Model &model, const TrainOptions &options,
 		torch::optim::AdamWOptions(options.learning_rate).weight_decay(options.weight_decay));
 	model->train();
 	TrainStats stats;
-	std::int64_t window_samples = 0;
-	double window_policy_loss = 0.0;
-	double window_value_loss = 0.0;
-	double window_target_entropy = 0.0;
-	double window_value_mae = 0.0;
-	double window_prediction_sum = 0.0;
-	double window_target_sum = 0.0;
-	double window_prediction_square_sum = 0.0;
-	double window_target_square_sum = 0.0;
-	double window_prediction_target_sum = 0.0;
 	const std::int64_t chunk_rows =
 		std::max<std::int64_t>(4096, static_cast<std::int64_t>(options.batch_size) * 16);
 	std::vector<std::int64_t> chunks;
@@ -573,100 +715,17 @@ TrainStats train_from_h5(Model &model, const TrainOptions &options,
 				torch::nn::utils::clip_grad_norm_(model->value->parameters(), 1.0);
 				policy_optimizer.step();
 				value_optimizer.step();
-				torch::Tensor diagnostic_tensor;
-				{
-					torch::NoGradGuard no_grad;
-					const auto targets = value_targets.detach();
-					const auto probabilities = torch::sigmoid(value_prediction.detach());
-					const auto clipped_targets = torch::clamp(targets, 1.0e-7, 1.0 - 1.0e-7);
-					const auto target_entropy = -(
-						targets * torch::log(clipped_targets) +
-						(1.0 - targets) * torch::log(1.0 - clipped_targets));
-					diagnostic_tensor = torch::stack({
-						policy_loss.detach(),
-						value_loss.detach(),
-						target_entropy.mean(),
-						torch::mean(torch::abs(probabilities - targets)),
-						probabilities.mean(),
-						targets.mean(),
-						torch::mean(probabilities.square()),
-						torch::mean(targets.square()),
-						torch::mean(probabilities * targets),
-					}).to(torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat64));
-				}
-				diagnostic_tensor = diagnostic_tensor.contiguous();
-				const auto *diagnostics = diagnostic_tensor.data_ptr<double>();
-				const double policy_loss_value = diagnostics[0];
-				const double value_loss_value = diagnostics[1];
-				const double loss_value = policy_loss_value + value_loss_value;
 				++stats.steps;
 				stats.samples += count;
-				stats.mean_policy_loss += policy_loss_value;
-				stats.mean_value_loss += value_loss_value;
-				stats.mean_loss += loss_value;
-				const double sample_count = static_cast<double>(count);
-				window_samples += count;
-				window_policy_loss += policy_loss_value * sample_count;
-				window_value_loss += value_loss_value * sample_count;
-				window_target_entropy += diagnostics[2] * sample_count;
-				window_value_mae += diagnostics[3] * sample_count;
-				window_prediction_sum += diagnostics[4] * sample_count;
-				window_target_sum += diagnostics[5] * sample_count;
-				window_prediction_square_sum += diagnostics[6] * sample_count;
-				window_target_square_sum += diagnostics[7] * sample_count;
-				window_prediction_target_sum += diagnostics[8] * sample_count;
-				if (options.log_every > 0 && stats.steps % options.log_every == 0) {
-					const double divisor = static_cast<double>(window_samples);
-					const double policy_mean = window_policy_loss / divisor;
-					const double value_mean = window_value_loss / divisor;
-					const double prediction_mean = window_prediction_sum / divisor;
-					const double target_mean = window_target_sum / divisor;
-					const double prediction_variance = std::max(
-						0.0, window_prediction_square_sum / divisor -
-							prediction_mean * prediction_mean);
-					const double target_variance = std::max(
-						0.0, window_target_square_sum / divisor - target_mean * target_mean);
-					const double covariance =
-						window_prediction_target_sum / divisor - prediction_mean * target_mean;
-					const double correlation_denominator =
-						std::sqrt(prediction_variance * target_variance);
-					const double correlation = correlation_denominator > 1.0e-12
-						? covariance / correlation_denominator
-						: 0.0;
-					const double value_kl = std::max(
-						0.0, value_mean - window_target_entropy / divisor);
+				if (options.log_every > 0 && stats.steps % options.log_every == 0)
 					std::cout << "Eleginus training: epoch=" << (epoch + 1)
-							  << " step=" << stats.steps
-							  << " policy=" << policy_mean
-							  << " value=" << value_mean
-							  << " value_kl=" << value_kl
-							  << " value_mae=" << window_value_mae / divisor
-							  << " value_corr=" << correlation
-							  << " pred_mean=" << prediction_mean
-							  << " target_mean=" << target_mean
-							  << " loss=" << policy_mean + value_mean << std::endl;
-					window_samples = 0;
-					window_policy_loss = 0.0;
-					window_value_loss = 0.0;
-					window_target_entropy = 0.0;
-					window_value_mae = 0.0;
-					window_prediction_sum = 0.0;
-					window_target_sum = 0.0;
-					window_prediction_square_sum = 0.0;
-					window_target_square_sum = 0.0;
-					window_prediction_target_sum = 0.0;
-				}
+							  << " step=" << stats.steps << std::endl;
 			}
 			if (stop)
 				break;
 		}
 	}
 	model->eval();
-	if (stats.steps > 0) {
-		stats.mean_policy_loss /= static_cast<double>(stats.steps);
-		stats.mean_value_loss /= static_cast<double>(stats.steps);
-		stats.mean_loss /= static_cast<double>(stats.steps);
-	}
 	return stats;
 }
 

@@ -39,9 +39,11 @@ TORCH_MODULE(PolicyNetwork);
 
 struct ValueNetworkImpl : torch::nn::Module {
 	ValueNetworkImpl();
+	torch::Tensor relation_state(torch::Tensor features);
 	torch::Tensor forward(torch::Tensor features, torch::Tensor white_to_move);
 
 	SparseEncoder encoder{nullptr};
+	torch::nn::Embedding attention{nullptr};
 	torch::nn::Linear hidden{nullptr};
 	torch::nn::Linear bottleneck{nullptr};
 	torch::nn::Linear output{nullptr};

@@ -58,9 +58,6 @@ int main(int argc, char **argv) {
 		eleginus::save_checkpoint_atomic(output, model);
 		std::cout << "Eleginus supervised training complete: rows=" << stats.samples
 				  << " steps=" << stats.steps
-				  << " mean_policy=" << stats.mean_policy_loss
-				  << " mean_value=" << stats.mean_value_loss
-				  << " mean_loss=" << stats.mean_loss
 				  << " checkpoint=" << output.string() << std::endl;
 		return 0;
 	} catch (const std::exception &error) {

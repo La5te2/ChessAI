@@ -31,7 +31,7 @@ inline constexpr float kValueCentipawnScale = 150.0F;
 struct Position {
 	chess::Board board;
 	FloatAccumulator policy_accumulator;
-	FloatAccumulator value_accumulator;
+	ValueAccumulator value_accumulator;
 };
 
 struct OrderedMove {

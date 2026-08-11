@@ -38,6 +38,9 @@ void write_architecture(torch::serialize::OutputArchive &archive) {
 	archive.write("policy_accumulator", scalar(kPolicyAccumulatorWidth), true);
 	archive.write("policy_hidden", scalar(kPolicyHiddenWidth), true);
 	archive.write("value_accumulator", scalar(kValueAccumulatorWidth), true);
+	archive.write("value_attention", scalar(kValueAttentionWidth), true);
+	archive.write("value_relation_formula", scalar(kValueRelationFormula), true);
+	archive.write("value_dense", scalar(kValueDenseWidth), true);
 	archive.write("value_hidden", scalar(kValueHiddenWidth), true);
 	archive.write("value_bottleneck", scalar(kValueBottleneckWidth), true);
 	archive.write("value_buckets", scalar(kValueBucketCount), true);
@@ -51,6 +54,9 @@ void validate_architecture(torch::serialize::InputArchive &archive) {
 	require_scalar(archive, "policy_accumulator", kPolicyAccumulatorWidth);
 	require_scalar(archive, "policy_hidden", kPolicyHiddenWidth);
 	require_scalar(archive, "value_accumulator", kValueAccumulatorWidth);
+	require_scalar(archive, "value_attention", kValueAttentionWidth);
+	require_scalar(archive, "value_relation_formula", kValueRelationFormula);
+	require_scalar(archive, "value_dense", kValueDenseWidth);
 	require_scalar(archive, "value_hidden", kValueHiddenWidth);
 	require_scalar(archive, "value_bottleneck", kValueBottleneckWidth);
 	require_scalar(archive, "value_buckets", kValueBucketCount);

@@ -344,18 +344,21 @@ Preprocess a PGN into the architecture-locked Eleginus Policy/Value schema with:
 build/eleginus/preprocess \
 	--input data/ccrl.pgn \
 	--output data/games.eleginus.h5 \
-	--has-cmt 1 \
+	--has-cmt 0 \
 	--compression-level 4 \
-	--max-games 500000
+	--max-games 100000
 ```
 
 The HDF5 file uses the same `states`, `moves` and `values` dataset names as Gadus and Melano, but
 its root metadata identifies `arch_type=eleginus` together with Eleginus-specific state, move and
 target encodings. Eleginus moves use side-to-move-relative coordinates, and the reader accepts only
-`target_schema=policy_value_supervised_v1`. Generate the HDF5 file with the Eleginus preprocessor
+`target_schema=policy_value_perspective_resolved`. Generate the HDF5 file with the Eleginus preprocessor
 before training.
-With `--has-cmt 1`, numerical pawn evaluations in PGN comments become side-to-move targets in `[0,1]`;
-with `--has-cmt 0`, completed game results supply targets in `{0, 0.5, 1}`.
+With `--has-cmt 1`, the preprocessor determines whether each game's numerical pawn evaluations use
+White or mover perspective, converts them to side-to-move targets and maps them into `[0,1]`. With
+`--has-cmt 0`, completed game results supply targets in `{0, 0.5, 1}`. A game with an unparseable move
+is rejected as an `invalid_game`, while a game lacking the target required by the selected mode is
+counted as a `missing_target_game`.
 
 Train independent Eleginus Policy and Value networks with:
 
@@ -363,7 +366,7 @@ Train independent Eleginus Policy and Value networks with:
 build/eleginus/train \
 	--data data/games.eleginus.h5 \
 	--out models/eleginus/eleginus.pth \
-	--epochs 2 \
+	--epochs 1 \
 	--batch-size 512 \
 	--lr 0.001 \
 	--device cuda \

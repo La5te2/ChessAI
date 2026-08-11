@@ -3,11 +3,13 @@
 #include "eleginus/checkpoint.hpp"
 #include "eleginus/dataset.hpp"
 #include "eleginus/search.hpp"
+#include <array>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 
 namespace {
@@ -31,6 +33,21 @@ float max_difference(const std::vector<float> &left, const std::vector<float> &r
 	float difference = 0.0F;
 	for (std::size_t index = 0; index < left.size(); ++index) {
 		difference = std::max(difference, std::abs(left[index] - right[index]));
+	}
+	return difference;
+}
+
+float max_relation_difference(const eleginus::RelationAccumulator &left,
+							  const eleginus::RelationAccumulator &right) {
+	float difference = 0.0F;
+	for (int perspective = 0; perspective < eleginus::kPerspectiveCount; ++perspective) {
+		for (int channel = 0; channel < eleginus::kValueAttentionWidth; ++channel) {
+			difference = std::max(difference, std::abs(
+				left.perspective[static_cast<std::size_t>(perspective)]
+					[static_cast<std::size_t>(channel)] -
+				right.perspective[static_cast<std::size_t>(perspective)]
+					[static_cast<std::size_t>(channel)]));
+		}
 	}
 	return difference;
 }
@@ -112,9 +129,55 @@ int main() {
 						policy_refreshed.perspective[static_cast<std::size_t>(perspective)]) < 1.0e-5F,
 					"incremental Policy accumulator differs from refresh");
 			require(max_difference(
-						value_updated.perspective[static_cast<std::size_t>(perspective)],
-						value_refreshed.perspective[static_cast<std::size_t>(perspective)]) < 1.0e-5F,
+						value_updated.features.perspective[static_cast<std::size_t>(perspective)],
+						value_refreshed.features.perspective[static_cast<std::size_t>(perspective)]) <
+					1.0e-5F,
 					"incremental Value accumulator differs from refresh");
+		}
+		require(max_relation_difference(value_updated.relations,
+			value_refreshed.relations) < 1.0e-4F,
+			"incremental Value relation state differs from refresh");
+		require(std::abs(value.evaluate(value_updated) - value.evaluate(value_refreshed)) < 1.0e-5F,
+			"incremental Value output differs from refresh");
+
+		auto require_value_update = [&](const chess::Board &before, const char *uci) {
+			auto next = before;
+			next.makeMove(chess::uci::uciToMove(next, uci));
+			const auto updated = value.update(value.refresh(before), before, next);
+			const auto refreshed = value.refresh(next);
+			for (int perspective = 0; perspective < eleginus::kPerspectiveCount; ++perspective) {
+				require(max_difference(
+					updated.features.perspective[static_cast<std::size_t>(perspective)],
+					refreshed.features.perspective[static_cast<std::size_t>(perspective)]) <
+					1.0e-5F,
+					"incremental Value feature state differs on a special move");
+			}
+			require(max_relation_difference(updated.relations, refreshed.relations) < 1.0e-4F,
+				"incremental Value relation state differs on a special move");
+			require(std::abs(value.evaluate(updated) - value.evaluate(refreshed)) < 1.0e-5F,
+				"incremental Value output differs on a special move");
+		};
+		require_value_update(
+			chess::Board("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1"), "e1g1");
+		require_value_update(
+			chess::Board("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1"), "e5d6");
+		require_value_update(
+			chess::Board("4k3/P7/8/8/8/8/8/4K3 w - - 0 1"), "a7a8q");
+
+		chess::Board sequence;
+		auto sequence_state = value.refresh(sequence);
+		for (const char *uci : {"e2e4", "e7e5", "g1f3", "b8c6", "f1b5", "a7a6",
+				 "b5a4", "g8f6", "e1g1", "f8e7", "f1e1", "b7b5", "a4b3"}) {
+			auto next = sequence;
+			next.makeMove(chess::uci::uciToMove(next, uci));
+			sequence_state = value.update(sequence_state, sequence, next);
+			const auto refreshed = value.refresh(next);
+			require(max_relation_difference(sequence_state.relations,
+				refreshed.relations) < 2.0e-4F,
+				"cumulative Value relation updates drifted from refresh");
+			require(std::abs(value.evaluate(sequence_state) - value.evaluate(refreshed)) < 1.0e-5F,
+				"cumulative Value updates changed the evaluated result");
+			sequence = std::move(next);
 		}
 
 		eleginus::SearchOptions search_options;
@@ -219,6 +282,9 @@ int main() {
 				"Eleginus HDF5 side-to-move orientation changed Policy input");
 		}
 		auto training_model = eleginus::make_model(torch::Device(torch::kCPU), 11);
+		const auto attention_before =
+			training_model->value->attention->weight.detach().clone();
+		const auto output_before = training_model->value->output->weight.detach().clone();
 		eleginus::TrainOptions training_options;
 		training_options.data = dataset_path;
 		training_options.epochs = 1;
@@ -229,10 +295,71 @@ int main() {
 			training_model, training_options, torch::Device(torch::kCPU));
 		require(training_stats.steps == 1 && training_stats.samples == 2,
 			"Eleginus training batch mismatch");
-		require(std::isfinite(training_stats.mean_policy_loss) &&
-				std::isfinite(training_stats.mean_value_loss),
-			"Eleginus training loss is not finite");
+		const auto attention_change =
+			(training_model->value->attention->weight.detach() - attention_before).abs();
+		for (int part = 0; part < 3; ++part) {
+			const auto begin = part * eleginus::kValueAttentionWidth;
+			const auto end = begin + eleginus::kValueAttentionWidth;
+			require(attention_change.index({torch::indexing::Slice(),
+				torch::indexing::Slice(begin, end)}).max().item<float>() > 0.0F,
+				"Eleginus relation parameters received no Value gradient");
+		}
+		require((training_model->value->output->weight.detach() - output_before)
+				.abs().max().item<float>() > 0.0F,
+			"Eleginus Value output received no gradient");
 		std::filesystem::remove(dataset_path);
+
+		const auto pgn_path =
+			std::filesystem::temp_directory_path() / "eleginus-preprocess-test.pgn";
+		const auto preprocessed_path =
+			std::filesystem::temp_directory_path() / "eleginus-preprocess-test.h5";
+		{
+			std::ofstream pgn(pgn_path);
+			pgn << "[Event \"root comment\"]\n"
+				   "[Result \"1-0\"]\n\n"
+				   "{opening note} 1. e4\n"
+				   "{0s}\n"
+				   "e5\n"
+				   "{+0.20/12 0s}\n"
+				   "2. Nf3\n"
+				   "{+0.15/12 0s}\n"
+				   "Nc6\n"
+				   "{+0.10/12 0s} 1-0\n\n"
+				   "[Event \"invalid move\"]\n"
+				   "[Result \"1-0\"]\n\n"
+				   "1. e4 e5 2. Qa9 1-0\n";
+		}
+		{
+			eleginus::PreprocessOptions preprocess_options;
+			preprocess_options.input = pgn_path;
+			preprocess_options.output = preprocessed_path;
+			preprocess_options.has_comments = 1;
+			preprocess_options.compression_level = 0;
+			preprocess_options.log_every = 0;
+			eleginus::preprocess_pgn(preprocess_options);
+			eleginus::H5Dataset dataset(preprocessed_path);
+			require(dataset.info().length == 4,
+				"Eleginus preprocessing rejected multiline comments or retained invalid moves");
+			auto stored = dataset.read_contiguous(0, 4);
+			require(std::abs(stored.values[0].item<float>() - 0.5F) < 1.0e-6F &&
+					std::abs(stored.values[1].item<float>() - 0.5F) < 1.0e-6F,
+				"Eleginus preprocessing changed neutral opening targets");
+			require(stored.values[2].item<float>() > 0.5F &&
+					stored.values[3].item<float>() < 0.5F,
+				"Eleginus preprocessing lost multiline evaluation comments");
+			chess::Board replay;
+			for (std::int64_t row = 0; row < 4; ++row) {
+				const auto expected = chess::uci::parseSan(
+					replay, std::array<std::string_view, 4>{"e4", "e5", "Nf3", "Nc6"}
+						[static_cast<std::size_t>(row)]);
+				require(stored.moves[row].item<std::int64_t>() ==
+						eleginus::move_to_index(expected, replay.sideToMove()),
+					"Eleginus preprocessing changed a move after a root comment");
+				replay.makeMove(expected);
+			}
+		}
+		std::filesystem::remove(pgn_path);
+		std::filesystem::remove(preprocessed_path);
 
 		chess::Board mate("7k/6Q1/6K1/8/8/8/8/8 b - - 0 1");
 		require(eleginus::game_is_over(mate), "checkmate not detected");

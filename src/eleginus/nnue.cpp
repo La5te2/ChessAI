@@ -66,9 +66,9 @@ void add_feature(std::vector<float> &accumulator, const std::vector<float> &tabl
 	}
 }
 
-FloatAccumulator refresh_accumulator(const chess::Board &board, const std::vector<float> &table,
+FloatAccumulator refresh_accumulator(const EncodedFeatures &encoded,
+									 const std::vector<float> &table,
 									 const std::vector<float> &bias, int width) {
-	const auto encoded = encode_features(board);
 	FloatAccumulator result;
 	result.white_to_move = encoded.white_to_move;
 	for (const int feature : encoded.perspective[0])
@@ -88,11 +88,15 @@ FloatAccumulator refresh_accumulator(const chess::Board &board, const std::vecto
 	return result;
 }
 
-FloatAccumulator update_accumulator(const FloatAccumulator &current, const chess::Board &before,
-									const chess::Board &after,
+FloatAccumulator refresh_accumulator(const chess::Board &board, const std::vector<float> &table,
+									 const std::vector<float> &bias, int width) {
+	return refresh_accumulator(encode_features(board), table, bias, width);
+}
+
+FloatAccumulator update_accumulator(const FloatAccumulator &current,
+									const EncodedFeatures &old_features,
+									const EncodedFeatures &new_features,
 									const std::vector<float> &table, int width) {
-	const auto old_features = encode_features(before);
-	const auto new_features = encode_features(after);
 	FloatAccumulator result = current;
 	result.white_to_move = new_features.white_to_move;
 	result.piece_count = 0;
@@ -121,6 +125,115 @@ FloatAccumulator update_accumulator(const FloatAccumulator &current, const chess
 	return result;
 }
 
+FloatAccumulator update_accumulator(const FloatAccumulator &current, const chess::Board &before,
+									const chess::Board &after,
+									const std::vector<float> &table, int width) {
+	return update_accumulator(current, encode_features(before), encode_features(after), table,
+		width);
+}
+
+std::vector<int> piece_features(const EncodedFeatures &encoded, int perspective) {
+	const auto canonical = canonicalize_features(
+		encoded.perspective[static_cast<std::size_t>(perspective)]);
+	std::vector<int> result;
+	result.reserve(kFeatureSlots - 2);
+	for (const int feature : canonical) {
+		if (feature >= 0 && feature < kPieceFeatureCount)
+			result.push_back(feature);
+	}
+	return result;
+}
+
+bool contains_feature(const std::vector<int> &features, int feature) {
+	return std::find(features.begin(), features.end(), feature) != features.end();
+}
+
+void add_relation_pair(std::array<float, kValueAttentionWidth> &accumulator,
+						   const std::vector<float> &table, int source, int target, float sign) {
+	const auto source_offset = static_cast<std::size_t>(source) * kValueAttentionTableWidth;
+	const auto target_offset = static_cast<std::size_t>(target) * kValueAttentionTableWidth;
+	float score = 0.0F;
+	for (int channel = 0; channel < kValueAttentionWidth; ++channel) {
+		score += table[source_offset + static_cast<std::size_t>(channel)] *
+			table[target_offset + kValueAttentionWidth + static_cast<std::size_t>(channel)];
+	}
+	score = std::clamp(score / std::sqrt(static_cast<float>(kValueAttentionWidth)),
+		-8.0F, 8.0F);
+	const float coefficient = 2.0F / (1.0F + std::exp(-score)) - 1.0F;
+	for (int channel = 0; channel < kValueAttentionWidth; ++channel) {
+		accumulator[static_cast<std::size_t>(channel)] += sign * coefficient *
+			table[target_offset + 2 * kValueAttentionWidth +
+				static_cast<std::size_t>(channel)];
+	}
+}
+
+RelationAccumulator refresh_relations(const EncodedFeatures &encoded,
+									  const std::vector<float> &table) {
+	RelationAccumulator result;
+	for (int perspective = 0; perspective < kPerspectiveCount; ++perspective) {
+		const auto pieces = piece_features(encoded, perspective);
+		auto &total = result.perspective[static_cast<std::size_t>(perspective)];
+		for (std::size_t source = 0; source < pieces.size(); ++source) {
+			for (std::size_t target = 0; target < pieces.size(); ++target) {
+				if (source != target)
+					add_relation_pair(total, table, pieces[source], pieces[target], 1.0F);
+			}
+		}
+	}
+	return result;
+}
+
+RelationAccumulator update_relations(const RelationAccumulator &current,
+									 const EncodedFeatures &old_encoded,
+									 const EncodedFeatures &new_encoded,
+									 const std::vector<float> &table) {
+	RelationAccumulator result = current;
+	for (int perspective = 0; perspective < kPerspectiveCount; ++perspective) {
+		const auto old_pieces = piece_features(old_encoded, perspective);
+		const auto new_pieces = piece_features(new_encoded, perspective);
+		std::vector<int> removed;
+		std::vector<int> added;
+		for (const int feature : old_pieces) {
+			if (!contains_feature(new_pieces, feature))
+				removed.push_back(feature);
+		}
+		for (const int feature : new_pieces) {
+			if (!contains_feature(old_pieces, feature))
+				added.push_back(feature);
+		}
+
+		auto &total = result.perspective[static_cast<std::size_t>(perspective)];
+		// Remove every old ordered pair with at least one endpoint in removed.
+		for (const int source : removed) {
+			for (const int target : old_pieces) {
+				if (source != target)
+					add_relation_pair(total, table, source, target, -1.0F);
+			}
+		}
+		for (const int source : old_pieces) {
+			if (contains_feature(removed, source))
+				continue;
+			for (const int target : removed)
+				add_relation_pair(total, table, source, target, -1.0F);
+		}
+
+		// Add every new ordered pair with at least one endpoint in added.
+		for (const int source : added) {
+			for (const int target : new_pieces) {
+				if (source != target)
+					add_relation_pair(total, table, source, target, 1.0F);
+			}
+		}
+		for (const int source : new_pieces) {
+			if (contains_feature(added, source))
+				continue;
+			for (const int target : added)
+				add_relation_pair(total, table, source, target, 1.0F);
+		}
+	}
+	return result;
+}
+
 std::vector<float> oriented_input(const FloatAccumulator &accumulator, int width,
 								  bool squared) {
 	std::vector<float> input(static_cast<std::size_t>(width * 2));
@@ -136,6 +249,29 @@ std::vector<float> oriented_input(const FloatAccumulator &accumulator, int width
 		input[static_cast<std::size_t>(channel)] = squared ? first_value * first_value : first_value;
 		input[static_cast<std::size_t>(width + channel)] =
 			squared ? second_value * second_value : second_value;
+	}
+	return input;
+}
+
+std::vector<float> oriented_value_input(const ValueAccumulator &accumulator) {
+	std::vector<float> input(static_cast<std::size_t>(kValueDenseWidth * 2));
+	const int first = accumulator.features.white_to_move ? 0 : 1;
+	const int second = 1 - first;
+	const float source_count = std::max(1, accumulator.features.piece_count);
+	for (int side = 0; side < kPerspectiveCount; ++side) {
+		const int perspective = side == 0 ? first : second;
+		const auto output_offset = static_cast<std::size_t>(side * kValueDenseWidth);
+		for (int channel = 0; channel < kValueAccumulatorWidth; ++channel) {
+			const float value = std::clamp(
+				accumulator.features.perspective[static_cast<std::size_t>(perspective)]
+					[static_cast<std::size_t>(channel)], 0.0F, 1.0F);
+			input[output_offset + static_cast<std::size_t>(channel)] = value * value;
+		}
+		for (int channel = 0; channel < kValueAttentionWidth; ++channel) {
+			input[output_offset + kValueAccumulatorWidth + static_cast<std::size_t>(channel)] =
+				accumulator.relations.perspective[static_cast<std::size_t>(perspective)]
+					[static_cast<std::size_t>(channel)] / source_count;
+		}
 	}
 	return input;
 }
@@ -327,9 +463,12 @@ CpuValue::CpuValue(ValueWeights weights) : weights_(std::move(weights)) {
 		static_cast<std::size_t>(kFeatureVocabulary) * kValueFeatureWidth,
 		"Value feature table");
 	require_size(weights_.accumulator_bias, kValueFeatureWidth, "Value accumulator bias");
+	require_size(weights_.attention_table,
+		static_cast<std::size_t>(kFeatureVocabulary) * kValueAttentionTableWidth,
+		"Value attention table");
 	require_size(weights_.hidden_weight,
 		static_cast<std::size_t>(kValueBucketCount) * kValueHiddenWidth *
-			kValueAccumulatorWidth * 2,
+			kValueDenseWidth * 2,
 		"Value hidden weight");
 	require_size(weights_.hidden_bias, kValueBucketCount * kValueHiddenWidth,
 		"Value hidden bias");
@@ -344,20 +483,30 @@ CpuValue::CpuValue(ValueWeights weights) : weights_(std::move(weights)) {
 	require_size(weights_.output_bias, kValueBucketCount, "Value output bias");
 }
 
-FloatAccumulator CpuValue::refresh(const chess::Board &board) const {
-	return refresh_accumulator(board, weights_.feature_table, weights_.accumulator_bias,
-		kValueFeatureWidth);
+ValueAccumulator CpuValue::refresh(const chess::Board &board) const {
+	const auto encoded = encode_features(board);
+	return ValueAccumulator{
+		refresh_accumulator(encoded, weights_.feature_table, weights_.accumulator_bias,
+			kValueFeatureWidth),
+		refresh_relations(encoded, weights_.attention_table),
+	};
 }
 
-FloatAccumulator CpuValue::update(const FloatAccumulator &current, const chess::Board &before,
+ValueAccumulator CpuValue::update(const ValueAccumulator &current, const chess::Board &before,
 								  const chess::Board &after) const {
-	return update_accumulator(current, before, after, weights_.feature_table,
-		kValueFeatureWidth);
+	const auto old_encoded = encode_features(before);
+	const auto new_encoded = encode_features(after);
+	return ValueAccumulator{
+		update_accumulator(current.features, old_encoded, new_encoded,
+			weights_.feature_table, kValueFeatureWidth),
+		update_relations(current.relations, old_encoded, new_encoded,
+			weights_.attention_table),
+	};
 }
 
-float CpuValue::evaluate(const FloatAccumulator &accumulator) const {
-	const int bucket = value_bucket(accumulator.piece_count);
-	const auto input = oriented_input(accumulator, kValueAccumulatorWidth, true);
+float CpuValue::evaluate(const ValueAccumulator &accumulator) const {
+	const int bucket = value_bucket(accumulator.features.piece_count);
+	const auto input = oriented_value_input(accumulator);
 	const auto hidden = linear_relu_bucket(input, weights_.hidden_weight,
 		weights_.hidden_bias, kValueHiddenWidth, bucket);
 	const auto bottleneck = linear_relu_bucket(hidden, weights_.bottleneck_weight,
@@ -368,12 +517,12 @@ float CpuValue::evaluate(const FloatAccumulator &accumulator) const {
 		output += weights_.output_weight[output_offset + static_cast<std::size_t>(channel)] *
 				  bottleneck[static_cast<std::size_t>(channel)];
 	}
-	const int first = accumulator.white_to_move ? 0 : 1;
+	const int first = accumulator.features.white_to_move ? 0 : 1;
 	const int second = 1 - first;
 	const auto psqt = static_cast<std::size_t>(kValueAccumulatorWidth + bucket);
 	output += 0.5F *
-		(accumulator.perspective[static_cast<std::size_t>(first)][psqt] -
-		 accumulator.perspective[static_cast<std::size_t>(second)][psqt]);
+		(accumulator.features.perspective[static_cast<std::size_t>(first)][psqt] -
+		 accumulator.features.perspective[static_cast<std::size_t>(second)][psqt]);
 	return output;
 }
 

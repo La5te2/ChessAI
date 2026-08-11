@@ -15,7 +15,7 @@
 namespace eleginus {
 
 inline constexpr const char *kStateEncoding = "eleginus_sparse_features_v1";
-inline constexpr const char *kTargetSchema = "policy_value_supervised_v1";
+inline constexpr const char *kTargetSchema = "policy_value_perspective_resolved";
 
 struct DatasetInfo {
 	std::int64_t length = 0;
@@ -101,9 +101,6 @@ struct TrainOptions {
 struct TrainStats {
 	std::int64_t steps = 0;
 	std::int64_t samples = 0;
-	double mean_policy_loss = 0.0;
-	double mean_value_loss = 0.0;
-	double mean_loss = 0.0;
 };
 
 TrainStats train_from_h5(Model &model, const TrainOptions &options, const torch::Device &device);
