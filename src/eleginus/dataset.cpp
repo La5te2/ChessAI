@@ -495,6 +495,16 @@ TrainStats train_from_h5(Model &model, const TrainOptions &options,
 		torch::optim::AdamWOptions(options.learning_rate).weight_decay(options.weight_decay));
 	model->train();
 	TrainStats stats;
+	std::int64_t window_samples = 0;
+	double window_policy_loss = 0.0;
+	double window_value_loss = 0.0;
+	double window_target_entropy = 0.0;
+	double window_value_mae = 0.0;
+	double window_prediction_sum = 0.0;
+	double window_target_sum = 0.0;
+	double window_prediction_square_sum = 0.0;
+	double window_target_square_sum = 0.0;
+	double window_prediction_target_sum = 0.0;
 	const std::int64_t chunk_rows =
 		std::max<std::int64_t>(4096, static_cast<std::int64_t>(options.batch_size) * 16);
 	std::vector<std::int64_t> chunks;
@@ -563,20 +573,89 @@ TrainStats train_from_h5(Model &model, const TrainOptions &options,
 				torch::nn::utils::clip_grad_norm_(model->value->parameters(), 1.0);
 				policy_optimizer.step();
 				value_optimizer.step();
-				const double policy_loss_value = policy_loss.item<double>();
-				const double value_loss_value = value_loss.item<double>();
-				const double loss_value = loss.item<double>();
+				torch::Tensor diagnostic_tensor;
+				{
+					torch::NoGradGuard no_grad;
+					const auto targets = value_targets.detach();
+					const auto probabilities = torch::sigmoid(value_prediction.detach());
+					const auto clipped_targets = torch::clamp(targets, 1.0e-7, 1.0 - 1.0e-7);
+					const auto target_entropy = -(
+						targets * torch::log(clipped_targets) +
+						(1.0 - targets) * torch::log(1.0 - clipped_targets));
+					diagnostic_tensor = torch::stack({
+						policy_loss.detach(),
+						value_loss.detach(),
+						target_entropy.mean(),
+						torch::mean(torch::abs(probabilities - targets)),
+						probabilities.mean(),
+						targets.mean(),
+						torch::mean(probabilities.square()),
+						torch::mean(targets.square()),
+						torch::mean(probabilities * targets),
+					}).to(torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat64));
+				}
+				diagnostic_tensor = diagnostic_tensor.contiguous();
+				const auto *diagnostics = diagnostic_tensor.data_ptr<double>();
+				const double policy_loss_value = diagnostics[0];
+				const double value_loss_value = diagnostics[1];
+				const double loss_value = policy_loss_value + value_loss_value;
 				++stats.steps;
 				stats.samples += count;
 				stats.mean_policy_loss += policy_loss_value;
 				stats.mean_value_loss += value_loss_value;
 				stats.mean_loss += loss_value;
-				if (options.log_every > 0 && stats.steps % options.log_every == 0)
+				const double sample_count = static_cast<double>(count);
+				window_samples += count;
+				window_policy_loss += policy_loss_value * sample_count;
+				window_value_loss += value_loss_value * sample_count;
+				window_target_entropy += diagnostics[2] * sample_count;
+				window_value_mae += diagnostics[3] * sample_count;
+				window_prediction_sum += diagnostics[4] * sample_count;
+				window_target_sum += diagnostics[5] * sample_count;
+				window_prediction_square_sum += diagnostics[6] * sample_count;
+				window_target_square_sum += diagnostics[7] * sample_count;
+				window_prediction_target_sum += diagnostics[8] * sample_count;
+				if (options.log_every > 0 && stats.steps % options.log_every == 0) {
+					const double divisor = static_cast<double>(window_samples);
+					const double policy_mean = window_policy_loss / divisor;
+					const double value_mean = window_value_loss / divisor;
+					const double prediction_mean = window_prediction_sum / divisor;
+					const double target_mean = window_target_sum / divisor;
+					const double prediction_variance = std::max(
+						0.0, window_prediction_square_sum / divisor -
+							prediction_mean * prediction_mean);
+					const double target_variance = std::max(
+						0.0, window_target_square_sum / divisor - target_mean * target_mean);
+					const double covariance =
+						window_prediction_target_sum / divisor - prediction_mean * target_mean;
+					const double correlation_denominator =
+						std::sqrt(prediction_variance * target_variance);
+					const double correlation = correlation_denominator > 1.0e-12
+						? covariance / correlation_denominator
+						: 0.0;
+					const double value_kl = std::max(
+						0.0, value_mean - window_target_entropy / divisor);
 					std::cout << "Eleginus training: epoch=" << (epoch + 1)
 							  << " step=" << stats.steps
-							  << " policy=" << policy_loss_value
-							  << " value=" << value_loss_value
-							  << " loss=" << loss_value << std::endl;
+							  << " policy=" << policy_mean
+							  << " value=" << value_mean
+							  << " value_kl=" << value_kl
+							  << " value_mae=" << window_value_mae / divisor
+							  << " value_corr=" << correlation
+							  << " pred_mean=" << prediction_mean
+							  << " target_mean=" << target_mean
+							  << " loss=" << policy_mean + value_mean << std::endl;
+					window_samples = 0;
+					window_policy_loss = 0.0;
+					window_value_loss = 0.0;
+					window_target_entropy = 0.0;
+					window_value_mae = 0.0;
+					window_prediction_sum = 0.0;
+					window_target_sum = 0.0;
+					window_prediction_square_sum = 0.0;
+					window_target_square_sum = 0.0;
+					window_prediction_target_sum = 0.0;
+				}
 			}
 			if (stop)
 				break;
