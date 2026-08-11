@@ -396,7 +396,25 @@ $$
 
 The implementation evaluates this expression with a numerically stable binary-cross-entropy-with-logits operator. Its derivative with respect to the raw logit is proportional to $V_{\theta_V}(s)-y$, so corrections near either end of the expected-score range retain their gradient strength.
 
-Their sum defines the complete supervised objective:
+For one record, write $p=V_{\theta_V}(s)$ and define its target entropy by
+
+$$
+h(y)=-y\log y-(1-y)\log(1-y),
+$$
+
+where $0\log0$ is defined as $0$. The record's Value loss decomposes as
+
+$$
+-y\log p-(1-y)\log(1-p)
+=
+h(y)+D_{\mathrm{KL}}\left(
+\mathrm{Bern}(y)\mathbin\Vert\mathrm{Bern}(p)
+\right),
+$$
+
+where $D_{\mathrm{KL}}$ is the Kullback-Leibler divergence between Bernoulli distributions. The entropy term depends only on the target, while the divergence is the reducible prediction error and reaches zero exactly when $p=y$. Soft targets near $\frac12$ can therefore keep the absolute Value loss near $\log 2$ after the prediction error has become much smaller.
+
+The Policy and Value losses define the complete supervised objective:
 
 $$
 L_{\mathrm{sup}}^{(\mathcal B)}=
@@ -484,7 +502,13 @@ The nonpadding feature rows begin with independent samples from $\mathcal N(0,0.
 
 ## 5. Search
 
-Eleginus applies iterative deepening and principal-variation search to a negamax tree. The Value network supplies static leaf scores, while the Policy network orders legal actions so that promising branches establish alpha-beta bounds early.
+Eleginus applies iterative deepening and principal-variation search (PVS) to a negamax tree. The Policy network determines the order in which legal actions enter the tree procedure, whereas the Value network supplies the numerical score of each ongoing state evaluated at the search frontier. If an ongoing state $x_\ell$ receives a static evaluation after $\ell$ plies from the root, repeated negamax sign reversal gives its root-perspective contribution as
+
+$$
+(-1)^\ell E_{\theta_V}(x_\ell).
+$$
+
+An exact terminal score follows the same sign convention. The Policy probabilities affect alpha-beta bounds, cutoffs and late-move reductions through action order, while the Value scores determine the numerical quantities propagated through the selected tree.
 
 ### 5.1 Scores and Move Order
 
@@ -500,43 +524,174 @@ $$
 
 The scale follows the annotation transformation used by supervised Value targets. If a pawn-unit annotation $z$ produces target $y=(\tanh(z/3)+1)/2$, then the ideal raw score is $v=2z/3$, and $150v$ equals $100z$ centipawns.
 
-The rules engine evaluates terminal states before neural evaluation. A draw receives score $0$. At search ply $p$, a win for the side to move receives $30000-p$, and a loss receives $-30000+p$. The ply adjustment prefers faster wins and slower losses.
+The rules engine evaluates terminal states before neural evaluation. At search ply $p$, the terminal score from the perspective of the side to move is
 
-At every ongoing state, legal actions are sorted by decreasing $P_{\theta_P}(a\mid\phi_E(x))$. Equal probabilities are ordered by their coordinate move strings. When a shallower completed iteration has identified a best action for the same board hash, that action is moved to the front of the ordered list. Policy and iterative-deepening information therefore determine search order, while returned action scores come from the Value-driven negamax tree.
+$$
+Z(x,p)=
+\begin{cases}
+0,&x\text{ is drawn},\\
+-30000+p,&x\text{ is lost by the side to move}.
+\end{cases}
+$$
+
+The ply adjustment makes a loss less negative when it occurs farther from the root. When a parent action checkmates, negamax changes the sign of the child score, so the corresponding positive score becomes larger for a faster mate.
+
+For an ongoing state $x$, let $a_1,\ldots,a_m$ be its ordered legal actions before a stored search hint is applied. Their order satisfies
+
+$$
+P_{\theta_P}(a_j\mid\phi_E(x))
+\geq
+P_{\theta_P}(a_{j+1}\mid\phi_E(x)),
+\qquad 1\leq j<m.
+$$
+
+Equal probabilities are ordered by ascending coordinate move string. When an earlier search has recorded a preferred action for the same position, that action moves to the front and the remaining actions retain their Policy order. The Policy network therefore decides which actions establish bounds first and which actions become eligible for late-move reduction. Terminal scores and Value evaluations supply every returned centipawn score.
 
 ### 5.2 Quiescence Search
 
-At the nominal depth boundary, quiescence search replaces an immediate static evaluation. In a state where the side to move is not in check, the static score acts as the stand-pat value. A stand-pat score at least $\beta$ produces a beta cutoff, and a larger stand-pat score raises $\alpha$. The node returns after this update when its remaining quiescence depth is zero.
+At the nominal depth boundary, quiescence search replaces an immediate static evaluation. Write $\mathrm{QS}(x,p,r,\alpha,\beta)$ for quiescence search at state $x$, search ply $p$ and remaining quiescence depth $r$. When the side to move is not in check, the Value score supplies the stand-pat value
 
-Quiescence search otherwise examines captures and promotions in decreasing order of captured-piece gain, with promotion value included in the ordering score. A checked state examines every legal evasion because stand pat is invalid while the king is in check. The default quiescence allowance is eight plies, and checked continuations may extend by four additional plies before static evaluation terminates the branch. A nonchecking capture is skipped when its stand-pat score plus the captured-piece value and a 120-centipawn margin remains below $\alpha$. Every searched child uses the negated window $[-\beta,-\alpha]$ and returns the negative of its child score.
+$$
+e=E_{\theta_V}(x),
+\qquad
+\alpha'=\max(\alpha,e).
+$$
+
+A stand-pat score satisfying $e\geq\beta$ returns immediately as a beta cutoff. When $r\leq0$, the procedure returns $e$ after the bound update.
+
+Quiescence search otherwise examines captures and promotions in decreasing order of captured-piece gain, with promotion value included in the ordering score. If $\alpha_a$ is the current lower bound before tactical action $a$ is searched, its returned score is
+
+$$
+q_Q(x,a)=
+-\mathrm{QS}\left(
+T(x,a),p+1,r-1,-\beta,-\alpha_a
+\right).
+$$
+
+The procedure updates its best score and lower bound with $q_Q(x,a)$, and a score satisfying $q_Q(x,a)\geq\beta$ produces a cutoff. A checked state examines every legal evasion because stand pat is invalid while the king is in check. The default quiescence allowance is eight plies, and checked continuations may extend by four additional plies before static evaluation terminates the branch. A nonpromoting capture that does not give check is skipped when its stand-pat score plus the captured-piece value and a 120-centipawn margin remains below the current lower bound.
 
 ### 5.3 Principal-Variation Search
 
-Let the ordered legal actions at state $x$ be $a_1,\ldots,a_m$. At remaining principal depth $d>0$, the first action is searched with the full negated alpha-beta window:
+Let $d_Q$ be the initial quiescence allowance. Reaching the principal depth boundary transfers the current window to quiescence search:
 
 $$
-q_1=-\mathrm{PVS}\left(T(x,a_1),d-1,-\beta,-\alpha\right).
+\mathrm{PVS}(x,0,p,\alpha,\beta)=
+\mathrm{QS}(x,p,d_Q,\alpha,\beta).
+$$
+
+For remaining principal depth $d>0$, let $a_1,\ldots,a_m$ be the actions ordered as described in Section 5.1. The first action is searched with the full negated alpha-beta window:
+
+$$
+q_1=-\mathrm{PVS}\left(T(x,a_1),d-1,p+1,-\beta,-\alpha\right).
 $$
 
 After updating $\alpha$, each later action is first tested with a null window of width one centipawn:
 
 $$
-q_j=-\mathrm{PVS}\left(T(x,a_j),d-1,-\alpha-1,-\alpha\right),
+q_j=-\mathrm{PVS}\left(T(x,a_j),d-1,p+1,-\alpha-1,-\alpha\right),
 \qquad j>1.
 $$
 
-A null-window result satisfying $\alpha<q_j<\beta$ proves that the action improves the current bound but does not determine its exact score. The procedure then repeats that child with the full window $[-\beta,-\alpha]$. A score satisfying $q_j\geq\beta$ produces a beta cutoff, and the remaining actions at that node do not affect the current bound.
+A null-window result satisfying $\alpha<q_j<\beta$ proves that the action improves the current bound but does not determine its exact score. The procedure then repeats that child with the full window $[-\beta,-\alpha]$. After each searched action, the node updates its best score and replaces $\alpha$ by $\max(\alpha,q_j)$. A score satisfying $q_j\geq\beta$ produces a beta cutoff, and the remaining actions at that node do not affect the current bound.
 
-Late-move reduction applies to a quiet, nonchecking action after the first three ordered actions when the remaining depth is at least three. The reduced null-window search removes one ply, with one further ply removed at depth six and another after the first eight actions. A reduced result above $\alpha$ is repeated at full depth before it can raise the node bound.
+Late-move reduction applies to action $a_j$ when $d\geq3$, $j\geq4$, the action is quiet and nonchecking, the side to move is not in check and the action is not the stored preferred action. For an eligible action, the reduction is
 
-Depth zero invokes the quiescence procedure in Section 5.2. Terminal scores and static scores use the perspective of the side to move at their own nodes, and negation converts each child result to the parent perspective.
+$$
+r(d,j)=
+\min\left(
+d-2,
+1+\mathbf 1[d\geq6]+\mathbf 1[j\geq9]
+\right).
+$$
+
+The first null-window attempt searches the child at depth $d-1-r(d,j)$. A reduced result above $\alpha$ is repeated with a null window at the full child depth $d-1$ before it can raise the node bound. A full-depth null-window result between $\alpha$ and $\beta$ then receives the full-window search defined above.
+
+Every terminal score and static score uses the perspective of the side to move at its own state. The leading minus sign in every child call converts that score to the parent perspective, which makes the root result consistent with the side-to-move convention of the Value network.
 
 ### 5.4 Transposition Table
 
-A direct-mapped transposition table stores the position key, searched depth, score bound and best action. A stored entry may return an exact score or tighten $\alpha$ or $\beta$ when its depth covers the current request. Shallower entries still supply their best actions for move ordering. Rule-terminal states are resolved before table lookup, and the table key combines the board hash with the halfmove clock and current repetition status.
+A direct-mapped transposition table stores the position key, searched depth, score bound and best action. A stored entry may return an exact score or tighten $\alpha$ or $\beta$ when its depth covers the current request. Shallower entries still supply their best actions for move ordering. Rule-terminal states are resolved before table lookup, and the table key combines the board hash with the halfmove clock and current repetition status. Each root worker owns a separate table, and the configured table capacity is divided among those workers.
 
-### 5.5 Iterative Deepening and Root Decision
+### 5.5 Iterative Deepening
 
 For requested principal depth $D$, Eleginus completes searches at depths $1,2,\ldots,D$. Each iteration starts with the full root window $[-32000,32000]$. Best actions recorded at internal states become ordering hints for later iterations, allowing shallow tactical information to supplement the learned Policy order.
 
-The final iteration determines the selected root action. Actions are ranked first by their PVS scores, then by exact bounds, Policy probabilities and coordinate move strings. The reported root score is the selected action's exact PVS score. Node counts include principal and quiescence nodes visited across all completed iterations, while the selective depth is the greatest ply reached by either procedure.
+Each completed iteration replaces the current root result. When a later iteration is interrupted by its node or time budget, the deepest completed iteration remains available as the search result.
+
+### 5.6 Root Decision
+
+At completed principal depth $d$, let $a_1,\ldots,a_m$ be the ordered root actions, let $T_R\geq1$ be the configured worker count and let $I=32000$ be the root-window limit. The number of active root workers is
+
+$$
+W=\min(T_R,m).
+$$
+
+The first action is evaluated before the remaining root work is distributed. Its exact score is
+
+$$
+q_1^{(d)}=
+-\mathrm{PVS}\left(
+T(x_0,a_1),d-1,1,-I,I
+\right),
+$$
+
+and it initializes the shared root lower bound to $\alpha_R=q_1^{(d)}$. When $W>1$, the remaining action indices are assigned dynamically to worker sets $\mathcal J_1,\ldots,\mathcal J_W$ satisfying
+
+$$
+\bigcup_{w=1}^{W}\mathcal J_w=\lbrace2,\ldots,m\rbrace,
+\qquad
+\mathcal J_u\cap\mathcal J_v=\varnothing
+\quad\text{for }u\ne v.
+$$
+
+Each worker searches the child subtrees associated with its assigned indices. For a single requested principal variation, a worker reads the current shared lower bound $\alpha_j^{(0)}$ before probing action $a_j$ with
+
+$$
+\widetilde q_j^{(d)}=
+-\mathrm{PVS}\left(
+T(x_0,a_j),d-1,1,
+-\alpha_j^{(0)}-1,-\alpha_j^{(0)}
+\right).
+$$
+
+After the probe, the worker reads the latest shared bound $\alpha_j^{(1)}$. If $\widetilde q_j^{(d)}>\alpha_j^{(1)}$, the worker obtains a full-window result from
+
+$$
+q_j^{(d)}=
+-\mathrm{PVS}\left(
+T(x_0,a_j),d-1,1,-I,-\alpha_j^{(1)}
+\right)
+$$
+
+and raises the shared lower bound by the atomic update
+
+$$
+\alpha_R\leftarrow\max\left(\alpha_R,q_j^{(d)}\right).
+$$
+
+For $K>1$ requested principal variations, every root action instead receives the exact full-window score
+
+$$
+q_j^{(d)}=
+-\mathrm{PVS}\left(
+T(x_0,a_j),d-1,1,-I,I
+\right),
+\qquad 1\leq j\leq m.
+$$
+
+For every root action with an exact score at completed depth $d$, define $q^{(d)}(a_j)=q_j^{(d)}$, and let $\mathcal E_d$ contain these actions. The selected action is
+
+$$
+a_d^*=
+\arg\max_{a_j\in\mathcal E_d}q^{(d)}(a_j).
+$$
+
+Equal exact scores are resolved first by decreasing $P_{\theta_P}(a_j\mid\phi_E(x_0))$ and then by ascending coordinate move string. Root rows are ordered by decreasing PVS score. Rows tied on score place exact values before bounds, then use decreasing Policy probability and ascending coordinate move string. The deepest completed iteration supplies the final action $a^*$ and root score
+
+$$
+a^*=a_{D_c}^*,
+\qquad
+E_{\mathrm{root}}=q^{(D_c)}(a^*),
+$$
+
+where $D_c$ is the deepest completed principal depth. Node counts include principal and quiescence nodes visited during every attempted iteration, including an interrupted final iteration. The selective depth is the greatest ply reached by either procedure.
