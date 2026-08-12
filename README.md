@@ -140,10 +140,10 @@ build/gadus/preprocess \
 	--input data/ccrl.pgn \
 	--output data/games.gadus.h5 \
 	--has-cmt 1 \
-	--chunk-size 4096 \
+	--chunk-size 512 \
 	--compression-level 1 \
 	--log-every 10000 \
-	--max-games 1000000
+	--max-games 1200000
 ```
 
 `--has-cmt 1` derives Value targets from numerical PGN comments, while `--has-cmt 0` derives them from final game results. `--max-games` limits the number of PGN games read. `--chunk-size` controls HDF5 dataset extension units. `--compression-level` selects the deflate level. `--log-every` controls progress reporting by game count.
@@ -154,7 +154,7 @@ Train a new Gadus model with:
 build/gadus/train \
 	--data data/games.gadus.h5 \
 	--out models/gadus/gadus.pth \
-	--channels 128 \
+	--channels 192 \
 	--blocks 20 \
 	--epochs 10 \
 	--batch-size 512 \
@@ -179,9 +179,8 @@ build/gadus/search \
 	--fen "startpos" \
 	--device cuda \
 	--precision bf16 \
-	--search-type only-mcts \
+	--search-type open \
 	--mcts-sims 1000 \
-	--mcts-min-sims 100 \
 	--mcts-batch-size 64 \
 	--c-puct 0.5 \
 	--c-puct-base 19652 \
@@ -233,7 +232,7 @@ build\gadus\uci.exe `
 	--device cpu `
 	--threads 2 `
 	--eval-cache-mb 256 `
-	--search-type only-mcts `
+	--search-type open `
 	--mcts-sims 100
 ```
 
@@ -245,7 +244,7 @@ build/gadus/uci \
 	--device cpu \
 	--threads 2 \
 	--eval-cache-mb 256 \
-	--search-type only-mcts \
+	--search-type open \
 	--mcts-sims 100
 ```
 
@@ -494,9 +493,8 @@ Gadus and Melano expose these shared options:
 
 - `ModelPath` selects the checkpoint.
 - `Device` selects `auto`, `cpu` or `cuda` and defaults to `auto`.
-- `SearchType` selects `closed` or `only-mcts` and defaults to `only-mcts`.
+- `SearchType` selects `closed` or the architecture's tree-search mode. Gadus names that mode `open`, while Melano names it `only-mcts`; each engine defaults to its tree-search mode.
 - `MCTSSims` sets the simulation cap and defaults to `100`.
-- `MCTSMinSims` sets the nominal simulation floor and defaults to `0`, which activates the dynamic floor described in each architecture's search specification.
 - `MCTSBatchSize` sets the neural leaf-batch capacity and defaults to `32`.
 - `Move Overhead` reserves time for communication and move submission and defaults to `10`.
 - `CPuct`, `CPuctBase` and `CPuctFactor` configure the visit-dependent exploration coefficient and default to `0.5`, `19652` and `1.0`.
@@ -510,12 +508,14 @@ Gadus and Melano expose these shared options:
 
 Gadus and Melano expose `Threads`, which controls LibTorch CPU threads and defaults to `2`, and `EvalCacheMB`, which defaults to `256`. A positive `EvalCacheMB` retains compact Policy and Value evaluations across successive `go` commands in TLRU (trajectory-aware least-recently-used). TLRU records evaluated parent-child transitions, and the root of each search call promotes its retained descendants within two recorded plies before capacity-based eviction resumes. Every search call creates a separate MCTS tree. Setting the option to zero selects a per-search cache that removes duplicate evaluations within the call and discards its records when the call returns. `ucinewgame`, `ModelPath` changes and `Device` changes clear retained cross-search evaluations.
 
+Melano additionally exposes `MCTSMinSims`, which sets its nominal simulation floor and defaults to `0`. Gadus uses its complete `MCTSSims` budget for fair-root PUCT and therefore has no separate simulation-floor option.
+
 A UCI client may configure the engines with commands such as:
 
 ```text
 setoption name Threads value 2
 setoption name EvalCacheMB value 256
-setoption name SearchType value only-mcts
+setoption name SearchType value open
 setoption name MCTSSims value 1000
 setoption name MCTSBatchSize value 64
 setoption name CPuct value 0.5
@@ -523,7 +523,7 @@ setoption name RepetitionPolicyPenalty value 1.0
 setoption name InstantMateFirst value true
 ```
 
-All commands above apply to Gadus and Melano.
+The example uses the Gadus search-type name. A Melano client supplies `only-mcts` to select its tree-search mode; the remaining commands apply to both engines.
 
 ### Eleginus
 

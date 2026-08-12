@@ -1,4 +1,4 @@
-// Implements Gadus batched PUCT; search.cpp only supplies the command-line front end.
+// Implements Gadus batched fair-root PUCT MCTS; search.cpp supplies the CLI front end.
 
 #include "gadus/search.hpp"
 #include <algorithm>
@@ -256,7 +256,6 @@ struct TreeState {
 	EvaluationRow network;
 	float network_value = 0.0F;
 	int sims_completed = 0;
-	int dynamic_target = 0;
 	int expanded_nodes = 0;
 	int nn_batches = 0;
 	int nn_evaluations = 0;
@@ -264,6 +263,7 @@ struct TreeState {
 	double total_leaf_depth = 0.0;
 	int leaf_samples = 0;
 	int max_leaf_depth = 0;
+	int root_visit_floor = 0;
 };
 
 // Keep bounded value arithmetic inside the model's [-1, 1] convention.
@@ -584,8 +584,42 @@ struct Searcher::Impl {
 		return &*selected;
 	}
 
-	// Descend to an unexpanded or terminal node while reserving the path for batching.
-	SelectedLeaf select_leaf(std::size_t state_index, TreeState &state) const {
+	// Give every legal root action a growing visit floor before competitive PUCT allocation.
+	int root_fair_visit_floor(const TreeState &state) const {
+		const int actions = static_cast<int>(state.root->children.size());
+		const int budget = std::max(0, options.mcts_sims);
+		if (actions <= 0 || budget <= 0) {
+			return 0;
+		}
+		const double denominator =
+			static_cast<double>(actions) * std::log(std::exp(1.0) + budget);
+		return std::max(1, static_cast<int>(std::floor(budget / denominator)));
+	}
+
+	// Fill the root visit floor by largest deficit, then allocate additional work with PUCT.
+	Node *select_root_action(TreeState &state) const {
+		Node *selected = nullptr;
+		int largest_deficit = 0;
+		for (auto &child : state.root->children) {
+			const int augmented_visits = child.visits + child.virtual_visits;
+			const int deficit = state.root_visit_floor - augmented_visits;
+			if (deficit <= 0) {
+				continue;
+			}
+			if (selected == nullptr || deficit > largest_deficit ||
+				(deficit == largest_deficit &&
+				 selection_score(state.root.get(), &child) >
+					 selection_score(state.root.get(), selected))) {
+				selected = &child;
+				largest_deficit = deficit;
+			}
+		}
+		return selected != nullptr ? selected : select_child(state.root.get());
+	}
+
+	// Enter one selected root action, then use PUCT below the root until reaching a leaf.
+	SelectedLeaf select_leaf(std::size_t state_index, TreeState &state,
+						 Node *root_action) const {
 		SelectedLeaf selected;
 		selected.state_index = state_index;
 		selected.board = state.board;
@@ -593,6 +627,12 @@ struct Searcher::Impl {
 		selected.path.reserve(16);
 		selected.path.push_back(selected.leaf);
 		selected.leaf->virtual_visits += 1;
+		if (root_action != nullptr) {
+			selected.leaf = root_action;
+			selected.leaf->virtual_visits += 1;
+			selected.board.makeMove(selected.leaf->move);
+			selected.path.push_back(selected.leaf);
+		}
 		while (!selected.leaf->children.empty()) {
 			selected.leaf = select_child(selected.leaf);
 			selected.leaf->virtual_visits += 1;
@@ -604,68 +644,6 @@ struct Searcher::Impl {
 		state.leaf_samples += 1;
 		state.max_leaf_depth = std::max(state.max_leaf_depth, depth);
 		return selected;
-	}
-
-	// Combine normalized visit entropy, top-two visit proximity, and top-two Q proximity.
-	double uncertainty(const Node *root) const {
-		if (root->children.size() <= 1) {
-			return 0.0;
-		}
-		double total = 0.0;
-		for (const auto &child : root->children) {
-			total += child.visits;
-		}
-		if (total <= 0.0) {
-			for (const auto &child : root->children) {
-				total += std::max(0.0F, child.prior);
-			}
-		}
-		double entropy = 0.0;
-		for (const auto &child : root->children) {
-			const double weight = root->visits > 0 ? child.visits : std::max(0.0F, child.prior);
-			const double probability = weight / std::max(1e-12, total);
-			if (probability > 0.0) {
-				entropy -= probability * std::log(probability);
-			}
-		}
-		entropy /= std::max(1e-12, std::log(static_cast<double>(root->children.size())));
-
-		std::vector<const Node *> ordered;
-		ordered.reserve(root->children.size());
-		for (const auto &child : root->children) {
-			ordered.push_back(&child);
-		}
-		std::sort(ordered.begin(), ordered.end(), [](const Node *left, const Node *right) {
-			return std::pair(left->visits, left->prior) > std::pair(right->visits, right->prior);
-		});
-		const double first = ordered[0]->visits;
-		const double second = ordered[1]->visits;
-		const double visit_uncertainty =
-			1.0 - std::abs(first - second) / std::max(1.0, first + second);
-		const double q_uncertainty =
-			1.0 - std::min(1.0, std::abs(-ordered[0]->q() + ordered[1]->q()) / 0.5);
-		return std::clamp(0.5 * entropy + 0.35 * visit_uncertainty + 0.15 * q_uncertainty, 0.0,
-						  1.0);
-	}
-
-	// Establish the mandatory simulation floor before uncertainty can extend the budget.
-	int minimum_simulations() const {
-		const int cap = std::max(0, options.mcts_sims);
-		if (cap == 0) {
-			return 0;
-		}
-		const int configured = options.mcts_min_sims > 0
-								   ? options.mcts_min_sims
-								   : std::max(std::max(1, options.mcts_batch_size), cap / 4);
-		return std::max(1, std::min(cap, configured));
-	}
-
-	// Interpolate from minimum to the hard cap using the current root uncertainty.
-	int dynamic_target(const Node *root, int minimum) const {
-		const int cap = std::max(0, options.mcts_sims);
-		const int desired =
-			minimum + static_cast<int>(std::ceil(uncertainty(root) * std::max(0, cap - minimum)));
-		return std::max(minimum, std::min(cap, desired));
 	}
 
 	// Track the cost of one uncached neural evaluation for deadline-aware batching.
@@ -767,14 +745,11 @@ struct Searcher::Impl {
 		result.decision_scores = result.policy;
 		result.value = state.root->visits > 0 ? state.root->q() : state.network_value;
 		result.sims_completed = state.sims_completed;
-		result.dynamic_target = options.type == SearchType::Closed ? 0 : state.dynamic_target;
 		result.expanded_nodes = state.expanded_nodes;
 		result.nn_batches = state.nn_batches;
 		result.nn_evaluations = state.nn_evaluations;
 		result.evaluation_reuses = state.evaluation_reuses;
 		result.cpu_threads = active_cpu_threads;
-		result.uncertainty =
-			options.type == SearchType::Closed ? 0.0 : uncertainty(state.root.get());
 		result.elapsed_ms = seconds_since(start) * 1000.0;
 
 		std::unordered_set<int> repetitions;
@@ -864,14 +839,13 @@ struct Searcher::Impl {
 		const auto root_evaluation_started = Clock::now();
 		auto roots = evaluate_rows(boards, evaluation_cache);
 		observe_evaluation(roots, root_evaluation_started);
-		const int minimum = minimum_simulations();
 		for (std::size_t index = 0; index < states.size(); ++index) {
 			states[index].network_value = roots[index].value;
 			states[index].nn_batches = roots[index].reused ? 0 : 1;
 			states[index].nn_evaluations = roots[index].reused ? 0 : 1;
 			states[index].evaluation_reuses = roots[index].reused ? 1 : 0;
-			states[index].dynamic_target = minimum;
 			expand(states[index].root.get(), roots[index]);
+			states[index].root_visit_floor = root_fair_visit_floor(states[index]);
 			states[index].network = std::move(roots[index]);
 			states[index].expanded_nodes = 1;
 		}
@@ -882,7 +856,7 @@ struct Searcher::Impl {
 				Clock::now() + std::chrono::milliseconds(std::max(1, progress_interval_ms));
 		}
 
-		if (options.type == SearchType::OnlyMcts && options.mcts_sims > 0) {
+		if (options.type == SearchType::Open && options.mcts_sims > 0) {
 			const int configured_batch_size = std::max(1, options.mcts_batch_size);
 			while (!deadline_reached(deadline) && !(cancel && cancel())) {
 				const int batch_size = deadline_batch_size(deadline, configured_batch_size);
@@ -895,14 +869,12 @@ struct Searcher::Impl {
 				selected.reserve(states.size() * static_cast<std::size_t>(batch_size));
 				for (std::size_t state_index = 0; state_index < states.size(); ++state_index) {
 					auto &state = states[state_index];
-					if (state.sims_completed >= options.mcts_sims ||
-						state.sims_completed >= state.dynamic_target) {
+					if (state.sims_completed >= options.mcts_sims) {
 						continue;
 					}
 					active = true;
 					const int wanted =
-						std::min({batch_size, options.mcts_sims - state.sims_completed,
-								  state.dynamic_target - state.sims_completed});
+						std::min(batch_size, options.mcts_sims - state.sims_completed);
 					std::unordered_set<Node *> selected_nodes;
 					selected_nodes.reserve(static_cast<std::size_t>(wanted) * 2);
 					for (int attempt = 0, accepted = 0;
@@ -911,7 +883,10 @@ struct Searcher::Impl {
 						if (deadline_reached(deadline) || (cancel && cancel())) {
 							break;
 						}
-						auto leaf = select_leaf(state_index, state);
+						auto *root_action = select_root_action(state);
+						if (root_action == nullptr)
+							break;
+						auto leaf = select_leaf(state_index, state, root_action);
 						float terminal = 0.0F;
 						if (is_terminal(leaf.board, &terminal)) {
 							clear_virtual(leaf.path);
@@ -980,11 +955,6 @@ struct Searcher::Impl {
 					begin = end;
 				}
 
-				for (auto &state : states) {
-					if (state.sims_completed >= minimum) {
-						state.dynamic_target = dynamic_target(state.root.get(), minimum);
-					}
-				}
 				if (progress && states.size() == 1 && progress_interval_ms > 0 &&
 					Clock::now() >= next_progress) {
 					progress(make_result(states[0], start));
@@ -1044,15 +1014,15 @@ SearchType parse_search_type(const std::string &value) {
 	if (value == "closed") {
 		return SearchType::Closed;
 	}
-	if (value == "only-mcts") {
-		return SearchType::OnlyMcts;
+	if (value == "open") {
+		return SearchType::Open;
 	}
-	throw std::invalid_argument("search-type must be closed or only-mcts");
+	throw std::invalid_argument("search-type must be closed or open");
 }
 
 // Convert a search mode back to its stable external spelling.
 std::string search_type_name(SearchType value) {
-	return value == SearchType::Closed ? "closed" : "only-mcts";
+	return value == SearchType::Closed ? "closed" : "open";
 }
 
 } // namespace gadus

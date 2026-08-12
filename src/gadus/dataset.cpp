@@ -242,6 +242,22 @@ float result_value(const std::string &result, chess::Color turn) {
 
 struct StopPgnParsing {};
 
+// Recognize numeric movetext metadata after the PGN parser has removed leading digits.
+bool is_detached_numeric_metadata(std::string_view token) {
+	if (token.empty())
+		return false;
+	bool has_separator = false;
+	for (const char character : token) {
+		if (character == ':' || character == ',') {
+			has_separator = true;
+			continue;
+		}
+		if (character < '0' || character > '9')
+			return false;
+	}
+	return has_separator;
+}
+
 class PreprocessVisitor : public chess::pgn::Visitor {
 	public:
 	// Bind parser callbacks to one Gadus writer and option set.
@@ -285,6 +301,11 @@ class PreprocessVisitor : public chess::pgn::Visitor {
 		}
 		if (consume_detached_comment(san))
 			return;
+		if (is_detached_numeric_metadata(san)) {
+			if (options_.has_comments && !comment.empty())
+				attach_detached_comment(comment);
+			return;
+		}
 		if (game_invalid_)
 			return;
 		try {

@@ -192,11 +192,9 @@ class UciEngine {
 		print("option name EvalCacheMB type spin default " +
 			  std::to_string(options_.search.evaluation_cache_mb) + " min 0 max 65536");
 		print("option name SearchType type combo default " +
-			  gadus::search_type_name(options_.search.type) + " var closed var only-mcts");
+			  gadus::search_type_name(options_.search.type) + " var closed var open");
 		print("option name MCTSSims type spin default " + std::to_string(options_.search.mcts_sims) +
 			  " min 0 max 1000000");
-		print("option name MCTSMinSims type spin default " +
-			  std::to_string(options_.search.mcts_min_sims) + " min 0 max 1000000");
 		print("option name MCTSBatchSize type spin default " +
 			  std::to_string(options_.search.mcts_batch_size) + " min 1 max 4096");
 		print("option name Move Overhead type spin default " +
@@ -269,8 +267,6 @@ class UciEngine {
 			options_.search.type = gadus::parse_search_type(value);
 		} else if (key == "mctssims") {
 			options_.search.mcts_sims = std::max(0, parse_int(value, options_.search.mcts_sims));
-		} else if (key == "mctsminsims") {
-			options_.search.mcts_min_sims = std::max(0, parse_int(value, options_.search.mcts_min_sims));
 		} else if (key == "mctsbatchsize") {
 			options_.search.mcts_batch_size = std::max(1, parse_int(value, options_.search.mcts_batch_size));
 		} else if (key == "moveoverhead") {
@@ -505,9 +501,8 @@ EngineOptions options_from_args(int argc, char **argv) {
 	options.search.cpu_threads = std::clamp(args.get_int("threads", 2), 1, 256);
 	options.search.evaluation_cache_mb =
 		std::clamp(args.get_int("eval-cache-mb", 256), 0, 65536);
-	options.search.type = gadus::parse_search_type(args.get("search-type", "only-mcts"));
+	options.search.type = gadus::parse_search_type(args.get("search-type", "open"));
 	options.search.mcts_sims = args.get_int("mcts-sims", options.search.mcts_sims);
-	options.search.mcts_min_sims = args.get_int("mcts-min-sims", options.search.mcts_min_sims);
 	options.search.mcts_batch_size = args.get_int("mcts-batch-size", options.search.mcts_batch_size);
 	options.search.c_puct = args.get_double("c-puct", options.search.c_puct);
 	options.search.c_puct_base = args.get_double("c-puct-base", options.search.c_puct_base);

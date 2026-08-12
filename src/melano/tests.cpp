@@ -167,14 +167,14 @@ int main() {
 		require(melano::game_termination(repetition) == "threefold repetition",
 				"threefold-repetition termination mismatch");
 
-		// Detached CCRL comments are metadata, while a genuinely invalid SAN rejects its game.
+		// Detached CCRL comments and clock fields are metadata; invalid SAN rejects its game.
 		const auto pgn = std::filesystem::temp_directory_path() / "melanotest.pgn";
 		const auto h5 = std::filesystem::temp_directory_path() / "melanotest.h5";
 		{
 			std::ofstream output(pgn);
 			output << "[Event \"Melano test\"]\n"
 					  "[Result \"1-0\"]\n\n"
-					  "1. d4 {0s} Nf6 {0s} 2. c4\n"
+					  "1. d4 17:00: {0s} Nf6 {0s} 2. c4 23,\n"
 					  "{Both last book move 0s}\n"
 					  "g6 {+0.60/16 193s} 3. Nc3\n"
 					  "{(d5) +0.28/14 77s}\n"

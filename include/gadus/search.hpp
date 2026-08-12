@@ -1,6 +1,6 @@
 #pragma once
 
-// Gadus direct-policy and batched PUCT search API.
+// Gadus direct-policy and batched fair-root PUCT MCTS API.
 
 #include <cstdint>
 #include <functional>
@@ -13,15 +13,14 @@
 
 namespace gadus {
 
-enum class SearchType { Closed, OnlyMcts };
+enum class SearchType { Closed, Open };
 
 struct SearchOptions {
-	SearchType type = SearchType::OnlyMcts;
+	SearchType type = SearchType::Open;
 	ComputePrecision precision = ComputePrecision::Fp32;
 	int cpu_threads = 0;
 	int evaluation_cache_mb = 0;
 	int mcts_sims = 100;
-	int mcts_min_sims = 0;
 	int mcts_batch_size = 32;
 	double movetime_ms = 0.0;
 	double c_puct = 0.5;
@@ -51,13 +50,11 @@ struct SearchResult {
 	std::vector<float> decision_scores;
 	float value = 0.0F;
 	int sims_completed = 0;
-	int dynamic_target = 0;
 	int expanded_nodes = 0;
 	int nn_batches = 0;
 	int nn_evaluations = 0;
 	int evaluation_reuses = 0;
 	int cpu_threads = 0;
-	double uncertainty = 0.0;
 	double elapsed_ms = 0.0;
 	std::vector<RootMove> root;
 };
@@ -95,7 +92,7 @@ class Searcher {
 	std::shared_ptr<Impl> impl_;
 };
 
-/// Parses the exact public names closed and only-mcts.
+/// Parses the exact public names closed and open.
 SearchType parse_search_type(const std::string &value);
 /// Returns the stable command-line name of a search type.
 std::string search_type_name(SearchType value);

@@ -391,9 +391,9 @@ $$
 
 Let $N(x,a)$ denote the completed-visit count of the child reached through action $a$. This count equals the number of completed simulations that traversed the edge from $x$ to $T(x,a)$. A node can first be evaluated before any simulation traverses one of its outgoing edges, so its node count $N(x)$ can exceed $\sum_{a\in\mathcal A(x)}N(x,a)$.
 
-### 5.3 PUCT Selection
+### 5.3 Non-root PUCT Selection
 
-Each simulation uses Predictor + Upper Confidence bounds applied to Trees (PUCT) to descend through expanded nodes. The PUCT score combines the empirical evaluation of an action with an exploration term derived from its prior and visit count. Because an unvisited edge has no empirical action evaluation, First Play Urgency (FPU) supplies its initial selection value.
+After the root procedure in Section 5.5 selects the first action of a simulation, Predictor + Upper Confidence bounds applied to Trees (PUCT) selects each subsequent action at an expanded non-root node. Its score combines the empirical evaluation of an action with an exploration term derived from the edge prior and visit counts. First Play Urgency (FPU) supplies the selection value of an unvisited edge, which has no empirical action evaluation.
 
 Let the explored prior mass at node $x$ be
 
@@ -440,7 +440,7 @@ S(x,a)=Q_{\mathrm{sel}}(x,a)
 -l_vN_v(x,a).
 $$
 
-At each expanded node, the selector follows the action with the largest $S(x,a)$. Equal PUCT scores are resolved first by the larger prior $P(x,a)$ and then by the larger $Q_{\mathrm{sel}}(x,a)$. If all three quantities are equal, the selector follows the action that the rules engine enumerated first when the node was expanded. The resulting path ends at a terminal state or at a nonterminal node that has not yet been expanded.
+At each expanded non-root node, the selector follows the action with the largest $S(x,a)$. Equal PUCT scores are resolved first by the larger prior $P(x,a)$ and then by the larger $Q_{\mathrm{sel}}(x,a)$. If all three quantities are equal, the selector follows the action that the rules engine enumerated first when the node was expanded. The resulting path ends at a terminal state or at a nonterminal node that has not yet been expanded.
 
 ### 5.4 Leaf Evaluation and Backup
 
@@ -470,64 +470,48 @@ $$
 
 These updates increase the completed count of each traversed child and thereby increase the corresponding edge count $N(x_{k-1},a_k)$. The empirical means $Q(x_k)$ and the parent-perspective action evaluations $Q(x_{k-1},a_k)$ then follow from the definitions in Section 5.2.
 
-### 5.5 Simulation Budget
+### 5.5 Root Allocation
 
-The simulation budget uses root uncertainty to choose a target between a required minimum and a fixed cap. Let $N_{\mathrm{cap}}\geq0$ be the simulation cap, let $B_{\mathrm{batch}}\geq1$ be the neural batch capacity and let $N_{\mathrm{floor}}\geq0$ be an optional explicit minimum. The minimum number of completed simulations is
-
-$$
-N_{\min}=
-\begin{cases}
-0,&N_{\mathrm{cap}}=0,\\
-\max\!\left(1,\min\!\left(N_{\mathrm{cap}},N_{\mathrm{floor}}\right)\right),
-&N_{\mathrm{cap}}>0\ \text{and}\ N_{\mathrm{floor}}>0,\\
-\max\!\left(1,\min\!\left(N_{\mathrm{cap}},
-\max\!\left(B_{\mathrm{batch}},\left\lfloor\dfrac{N_{\mathrm{cap}}}{4}\right\rfloor\right)
-\right)\right),
-&N_{\mathrm{cap}}>0\ \text{and}\ N_{\mathrm{floor}}=0.
-\end{cases}
-$$
-
-When $N_{\mathrm{cap}}>0$, the root first completes $N_{\min}$ simulations. Its root-edge counts then define the empirical visit distribution
+Let $N_{\mathrm{cap}}\geq0$ be the simulation cap and let $M=|\mathcal A(x_0)|$ be the number of legal root actions. A zero cap performs no simulation. For a positive cap, the fair visit floor is
 
 $$
-\widehat P_N(a\mid x_0)=
-\frac{N(x_0,a)}
-{\displaystyle\sum_{b\in\mathcal A(x_0)}N(x_0,b)}.
+m_{\mathrm{fair}}=
+\max\left(
+1,
+\left\lfloor
+\frac{N_{\mathrm{cap}}}
+{M\log(e+N_{\mathrm{cap}})}
+\right\rfloor
+\right).
 $$
 
-For a root with at least two legal actions, sort the actions first by decreasing visit count $N(x_0,a)$. Among actions with equal visit counts, place the action with the larger prior $P(x_0,a)$ first. Denote the first two actions in this order by $a_1$ and $a_2$, and define $N_i=N(x_0,a_i)$. For each $a_i$, define $Q_i=Q(x_0,a_i)$ when $N_i>0$ and $Q_i=0$ when $N_i=0$. The normalized visit entropy $H_N$, visit-count proximity $U_N$ and action-evaluation proximity $U_Q$ are
+The scheduler compares this floor with the augmented root-edge counts from Section 5.3. The fair-allocation deficit of action $a$ is
 
 $$
-H_N=-
-\frac{\displaystyle\sum_{a\in\mathcal A(x_0)}
-\widehat P_N(a\mid x_0)\log\widehat P_N(a\mid x_0)}
-{\log|\mathcal A(x_0)|},
+d_{\mathrm{fair}}(x_0,a)=
+\max\left(
+0,
+m_{\mathrm{fair}}-\widetilde N(x_0,a)
+\right).
 $$
 
-$$
-U_N=1-
-\frac{|N_1-N_2|}{\max(1,N_1+N_2)},
-$$
+While at least one action has a positive deficit, the next simulation enters an action with the largest deficit. The PUCT score $S(x_0,a)$ resolves equal deficits, and the order established when the root was expanded resolves any remaining equality. Completed and virtual visits both reduce the deficit, which distributes concurrent requests among root actions before their neural evaluations return.
+
+When every deficit is zero, root allocation uses the PUCT score from Section 5.3 over the complete legal-action set. An action whose searched evaluation increases can therefore receive additional simulations through the exploitation term of $S(x_0,a)$, while the prior and exploration term continue to allocate work among less-visited actions. Every root action remains eligible throughout the procedure.
+
+For a fixed legal width $M$, increasing the simulation cap gives
 
 $$
-U_Q=1-
-\min\left(1,\frac{|Q_1-Q_2|}{0.5}\right).
+\lim_{N_{\mathrm{cap}}\rightarrow\infty}
+m_{\mathrm{fair}}=\infty,
+\qquad
+\lim_{N_{\mathrm{cap}}\rightarrow\infty}
+\frac{M m_{\mathrm{fair}}}{N_{\mathrm{cap}}}=0.
 $$
 
-The entropy summand for $\widehat P_N(a\mid x_0)=0$ equals zero by the limit $\lim_{p\to0^+}p\log p=0$. The three statistics lie in $[0,1]$, and their weighted sum defines the root uncertainty
+The first limit gives every root action an unbounded number of mandatory visits as the cap increases. The second limit makes the mandatory fraction of the budget vanish, leaving an asymptotically dominant fraction for competitive PUCT allocation. If $N_{\mathrm{cap}}<M$, the available budget cannot visit every legal action once; equal initial deficits are then resolved by the PUCT score, whose exploration term favors the larger priors before any root edge has been visited.
 
-$$
-u=\mathrm{clip}_{[0,1]}\left(0.5H_N+0.35U_N+0.15U_Q\right).
-$$
-
-The current uncertainty determines the simulation target
-
-$$
-N_{\mathrm{target}}=
-N_{\min}+\left\lceil u(N_{\mathrm{cap}}-N_{\min})\right\rceil.
-$$
-
-The MCTS procedure recalculates $N_{\mathrm{target}}$ after each selection-and-evaluation cycle once the root has reached $N_{\min}$. A new cycle starts for a root only while its completed count is smaller than both the current target and the cap. The target and cap are checked between cycles, so backups completed within the final cycle may carry the final count beyond either threshold. A root with one legal action uses $u=0$ and admits no new cycle after reaching $N_{\min}$. A zero cap sets both $N_{\min}$ and $N_{\mathrm{target}}$ to zero. A cancellation signal or an expired execution deadline stops further leaf selection and the submission of neural-evaluation requests. Completed backups remain in the tree, while virtual visits attached to unevaluated requests are released as described in Section 5.7.
+An execution deadline or a cancellation request can end the procedure before all $N_{\mathrm{cap}}$ simulations complete. Every completed backup remains in the tree, and Section 5.7 describes how the scheduler releases virtual visits belonging to requests that did not reach evaluation.
 
 ### 5.6 Evaluation Reuse
 
@@ -589,19 +573,18 @@ $$
 
 where $R_{\mathrm{cycle}}$ is the remaining time at the start of the cycle. If $B_{\mathrm{cycle}}=0$, the invocation ends before the cycle selects any leaves.
 
-For $B_{\mathrm{cycle}}>0$, the cycle processes each search tree whose root count $N(x_0)$ is smaller than both $N_{\mathrm{target}}$ and $N_{\mathrm{cap}}$. The maximum number of distinct nonterminal leaves requested from one such tree is
+For $B_{\mathrm{cycle}}>0$, the cycle processes each search tree whose root count $N(x_0)$ is smaller than $N_{\mathrm{cap}}$. The maximum number of distinct nonterminal leaves requested from one such tree is
 
 $$
 m=\min\left(
 B_{\mathrm{cycle}},
-N_{\mathrm{target}}-N(x_0),
 N_{\mathrm{cap}}-N(x_0)
 \right).
 $$
 
-The three terms limit the request by the available cycle capacity, the remaining count to the current target and the remaining count to the simulation cap, respectively.
+The two terms limit the request by the available cycle capacity and the remaining simulation budget.
 
-To build this request set, each selection attempt starts at the root and follows PUCT through expanded nodes until it reaches a terminal node or an unexpanded nonterminal node. A terminal node receives its exact rule outcome, and immediate backup completes one simulation without adding a neural-evaluation request. An unexpanded nonterminal node enters the request set when that tree has not reserved the node earlier in the same cycle, and its selected path retains one virtual visit until the request is resolved. If another attempt from the same tree reaches an already reserved node, the selector removes the virtual visits introduced by that attempt and adds no request. The tree performs at most $\max(5m,m+8)$ attempts while collecting up to $m$ distinct nonterminal leaves.
+To build this request set, the root scheduler first selects an action with the largest positive fair-allocation deficit. When every deficit is zero, it selects the action with the largest root PUCT score. It applies the selected action and then follows the non-root PUCT rule from Section 5.3 until it reaches a terminal node or an unexpanded nonterminal node. A terminal node receives its exact rule outcome, and immediate backup completes one simulation without adding a neural-evaluation request. An unexpanded nonterminal node enters the request set when that tree has not reserved the node earlier in the same cycle, and its selected path retains one virtual visit until the request is resolved. If another attempt from the same tree reaches an already reserved node, the selector removes the virtual visits introduced by that attempt and adds no request. The tree performs at most $\max(5m,m+8)$ attempts while collecting up to $m$ distinct nonterminal leaves.
 
 The requests collected from all trees form one list. Before each evaluation submission, the scheduler computes
 
@@ -629,7 +612,7 @@ together with the scalar $V_\theta(\phi_G(x))$. Entries with the same index $j$ 
 
 After the neural batch returns, each newly computed record enters the active cache. The evaluator then assigns a cached or computed record to every request with the matching `PackedState`. For each requested leaf, tree expansion creates one outgoing edge for every $a_j$ and assigns $P_\theta(a_j\mid\phi_G(x))$ as that edge's prior. The scalar $V_\theta(\phi_G(x))$ is then backed up along the leaf's reserved path, so different trees can share a network record while retaining separate nodes, paths and search statistics.
 
-After the submitted leaves complete their backups, every root that has reached $N_{\min}$ receives a recalculated dynamic target. Another cycle begins only when at least one tree remains below both its target and $N_{\mathrm{cap}}$ and the preceding cycle completed at least one backup.
+After the submitted leaves complete their backups, another cycle begins only when at least one tree remains below $N_{\mathrm{cap}}$ and the preceding cycle completed at least one backup. The updated completed-visit counts and action evaluations determine the fair deficits and PUCT scores used by the next cycle.
 
 ### 5.8 Root Evaluation and Policy
 
@@ -660,6 +643,8 @@ $$
 
 The MCTS root Policy therefore coincides with the direct network Policy when the simulation cap is zero.
 
+The visit-based distribution $P_{\mathrm{root}}$ records the allocation produced by the fair visit floor and competitive root PUCT. It also supplies the base ordering used by the decision components in Section 5.9. Each legal action retains positive weight because its edge prior is included alongside its completed visits.
+
 When an output requires one probability for every index in $\mathcal I_G$, Gadus expands the compact root distribution into
 
 $$
@@ -675,7 +660,7 @@ This conversion is performed only for a final result or a progress report that r
 
 ### 5.9 Decision Components
 
-The decision layer can apply two optional transformations to the final move ordering. It begins with a copy of the root Policy distribution:
+The decision layer can apply two optional transformations to the final move ordering. It begins with a copy of the root Policy defined in Section 5.8:
 
 $$
 D_0(a)=P_{\mathrm{root}}(a\mid s_0).
@@ -715,7 +700,7 @@ D_I(a),&a\in\mathcal A(x_0)\setminus\mathcal R_3(x_0).
 \end{cases}
 $$
 
-IMF and RPP transform a copy of $P_{\mathrm{root}}$, so the network probabilities, edge priors and tree statistics keep their computed values. The decision scores are ordering quantities rather than a probability distribution. Gadus orders legal actions by decreasing $D(a)$, then by decreasing $D_0(a)$ and finally by decreasing coordinate move string in Universal Chess Interface (UCI) notation. The first action in this deterministic ordering becomes the selected move.
+IMF and RPP transform a copy of $D_0$, so the network probabilities, edge priors and tree statistics keep their computed values. The decision scores are ordering quantities rather than a probability distribution. Gadus orders legal actions by decreasing $D(a)$, then by decreasing $D_0(a)$ and finally by decreasing UCI move string. The first action in this deterministic ordering becomes the selected move.
 
 ## 6. FCPI
 

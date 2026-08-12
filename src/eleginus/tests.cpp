@@ -329,7 +329,7 @@ int main() {
 			pgn << "[Event \"root comment\"]\n"
 				   "[Result \"1-0\"]\n\n"
 				   "{opening note} 1. e4\n"
-				   "{0s}\n"
+				   "17:00: {0s}\n"
 				   "e5\n"
 				   "{+0.20/12 0s}\n"
 				   "2. Nf3\n"

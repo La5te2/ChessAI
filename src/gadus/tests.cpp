@@ -53,7 +53,7 @@ int main() {
 	try {
 		chess::Board board;
 
-		// Detached CCRL comments are metadata, while a genuinely invalid SAN rejects its game.
+		// Detached CCRL comments and clock fields are metadata; invalid SAN rejects its game.
 		const auto preprocess_pgn =
 			std::filesystem::temp_directory_path() / "gadus-preprocess-test.pgn";
 		const auto preprocess_h5 =
@@ -62,7 +62,7 @@ int main() {
 			std::ofstream pgn(preprocess_pgn);
 			pgn << "[Event \"detached comments\"]\n"
 				   "[Result \"1-0\"]\n\n"
-				   "1. d4 {0s} Nf6 {0s} 2. c4\n"
+				   "1. d4 17:00: {0s} Nf6 {0s} 2. c4 23,\n"
 				   "{Both last book move 0s}\n"
 				   "g6 {+0.60/16 193s} 3. Nc3\n"
 				   "{(d5) +0.28/14 77s}\n"
@@ -268,16 +268,40 @@ int main() {
 		require(after_clear.nn_evaluations == 1 && after_clear.evaluation_reuses == 0,
 				"clearing the persistent evaluation cache did not force reevaluation");
 
-		// Four simulations exercise selection, batched expansion, and value backup.
+		// Four simulations exercise fair root allocation, batched expansion, and value backup.
 		gadus::SearchOptions mcts_options = closed_options;
-		mcts_options.type = gadus::SearchType::OnlyMcts;
+		mcts_options.type = gadus::SearchType::Open;
 		mcts_options.mcts_sims = 4;
-		mcts_options.mcts_min_sims = 4;
 		mcts_options.mcts_batch_size = 2;
 		gadus::Searcher mcts_searcher(loaded, torch::Device(torch::kCPU), mcts_options);
 		const auto mcts_result = mcts_searcher.search(board);
 		require(mcts_result.sims_completed == 4, "MCTS simulation budget mismatch");
 		require(mcts_result.expanded_nodes > 0, "MCTS did not expand a node");
+
+		// A budget equal to the legal width gives every root action one completed visit.
+		auto coverage_options = mcts_options;
+		coverage_options.mcts_sims = static_cast<int>(start_moves.size());
+		coverage_options.root_topn = static_cast<int>(start_moves.size());
+		gadus::Searcher coverage_searcher(loaded, torch::Device(torch::kCPU), coverage_options);
+		const auto coverage_result = coverage_searcher.search(board);
+		require(coverage_result.root.size() == start_moves.size(),
+				"fair root allocation omitted a legal action from diagnostics");
+		for (const auto &root_move : coverage_result.root)
+			require(root_move.visits == 1,
+					"fair root allocation did not visit every legal root action once");
+
+		auto competition_options = coverage_options;
+		competition_options.mcts_sims += 1;
+		gadus::Searcher competition_searcher(
+			loaded, torch::Device(torch::kCPU), competition_options);
+		const auto competition_result = competition_searcher.search(board);
+		const auto represented = std::count_if(
+			competition_result.decision_scores.begin(), competition_result.decision_scores.end(),
+			[](float score) { return score > 0.0F; });
+		require(competition_result.sims_completed == competition_options.mcts_sims,
+				"root competition changed the simulation budget");
+		require(represented == static_cast<int>(start_moves.size()),
+				"root competition permanently removed a legal action");
 
 		// A searched child becomes the next root and reuses its exact evaluation through TLRU.
 		auto trajectory_options = mcts_options;

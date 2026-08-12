@@ -20,7 +20,7 @@ int main(int argc, char **argv) {
 				<< "  --batch-size <n> --lr <x>\n"
 				<< "  --eval-games <n> --eval-games-in-flight <n> --eval-max-plies <n>\n"
 				<< "  --eval-opening-book <path|empty> --eval-book-plies <n>\n"
-				<< "  --eval-max-book-positions <n> --eval-search-type <closed|only-mcts>\n"
+				<< "  --eval-max-book-positions <n> --eval-search-type <closed|open>\n"
 				<< "  --eval-sims <n> --eval-mcts-batch-size <n>\n"
 				<< "  --eval-c-puct <x> --eval-c-puct-base <x> --eval-c-puct-factor <x>\n"
 				<< "  --eval-fpu-reduction <x> --eval-repetition-policy-penalty <x>\n"
