@@ -152,11 +152,10 @@ class H5Writer {
 	}
 
 	// Record final counters and flush all HDF5 buffers to disk.
-	void finish(std::int64_t games, std::int64_t skipped_moves, std::int64_t skipped_games) {
+	void finish(std::int64_t games, std::int64_t skipped_games) {
 		write_int_attribute(file_, "games", games);
 		write_int_attribute(file_, "positions", static_cast<std::int64_t>(size_));
-		write_int_attribute(file_, "skipped_moves", skipped_moves);
-		write_int_attribute(file_, "skipped_games_no_cmt", skipped_games);
+		write_int_attribute(file_, "skipped_games", skipped_games);
 		require_h5(H5Fflush(file_, H5F_SCOPE_GLOBAL), "flush output file");
 	}
 
@@ -258,9 +257,12 @@ class PreprocessVisitor : public chess::pgn::Visitor {
 		result_ = "*";
 		previous_comment_.clear();
 		game_has_eval_ = false;
+		game_invalid_ = false;
 		game_states_.clear();
 		game_moves_.clear();
 		game_values_.clear();
+		detached_comment_.clear();
+		collecting_detached_comment_ = false;
 	}
 
 	// Capture Result and optional non-starting FEN headers before move parsing.
@@ -276,6 +278,15 @@ class PreprocessVisitor : public chess::pgn::Visitor {
 
 	// Encode the pre-move state and use the previous post-move comment as its V target.
 	void move(std::string_view san, std::string_view comment) override {
+		if (san.empty()) {
+			if (options_.has_comments)
+				attach_detached_comment(comment);
+			return;
+		}
+		if (consume_detached_comment(san))
+			return;
+		if (game_invalid_)
+			return;
 		try {
 			const auto move = chess::uci::parseSan(board_, san);
 			game_states_.push_back(encode_state(board_));
@@ -287,14 +298,19 @@ class PreprocessVisitor : public chess::pgn::Visitor {
 				game_has_eval_ = true;
 			board_.makeMove(move);
 			previous_comment_ = std::string(comment);
-		} catch (const std::exception &) {
-			++skipped_moves_;
+		} catch (const std::exception &error) {
+			game_invalid_ = true;
+			if (parse_warning_count_ < 8) {
+				std::cerr << "Gadus preprocess rejected game after SAN '" << san
+						  << "': " << error.what() << std::endl;
+				++parse_warning_count_;
+			}
 		}
 	}
 
-	// Commit complete games, rejecting comment-required games with no evaluation.
+	// Commit complete games whose SAN sequence and requested target source are valid.
 	void endPgn() override {
-		if (options_.has_comments && !game_has_eval_) {
+		if (game_invalid_ || (options_.has_comments && !game_has_eval_)) {
 			++skipped_games_;
 			return;
 		}
@@ -302,31 +318,57 @@ class PreprocessVisitor : public chess::pgn::Visitor {
 		++games_;
 		if (options_.log_every > 0 && games_ % options_.log_every == 0) {
 			std::cout << "preprocess progress: games=" << games_ << " positions=" << writer_.size()
-					  << " skipped_moves=" << skipped_moves_
-					  << " skipped_games_no_cmt=" << skipped_games_ << std::endl;
+					  << " skipped=" << skipped_games_ << std::endl;
 		}
 	}
 
 	// Return the number of games committed to HDF5.
 	std::int64_t games() const { return games_; }
-	// Return the number of SAN moves that failed to parse.
-	std::int64_t skipped_moves() const { return skipped_moves_; }
-	// Return the number of comment-required games rejected without evaluations.
+	// Return the number of games rejected for invalid SAN or a missing requested target.
 	std::int64_t skipped_games() const { return skipped_games_; }
 
 	private:
+	// Attach a parser-separated comment to the state reached by the preceding move.
+	void attach_detached_comment(std::string_view comment) {
+		previous_comment_ = std::string(comment);
+		if (comment_score_white(previous_comment_).has_value())
+			game_has_eval_ = true;
+	}
+
+	// Consume a brace comment that the PGN parser exposed through its SAN callback.
+	bool consume_detached_comment(std::string_view token) {
+		if (!collecting_detached_comment_ && (token.empty() || token.front() != '{'))
+			return false;
+		if (!detached_comment_.empty())
+			detached_comment_.push_back(' ');
+		detached_comment_.append(token);
+		collecting_detached_comment_ = detached_comment_.find('}') == std::string::npos;
+		if (collecting_detached_comment_)
+			return true;
+
+		const auto open = detached_comment_.find('{');
+		const auto close = detached_comment_.rfind('}');
+		attach_detached_comment(std::string_view(detached_comment_).substr(
+			open + 1, close - open - 1));
+		detached_comment_.clear();
+		return true;
+	}
+
 	PreprocessOptions options_;
 	H5Writer &writer_;
 	chess::Board board_;
 	std::string result_;
 	std::string previous_comment_;
 	bool game_has_eval_ = false;
+	bool game_invalid_ = false;
 	std::vector<PackedState> game_states_;
 	std::vector<std::uint16_t> game_moves_;
 	std::vector<float> game_values_;
+	std::string detached_comment_;
+	bool collecting_detached_comment_ = false;
 	std::int64_t games_ = 0;
-	std::int64_t skipped_moves_ = 0;
 	std::int64_t skipped_games_ = 0;
+	int parse_warning_count_ = 0;
 };
 
 // Build an ordered union of one-row hyperslabs for arbitrary batch indices.
@@ -575,10 +617,9 @@ void preprocess_pgn(const PreprocessOptions &options) {
 		}
 	} catch (const StopPgnParsing &) {
 	}
-	writer.finish(visitor.games(), visitor.skipped_moves(), visitor.skipped_games());
+	writer.finish(visitor.games(), visitor.skipped_games());
 	std::cout << "preprocess summary: games=" << visitor.games() << " positions=" << writer.size()
-			  << " skipped_moves=" << visitor.skipped_moves()
-			  << " skipped_games_no_cmt=" << visitor.skipped_games()
+			  << " skipped=" << visitor.skipped_games()
 			  << " output=" << options.output.string() << std::endl;
 }
 

@@ -167,45 +167,53 @@ int main() {
 		require(melano::game_termination(repetition) == "threefold repetition",
 				"threefold-repetition termination mismatch");
 
-		// A move comment supervises the state reached immediately before the next move.
+		// Detached CCRL comments are metadata, while a genuinely invalid SAN rejects its game.
 		const auto pgn = std::filesystem::temp_directory_path() / "melanotest.pgn";
 		const auto h5 = std::filesystem::temp_directory_path() / "melanotest.h5";
 		{
 			std::ofstream output(pgn);
 			output << "[Event \"Melano test\"]\n"
 					  "[Result \"1-0\"]\n\n"
-					  "1. e4 {+0.60/12} e5 {+0.20/12} 1-0\n";
+					  "1. d4 {0s} Nf6 {0s} 2. c4\n"
+					  "{Both last book move 0s}\n"
+					  "g6 {+0.60/16 193s} 3. Nc3\n"
+					  "{(d5) +0.28/14 77s}\n"
+					  "d5 {+0.27/15 177s} 1-0\n\n"
+					  "[Event \"invalid move\"]\n"
+					  "[Result \"1-0\"]\n\n"
+					  "1. e4 e5 2. Qa9 1-0\n";
 		}
 		melano::PreprocessOptions preprocess;
 		preprocess.input = pgn;
 		preprocess.output = h5;
-		preprocess.max_games = 1;
 		preprocess.chunk_size = 2;
 		preprocess.compression_level = 0;
 		preprocess.log_every = 0;
 		melano::preprocess_pgn(preprocess);
 		{
 			melano::SupervisedH5 supervised(h5);
-			require(supervised.info().length == 2, "annotated PGN row count mismatch");
-			const auto supervised_batch = supervised.read({0, 1});
+			require(supervised.info().length == 6,
+					"Melano preprocessing rejected detached comments or retained invalid SAN");
+			const auto supervised_batch = supervised.read_contiguous(0, 6);
 			const auto expected_initial = melano::encode_boards({board}).index({0});
 			require(torch::equal(supervised_batch.states.index({0}), expected_initial),
 					"HDF5 initial state differs from live state codec");
-			auto after_e4 = board;
-			const auto e4 = chess::uci::uciToMove(after_e4, "e2e4");
-			after_e4.makeMove(e4);
-			const auto expected_after_e4 = melano::encode_boards({after_e4}).index({0});
-			require(torch::equal(supervised_batch.states.index({1}), expected_after_e4),
+			auto after_d4 = board;
+			const auto d4 = chess::uci::uciToMove(after_d4, "d2d4");
+			after_d4.makeMove(d4);
+			const auto expected_after_d4 = melano::encode_boards({after_d4}).index({0});
+			require(torch::equal(supervised_batch.states.index({1}), expected_after_d4),
 					"HDF5 second state differs from live state codec");
 			require(supervised_batch.moves.index({0}).item<std::int64_t>() ==
-						melano::move_to_index(e4),
+						melano::move_to_index(d4),
 					"HDF5 policy target differs from live move codec");
-			const float expected_after_e4_value = -static_cast<float>(std::tanh(0.60 / 3.0));
-			require(std::abs(supervised_batch.values.index({0}).item<float>()) < 1e-6F,
-					"first value without a preceding comment must remain neutral");
-			require(std::abs(supervised_batch.values.index({1}).item<float>() -
-							 expected_after_e4_value) < 1e-6F,
-					"annotated second-state value was lost");
+			require(std::abs(supervised_batch.values.index({0}).item<float>()) < 1e-6F &&
+						std::abs(supervised_batch.values.index({1}).item<float>()) < 1e-6F &&
+						std::abs(supervised_batch.values.index({2}).item<float>()) < 1e-6F,
+					"Melano preprocessing changed neutral opening targets");
+			require(supervised_batch.values.index({4}).item<float>() > 0.0F &&
+						supervised_batch.values.index({5}).item<float>() < 0.0F,
+					"Melano preprocessing lost detached numerical comments");
 		}
 		std::filesystem::remove(pgn);
 		std::filesystem::remove(h5);

@@ -344,7 +344,7 @@ Preprocess a PGN into the architecture-locked Eleginus Policy/Value schema with:
 build/eleginus/preprocess \
 	--input data/ccrl.pgn \
 	--output data/games.eleginus.h5 \
-	--has-cmt 0 \
+	--has-cmt 1 \
 	--compression-level 4 \
 	--max-games 100000
 ```
@@ -366,7 +366,7 @@ Train independent Eleginus Policy and Value networks with:
 build/eleginus/train \
 	--data data/games.eleginus.h5 \
 	--out models/eleginus/eleginus.pth \
-	--epochs 1 \
+	--epochs 4 \
 	--batch-size 512 \
 	--lr 0.001 \
 	--device cuda \

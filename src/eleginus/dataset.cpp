@@ -329,8 +329,7 @@ class PreprocessVisitor : public chess::pgn::Visitor {
 		if (options_.log_every > 0 && games_ % options_.log_every == 0) {
 			std::cout << "preprocess progress: games=" << games_
 					  << " positions=" << writer_.size()
-					  << " invalid_games=" << invalid_games_
-					  << " missing_target_games=" << missing_target_games_ << std::endl;
+					  << " skipped=" << invalid_games_ + missing_target_games_ << std::endl;
 		}
 	}
 
@@ -624,8 +623,7 @@ void preprocess_pgn(const PreprocessOptions &options) {
 	writer.flush();
 	std::cout << "Eleginus preprocess summary: games=" << visitor.games()
 			  << " positions=" << writer.size()
-			  << " invalid_games=" << visitor.invalid_games()
-			  << " missing_target_games=" << visitor.missing_target_games()
+			  << " skipped=" << visitor.invalid_games() + visitor.missing_target_games()
 			  << " output=" << options.output.string() << std::endl;
 }
 

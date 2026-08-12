@@ -6,10 +6,12 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
 #include "gadus/checkpoint.hpp"
+#include "gadus/dataset.hpp"
 #include "gadus/game.hpp"
 #include "gadus/model.hpp"
 #include "gadus/search.hpp"
@@ -50,6 +52,47 @@ void require_finite_gradients(const gadus::Model &model) {
 int main() {
 	try {
 		chess::Board board;
+
+		// Detached CCRL comments are metadata, while a genuinely invalid SAN rejects its game.
+		const auto preprocess_pgn =
+			std::filesystem::temp_directory_path() / "gadus-preprocess-test.pgn";
+		const auto preprocess_h5 =
+			std::filesystem::temp_directory_path() / "gadus-preprocess-test.h5";
+		{
+			std::ofstream pgn(preprocess_pgn);
+			pgn << "[Event \"detached comments\"]\n"
+				   "[Result \"1-0\"]\n\n"
+				   "1. d4 {0s} Nf6 {0s} 2. c4\n"
+				   "{Both last book move 0s}\n"
+				   "g6 {+0.60/16 193s} 3. Nc3\n"
+				   "{(d5) +0.28/14 77s}\n"
+				   "d5 {+0.27/15 177s} 1-0\n\n"
+				   "[Event \"invalid move\"]\n"
+				   "[Result \"1-0\"]\n\n"
+				   "1. e4 e5 2. Qa9 1-0\n";
+		}
+		gadus::PreprocessOptions preprocess_options;
+		preprocess_options.input = preprocess_pgn;
+		preprocess_options.output = preprocess_h5;
+		preprocess_options.has_comments = 1;
+		preprocess_options.compression_level = 0;
+		preprocess_options.log_every = 0;
+		gadus::preprocess_pgn(preprocess_options);
+		{
+			gadus::SupervisedH5 supervised(preprocess_h5);
+			require(supervised.info().length == 6,
+					"Gadus preprocessing rejected detached comments or retained invalid SAN");
+			const auto batch = supervised.read_contiguous(0, 6);
+			require(std::abs(batch.values.index({0}).item<float>()) < 1e-6F &&
+						std::abs(batch.values.index({1}).item<float>()) < 1e-6F &&
+						std::abs(batch.values.index({2}).item<float>()) < 1e-6F,
+					"Gadus preprocessing changed neutral opening targets");
+			require(batch.values.index({4}).item<float>() > 0.0F &&
+						batch.values.index({5}).item<float>() < 0.0F,
+					"Gadus preprocessing lost detached numerical comments");
+		}
+		std::filesystem::remove(preprocess_pgn);
+		std::filesystem::remove(preprocess_h5);
 		require(gadus::parse_compute_precision("fp32") == gadus::ComputePrecision::Fp32,
 				"fp32 precision parsing failed");
 		require(gadus::parse_compute_precision("bf16") == gadus::ComputePrecision::Bf16,
