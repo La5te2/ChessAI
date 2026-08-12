@@ -549,17 +549,22 @@ Gadus Arena reads Polyglot books by traversing legal book moves breadth-first fr
 
 An empty arena book path starts every game from the standard initial position and alternates the candidate's color. A nonempty book must provide at least one unique position for each game pair. The arena shuffles the available positions, selects one position per pair and plays both color assignments.
 
-Gadus FCPI reads a sampling book as a randomized traversal in which every reachable nonterminal position may enter the starting-state pool, including the standard initial position. It removes transpositions using the same position identity, limits the resulting pool to the requested size and treats outgoing Polyglot moves uniformly.
+Gadus FCPI reads every reachable nonterminal position in a sampling book as a possible starting state, including the standard initial position. It removes transpositions using the same position identity, limits the resulting pool to the requested size and treats outgoing Polyglot moves uniformly.
 
-`scripts/opening_book.py` creates two kinds of Polyglot books. A sampling book supplies arbitrary-ply positions to Gadus FCPI. The `--sampling-source` option accepts a PGN or an existing Polyglot book. The following command creates a pool of at least 10,000 positions from an existing book:
+`scripts/opening_book.py` creates two kinds of Polyglot books. A sampling book supplies positions from ply zero through ply eight to Gadus FCPI. The generator assigns each position to one ply, asks a UCI engine to evaluate every noninitial position and includes only positions whose absolute evaluation does not exceed 80 centipawns. The `--sampling-source` option accepts a PGN or an existing Polyglot book, and sampling generation requires at least 10,000 unique readable positions. The following command creates `openings.sam.bin` from a PGN:
 
 ```bash
 python scripts/opening_book.py \
-	--sampling-source data/openings.bin \
+	--sampling-source data/games.pgn \
+	--uci models/stockfish/stockfish \
 	--output data/openings.sam.bin \
 	--min-fens 10000 \
+	--book-plies 8 \
+	--max-abs-cp 80 \
 	--log-every 1000
 ```
+
+The same command accepts a Polyglot source by replacing `data/games.pgn` with its `.bin` path. Sampling generation accepts stricter evaluation bounds but rejects a bound above 80 centipawns or a ply limit above eight. Its final validation checks the minimum position count, the maximum reachable ply and the absence of outgoing edges from the final layer.
 
 An arena book contains positions from one fixed ply whose absolute UCI evaluation lies within a selected bound. The following launcher invocations request 1,000 positions at ply eight with the default bound of 80 centipawns:
 

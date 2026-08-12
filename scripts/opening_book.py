@@ -21,7 +21,11 @@ import chess.polyglot
 POLYGLOT_ENTRY_STRUCT = struct.Struct(">QHHI")
 MATE_SCORE_CP = 100000
 GENERATED_BOOK_PATH = "data/openings.gen.bin"
-DEFAULT_MIN_FENS = 50000
+DEFAULT_GENERATED_MIN_FENS = 50000
+DEFAULT_SAMPLING_MIN_FENS = 10000
+DEFAULT_GENERATED_MAX_ABS_CP = 80
+DEFAULT_SAMPLING_MAX_ABS_CP = 80
+MAX_SAMPLING_PLIES = 8
 UCI_BINARY = "stockfish.exe" if os.name == "nt" else "stockfish"
 UCI_PATH = str(Path(__file__).resolve().parent.parent / "models" / "stockfish" / UCI_BINARY)
 
@@ -93,27 +97,32 @@ def load_polyglot_positions(
     return positions
 
 
-def load_reachable_polyglot_positions(
+def inspect_sampling_book(
     path: str,
-    max_positions: int = 50000,
+    max_plies: int = MAX_SAMPLING_PLIES,
     seed: int = 2026,
-) -> List[str]:
-    """Returns unique non-terminal states from every reachable ply, including startpos."""
+) -> Tuple[List[str], Dict[str, int]]:
+    """Traverses a layered sampling book and reports structural violations."""
     book_path = Path(path)
     if book_path.suffix.lower() != ".bin":
         raise ValueError(f"opening book must be a Polyglot .bin file: {path}")
     if not book_path.exists():
         raise FileNotFoundError(f"opening book not found: {path}")
 
-    target = max(1, int(max_positions))
+    depth_limit = max(1, int(max_plies))
     rng = random.Random(int(seed))
     positions: List[str] = []
+    start = chess.Board()
+    start_key = opening_state_key(start.fen())
+    assigned_depth = {start_key: 0}
     visited = set()
-    pending = [chess.Board()]
+    pending = [(start, 0)]
+    cross_layer_edges = 0
+    boundary_edges = 0
 
     with chess.polyglot.open_reader(str(book_path)) as reader:
-        while pending and len(positions) < target:
-            board = pending.pop()
+        while pending:
+            board, ply = pending.pop()
             state_key = opening_state_key(board.fen())
             if state_key in visited:
                 continue
@@ -128,15 +137,32 @@ def load_reachable_polyglot_positions(
                 if entry.move in board.legal_moves
             ]
             rng.shuffle(entries)
+            if ply >= depth_limit:
+                boundary_edges += len(entries)
+                continue
             for entry in entries:
                 child = board.copy(stack=False)
                 child.push(entry.move)
-                if not child.is_game_over(claim_draw=True):
-                    pending.append(child)
+                if child.is_game_over(claim_draw=True):
+                    continue
+                child_key = opening_state_key(child.fen())
+                child_depth = ply + 1
+                previous_depth = assigned_depth.get(child_key)
+                if previous_depth is not None and previous_depth != child_depth:
+                    cross_layer_edges += 1
+                    continue
+                if previous_depth is None:
+                    assigned_depth[child_key] = child_depth
+                    pending.append((child, child_depth))
 
     if not positions:
         positions.append(chess.Board().fen())
-    return positions
+    return positions, {
+        "readable_fens": len(positions),
+        "max_readable_ply": max(assigned_depth.values(), default=0),
+        "cross_layer_edges": int(cross_layer_edges),
+        "boundary_edges": int(boundary_edges),
+    }
 
 
 def opening_state_key(fen: str) -> str:
@@ -500,42 +526,73 @@ def validate_written_book(path: str, book_plies: int, min_fens: int) -> int:
     return readable_fens
 
 
-def validate_sampling_book(path: str, min_fens: int, seed: int) -> int:
-    readable_fens = len(
-        load_reachable_polyglot_positions(
-            path,
-            max_positions=min_fens,
-            seed=seed,
-        )
-    )
-    if readable_fens < min_fens:
+def validate_sampling_book(
+    path: str,
+    min_fens: int,
+    max_plies: int,
+    seed: int,
+) -> Dict[str, int]:
+    _, inspection = inspect_sampling_book(path, max_plies=max_plies, seed=seed)
+    if inspection["readable_fens"] < min_fens:
         raise RuntimeError(
             f"sampling book reachable positions below --min-fens: "
-            f"{readable_fens} < {min_fens}"
+            f"{inspection['readable_fens']} < {min_fens}"
         )
-    return readable_fens
+    if inspection["max_readable_ply"] > max_plies:
+        raise RuntimeError(
+            f"sampling book exceeds the ply limit: "
+            f"{inspection['max_readable_ply']} > {max_plies}"
+        )
+    if inspection["cross_layer_edges"]:
+        raise RuntimeError(
+            "sampling book contains edges that assign one position to multiple plies"
+        )
+    if inspection["boundary_edges"]:
+        raise RuntimeError("sampling book contains outgoing edges at the ply limit")
+    return inspection
 
 
-def extract_sampling_book_from_polyglot(
+def sampling_position_cp(engine, board: chess.Board, limit, cache) -> Optional[int]:
+    state_key = opening_state_key(board.fen())
+    if state_key not in cache:
+        cache[state_key] = analyse_book_position(engine, board, limit)
+    return cache[state_key]
+
+
+def balanced_sampling_book_from_polyglot(
     source: Path,
     output: str,
     min_fens: int,
+    max_plies: int,
+    max_abs_cp: int,
+    engine,
+    limit,
     seed: int,
     log_every: int,
 ) -> Dict[str, object]:
     rng = random.Random(seed)
-    pending = [chess.Board()]
+    root = chess.Board()
+    root_key = opening_state_key(root.fen())
+    assigned_depth = {root_key: 0}
+    pending = deque([(root, 0)])
     visited = set()
+    evaluations = {}
     entries: Dict[Tuple[int, int], PolyglotOutputEntry] = {}
-    next_log = max(1, log_every)
+    checked = 0
+    rejected = 0
+    terminal = 0
+    unknown = 0
+    layer_conflicts = 0
 
     with chess.polyglot.open_reader(str(source)) as reader:
-        while pending and len(visited) < min_fens:
-            board = pending.pop()
+        while pending and len(assigned_depth) < min_fens:
+            board, ply = pending.popleft()
             state_key = opening_state_key(board.fen())
-            if state_key in visited or board.is_game_over(claim_draw=True):
+            if state_key in visited:
                 continue
             visited.add(state_key)
+            if ply >= max_plies:
+                continue
 
             available = [
                 entry
@@ -544,97 +601,176 @@ def extract_sampling_book_from_polyglot(
             ]
             rng.shuffle(available)
             for entry in available:
+                checked += 1
+                child = board.copy(stack=False)
+                child.push(entry.move)
+                if child.is_game_over(claim_draw=True):
+                    terminal += 1
+                    rejected += 1
+                    continue
+
+                child_key = opening_state_key(child.fen())
+                child_depth = ply + 1
+                previous_depth = assigned_depth.get(child_key)
+                if previous_depth is not None and previous_depth != child_depth:
+                    layer_conflicts += 1
+                    rejected += 1
+                    continue
+
+                cp = sampling_position_cp(engine, child, limit, evaluations)
+                if cp is None:
+                    unknown += 1
+                    rejected += 1
+                    continue
+                if abs(cp) > max_abs_cp:
+                    rejected += 1
+                    continue
+
                 entries[(int(entry.key), int(entry.raw_move))] = PolyglotOutputEntry(
                     key=int(entry.key),
                     raw_move=int(entry.raw_move),
                     weight=max(1, int(entry.weight)),
                     learn=int(entry.learn),
                 )
-                child = board.copy(stack=False)
-                child.push(entry.move)
-                if not child.is_game_over(claim_draw=True):
-                    pending.append(child)
+                if previous_depth is None:
+                    assigned_depth[child_key] = child_depth
+                    pending.append((child, child_depth))
+                    if len(assigned_depth) >= min_fens:
+                        break
 
-            if log_every > 0 and len(visited) >= next_log:
-                print(
-                    "sampling book:",
-                    f"readable_fens={len(visited)}/{min_fens}",
-                    f"unique_entries={len(entries)}",
-                    flush=True,
-                )
-                next_log += log_every
+                if log_every and checked % log_every == 0:
+                    print(
+                        "sampling book:",
+                        f"checked={checked}",
+                        f"readable_fens={len(assigned_depth)}/{min_fens}",
+                        f"unique_entries={len(entries)}",
+                        f"rejected={rejected}",
+                        flush=True,
+                    )
 
-    if len(visited) < min_fens:
+    if len(assigned_depth) < min_fens:
         raise RuntimeError(
-            f"source book has too few reachable positions: {len(visited)} < {min_fens}"
+            f"balanced source book has too few positions within {max_plies} plies: "
+            f"{len(assigned_depth)} < {min_fens}"
         )
     write_polyglot_book(output, entries.values())
-    readable_fens = validate_sampling_book(output, min_fens, seed)
+    inspection = validate_sampling_book(output, min_fens, max_plies, seed)
     return {
         "input": str(source),
         "output": str(output),
         "source_type": "polyglot",
-        "readable_fens": int(readable_fens),
+        **inspection,
         "min_fens": int(min_fens),
+        "max_abs_cp": int(max_abs_cp),
+        "book_plies": int(max_plies),
+        "checked_positions": int(checked),
+        "evaluated_positions": len(evaluations),
         "unique_entries": len(entries),
+        "rejected_positions": int(rejected),
+        "terminal_positions": int(terminal),
+        "unknown_score_positions": int(unknown),
+        "layer_conflicts": int(layer_conflicts),
         "seed": int(seed),
     }
 
 
-def generate_sampling_book_from_pgn(
+def balanced_sampling_book_from_pgn(
     source: Path,
     output: str,
     min_fens: int,
+    max_plies: int,
+    max_abs_cp: int,
+    engine,
+    limit,
     seed: int,
     log_every: int,
 ) -> Dict[str, object]:
+    root = chess.Board()
+    root_key = opening_state_key(root.fen())
+    assigned_depth = {root_key: 0}
+    evaluations = {}
     counts: Dict[Tuple[int, int], int] = {}
-    readable = {opening_state_key(chess.Board().fen())}
     games = 0
     checked = 0
+    rejected = 0
     illegal = 0
-    next_log = max(1, log_every)
+    terminal = 0
+    unknown = 0
+    layer_conflicts = 0
+    nonstandard_starts = 0
 
     with open(source, "r", encoding="utf-8", errors="replace") as handle:
-        while len(readable) < min_fens:
+        while len(assigned_depth) < min_fens:
             game = chess.pgn.read_game(handle)
             if game is None:
                 break
             games += 1
             board = game.board()
-            for move in game.mainline_moves():
+            if opening_state_key(board.fen()) != root_key:
+                nonstandard_starts += 1
+                continue
+
+            for ply, move in enumerate(game.mainline_moves(), 1):
+                if ply > max_plies:
+                    break
+                parent_key = opening_state_key(board.fen())
+                if assigned_depth.get(parent_key) != ply - 1:
+                    layer_conflicts += 1
+                    break
                 if move not in board.legal_moves:
                     illegal += 1
                     break
+
+                checked += 1
                 child = board.copy(stack=False)
                 child.push(move)
-                checked += 1
                 if child.is_game_over(claim_draw=True):
+                    terminal += 1
+                    rejected += 1
                     break
+
+                child_key = opening_state_key(child.fen())
+                previous_depth = assigned_depth.get(child_key)
+                if previous_depth is not None and previous_depth != ply:
+                    layer_conflicts += 1
+                    rejected += 1
+                    break
+
+                cp = sampling_position_cp(engine, child, limit, evaluations)
+                if cp is None:
+                    unknown += 1
+                    rejected += 1
+                    break
+                if abs(cp) > max_abs_cp:
+                    rejected += 1
+                    break
+
                 edge = (
                     int(chess.polyglot.zobrist_hash(board)),
                     int(encode_polyglot_move(board, move)),
                 )
                 counts[edge] = counts.get(edge, 0) + 1
+                if previous_depth is None:
+                    assigned_depth[child_key] = ply
                 board = child
-                readable.add(opening_state_key(board.fen()))
 
-                if log_every > 0 and len(readable) >= next_log:
+                if log_every and checked % log_every == 0:
                     print(
                         "sampling pgn:",
                         f"games={games}",
                         f"checked={checked}",
-                        f"readable_fens={len(readable)}/{min_fens}",
+                        f"readable_fens={len(assigned_depth)}/{min_fens}",
                         f"unique_entries={len(counts)}",
+                        f"rejected={rejected}",
                         flush=True,
                     )
-                    next_log += log_every
-                if len(readable) >= min_fens:
+                if len(assigned_depth) >= min_fens:
                     break
 
-    if len(readable) < min_fens:
+    if len(assigned_depth) < min_fens:
         raise RuntimeError(
-            f"PGN has too few reachable positions: {len(readable)} < {min_fens}"
+            f"balanced PGN has too few positions within {max_plies} plies: "
+            f"{len(assigned_depth)} < {min_fens}"
         )
     entries = [
         PolyglotOutputEntry(
@@ -645,17 +781,25 @@ def generate_sampling_book_from_pgn(
         for (key, raw_move), weight in counts.items()
     ]
     write_polyglot_book(output, entries)
-    readable_fens = validate_sampling_book(output, min_fens, seed)
+    inspection = validate_sampling_book(output, min_fens, max_plies, seed)
     return {
         "input": str(source),
         "output": str(output),
         "source_type": "pgn",
+        **inspection,
+        "min_fens": int(min_fens),
+        "max_abs_cp": int(max_abs_cp),
+        "book_plies": int(max_plies),
         "games": int(games),
         "checked_positions": int(checked),
-        "readable_fens": int(readable_fens),
-        "min_fens": int(min_fens),
+        "evaluated_positions": len(evaluations),
         "unique_entries": len(entries),
+        "rejected_positions": int(rejected),
         "illegal_moves": int(illegal),
+        "terminal_positions": int(terminal),
+        "unknown_score_positions": int(unknown),
+        "layer_conflicts": int(layer_conflicts),
+        "nonstandard_start_games": int(nonstandard_starts),
         "seed": int(seed),
     }
 
@@ -664,29 +808,66 @@ def generate_sampling_book(args):
     source = Path(args.sampling_source)
     if not source.exists():
         raise FileNotFoundError(f"sampling source not found: {source}")
+    if not os.path.exists(args.uci):
+        raise FileNotFoundError(f"UCI engine not found: {args.uci}")
     output = args.output or "data/openings.sam.bin"
     if Path(output).resolve() == source.resolve():
         raise ValueError("sampling output must differ from its source")
-    min_fens = max(1, int(args.min_fens))
+    min_fens = max(DEFAULT_SAMPLING_MIN_FENS, int(args.min_fens))
+    max_plies = max(1, int(args.book_plies))
+    if max_plies > MAX_SAMPLING_PLIES:
+        raise ValueError(
+            f"sampling book plies must be in [1,{MAX_SAMPLING_PLIES}]"
+        )
+    max_abs_cp = max(0, int(args.max_abs_cp))
+    if max_abs_cp > DEFAULT_SAMPLING_MAX_ABS_CP:
+        raise ValueError(
+            f"sampling book max-abs-cp must be in "
+            f"[0,{DEFAULT_SAMPLING_MAX_ABS_CP}]"
+        )
     seed = int(args.seed)
     log_every = max(0, int(args.log_every))
+    limit = engine_limit(args.uci_depth, args.uci_movetime_ms)
     start = time.monotonic()
     print(
         "sampling book start:",
         f"input={source}",
         f"output={output}",
+        f"uci={args.uci}",
+        f"book_plies={max_plies}",
         f"min_fens={min_fens}",
+        f"max_abs_cp={max_abs_cp}",
         f"seed={seed}",
         flush=True,
     )
-    if source.suffix.lower() == ".bin":
-        summary = extract_sampling_book_from_polyglot(
-            source, output, min_fens, seed, log_every
-        )
-    else:
-        summary = generate_sampling_book_from_pgn(
-            source, output, min_fens, seed, log_every
-        )
+    with chess.engine.SimpleEngine.popen_uci(args.uci) as engine:
+        configure_uci_engine(engine, args.uci_threads, args.uci_hash_mb)
+        if source.suffix.lower() == ".bin":
+            summary = balanced_sampling_book_from_polyglot(
+                source,
+                output,
+                min_fens,
+                max_plies,
+                max_abs_cp,
+                engine,
+                limit,
+                seed,
+                log_every,
+            )
+        else:
+            summary = balanced_sampling_book_from_pgn(
+                source,
+                output,
+                min_fens,
+                max_plies,
+                max_abs_cp,
+                engine,
+                limit,
+                seed,
+                log_every,
+            )
+    summary["uci_depth"] = int(args.uci_depth)
+    summary["uci_movetime_ms"] = int(args.uci_movetime_ms)
     summary["elapsed_sec"] = round(time.monotonic() - start, 3)
     print("sampling book summary:", flush=True)
     print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
@@ -1087,8 +1268,8 @@ def parse_args():
     parser.add_argument("--uci", default=UCI_PATH)
     parser.add_argument("--output", default=None)
     parser.add_argument("--in-place", action="store_true", default=False)
-    parser.add_argument("--max-abs-cp", type=int, default=80)
-    parser.add_argument("--min-fens", type=int, default=DEFAULT_MIN_FENS)
+    parser.add_argument("--max-abs-cp", type=int, default=None)
+    parser.add_argument("--min-fens", type=int, default=None)
     parser.add_argument("--book-plies", type=int, default=8)
     parser.add_argument("--min-weight", type=int, default=1)
     parser.add_argument("--uci-depth", type=int, default=12)
@@ -1098,6 +1279,18 @@ def parse_args():
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--seed", type=int, default=2026)
     args = parser.parse_args()
+    if args.max_abs_cp is None:
+        args.max_abs_cp = (
+            DEFAULT_SAMPLING_MAX_ABS_CP
+            if args.sampling_source
+            else DEFAULT_GENERATED_MAX_ABS_CP
+        )
+    if args.min_fens is None:
+        args.min_fens = (
+            DEFAULT_SAMPLING_MIN_FENS
+            if args.sampling_source
+            else DEFAULT_GENERATED_MIN_FENS
+        )
     return args
 
 
