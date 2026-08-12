@@ -366,14 +366,14 @@ Train independent Eleginus Policy and Value networks with:
 build/eleginus/train \
 	--data data/games.eleginus.h5 \
 	--out models/eleginus/eleginus.pth \
-	--epochs 4 \
+	--epochs 2 \
 	--batch-size 512 \
 	--lr 0.001 \
 	--device cuda \
 	--seed 2026
 ```
 
-Eleginus uses the same `--max-steps` convention: a positive value caps optimizer updates, while `0` lets `--epochs` determine the training length.
+Eleginus uses the same `--max-steps` convention: a positive value caps optimizer updates, while `0` lets `--epochs` determine the training length. The trainer atomically updates the checkpoint selected by `--out` after every epoch.
 
 The Policy network learns the recorded PGN moves, while the Value network learns the selected
 comment- or result-derived targets. Their parameter sets and AdamW states are independent. Supplying

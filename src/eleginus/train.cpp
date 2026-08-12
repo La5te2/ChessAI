@@ -54,8 +54,8 @@ int main(int argc, char **argv) {
 		options.log_every = args.get_int("log-every", options.log_every);
 		options.seed = seed;
 		const auto output = std::filesystem::path(args.get("out", "models/eleginus/eleginus.pth"));
+		options.output = output;
 		const auto stats = eleginus::train_from_h5(model, options, device);
-		eleginus::save_checkpoint_atomic(output, model);
 		std::cout << "Eleginus supervised training complete: rows=" << stats.samples
 				  << " steps=" << stats.steps
 				  << " checkpoint=" << output.string() << std::endl;

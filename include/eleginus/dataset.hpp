@@ -89,6 +89,7 @@ void preprocess_pgn(const PreprocessOptions &options);
 
 struct TrainOptions {
 	std::filesystem::path data;
+	std::filesystem::path output;
 	int epochs = 1;
 	int batch_size = 512;
 	std::int64_t max_steps = 0;

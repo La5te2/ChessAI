@@ -20,6 +20,7 @@
 #include <torch/nn/utils/clip_grad.h>
 #include <torch/optim.h>
 
+#include "eleginus/checkpoint.hpp"
 #include "eleginus/game.hpp"
 
 namespace eleginus {
@@ -721,6 +722,12 @@ TrainStats train_from_h5(Model &model, const TrainOptions &options,
 			}
 			if (stop)
 				break;
+		}
+		if (!options.output.empty()) {
+			save_checkpoint_atomic(options.output, model);
+			std::cout << "Eleginus epoch checkpoint: epoch=" << (epoch + 1)
+					  << " step=" << stats.steps
+					  << " path=" << options.output.string() << std::endl;
 		}
 	}
 	model->eval();

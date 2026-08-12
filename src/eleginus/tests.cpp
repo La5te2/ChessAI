@@ -282,11 +282,14 @@ int main() {
 				"Eleginus HDF5 side-to-move orientation changed Policy input");
 		}
 		auto training_model = eleginus::make_model(torch::Device(torch::kCPU), 11);
+		const auto training_checkpoint =
+			std::filesystem::temp_directory_path() / "eleginus-training-test.pth";
 		const auto attention_before =
 			training_model->value->attention->weight.detach().clone();
 		const auto output_before = training_model->value->output->weight.detach().clone();
 		eleginus::TrainOptions training_options;
 		training_options.data = dataset_path;
+		training_options.output = training_checkpoint;
 		training_options.epochs = 1;
 		training_options.batch_size = 2;
 		training_options.max_steps = 1;
@@ -295,6 +298,13 @@ int main() {
 			training_model, training_options, torch::Device(torch::kCPU));
 		require(training_stats.steps == 1 && training_stats.samples == 2,
 			"Eleginus training batch mismatch");
+		require(std::filesystem::exists(training_checkpoint),
+			"Eleginus epoch checkpoint was not written");
+		const auto epoch_model = eleginus::load_checkpoint(
+			training_checkpoint, torch::Device(torch::kCPU));
+		require(torch::allclose(epoch_model->value->output->weight,
+			training_model->value->output->weight),
+			"Eleginus epoch checkpoint does not contain the trained parameters");
 		const auto attention_change =
 			(training_model->value->attention->weight.detach() - attention_before).abs();
 		for (int part = 0; part < 3; ++part) {
@@ -307,6 +317,7 @@ int main() {
 		require((training_model->value->output->weight.detach() - output_before)
 				.abs().max().item<float>() > 0.0F,
 			"Eleginus Value output received no gradient");
+		std::filesystem::remove(training_checkpoint);
 		std::filesystem::remove(dataset_path);
 
 		const auto pgn_path =
