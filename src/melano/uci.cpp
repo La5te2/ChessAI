@@ -185,7 +185,7 @@ class UciEngine {
 		print("option name Device type string default " + options_.device);
 		print("option name Threads type spin default " +
 			  std::to_string(options_.search.cpu_threads) + " min 1 max 256");
-		print("option name EvalCacheMB type spin default " +
+		print("option name Hash type spin default " +
 			  std::to_string(options_.search.evaluation_cache_mb) + " min 0 max 65536");
 		print("option name SearchType type combo default " +
 			  melano::search_type_name(options_.search.type) + " var closed var only-mcts");
@@ -292,7 +292,7 @@ class UciEngine {
 		} else if (key == "instantmatefirst") {
 			options_.search.instant_mate_first =
 				parse_bool(value, options_.search.instant_mate_first);
-		} else if (key == "evalcachemb") {
+		} else if (key == "hash") {
 			options_.search.evaluation_cache_mb =
 				std::clamp(parse_int(value, options_.search.evaluation_cache_mb), 0, 65536);
 		} else if (key == "progressintervalms") {

@@ -1,4 +1,4 @@
-// Implements Gadus batched fair-root PUCT MCTS; search.cpp supplies the CLI front end.
+// Implements Gadus batched PUCT MCTS with root coverage and adaptive internal widening.
 
 #include "gadus/search.hpp"
 #include <algorithm>
@@ -42,13 +42,21 @@ struct PackedStateHash {
 	}
 };
 
-// Stores exact network rows and combines ordinary recency with root-trajectory locality.
+struct TrajectoryHeat {
+	std::uint64_t id = 0;
+	double heat = 0.0;
+	int depth = 0;
+};
+
+// Stores exact network rows and combines ordinary recency with predicted trajectory locality.
 class TrajectoryLruCache {
 	struct Entry {
 		EvaluationRow evaluation;
 		std::list<PackedState>::iterator recency;
 		std::vector<std::uint64_t> children;
 		std::uint64_t id = 0;
+		std::uint64_t heat_generation = 0;
+		double trajectory_heat = 0.0;
 		std::size_t bytes = 0;
 	};
 
@@ -90,8 +98,8 @@ class TrajectoryLruCache {
 		auto stored = evaluation;
 		stored.cache_id = 0;
 		const auto id = next_id_++;
-		auto [inserted, success] =
-			entries_.emplace(state, Entry{std::move(stored), iterator, {}, id, bytes});
+		auto [inserted, success] = entries_.emplace(
+			state, Entry{std::move(stored), iterator, {}, id, 0, 0.0, bytes});
 		if (!success) {
 			recency_.erase(iterator);
 			throw std::logic_error("evaluation cache insertion failed");
@@ -130,42 +138,94 @@ class TrajectoryLruCache {
 		evict_to_capacity();
 	}
 
-	/// Promotes cached descendants near the new root before ordinary LRU replacement resumes.
-	void promote_trajectory_neighborhood(const PackedState &root, int radius) {
-		const auto found = entries_.find(root);
-		if (found == entries_.end() || radius < 0) {
+	/// Records visit-derived heat for the completed search tree and refreshes its recency.
+	void promote_trajectory_heat(std::vector<TrajectoryHeat> trajectory) {
+		if (trajectory.empty()) {
 			return;
 		}
+		const auto generation = next_heat_generation_++;
+		trajectory.erase(
+			std::remove_if(trajectory.begin(), trajectory.end(), [&](const TrajectoryHeat &item) {
+				return item.id == 0 || !entries_by_id_.contains(item.id);
+			}),
+			trajectory.end());
+		for (const auto &item : trajectory) {
+			auto &entry = *entries_by_id_.at(item.id);
+			entry.heat_generation = generation;
+			entry.trajectory_heat = item.heat;
+		}
+		std::sort(trajectory.begin(), trajectory.end(), [](const auto &left, const auto &right) {
+			if (left.heat != right.heat) {
+				return left.heat < right.heat;
+			}
+			if (left.depth != right.depth) {
+				return left.depth > right.depth;
+			}
+			return left.id < right.id;
+		});
+		for (const auto &item : trajectory) {
+			if (const auto entry = entries_by_id_.find(item.id); entry != entries_by_id_.end()) {
+				touch(*entry->second);
+			}
+		}
+	}
+
+	/// Conditions retained trajectory heat on the roots that actually begin the next search.
+	void promote_trajectory_neighborhoods(const std::vector<PackedState> &roots) {
 		struct FrontierItem {
 			std::uint64_t id = 0;
 			int depth = 0;
 		};
-		std::vector<FrontierItem> frontier{{found->second.id, 0}};
-		std::vector<std::uint64_t> neighborhood;
-		std::unordered_set<std::uint64_t> visited;
-		visited.reserve(64);
-		for (std::size_t cursor = 0; cursor < frontier.size(); ++cursor) {
-			const auto item = frontier[cursor];
-			if (!visited.insert(item.id).second) {
+		std::unordered_map<std::uint64_t, TrajectoryHeat> neighborhood;
+		for (const auto &root : roots) {
+			const auto found = entries_.find(root);
+			if (found == entries_.end() || found->second.heat_generation == 0) {
 				continue;
 			}
-			const auto entry = entries_by_id_.find(item.id);
-			if (entry == entries_by_id_.end()) {
-				continue;
-			}
-			neighborhood.push_back(item.id);
-			if (item.depth >= radius) {
-				continue;
-			}
-			for (const auto child_id : entry->second->children) {
-				if (entries_by_id_.contains(child_id)) {
-					frontier.push_back({child_id, item.depth + 1});
+			const auto generation = found->second.heat_generation;
+			std::vector<FrontierItem> frontier{{found->second.id, 0}};
+			std::unordered_set<std::uint64_t> visited;
+			for (std::size_t cursor = 0; cursor < frontier.size(); ++cursor) {
+				const auto item = frontier[cursor];
+				if (!visited.insert(item.id).second) {
+					continue;
+				}
+				const auto entry = entries_by_id_.find(item.id);
+				if (entry == entries_by_id_.end() ||
+					entry->second->heat_generation != generation) {
+					continue;
+				}
+				auto &aggregate = neighborhood[item.id];
+				if (aggregate.id == 0) {
+					aggregate.id = item.id;
+					aggregate.depth = item.depth;
+				} else {
+					aggregate.depth = std::min(aggregate.depth, item.depth);
+				}
+				aggregate.heat += entry->second->trajectory_heat;
+				for (const auto child_id : entry->second->children) {
+					if (entries_by_id_.contains(child_id)) {
+						frontier.push_back({child_id, item.depth + 1});
+					}
 				}
 			}
 		}
-		// Promote distant descendants first so the root and its nearest children remain newest.
-		for (auto iterator = neighborhood.rbegin(); iterator != neighborhood.rend(); ++iterator) {
-			if (const auto entry = entries_by_id_.find(*iterator); entry != entries_by_id_.end()) {
+		std::vector<TrajectoryHeat> ordered;
+		ordered.reserve(neighborhood.size());
+		for (const auto &[id, item] : neighborhood) {
+			ordered.push_back(item);
+		}
+		std::sort(ordered.begin(), ordered.end(), [](const auto &left, const auto &right) {
+			if (left.heat != right.heat) {
+				return left.heat < right.heat;
+			}
+			if (left.depth != right.depth) {
+				return left.depth > right.depth;
+			}
+			return left.id < right.id;
+		});
+		for (const auto &item : ordered) {
+			if (const auto entry = entries_by_id_.find(item.id); entry != entries_by_id_.end()) {
 				touch(*entry->second);
 			}
 		}
@@ -184,6 +244,7 @@ class TrajectoryLruCache {
 		recency_.clear();
 		used_bytes_ = 0;
 		next_id_ = 1;
+		next_heat_generation_ = 1;
 	}
 
 	private:
@@ -221,6 +282,7 @@ class TrajectoryLruCache {
 	std::size_t capacity_bytes_;
 	std::size_t used_bytes_ = 0;
 	std::uint64_t next_id_ = 1;
+	std::uint64_t next_heat_generation_ = 1;
 	std::list<PackedState> recency_;
 	Entries entries_;
 	std::unordered_map<std::uint64_t, Entry *> entries_by_id_;
@@ -239,6 +301,7 @@ struct Node {
 	int visits = 0;
 	float value_sum = 0.0F;
 	int virtual_visits = 0;
+	std::size_t active_children = 0;
 	std::uint64_t evaluation_id = 0;
 	std::vector<Node> children;
 };
@@ -264,6 +327,9 @@ struct TreeState {
 	int leaf_samples = 0;
 	int max_leaf_depth = 0;
 	int root_visit_floor = 0;
+	bool root_prior_fixed = false;
+	double root_prior_exponent = 1.0;
+	double root_prior_normalizer = 1.0;
 };
 
 // Keep bounded value arithmetic inside the model's [-1, 1] convention.
@@ -292,6 +358,29 @@ void backpropagate(const std::vector<Node *> &path, float value) {
 		(*iterator)->visits += 1;
 		(*iterator)->value_sum += value;
 		value = -value;
+	}
+}
+
+// Aggregate each cached state's visit share within the completed root tree.
+void collect_trajectory_heat(const Node *node, double denominator, int depth,
+							 std::unordered_map<std::uint64_t, TrajectoryHeat> &output) {
+	if (node == nullptr || node->visits <= 0 || denominator <= 0.0) {
+		return;
+	}
+	if (node->evaluation_id != 0) {
+		auto &item = output[node->evaluation_id];
+		if (item.id == 0) {
+			item.id = node->evaluation_id;
+			item.depth = depth;
+		} else {
+			item.depth = std::min(item.depth, depth);
+		}
+		item.heat += static_cast<double>(node->visits) / denominator;
+	}
+	for (const auto &child : node->children) {
+		if (child.visits > 0) {
+			collect_trajectory_heat(&child, denominator, depth + 1, output);
+		}
 	}
 }
 
@@ -518,6 +607,8 @@ struct Searcher::Impl {
 		for (std::size_t index = 0; index < evaluation.legal_moves.size(); ++index) {
 			node->children.emplace_back(normalized[index], evaluation.legal_moves[index]);
 		}
+		std::stable_sort(node->children.begin(), node->children.end(),
+			[](const Node &left, const Node &right) { return left.prior > right.prior; });
 	}
 
 	// Sum priors already explored under a parent for FPU reduction.
@@ -563,28 +654,75 @@ struct Searcher::Impl {
 		return exploitation + exploration - options.virtual_loss * child->virtual_visits;
 	}
 
-	// Break equal PUCT scores by policy prior, then by the edge value in the parent perspective.
-	Node *select_child(Node *parent) const {
-		if (parent->children.empty()) {
-			return nullptr;
+	// Compare two children by PUCT score, policy prior, and parent-perspective value.
+	bool child_precedes(const Node *parent, const Node *candidate, const Node *selected) const {
+		const double candidate_score = selection_score(parent, candidate);
+		const double selected_score = selection_score(parent, selected);
+		if (candidate_score != selected_score) {
+			return candidate_score > selected_score;
 		}
-		auto selected =
-			std::max_element(parent->children.begin(), parent->children.end(),
-							 [&](const Node &left, const Node &right) {
-								 const double left_score = selection_score(parent, &left);
-								 const double right_score = selection_score(parent, &right);
-								 if (left_score != right_score) {
-									 return left_score < right_score;
-								 }
-								 if (left.prior != right.prior) {
-									 return left.prior < right.prior;
-								 }
-								 return edge_value(parent, &left) < edge_value(parent, &right);
-							 });
-		return &*selected;
+		if (candidate->prior != selected->prior) {
+			return candidate->prior > selected->prior;
+		}
+		return edge_value(parent, candidate) > edge_value(parent, selected);
 	}
 
-	// Give every legal root action a growing visit floor before competitive PUCT allocation.
+	// Give fully opened internal nodes a sublinear per-action evidence floor.
+	int internal_verification_floor(const Node *parent) const {
+		const int actions = static_cast<int>(parent->children.size());
+		const int visits = std::max(0, parent->visits);
+		if (actions <= 0 || parent->active_children < parent->children.size()) {
+			return 0;
+		}
+		const double denominator =
+			static_cast<double>(actions) * std::log(std::exp(1.0) + visits);
+		return std::max(1, static_cast<int>(std::floor(visits / denominator)));
+	}
+
+	// Open internal actions, verify a fully opened node, then continue with PUCT.
+	Node *select_child(Node *parent, double opening_exponent) const {
+		const int augmented_visits = std::max(0, parent->visits + parent->virtual_visits);
+		const auto requested = static_cast<std::size_t>(std::ceil(std::pow(
+			static_cast<double>(augmented_visits) + 1.0, opening_exponent)));
+		parent->active_children = std::max(
+			parent->active_children, std::min(parent->children.size(), std::max<std::size_t>(1, requested)));
+		for (std::size_t index = 0; index < parent->active_children; ++index) {
+			auto &child = parent->children[index];
+			if (child.visits + child.virtual_visits == 0) {
+				return &child;
+			}
+		}
+		const int verification_floor = internal_verification_floor(parent);
+		Node *under_verified = nullptr;
+		int largest_deficit = 0;
+		for (std::size_t index = 0; index < parent->active_children; ++index) {
+			auto &child = parent->children[index];
+			const int deficit =
+				verification_floor - (child.visits + child.virtual_visits);
+			if (deficit <= 0) {
+				continue;
+			}
+			if (under_verified == nullptr || deficit > largest_deficit ||
+				(deficit == largest_deficit &&
+				 child_precedes(parent, &child, under_verified))) {
+				under_verified = &child;
+				largest_deficit = deficit;
+			}
+		}
+		if (under_verified != nullptr) {
+			return under_verified;
+		}
+		Node *selected = nullptr;
+		for (std::size_t index = 0; index < parent->active_children; ++index) {
+			auto &child = parent->children[index];
+			if (selected == nullptr || child_precedes(parent, &child, selected)) {
+				selected = &child;
+			}
+		}
+		return selected;
+	}
+
+	// Derive the fair visit floor from the total budget and complete legal width.
 	int root_fair_visit_floor(const TreeState &state) const {
 		const int actions = static_cast<int>(state.root->children.size());
 		const int budget = std::max(0, options.mcts_sims);
@@ -596,7 +734,93 @@ struct Searcher::Impl {
 		return std::max(1, static_cast<int>(std::floor(budget / denominator)));
 	}
 
-	// Fill the root visit floor by largest deficit, then allocate additional work with PUCT.
+	// Report whether every legal root action has completed its fair-stage visits.
+	bool root_fair_complete(const TreeState &state) const {
+		for (const auto &child : state.root->children) {
+			if (child.visits < state.root_visit_floor) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	// Fix 1/alpha from fair-stage rank agreement between original Policy and empirical Q.
+	void fix_root_prior(TreeState &state) const {
+		if (state.root_prior_fixed) {
+			return;
+		}
+		double concordant = 0.0;
+		double discordant = 0.0;
+		double prior_ties = 0.0;
+		double value_ties = 0.0;
+		for (std::size_t left = 0; left < state.root->children.size(); ++left) {
+			const auto &left_child = state.root->children[left];
+			for (std::size_t right = left + 1; right < state.root->children.size(); ++right) {
+				const auto &right_child = state.root->children[right];
+				const int prior_order = (left_child.prior > right_child.prior) -
+									(left_child.prior < right_child.prior);
+				const float left_value = -left_child.q();
+				const float right_value = -right_child.q();
+				const int value_order =
+					(left_value > right_value) - (left_value < right_value);
+				if (prior_order == 0 && value_order != 0) {
+					prior_ties += 1.0;
+				} else if (prior_order != 0 && value_order == 0) {
+					value_ties += 1.0;
+				} else if (prior_order != 0 && value_order != 0) {
+					if (prior_order == value_order) {
+						concordant += 1.0;
+					} else {
+						discordant += 1.0;
+					}
+				}
+			}
+		}
+		const double ranked_pairs = concordant + discordant;
+		const double denominator =
+			std::sqrt((ranked_pairs + prior_ties) * (ranked_pairs + value_ties));
+		const double tau = denominator > 0.0
+			? std::clamp((concordant - discordant) / denominator, -1.0, 1.0)
+			: 0.0;
+		state.root_prior_exponent = 0.5 * (1.0 + tau);
+		state.root_prior_normalizer = 0.0;
+		for (const auto &child : state.root->children) {
+			const double prior = std::max(0.0F, child.prior);
+			state.root_prior_normalizer += state.root_prior_exponent == 0.0
+				? 1.0
+				: std::pow(prior, state.root_prior_exponent);
+		}
+		if (state.root_prior_normalizer <= 0.0) {
+			state.root_prior_exponent = 0.0;
+			state.root_prior_normalizer = static_cast<double>(state.root->children.size());
+		}
+		state.root_prior_fixed = true;
+	}
+
+	// Widen at least by a square root and accelerate when fair Q opposes Policy ordering.
+	double internal_opening_exponent(const TreeState &state) const {
+		return std::max(0.5, 1.0 - state.root_prior_exponent);
+	}
+
+	// Return one legal root action's fixed power-tempered prior.
+	double root_tempered_prior(const TreeState &state, const Node &child) const {
+		const double numerator = state.root_prior_exponent == 0.0
+			? 1.0
+			: std::pow(std::max(0.0F, child.prior), state.root_prior_exponent);
+		return numerator / state.root_prior_normalizer;
+	}
+
+	// Score one fair-evaluated root edge with its fixed power-tempered prior.
+	double root_selection_score(const TreeState &state, const Node *child, double prior) const {
+		const auto *root = state.root.get();
+		const int child_visits = child->visits + child->virtual_visits;
+		const double exploration = scheduled_c_puct(root) * prior *
+								   std::sqrt(root->visits + root->virtual_visits + 1.0) /
+								   (1.0 + child_visits);
+		return -child->q() + exploration - options.virtual_loss * child->virtual_visits;
+	}
+
+	// Fill the fair floor on every legal root action, then allocate the remainder with fixed PUCT.
 	Node *select_root_action(TreeState &state) const {
 		Node *selected = nullptr;
 		int largest_deficit = 0;
@@ -608,18 +832,39 @@ struct Searcher::Impl {
 			}
 			if (selected == nullptr || deficit > largest_deficit ||
 				(deficit == largest_deficit &&
-				 selection_score(state.root.get(), &child) >
-					 selection_score(state.root.get(), selected))) {
+				 child_precedes(state.root.get(), &child, selected))) {
 				selected = &child;
 				largest_deficit = deficit;
 			}
 		}
-		return selected != nullptr ? selected : select_child(state.root.get());
+		if (selected != nullptr) {
+			return selected;
+		}
+		if (!root_fair_complete(state)) {
+			return nullptr;
+		}
+
+		fix_root_prior(state);
+		double selected_score = -std::numeric_limits<double>::infinity();
+		double selected_prior = 0.0;
+		for (auto &child : state.root->children) {
+			const double prior = root_tempered_prior(state, child);
+			const double score = root_selection_score(state, &child, prior);
+			const float value = -child.q();
+			const float selected_value = selected != nullptr ? -selected->q() : 0.0F;
+			if (selected == nullptr || score > selected_score ||
+				(score == selected_score && prior > selected_prior) ||
+				(score == selected_score && prior == selected_prior && value > selected_value)) {
+				selected = &child;
+				selected_score = score;
+				selected_prior = prior;
+			}
+		}
+		return selected;
 	}
 
 	// Enter one selected root action, then use PUCT below the root until reaching a leaf.
-	SelectedLeaf select_leaf(std::size_t state_index, TreeState &state,
-						 Node *root_action) const {
+	SelectedLeaf select_leaf(std::size_t state_index, TreeState &state, Node *root_action) const {
 		SelectedLeaf selected;
 		selected.state_index = state_index;
 		selected.board = state.board;
@@ -633,8 +878,9 @@ struct Searcher::Impl {
 			selected.board.makeMove(selected.leaf->move);
 			selected.path.push_back(selected.leaf);
 		}
+		const double opening_exponent = internal_opening_exponent(state);
 		while (!selected.leaf->children.empty()) {
-			selected.leaf = select_child(selected.leaf);
+			selected.leaf = select_child(selected.leaf, opening_exponent);
 			selected.leaf->virtual_visits += 1;
 			selected.board.makeMove(selected.leaf->move);
 			selected.path.push_back(selected.leaf);
@@ -674,7 +920,7 @@ struct Searcher::Impl {
 		return std::clamp(rows, 0, configured);
 	}
 
-	// Convert root visits to legal move probabilities; priors keep zero-visit moves representable.
+	// Convert all legal root visits and original priors to move probabilities.
 	std::vector<float> root_policy(const TreeState &state) const {
 		std::vector<float> policy(kActionSize, 0.0F);
 		for (const auto &child : state.root->children) {
@@ -830,11 +1076,12 @@ struct Searcher::Impl {
 		auto *evaluation_cache = options.evaluation_cache_mb > 0 ? &persistent_evaluation_cache
 																 : &local_evaluation_cache;
 		if (options.evaluation_cache_mb > 0) {
-			constexpr int kTrajectoryNeighborhoodRadius = 2;
+			std::vector<PackedState> root_states;
+			root_states.reserve(boards.size());
 			for (const auto &board : boards) {
-				persistent_evaluation_cache.promote_trajectory_neighborhood(
-					encode_state(board), kTrajectoryNeighborhoodRadius);
+				root_states.push_back(encode_state(board));
 			}
+			persistent_evaluation_cache.promote_trajectory_neighborhoods(root_states);
 		}
 		const auto root_evaluation_started = Clock::now();
 		auto roots = evaluate_rows(boards, evaluation_cache);
@@ -856,6 +1103,9 @@ struct Searcher::Impl {
 				Clock::now() + std::chrono::milliseconds(std::max(1, progress_interval_ms));
 		}
 
+		const int simulation_limit = options.unbounded_simulations
+			? std::numeric_limits<int>::max()
+			: std::max(0, options.mcts_sims);
 		if (options.type == SearchType::Open && options.mcts_sims > 0) {
 			const int configured_batch_size = std::max(1, options.mcts_batch_size);
 			while (!deadline_reached(deadline) && !(cancel && cancel())) {
@@ -869,16 +1119,16 @@ struct Searcher::Impl {
 				selected.reserve(states.size() * static_cast<std::size_t>(batch_size));
 				for (std::size_t state_index = 0; state_index < states.size(); ++state_index) {
 					auto &state = states[state_index];
-					if (state.sims_completed >= options.mcts_sims) {
+					if (state.sims_completed >= simulation_limit) {
 						continue;
 					}
 					active = true;
 					const int wanted =
-						std::min(batch_size, options.mcts_sims - state.sims_completed);
+						std::min(batch_size, simulation_limit - state.sims_completed);
 					std::unordered_set<Node *> selected_nodes;
 					selected_nodes.reserve(static_cast<std::size_t>(wanted) * 2);
-					for (int attempt = 0, accepted = 0;
-						 accepted < wanted && attempt < std::max(wanted * 5, wanted + 8);
+					for (int attempt = 0, scheduled = 0;
+						 scheduled < wanted && attempt < std::max(wanted * 5, wanted + 8);
 						 ++attempt) {
 						if (deadline_reached(deadline) || (cancel && cancel())) {
 							break;
@@ -892,15 +1142,17 @@ struct Searcher::Impl {
 							clear_virtual(leaf.path);
 							backpropagate(leaf.path, terminal);
 							state.sims_completed += 1;
+							scheduled += 1;
 							progressed = true;
 							continue;
 						}
 						if (!selected_nodes.insert(leaf.leaf).second) {
 							clear_virtual(leaf.path);
-							continue;
+							// Exact rollback makes the deterministic next attempt select the same leaf.
+							break;
 						}
 						selected.push_back(std::move(leaf));
-						++accepted;
+						++scheduled;
 					}
 				}
 
@@ -908,7 +1160,7 @@ struct Searcher::Impl {
 				while (begin < selected.size()) {
 					const int allowed = deadline_batch_size(deadline, batch_size);
 					if (allowed == 0 || (cancel && cancel())) {
-						for (std::size_t index = begin; index < selected.size(); ++index) {
+						for (std::size_t index = selected.size(); index-- > begin;) {
 							clear_virtual(selected[index].path);
 						}
 						break;
@@ -968,8 +1220,24 @@ struct Searcher::Impl {
 
 		std::vector<SearchResult> results;
 		results.reserve(states.size());
+		std::unordered_map<std::uint64_t, TrajectoryHeat> trajectory_heat;
 		for (auto &state : states) {
 			results.push_back(make_result(state, start));
+			if (options.evaluation_cache_mb <= 0) {
+				continue;
+			}
+			if (state.root->visits > 0) {
+				collect_trajectory_heat(state.root.get(), static_cast<double>(state.root->visits), 0,
+								trajectory_heat);
+			}
+		}
+		if (options.evaluation_cache_mb > 0 && !trajectory_heat.empty()) {
+			std::vector<TrajectoryHeat> ordered_heat;
+			ordered_heat.reserve(trajectory_heat.size());
+			for (const auto &[id, item] : trajectory_heat) {
+				ordered_heat.push_back(item);
+			}
+			persistent_evaluation_cache.promote_trajectory_heat(std::move(ordered_heat));
 		}
 		return results;
 	}

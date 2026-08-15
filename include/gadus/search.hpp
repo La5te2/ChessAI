@@ -1,6 +1,6 @@
 #pragma once
 
-// Gadus direct-policy and batched fair-root PUCT MCTS API.
+// Gadus direct-policy and batched PUCT MCTS API with sublinear root coverage.
 
 #include <cstdint>
 #include <functional>
@@ -22,6 +22,7 @@ struct SearchOptions {
 	int evaluation_cache_mb = 0;
 	int mcts_sims = 100;
 	int mcts_batch_size = 32;
+	bool unbounded_simulations = false;
 	double movetime_ms = 0.0;
 	double c_puct = 0.5;
 	double c_puct_base = 19652.0;

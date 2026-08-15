@@ -485,7 +485,9 @@ m_{\mathrm{fair}}=
 \right).
 $$
 
-The scheduler compares this floor with the augmented root-edge counts from Section 5.3. The fair-allocation deficit of action $a$ is
+Every legal root action receives this floor, so a completed fair phase uses $Mm_{\mathrm{fair}}$ root visits.
+
+For $a\in\mathcal A(x_0)$, the fair-allocation deficit is
 
 $$
 d_{\mathrm{fair}}(x_0,a)=
@@ -495,42 +497,165 @@ m_{\mathrm{fair}}-\widetilde N(x_0,a)
 \right).
 $$
 
-While at least one action has a positive deficit, the next simulation enters an action with the largest deficit. The PUCT score $S(x_0,a)$ resolves equal deficits, and the order established when the root was expanded resolves any remaining equality. Completed and virtual visits both reduce the deficit, which distributes concurrent requests among root actions before their neural evaluations return.
+While at least one legal root action has a positive deficit, the next simulation enters an action with the largest deficit. The PUCT ordering from Section 5.3 resolves equal deficits, and root expansion order resolves any remaining equality. Completed visits and virtual reservations both reduce the deficit, which distributes concurrent requests before their neural evaluations return. The scheduler begins post-fair allocation after every legal root action has completed $m_{\mathrm{fair}}$ visits, so pending virtual reservations contribute to batch formation but not to the fair-stage estimates.
 
-When every deficit is zero, root allocation uses the PUCT score from Section 5.3 over the complete legal-action set. An action whose searched evaluation increases can therefore receive additional simulations through the exploitation term of $S(x_0,a)$, while the prior and exploration term continue to allocate work among less-visited actions. Every root action remains eligible throughout the procedure.
-
-For a fixed legal width $M$, increasing the simulation cap gives
+Let
 
 $$
-\lim_{N_{\mathrm{cap}}\rightarrow\infty}
-m_{\mathrm{fair}}=\infty,
+Q_{\mathrm{fair}}(x_0,a)
+$$
+
+be the empirical action value at the end of the fair phase. Among unordered pairs of actions in $\mathcal A(x_0)$, let $C$ count pairs ordered identically by $P(x_0,a)$ and $Q_{\mathrm{fair}}(x_0,a)$, let $D$ count pairs ordered oppositely, let $T_P$ count pairs tied only in Policy and let $T_Q$ count pairs tied only in fair-stage value. Define
+
+$$
+Z=\sqrt{(C+D+T_P)(C+D+T_Q)}
+$$
+
+and
+
+$$
+\tau_{\mathrm{fair}}=
+\begin{cases}
+\dfrac{C-D}{Z},&Z>0,\\[6pt]
+0,&Z=0.
+\end{cases}
+$$
+
+The fixed root-prior exponent and its equivalent temperature are
+
+$$
+\gamma_{\mathrm{fair}}=
+\frac{1+\tau_{\mathrm{fair}}}{2},
+\qquad
+\alpha_{\mathrm{fair}}=
+\begin{cases}
+1/\gamma_{\mathrm{fair}},&\gamma_{\mathrm{fair}}>0,\\
+\infty,&\gamma_{\mathrm{fair}}=0.
+\end{cases}
+$$
+
+The post-fair root prior is
+
+$$
+\widehat P_{\alpha}(x_0,a)=
+\frac{P(x_0,a)^{\gamma_{\mathrm{fair}}}}
+{\displaystyle\sum_{b\in\mathcal A(x_0)}
+P(x_0,b)^{\gamma_{\mathrm{fair}}}},
+\qquad a\in\mathcal A(x_0).
+$$
+
+When $\gamma_{\mathrm{fair}}=0$, every numerator in this expression is defined as one, producing the uniform distribution on $\mathcal A(x_0)$. The scheduler computes $\alpha_{\mathrm{fair}}$ once from the completed fair-stage values and uses the resulting prior throughout the remaining root allocation.
+
+Every legal root action has a completed visit after the fair phase, so its post-fair action value is $Q(x_0,a)$. Root PUCT assigns
+
+$$
+S_{\mathrm{root}}(x_0,a)=
+Q(x_0,a)
++c_{\mathrm{puct}}\left(\widetilde N(x_0)\right)
+\widehat P_{\alpha}(x_0,a)
+\frac{\sqrt{\widetilde N(x_0)+1}}
+{1+\widetilde N(x_0,a)}
+-l_vN_v(x_0,a).
+$$
+
+The scheduler enters the legal root action with the largest $S_{\mathrm{root}}$. Equal scores are resolved by the larger $\widehat P_{\alpha}$, the larger $Q$ and root expansion order, in that sequence. The common fair baseline cancels in pairwise differences between root-edge visit counts, while fixed-$\alpha$ PUCT creates the visit-count differences used by the final root Policy.
+
+For fixed $M$,
+
+$$
+\lim_{N_{\mathrm{cap}}\rightarrow\infty}m_{\mathrm{fair}}=\infty,
 \qquad
 \lim_{N_{\mathrm{cap}}\rightarrow\infty}
-\frac{M m_{\mathrm{fair}}}{N_{\mathrm{cap}}}=0.
+\frac{Mm_{\mathrm{fair}}}{N_{\mathrm{cap}}}=0.
 $$
 
-The first limit gives every root action an unbounded number of mandatory visits as the cap increases. The second limit makes the mandatory fraction of the budget vanish, leaving an asymptotically dominant fraction for competitive PUCT allocation. If $N_{\mathrm{cap}}<M$, the available budget cannot visit every legal action once; equal initial deficits are then resolved by the PUCT score, whose exploration term favors the larger priors before any root edge has been visited.
+The first limit increases the evidence collected for every legal root action, while the second leaves an asymptotically dominant fraction of the budget for fixed-$\alpha$ PUCT. When the cap ends during the fair phase, the completed fair visits alone determine the root statistics and $\alpha_{\mathrm{fair}}$ remains undefined.
 
-An execution deadline or a cancellation request can end the procedure before all $N_{\mathrm{cap}}$ simulations complete. Every completed backup remains in the tree, and Section 5.7 describes how the scheduler releases virtual visits belonging to requests that did not reach evaluation.
+A configured deadline or a caller-supplied stop signal can end the procedure before all $N_{\mathrm{cap}}$ simulations complete. Every completed backup remains in the tree, and Section 5.8 specifies how unfinished reservations are released.
 
-### 5.6 Evaluation Reuse
+### 5.6 Internal Action Opening
+
+For an expanded non-root state $x$, let $M_x=|\mathcal A(x)|$ and order its legal actions $a_{(1)},\ldots,a_{(M_x)}$ by decreasing original Policy prior $P(x,a)$. Actions with equal priors retain their order in the legal-action array. The selectable actions form a prefix of this ordering.
+
+Before the root fair phase is complete, the opening exponent is $\beta_{\mathrm{open}}=1/2$. After $\gamma_{\mathrm{fair}}$ has been fixed by Section 5.5, the exponent is
+
+$$
+\beta_{\mathrm{open}}=
+\max\left(\frac12,1-\gamma_{\mathrm{fair}}\right).
+$$
+
+Let $K(x)$ denote the active-prefix width and initialize it to zero when $x$ is expanded. Before each selection at $x$, the scheduler updates this width by
+
+$$
+K(x)\leftarrow
+\max\left(
+K(x),
+\min\left(
+M_x,
+\left\lceil
+\left(\widetilde N(x)+1\right)^{\beta_{\mathrm{open}}}
+\right\rceil
+\right)
+\right).
+$$
+
+If the active prefix contains an action with $\widetilde N(x,a)=0$, the scheduler selects the first such action in Policy order. After every active action has a completed visit or virtual reservation, the allocation depends on whether the active prefix covers the complete legal-action set.
+
+Once $K(x)=M_x$, the internal verification floor is
+
+$$
+m_{\mathrm{verify}}(x)=
+\max\left(
+1,
+\left\lfloor
+\frac{N(x)}{M_x\log(e+N(x))}
+\right\rfloor
+\right).
+$$
+
+For every action $a\in\mathcal A(x)$, its internal verification deficit is
+
+$$
+d_{\mathrm{verify}}(x,a)=
+m_{\mathrm{verify}}(x)-\widetilde N(x,a).
+$$
+
+Whenever an action has a positive verification deficit, the scheduler selects an action with the largest deficit. The PUCT ordering from Section 5.3 resolves equal deficits. After all deficits become nonpositive, the same PUCT ordering allocates subsequent visits among the complete legal-action set.
+
+The maximum in the active-width update makes $K(x)$ nondecreasing, while the use of $\widetilde N(x)$ distributes concurrent reservations across newly active actions and under-verified actions. As $N(x)$ increases, the active prefix eventually reaches every legal action. Under a finite simulation budget, the visits accumulated at $x$ determine whether the prefix reaches full width and how far the subsequent verification proceeds. For fixed $M_x$,
+
+$$
+\lim_{N(x)\rightarrow\infty}m_{\mathrm{verify}}(x)=\infty,
+\qquad
+\lim_{N(x)\rightarrow\infty}
+\frac{M_xm_{\mathrm{verify}}(x)}{N(x)}=0.
+$$
+
+The first limit increases the evidence collected for every legal action at a fully opened node, while the second leaves an asymptotically dominant fraction of the node visits for PUCT.
+
+### 5.7 Evaluation Reuse
 
 Repeated neural evaluation of the same `PackedState` produces the same compact Policy and Value record, so Gadus stores each completed network evaluation in a cache indexed by its `PackedState`. For a requested complete state, the rules engine checks for a terminal outcome before consulting this cache. This order is required because `PackedState` omits move counters and repetition history. Exact rule outcomes therefore depend on the complete state, whereas cached network outputs depend only on the encoded state.
 
 One MCTS invocation receives one or more root states and constructs a separate search tree for each root. All trees created by that invocation access the same evaluation cache, which allows simulations within one tree and simulations from different trees to reuse completed network records. Let $M_C\geq0$ be the configured memory capacity for records retained across invocations. When $M_C=0$, the cache exists only for the current invocation and is discarded with its search trees. When $M_C>0$, the same cache persists across invocations and uses TLRU (trajectory-aware least-recently-used) to order its records. A successful lookup moves the accessed record to the most-recent end of this order, and inserting a new record places it at the same end.
 
-TLRU records a directed link when a cached nonterminal child is reached from a cached parent. Let $\mathcal C$ be the set of retained entries and let $E_C\subseteq\mathcal C\times\mathcal C$ be the set of recorded parent-child links. For a retained root entry $r\in\mathcal C$, the trajectory neighborhood of radius two is
+TLRU records a directed link when a cached nonterminal child is reached from a cached parent. Let $\mathcal C$ be the set of retained entries and let $E_C\subseteq\mathcal C\times\mathcal C$ be the set of recorded parent-child links. For a tree node $v$ whose network record remains in $\mathcal C$, write $\kappa(v)$ for the corresponding cache entry. For a completed tree with root $x_0$ and $N(x_0)>0$, the trajectory heat of entry $c$ is
 
 $$
-\mathcal N_2(r)=
-\lbrace y\in\mathcal C:d_C(r,y)\leq2\rbrace,
+H_{x_0}(c)=
+\sum_{\substack{v\text{ is a visited node}\\\kappa(v)=c}}
+\frac{N(v)}{N(x_0)}.
 $$
 
-where $d_C(r,y)$ is the length of the shortest directed path from $r$ to $y$ in $(\mathcal C,E_C)$. Before evaluating a new root, TLRU touches the retained entries in $\mathcal N_2(r)$ in decreasing order of $d_C(r,y)$. Two-ply descendants are touched first, one-ply descendants next and the root last, leaving the root as the most-recent entry. Ordinary lookups and insertions then continue to update the same order.
+The sum combines transposed tree nodes that use the same cached record. When one invocation searches several roots, TLRU adds the separately normalized heat contributions from their trees. This normalization gives each root one common visit-mass scale even when the trees complete different numbers of simulations.
 
-When the approximate memory use exceeds the configured capacity, TLRU removes entries from the least-recent end until the retained records fit within the limit. TLRU stores compact network records, whereas tree nodes and search statistics belong to one invocation. Every invocation therefore constructs fresh nodes with zero visits, zero accumulated evaluations and zero virtual reservations, initializes their network fields from cached records when available and computes their tree statistics through MCTS.
+After the invocation completes, every retained entry represented by a visited tree node receives the current heat generation and its aggregated $H$. TLRU refreshes these entries in increasing order of heat. For equal heat, it refreshes greater tree depth first. High-heat entries and shallower equal-heat entries consequently occupy the more-recent end of the cache order.
 
-### 5.7 Batched Evaluation
+The next invocation supplies the complete states that actually become its search roots. For every such root found in the cache, TLRU follows the retained parent-child links through entries that belong to the root's heat generation. It restricts the previous trajectory prediction to descendants of the actual root, combines the stored heat of entries reached from multiple roots and applies the same increasing-heat recency order before neural evaluation begins. Ordinary lookups and insertions then continue to update that order.
+
+When the approximate retained-cache memory exceeds the configured capacity, TLRU removes entries from the least-recent end until the retained records fit within the limit. Its byte account includes the compact network arrays, fixed entry fields, a conservative allowance for container bookkeeping and the allocated capacity of recorded parent-child links. Tree nodes and search statistics belong to one invocation, so every invocation constructs fresh nodes with zero visits, zero accumulated evaluations and zero virtual reservations, initializes their network fields from cached records when available and computes their tree statistics through MCTS. Cache ordering affects the survival of exact network records under the memory limit, while root allocation, PUCT, backup and decision scores depend only on the current search tree.
+
+### 5.8 Batched Evaluation
 
 One MCTS invocation may receive several root states. The evaluator first resolves every initial request whose `PackedState` has a cached record, then groups the remaining requests by `PackedState`. When uncached requests remain, their unique states form one neural batch. Each cached or computed record initializes every root tree with the corresponding `PackedState`.
 
@@ -584,7 +709,9 @@ $$
 
 The two terms limit the request by the available cycle capacity and the remaining simulation budget.
 
-To build this request set, the root scheduler first selects an action with the largest positive fair-allocation deficit. When every deficit is zero, it selects the action with the largest root PUCT score. It applies the selected action and then follows the non-root PUCT rule from Section 5.3 until it reaches a terminal node or an unexpanded nonterminal node. A terminal node receives its exact rule outcome, and immediate backup completes one simulation without adding a neural-evaluation request. An unexpanded nonterminal node enters the request set when that tree has not reserved the node earlier in the same cycle, and its selected path retains one virtual visit until the request is resolved. If another attempt from the same tree reaches an already reserved node, the selector removes the virtual visits introduced by that attempt and adds no request. The tree performs at most $\max(5m,m+8)$ attempts while collecting up to $m$ distinct nonterminal leaves.
+To build the request set, the root scheduler first selects a legal root action with the largest positive fair-allocation deficit. After every legal root action completes the fair floor, it selects the action with the largest fixed-$\alpha$ root PUCT score defined in Section 5.5. After applying the selected root action, the scheduler updates the active prefix at each expanded non-root node according to Section 5.6. It selects a newly active action that lacks a visit, then selects a positive verification deficit after the prefix reaches full width and otherwise applies the PUCT ordering from Section 5.3. This descent ends at a terminal node or an unexpanded nonterminal node.
+
+A terminal node receives its exact rule outcome, and immediate backup completes one simulation without adding a neural-evaluation request. An unexpanded nonterminal node enters the request set when that tree has not reserved the node earlier in the same cycle, and its selected path retains one virtual visit until the request is resolved. Immediate terminal backups and accepted neural-leaf reservations both count toward the limit $m$. If another attempt from the same tree reaches an already reserved node, the selector releases the virtual visits introduced by that attempt and ends request selection for that tree in the current cycle. The submitted requests then change the completed tree statistics before the next cycle begins, preventing exact rollback from immediately reconstructing the same deterministic path. The tree performs at most $\max(5m,m+8)$ attempts while scheduling at most $m$ simulations, and a repeated reservation can end its current selection pass earlier.
 
 The requests collected from all trees form one list. Before each evaluation submission, the scheduler computes
 
@@ -596,9 +723,9 @@ D(R_{\mathrm{call}},B_{\mathrm{cycle}}),&\text{if a deadline is active},
 \end{cases}
 $$
 
-where $R_{\mathrm{call}}$ is the remaining time before that submission. The next submission contains at most $B_{\mathrm{call}}$ requests. If this capacity is zero or cancellation has been requested, the scheduler releases the virtual visits attached to all remaining requests and ends batch submission.
+where $R_{\mathrm{call}}$ is the remaining time before that submission. The next submission contains at most $B_{\mathrm{call}}$ requests. If this capacity is zero or a stop signal has been received, the scheduler releases the virtual visits attached to all remaining requests and ends batch submission.
 
-For each submitted group, the evaluation-reuse mechanism from Section 5.6 resolves cache hits before the evaluator groups the unresolved requests by `PackedState`. When unresolved requests remain, their unique states form one neural batch, and one computed record serves every request in the corresponding group.
+For each submitted group, the evaluation-reuse mechanism from Section 5.7 resolves cache hits before the evaluator groups the unresolved requests by `PackedState`. When unresolved requests remain, their unique states form one neural batch, and one computed record serves every request in the corresponding group.
 
 For a representative leaf state $x$, let $L=|\mathcal A(x)|$, and write its ordered legal actions as $a_1,\ldots,a_L$. The compact evaluation record contains the three sequences
 
@@ -612,9 +739,9 @@ together with the scalar $V_\theta(\phi_G(x))$. Entries with the same index $j$ 
 
 After the neural batch returns, each newly computed record enters the active cache. The evaluator then assigns a cached or computed record to every request with the matching `PackedState`. For each requested leaf, tree expansion creates one outgoing edge for every $a_j$ and assigns $P_\theta(a_j\mid\phi_G(x))$ as that edge's prior. The scalar $V_\theta(\phi_G(x))$ is then backed up along the leaf's reserved path, so different trees can share a network record while retaining separate nodes, paths and search statistics.
 
-After the submitted leaves complete their backups, another cycle begins only when at least one tree remains below $N_{\mathrm{cap}}$ and the preceding cycle completed at least one backup. The updated completed-visit counts and action evaluations determine the fair deficits and PUCT scores used by the next cycle.
+After the submitted leaves complete their backups, another cycle begins only when at least one tree remains below $N_{\mathrm{cap}}$ and the preceding cycle completed at least one backup. The updated completed-visit counts and action evaluations determine the fair-allocation deficits and PUCT scores used by the next cycle. The first cycle following completion of the fair floor computes $\alpha_{\mathrm{fair}}$, whose fixed value determines the root prior throughout the remainder of that invocation.
 
-### 5.8 Root Evaluation and Policy
+### 5.9 Root Evaluation and Policy
 
 After the simulation phase, the root evaluation uses the network estimate when no simulation has completed and the empirical root mean otherwise:
 
@@ -626,24 +753,23 @@ Q(x_0),&N(x_0)>0.
 \end{cases}
 $$
 
-The completed root-edge visits and their priors define the root Policy distribution
+For a positive simulation cap, the completed root-edge visits and original priors define the root Policy distribution
 
 $$
 P_{\mathrm{root}}(a\mid s_0)=
 \frac{N(x_0,a)+P(x_0,a)}
 {\displaystyle\sum_{b\in\mathcal A(x_0)}
-\left(N(x_0,b)+P(x_0,b)\right)}.
+\left(N(x_0,b)+P(x_0,b)\right)},
+\qquad a\in\mathcal A(x_0).
 $$
 
-The priors sum to one over $\mathcal A(x_0)$, so the added prior terms contribute total weight one to the root distribution. When $N_{\mathrm{cap}}=0$, every root-edge visit count remains zero and the formula reduces to
+The denominator normalizes the visit-plus-prior weights of all legal root actions. When $N_{\mathrm{cap}}=0$, direct inference instead uses the complete legal-move Policy
 
 $$
 P_{\mathrm{root}}(a\mid s_0)=P_\theta(a\mid s_0).
 $$
 
-The MCTS root Policy therefore coincides with the direct network Policy when the simulation cap is zero.
-
-The visit-based distribution $P_{\mathrm{root}}$ records the allocation produced by the fair visit floor and competitive root PUCT. It also supplies the base ordering used by the decision components in Section 5.9. Each legal action retains positive weight because its edge prior is included alongside its completed visits.
+The visit-based distribution $P_{\mathrm{root}}$ records the allocation produced by the fair visit floor and subsequent fixed-$\alpha$ root PUCT. It also supplies the base ordering used by the decision components in Section 5.10. Every legal root action retains positive weight because its original prior is included alongside its completed visits.
 
 When an output requires one probability for every index in $\mathcal I_G$, Gadus expands the compact root distribution into
 
@@ -658,9 +784,9 @@ $$
 
 This conversion is performed only for a final result or a progress report that requires the fixed action-index space $\mathcal I_G$.
 
-### 5.9 Decision Components
+### 5.10 Decision Components
 
-The decision layer can apply two optional transformations to the final move ordering. It begins with a copy of the root Policy defined in Section 5.8:
+The decision layer can apply two optional transformations to the final move ordering. It begins with a copy of the root Policy defined in Section 5.9:
 
 $$
 D_0(a)=P_{\mathrm{root}}(a\mid s_0).

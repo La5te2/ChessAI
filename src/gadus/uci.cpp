@@ -189,7 +189,7 @@ class UciEngine {
 		print("option name Device type string default " + options_.device);
 		print("option name Threads type spin default " +
 			  std::to_string(options_.search.cpu_threads) + " min 1 max 256");
-		print("option name EvalCacheMB type spin default " +
+		print("option name Hash type spin default " +
 			  std::to_string(options_.search.evaluation_cache_mb) + " min 0 max 65536");
 		print("option name SearchType type combo default " +
 			  gadus::search_type_name(options_.search.type) + " var closed var open");
@@ -260,7 +260,7 @@ class UciEngine {
 		} else if (key == "threads") {
 			options_.search.cpu_threads =
 				std::clamp(parse_int(value, options_.search.cpu_threads), 1, 256);
-		} else if (key == "evalcachemb") {
+		} else if (key == "hash") {
 			options_.search.evaluation_cache_mb =
 				std::clamp(parse_int(value, options_.search.evaluation_cache_mb), 0, 65536);
 		} else if (key == "searchtype") {
@@ -441,8 +441,11 @@ class UciEngine {
 		auto search_options = options_.search;
 		const auto go_values = parse_go(line);
 		search_options.movetime_ms = movetime_for(go_values);
+		search_options.unbounded_simulations = go_values.contains("infinite") &&
+			search_options.type == gadus::SearchType::Open && search_options.mcts_sims > 0;
 		if (const auto nodes = go_values.find("nodes"); nodes != go_values.end()) {
 			search_options.mcts_sims = std::max(0, parse_int(nodes->second, search_options.mcts_sims));
+			search_options.unbounded_simulations = false;
 		}
 		search_options.root_topn = std::max(options_.multipv, search_options.root_topn);
 		const auto board = board_;

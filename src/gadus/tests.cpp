@@ -9,6 +9,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <string>
+#include <numeric>
 #include <unordered_set>
 #include "gadus/checkpoint.hpp"
 #include "gadus/dataset.hpp"
@@ -268,7 +269,7 @@ int main() {
 		require(after_clear.nn_evaluations == 1 && after_clear.evaluation_reuses == 0,
 				"clearing the persistent evaluation cache did not force reevaluation");
 
-		// Four simulations exercise fair root allocation, batched expansion, and value backup.
+		// Four simulations exercise root allocation, batched expansion, and value backup.
 		gadus::SearchOptions mcts_options = closed_options;
 		mcts_options.type = gadus::SearchType::Open;
 		mcts_options.mcts_sims = 4;
@@ -279,16 +280,17 @@ int main() {
 		require(mcts_result.expanded_nodes > 0, "MCTS did not expand a node");
 
 		// A budget equal to the legal width gives every root action one completed visit.
+		const int active_root_width = static_cast<int>(start_moves.size());
 		auto coverage_options = mcts_options;
-		coverage_options.mcts_sims = static_cast<int>(start_moves.size());
+		coverage_options.mcts_sims = active_root_width;
 		coverage_options.root_topn = static_cast<int>(start_moves.size());
 		gadus::Searcher coverage_searcher(loaded, torch::Device(torch::kCPU), coverage_options);
 		const auto coverage_result = coverage_searcher.search(board);
 		require(coverage_result.root.size() == start_moves.size(),
-				"fair root allocation omitted a legal action from diagnostics");
-		for (const auto &root_move : coverage_result.root)
-			require(root_move.visits == 1,
-					"fair root allocation did not visit every legal root action once");
+				"root coverage omitted a legal action from diagnostics");
+		for (int index = 0; index < active_root_width; ++index)
+			require(coverage_result.root[static_cast<std::size_t>(index)].visits == 1,
+					"legal root action did not receive its fair visit");
 
 		auto competition_options = coverage_options;
 		competition_options.mcts_sims += 1;
@@ -296,20 +298,58 @@ int main() {
 			loaded, torch::Device(torch::kCPU), competition_options);
 		const auto competition_result = competition_searcher.search(board);
 		const auto represented = std::count_if(
-			competition_result.decision_scores.begin(), competition_result.decision_scores.end(),
+			competition_result.policy.begin(), competition_result.policy.end(),
 			[](float score) { return score > 0.0F; });
 		require(competition_result.sims_completed == competition_options.mcts_sims,
 				"root competition changed the simulation budget");
-		require(represented == static_cast<int>(start_moves.size()),
-				"root competition permanently removed a legal action");
+		const int competition_visits = std::accumulate(
+			competition_result.root.begin(), competition_result.root.end(), 0,
+			[](int total, const gadus::RootMove &move) { return total + move.visits; });
+		require(competition_visits == competition_result.sims_completed,
+				"root competition visits do not match completed simulations");
+		require(represented == active_root_width,
+				"root competition omitted a legal action");
+		for (const auto &root_move : competition_result.root)
+			require(std::abs(root_move.decision_score - root_move.probability) < 1e-6F,
+					"root decision score differs from the PUCT visit distribution");
 
-		// A searched child becomes the next root and reuses its exact evaluation through TLRU.
+		// A larger budget raises the fair floor above the one-visit bootstrap.
+		const int legal_width = static_cast<int>(start_moves.size());
+		int fair_budget = legal_width;
+		while (static_cast<int>(std::floor(
+				   fair_budget /
+				   (static_cast<double>(legal_width) *
+					std::log(std::exp(1.0) + static_cast<double>(fair_budget))))) < 2) {
+			++fair_budget;
+		}
+		auto fair_options = coverage_options;
+		fair_options.mcts_sims = fair_budget;
+		gadus::Searcher fair_searcher(loaded, torch::Device(torch::kCPU), fair_options);
+		const auto fair_result = fair_searcher.search(board);
+		for (int index = 0; index < active_root_width; ++index)
+			require(fair_result.root[static_cast<std::size_t>(index)].visits >= 2,
+					"legal root action did not satisfy its fair visit floor");
+
+		auto narrow_options = competition_options;
+		narrow_options.root_topn = 1;
+		gadus::Searcher narrow_searcher(loaded, torch::Device(torch::kCPU), narrow_options);
+		const auto narrow_result = narrow_searcher.search(board);
+		require(narrow_result.root.size() == 1, "narrow MultiPV width was ignored");
+		require(narrow_result.move == competition_result.move,
+				"MultiPV width changed the selected move");
+		require(torch::allclose(torch::tensor(narrow_result.policy),
+							torch::tensor(competition_result.policy), 1e-6, 1e-7),
+				"MultiPV width changed root allocation");
+
+		// An actually played searched move reuses its evaluation even when it differs from bestmove.
 		auto trajectory_options = mcts_options;
 		trajectory_options.evaluation_cache_mb = 1;
 		gadus::Searcher trajectory_searcher(loaded, torch::Device(torch::kCPU), trajectory_options);
 		const auto trajectory_root = trajectory_searcher.search(board);
+		require(trajectory_root.root.size() > 1,
+				"trajectory-cache test requires a non-best searched move");
 		auto trajectory_child = board;
-		trajectory_child.makeMove(trajectory_root.move);
+		trajectory_child.makeMove(trajectory_root.root[1].move);
 		const auto trajectory_next = trajectory_searcher.search(trajectory_child);
 		require(trajectory_next.evaluation_reuses > 0,
 				"trajectory-aware cache did not reuse the searched child root");
