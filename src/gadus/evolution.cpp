@@ -287,7 +287,7 @@ std::vector<SamplingSpec> make_sampling_specs(const FcpiOptions &options, int it
 }
 
 // Evaluate arbitrarily many positions through bounded neural batches.
-std::vector<ClosedEvaluation> evaluate_chunks(Searcher &searcher,
+std::vector<PolicyEvaluation> evaluate_chunks(Searcher &searcher,
 											 const std::vector<chess::Board> &boards, int batch_size) {
 	std::unordered_map<PackedState, std::size_t, PackedStateHash> unique_rows;
 	std::vector<chess::Board> unique_boards;
@@ -303,17 +303,17 @@ std::vector<ClosedEvaluation> evaluate_chunks(Searcher &searcher,
 		source_rows.push_back(found->second);
 	}
 
-	std::vector<ClosedEvaluation> unique_output;
+	std::vector<PolicyEvaluation> unique_output;
 	unique_output.reserve(unique_boards.size());
 	for (std::size_t begin = 0; begin < unique_boards.size(); begin += std::max(1, batch_size)) {
 		const auto end = std::min(unique_boards.size(), begin + std::max(1, batch_size));
 		std::vector<chess::Board> chunk(unique_boards.begin() + begin,
 										   unique_boards.begin() + end);
-		auto results = searcher.evaluate_closed_many(chunk);
+		auto results = searcher.evaluate_policy_many(chunk);
 		unique_output.insert(unique_output.end(), std::make_move_iterator(results.begin()),
 							 std::make_move_iterator(results.end()));
 	}
-	std::vector<ClosedEvaluation> output;
+	std::vector<PolicyEvaluation> output;
 	output.reserve(boards.size());
 	for (const auto row : source_rows) {
 		output.push_back(unique_output[row]);
@@ -365,17 +365,16 @@ std::vector<int> choose_candidates(const std::vector<int> &legal, const std::vec
 	return selected;
 }
 
-// Generate closed-policy current-model self-play from unique states in the sampling book.
+// Generate direct-policy current-model self-play from unique states in the sampling book.
 std::vector<Position> collect_selfplay(Model model, const torch::Device &device,
 									   const FcpiOptions &options, int iteration,
 									   nlohmann::json &sampling_summary) {
-	SearchOptions closed;
-	closed.type = SearchType::Closed;
-	closed.precision = options.precision;
-	closed.cpu_threads = options.cpu_threads;
-	closed.mcts_sims = 0;
-	closed.mcts_batch_size = options.inference_batch_size;
-	Searcher evaluator(model, device, closed);
+	SearchOptions direct;
+	direct.precision = options.precision;
+	direct.cpu_threads = options.cpu_threads;
+	direct.mcts_sims = 0;
+	direct.mcts_batch_size = options.inference_batch_size;
+	Searcher evaluator(model, device, direct);
 	nlohmann::json starts;
 	const auto specs = make_sampling_specs(options, iteration, starts);
 	std::unordered_map<PackedState, BehaviorCoverage, PackedStateHash> behavior_coverage;
@@ -546,7 +545,7 @@ std::vector<Position> collect_selfplay(Model model, const torch::Device &device,
 }
 
 // Materialize one non-terminal decision node from an exact board and a frozen-model evaluation.
-TreeNode make_tree_node(const chess::Board &board, const ClosedEvaluation &evaluation, int parent,
+TreeNode make_tree_node(const chess::Board &board, const PolicyEvaluation &evaluation, int parent,
 						int parent_action, int depth, double reach_probability) {
 	TreeNode node;
 	node.board = board;
@@ -643,13 +642,12 @@ void construct_targets(std::vector<Position> &records, Model model, const torch:
 	if (options.counterfactual_budget < 0) {
 		throw std::invalid_argument("counterfactual-budget cannot be negative");
 	}
-	SearchOptions closed;
-	closed.type = SearchType::Closed;
-	closed.precision = options.precision;
-	closed.cpu_threads = options.cpu_threads;
-	closed.mcts_sims = 0;
-	closed.mcts_batch_size = options.inference_batch_size;
-	Searcher evaluator(model, device, closed);
+	SearchOptions direct;
+	direct.precision = options.precision;
+	direct.cpu_threads = options.cpu_threads;
+	direct.mcts_sims = 0;
+	direct.mcts_batch_size = options.inference_batch_size;
+	Searcher evaluator(model, device, direct);
 	std::mt19937_64 rng(options.seed + 3'000'017);
 	std::vector<Position> tree_records;
 	tree_records.reserve(records.size() * 2);

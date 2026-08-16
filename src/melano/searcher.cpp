@@ -42,13 +42,21 @@ struct PackedStateHash {
 	}
 };
 
-// Stores exact compact evaluations and promotes retained descendants around a new root.
+struct TrajectoryHeat {
+	std::uint64_t id = 0;
+	double heat = 0.0;
+	int depth = 0;
+};
+
+// Stores exact compact evaluations and combines ordinary recency with predicted trajectory locality.
 class TrajectoryLruCache {
 	struct Entry {
 		CompactEvaluation evaluation;
 		std::list<PackedState>::iterator recency;
 		std::vector<std::uint64_t> children;
 		std::uint64_t id = 0;
+		std::uint64_t heat_generation = 0;
+		double trajectory_heat = 0.0;
 		std::size_t bytes = 0;
 	};
 
@@ -89,8 +97,8 @@ class TrajectoryLruCache {
 		auto stored = evaluation;
 		stored.cache_id = 0;
 		const auto id = next_id_++;
-		auto [entry, inserted] =
-			entries_.emplace(state, Entry{std::move(stored), recency, {}, id, bytes});
+		auto [entry, inserted] = entries_.emplace(
+			state, Entry{std::move(stored), recency, {}, id, 0, 0.0, bytes});
 		if (!inserted) {
 			recency_.erase(recency);
 			throw std::logic_error("evaluation cache insertion failed");
@@ -129,41 +137,94 @@ class TrajectoryLruCache {
 		evict_to_capacity();
 	}
 
-	// Refresh the cached root and its retained descendants within the requested radius.
-	void promote_trajectory_neighborhood(const PackedState &root, int radius) {
-		const auto found = entries_.find(root);
-		if (found == entries_.end() || radius < 0) {
+	// Record visit-derived heat for the completed search tree and refresh its recency.
+	void promote_trajectory_heat(std::vector<TrajectoryHeat> trajectory) {
+		if (trajectory.empty()) {
 			return;
 		}
+		const auto generation = next_heat_generation_++;
+		trajectory.erase(
+			std::remove_if(trajectory.begin(), trajectory.end(), [&](const TrajectoryHeat &item) {
+				return item.id == 0 || !entries_by_id_.contains(item.id);
+			}),
+			trajectory.end());
+		for (const auto &item : trajectory) {
+			auto &entry = *entries_by_id_.at(item.id);
+			entry.heat_generation = generation;
+			entry.trajectory_heat = item.heat;
+		}
+		std::sort(trajectory.begin(), trajectory.end(), [](const auto &left, const auto &right) {
+			if (left.heat != right.heat) {
+				return left.heat < right.heat;
+			}
+			if (left.depth != right.depth) {
+				return left.depth > right.depth;
+			}
+			return left.id < right.id;
+		});
+		for (const auto &item : trajectory) {
+			if (const auto entry = entries_by_id_.find(item.id); entry != entries_by_id_.end()) {
+				touch(*entry->second);
+			}
+		}
+	}
+
+	// Condition retained trajectory heat on the roots that actually begin the next search.
+	void promote_trajectory_neighborhoods(const std::vector<PackedState> &roots) {
 		struct FrontierItem {
 			std::uint64_t id = 0;
 			int depth = 0;
 		};
-		std::vector<FrontierItem> frontier{{found->second.id, 0}};
-		std::vector<std::uint64_t> neighborhood;
-		std::unordered_set<std::uint64_t> visited;
-		visited.reserve(64);
-		for (std::size_t cursor = 0; cursor < frontier.size(); ++cursor) {
-			const auto item = frontier[cursor];
-			if (!visited.insert(item.id).second) {
+		std::unordered_map<std::uint64_t, TrajectoryHeat> neighborhood;
+		for (const auto &root : roots) {
+			const auto found = entries_.find(root);
+			if (found == entries_.end() || found->second.heat_generation == 0) {
 				continue;
 			}
-			const auto entry = entries_by_id_.find(item.id);
-			if (entry == entries_by_id_.end()) {
-				continue;
-			}
-			neighborhood.push_back(item.id);
-			if (item.depth >= radius) {
-				continue;
-			}
-			for (const auto child_id : entry->second->children) {
-				if (entries_by_id_.contains(child_id)) {
-					frontier.push_back({child_id, item.depth + 1});
+			const auto generation = found->second.heat_generation;
+			std::vector<FrontierItem> frontier{{found->second.id, 0}};
+			std::unordered_set<std::uint64_t> visited;
+			for (std::size_t cursor = 0; cursor < frontier.size(); ++cursor) {
+				const auto item = frontier[cursor];
+				if (!visited.insert(item.id).second) {
+					continue;
+				}
+				const auto entry = entries_by_id_.find(item.id);
+				if (entry == entries_by_id_.end() ||
+					entry->second->heat_generation != generation) {
+					continue;
+				}
+				auto &aggregate = neighborhood[item.id];
+				if (aggregate.id == 0) {
+					aggregate.id = item.id;
+					aggregate.depth = item.depth;
+				} else {
+					aggregate.depth = std::min(aggregate.depth, item.depth);
+				}
+				aggregate.heat += entry->second->trajectory_heat;
+				for (const auto child_id : entry->second->children) {
+					if (entries_by_id_.contains(child_id)) {
+						frontier.push_back({child_id, item.depth + 1});
+					}
 				}
 			}
 		}
-		for (auto iterator = neighborhood.rbegin(); iterator != neighborhood.rend(); ++iterator) {
-			if (const auto entry = entries_by_id_.find(*iterator); entry != entries_by_id_.end()) {
+		std::vector<TrajectoryHeat> ordered;
+		ordered.reserve(neighborhood.size());
+		for (const auto &[id, item] : neighborhood) {
+			ordered.push_back(item);
+		}
+		std::sort(ordered.begin(), ordered.end(), [](const auto &left, const auto &right) {
+			if (left.heat != right.heat) {
+				return left.heat < right.heat;
+			}
+			if (left.depth != right.depth) {
+				return left.depth > right.depth;
+			}
+			return left.id < right.id;
+		});
+		for (const auto &item : ordered) {
+			if (const auto entry = entries_by_id_.find(item.id); entry != entries_by_id_.end()) {
 				touch(*entry->second);
 			}
 		}
@@ -180,6 +241,7 @@ class TrajectoryLruCache {
 		recency_.clear();
 		used_bytes_ = 0;
 		next_id_ = 1;
+		next_heat_generation_ = 1;
 	}
 
 	private:
@@ -213,6 +275,7 @@ class TrajectoryLruCache {
 	std::size_t capacity_bytes_;
 	std::size_t used_bytes_ = 0;
 	std::uint64_t next_id_ = 1;
+	std::uint64_t next_heat_generation_ = 1;
 	std::list<PackedState> recency_;
 	Entries entries_;
 	std::unordered_map<std::uint64_t, Entry *> entries_by_id_;
@@ -286,6 +349,29 @@ void backpropagate(const std::vector<Node *> &path, float value) {
 		node->visits += 1;
 		node->value_sum += value;
 		value = -value;
+	}
+}
+
+// Aggregate each cached state's visit share within the completed root tree.
+void collect_trajectory_heat(const Node *node, double denominator, int depth,
+							 std::unordered_map<std::uint64_t, TrajectoryHeat> &output) {
+	if (node == nullptr || node->visits <= 0 || denominator <= 0.0) {
+		return;
+	}
+	if (node->evaluation_id != 0) {
+		auto &item = output[node->evaluation_id];
+		if (item.id == 0) {
+			item.id = node->evaluation_id;
+			item.depth = depth;
+		} else {
+			item.depth = std::min(item.depth, depth);
+		}
+		item.heat += static_cast<double>(node->visits) / denominator;
+	}
+	for (const auto &child : node->children) {
+		if (child.visits > 0) {
+			collect_trajectory_heat(&child, denominator, depth + 1, output);
+		}
 	}
 }
 
@@ -706,20 +792,17 @@ struct Searcher::Impl {
 	// Assemble the final ranked move list and diagnostics from one completed tree.
 	SearchResult make_result(TreeState &state, Clock::time_point start) const {
 		SearchResult result;
-		result.policy = options.type == SearchType::Closed || options.mcts_sims <= 0
-							? dense_policy(state.network)
-							: root_policy(state);
+		result.policy = options.mcts_sims <= 0 ? dense_policy(state.network) : root_policy(state);
 		result.decision_scores = result.policy;
 		result.value = state.root->visits > 0 ? state.root->q() : state.network_value;
 		result.sims_completed = state.sims_completed;
-		result.dynamic_target = options.type == SearchType::Closed ? 0 : state.dynamic_target;
+		result.dynamic_target = options.mcts_sims <= 0 ? 0 : state.dynamic_target;
 		result.expanded_nodes = state.expanded_nodes;
 		result.nn_batches = state.nn_batches;
 		result.nn_evaluations = state.nn_evaluations;
 		result.evaluation_reuses = state.evaluation_reuses;
 		result.cpu_threads = active_cpu_threads;
-		result.uncertainty =
-			options.type == SearchType::Closed ? 0.0 : uncertainty(state.root.get());
+		result.uncertainty = options.mcts_sims <= 0 ? 0.0 : uncertainty(state.root.get());
 		result.elapsed_ms = seconds_since(start) * 1000.0;
 
 		std::unordered_set<int> repetitions;
@@ -798,13 +881,14 @@ struct Searcher::Impl {
 		}
 		TrajectoryLruCache local_evaluation_cache;
 		auto *evaluation_cache = options.evaluation_cache_mb > 0 ? &persistent_evaluation_cache
-																 : &local_evaluation_cache;
+															 : &local_evaluation_cache;
 		if (options.evaluation_cache_mb > 0) {
-			constexpr int kTrajectoryNeighborhoodRadius = 2;
+			std::vector<PackedState> root_states;
+			root_states.reserve(boards.size());
 			for (const auto &board : boards) {
-				persistent_evaluation_cache.promote_trajectory_neighborhood(
-					encode_state(board), kTrajectoryNeighborhoodRadius);
+				root_states.push_back(encode_state(board));
 			}
+			persistent_evaluation_cache.promote_trajectory_neighborhoods(root_states);
 		}
 		const auto root_evaluation_started = Clock::now();
 		auto roots = evaluate_compact(boards, evaluation_cache);
@@ -827,7 +911,10 @@ struct Searcher::Impl {
 				Clock::now() + std::chrono::milliseconds(std::max(1, progress_interval_ms));
 		}
 
-		if (options.type == SearchType::OnlyMcts && options.mcts_sims > 0) {
+		const int simulation_limit = options.unbounded_simulations
+			? std::numeric_limits<int>::max()
+			: std::max(0, options.mcts_sims);
+		if (options.mcts_sims > 0) {
 			const int configured_batch_size = std::max(1, options.mcts_batch_size);
 			while (!deadline_reached(deadline) && !(cancel && cancel())) {
 				const int batch_size = deadline_batch_size(deadline, configured_batch_size);
@@ -840,18 +927,20 @@ struct Searcher::Impl {
 				selected.reserve(states.size() * static_cast<std::size_t>(batch_size));
 				for (std::size_t state_index = 0; state_index < states.size(); ++state_index) {
 					auto &state = states[state_index];
-					if (state.sims_completed >= options.mcts_sims ||
-						state.sims_completed >= state.dynamic_target) {
+					if (state.sims_completed >= simulation_limit ||
+						(!options.unbounded_simulations &&
+						 state.sims_completed >= state.dynamic_target)) {
 						continue;
 					}
 					active = true;
-					const int wanted =
-						std::min({batch_size, options.mcts_sims - state.sims_completed,
-								  state.dynamic_target - state.sims_completed});
+					int wanted = std::min(batch_size, simulation_limit - state.sims_completed);
+					if (!options.unbounded_simulations) {
+						wanted = std::min(wanted, state.dynamic_target - state.sims_completed);
+					}
 					std::unordered_set<Node *> selected_nodes;
 					selected_nodes.reserve(static_cast<std::size_t>(wanted) * 2);
-					for (int attempt = 0, accepted = 0;
-						 accepted < wanted && attempt < std::max(wanted * 5, wanted + 8);
+					for (int attempt = 0, scheduled = 0;
+						 scheduled < wanted && attempt < std::max(wanted * 5, wanted + 8);
 						 ++attempt) {
 						if (deadline_reached(deadline) || (cancel && cancel())) {
 							break;
@@ -862,6 +951,7 @@ struct Searcher::Impl {
 							clear_virtual(leaf.path);
 							backpropagate(leaf.path, terminal);
 							state.sims_completed += 1;
+							++scheduled;
 							progressed = true;
 							continue;
 						}
@@ -870,7 +960,7 @@ struct Searcher::Impl {
 							continue;
 						}
 						selected.push_back(std::move(leaf));
-						++accepted;
+						++scheduled;
 					}
 				}
 
@@ -943,8 +1033,21 @@ struct Searcher::Impl {
 
 		std::vector<SearchResult> results;
 		results.reserve(states.size());
+		std::unordered_map<std::uint64_t, TrajectoryHeat> trajectory_heat;
 		for (auto &state : states) {
 			results.push_back(make_result(state, start));
+			if (options.evaluation_cache_mb > 0 && state.root->visits > 0) {
+				collect_trajectory_heat(state.root.get(), static_cast<double>(state.root->visits), 0,
+								trajectory_heat);
+			}
+		}
+		if (options.evaluation_cache_mb > 0 && !trajectory_heat.empty()) {
+			std::vector<TrajectoryHeat> ordered_heat;
+			ordered_heat.reserve(trajectory_heat.size());
+			for (const auto &[id, item] : trajectory_heat) {
+				ordered_heat.push_back(item);
+			}
+			persistent_evaluation_cache.promote_trajectory_heat(std::move(ordered_heat));
 		}
 		return results;
 	}
@@ -977,21 +1080,5 @@ void Searcher::set_options(SearchOptions options) { impl_->set_options(options);
 
 // Clear retained cross-search evaluations without changing capacity.
 void Searcher::clear_evaluation_cache() { impl_->persistent_evaluation_cache.clear(); }
-
-// Convert the command-line search mode to the strongly typed enum.
-SearchType parse_search_type(const std::string &value) {
-	if (value == "closed") {
-		return SearchType::Closed;
-	}
-	if (value == "only-mcts") {
-		return SearchType::OnlyMcts;
-	}
-	throw std::invalid_argument("search-type must be closed or only-mcts");
-}
-
-// Convert a search mode back to its stable external spelling.
-std::string search_type_name(SearchType value) {
-	return value == SearchType::Closed ? "closed" : "only-mcts";
-}
 
 } // namespace melano

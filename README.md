@@ -179,7 +179,6 @@ build/gadus/search \
 	--fen "startpos" \
 	--device cuda \
 	--precision bf16 \
-	--search-type open \
 	--mcts-sims 1000 \
 	--mcts-batch-size 64 \
 	--c-puct 0.5 \
@@ -208,7 +207,6 @@ build/gadus/arena \
 	--opening-book data/openings.gen.bin \
 	--book-plies 8 \
 	--max-book-positions 50000 \
-	--search-type closed \
 	--sims 0 \
 	--mcts-batch-size 64 \
 	--c-puct 0.5 \
@@ -227,25 +225,13 @@ Passing an empty value to `--opening-book` starts every game from the standard i
 Launch the Gadus UCI engine on Windows with:
 
 ```powershell
-build\gadus\uci.exe `
-	--model models\gadus\gadus.pth `
-	--device cpu `
-	--threads 2 `
-	--eval-cache-mb 256 `
-	--search-type open `
-	--mcts-sims 100
+build\gadus\uci.exe --model models\gadus\gadus.pth
 ```
 
 The corresponding Linux command is:
 
 ```bash
-build/gadus/uci \
-	--model models/gadus/gadus.pth \
-	--device cpu \
-	--threads 2 \
-	--eval-cache-mb 256 \
-	--search-type open \
-	--mcts-sims 100
+build/gadus/uci --model models/gadus/gadus.pth
 ```
 
 The [UCI](#uci) section describes runtime options, output fields and time management.
@@ -297,7 +283,6 @@ build/melano/search \
 	--fen "startpos" \
 	--device cuda \
 	--precision bf16 \
-	--search-type only-mcts \
 	--mcts-sims 1000 \
 	--mcts-min-sims 250 \
 	--mcts-batch-size 64 \
@@ -317,20 +302,14 @@ Launch the Melano UCI engine on Windows with:
 
 ```powershell
 build\melano\uci.exe `
-	--model models\melano\melano.pth `
-	--device cuda `
-	--search-type only-mcts `
-	--mcts-sims 1000
+	--model models\melano\melano.pth
 ```
 
 The corresponding Linux command is:
 
 ```bash
 build/melano/uci \
-	--model models/melano/melano.pth \
-	--device cuda \
-	--search-type only-mcts \
-	--mcts-sims 1000
+	--model models/melano/melano.pth
 ```
 
 The [UCI](#uci) section describes runtime options, output fields and time management.
@@ -467,11 +446,11 @@ $$
 
 ### Gadus
 
-The Gadus UCI executable loads its checkpoint when `isready` or `go` first requires neural evaluation. An explicit `--model` argument selects the checkpoint, while the default path is `gadus.pth` beside the executable. The process retains the loaded model across positions and evaluates it in FP32. Changing `ModelPath` or `Device` reloads the model before the next search.
+The Gadus UCI executable loads its checkpoint when `isready` or `go` first requires neural evaluation. An explicit `--model` argument selects the checkpoint, while the default path is `gadus.pth` beside the executable. The process selects a CUDA device when one is available and otherwise uses CPU. It retains the loaded model across positions, evaluates it in FP32 and reloads it before the next search after `ModelPath` changes.
 
-Search runs on a worker thread so the protocol loop can process `stop`. A `position`, `setoption` or `ucinewgame` command first stops and joins an active search before changing engine state. Closing the UCI process also joins the worker.
+The UCI worker performs neural inference and tree search while the protocol loop remains available for `stop`. A `position`, `setoption` or `ucinewgame` command first stops and joins an active worker before changing engine state. Closing the process also joins the worker.
 
-Gadus reports MultiPV rows containing `score cp`, nodes, NPS, elapsed time and a one-move principal variation. In `closed` mode, the reported root evaluation is the network Value $V_\theta(s)$. After at least one MCTS simulation, it is the mean return backed up to the root. A visited root edge reports its backed-up $Q(s,a)$, while an unvisited edge reports the root evaluation. For `ScoreScale` value $c_s$, the displayed value is
+Gadus reports MultiPV rows containing `score cp`, nodes, NPS, elapsed time and a one-move principal variation. With `Sims=0`, the reported root evaluation is the network Value $V_\theta(s)$. After at least one simulation, it is the mean return backed up to the root. A visited root edge reports its backed-up $Q(s,a)$, while an unvisited edge reports the root evaluation. The displayed score uses the fixed scale $c_s=1000$:
 
 $$
 \text{score cp}=\mathrm{round}\left(
@@ -479,57 +458,46 @@ c_s\,\mathrm{clip}(q_{\mathrm{line}},-0.999,0.999)
 \right).
 $$
 
-The score is expressed from the root side-to-move perspective. The `nodes` field reports completed simulations and represents the initial neural evaluation as one node until the first simulation completes. For reported node count $n$, both `depth` and `seldepth` equal
+The score is expressed from the root side-to-move perspective. The `nodes` field equals the number $n$ of completed simulations, including zero for direct Policy inference. Both `depth` and `seldepth` equal
 
 $$
 \max\left(1,\left\lfloor\log_2\max(1,n)\right\rfloor+1\right).
 $$
 
-These depth fields summarize search effort rather than maximum tree depth. NPS is $1000n/t$, where $t$ is elapsed time in milliseconds with a denominator of at least one millisecond. Gadus emits the initial root result, periodic MCTS updates and one final result before `bestmove`. `ProgressIntervalMS=0` suppresses periodic updates.
+These depth fields summarize simulation effort rather than maximum tree depth. NPS is $1000n/t$, where $t$ is elapsed time in milliseconds with a denominator of at least one millisecond. Gadus emits the initial root result, updates at fixed 300-millisecond intervals and one final result before `bestmove`.
 
-The MCTS deadline uses the time allocation defined above. `go nodes <n>` overrides the current simulation cap. `go infinite` removes that cap and continues simulation until the client sends `stop`.
+`Sims` supplies the default simulation cap and the reference budget used by root allocation. `go nodes N` gives the current command a cap and reference budget of $N$, taking priority over `Sims`, `depth` and `infinite`; `N=0` selects direct Policy inference. In the absence of `nodes`, `go depth d` uses $2^{d-1}$ simulations for $d\geq1$. A clock or `movetime` deadline may stop a bounded search before it reaches its simulation cap. When neither `nodes` nor `depth` is present, `go infinite` removes a positive `Sims` cap and continues until the client sends `stop`.
 
 Gadus exposes these options:
 
 - `ModelPath` selects the checkpoint.
-- `Device` selects `auto`, `cpu` or `cuda` and defaults to `auto`.
 - `Threads` controls LibTorch CPU threads and defaults to `2`.
 - `Hash` sets the evaluation-cache capacity in MiB and defaults to `256`.
-- `SearchType` selects `closed` or `open` and defaults to `open`.
-- `MCTSSims` sets the simulation cap and defaults to `100`.
-- `MCTSBatchSize` sets the neural leaf-batch capacity and defaults to `32`.
+- `Sims` sets the default simulation cap and defaults to `100`.
 - `Move Overhead` reserves time for communication and move submission and defaults to `10`.
-- `CPuct`, `CPuctBase` and `CPuctFactor` configure the visit-dependent exploration coefficient and default to `0.5`, `19652` and `1.0`.
-- `FPUReduction` sets the First Play Urgency reduction and defaults to `0.15`.
-- `VirtualLoss` sets the repeated-path penalty used during batched selection and defaults to `0.0`.
-- `RepetitionPolicyPenalty` sets the RPP coefficient in $[0,1]$ and defaults to `0.0`.
-- `InstantMateFirst` enables IMF and defaults to `false`.
-- `ProgressIntervalMS` sets the periodic report interval and defaults to `750` milliseconds.
 - `MultiPV` sets the number of reported root lines and defaults to `5`. It changes the report width while search allocation and move selection remain fixed.
-- `ScoreScale` sets $c_s$ in the displayed-score equation and defaults to `1000`.
 
-A positive `Hash` capacity retains compact Policy and Value evaluations across successive `go` commands. Gadus TLRU (trajectory-aware least-recently-used) records normalized tree-visit heat after each search, then restricts the retained trajectory region to the roots requested by the next `go` command before refreshing its eviction order. Cross-command reuse applies to neural-evaluation records, whereas each `go` command constructs a new MCTS tree and new tree statistics. Setting `Hash` to zero creates a call-local cache that deduplicates neural evaluations during one `go` command and releases its records when the command completes. `ucinewgame`, `ModelPath` changes and `Device` changes clear retained cross-search evaluations.
+The UCI adapter uses a neural batch capacity of 32, $c_{\mathrm{puct}}=1$, a PUCT base of 19652, a PUCT factor of 1, a First Play Urgency reduction of 0.15, zero virtual loss, a Repetition Policy Penalty coefficient of 1 and Instant Mate First. The standalone Gadus search command retains command-line controls for these quantities.
+
+A positive `Hash` capacity retains compact Policy and Value evaluations across successive `go` commands. Gadus TLRU (trajectory-aware least-recently-used) records normalized tree-visit heat after each search, then restricts the retained trajectory region to the roots requested by the next `go` command before refreshing its eviction order. Cross-command reuse applies to neural-evaluation records, whereas each `go` command constructs a new MCTS tree and new tree statistics. Setting `Hash` to zero creates a call-local cache that deduplicates neural evaluations during one `go` command and releases its records when the command completes. `ucinewgame` and `ModelPath` changes clear retained cross-search evaluations.
 
 A UCI client may configure Gadus with commands such as:
 
 ```text
 setoption name Threads value 2
 setoption name Hash value 256
-setoption name SearchType value open
-setoption name MCTSSims value 1000
-setoption name MCTSBatchSize value 64
-setoption name CPuct value 0.5
-setoption name RepetitionPolicyPenalty value 1.0
-setoption name InstantMateFirst value true
+setoption name Sims value 1000
+setoption name Move Overhead value 10
+setoption name MultiPV value 5
 ```
 
 ### Melano
 
-The Melano UCI executable loads its checkpoint when `isready` or `go` first requires neural evaluation. An explicit `--model` argument selects the checkpoint, while the default path is `melano.pth` beside the executable. The process retains the loaded model across positions and evaluates it in FP32. Changing `ModelPath` or `Device` reloads the model before the next search.
+The Melano UCI executable loads its checkpoint when `isready` or `go` first requires neural evaluation. An explicit `--model` argument selects the checkpoint, while the default path is `melano.pth` beside the executable. The process selects a CUDA device when one is available and otherwise uses CPU. It retains the loaded model across positions, evaluates it in FP32 and reloads it before the next search after `ModelPath` changes.
 
 Search runs on a worker thread so the protocol loop can process `stop`. A `position`, `setoption` or `ucinewgame` command first stops and joins an active search before changing engine state. Closing the UCI process also joins the worker.
 
-Melano reports MultiPV rows containing `score cp`, nodes, NPS, elapsed time and a one-move principal variation. In `closed` mode, the reported root evaluation is the network Value $V_\theta(s)$. After at least one MCTS simulation, it is the mean return backed up to the root. A visited root edge reports its backed-up $Q(s,a)$, while an unvisited edge reports the root evaluation. For `ScoreScale` value $c_s$, the displayed value is
+Melano reports MultiPV rows containing `score cp`, nodes, NPS, elapsed time and a one-move principal variation. With `Sims=0`, the reported root evaluation is the network Value $V_\theta(s)$. After at least one simulation, it is the mean return backed up to the root. A visited root edge reports its backed-up $Q(s,a)$, while an unvisited edge reports the root evaluation. The displayed score uses the fixed scale $c_s=1000$:
 
 $$
 \text{score cp}=\mathrm{round}\left(
@@ -537,50 +505,37 @@ c_s\,\mathrm{clip}(q_{\mathrm{line}},-0.999,0.999)
 \right).
 $$
 
-The score is expressed from the root side-to-move perspective. The `nodes` field reports completed simulations and represents the initial neural evaluation as one node until the first simulation completes. For reported node count $n$, both `depth` and `seldepth` equal
+The score is expressed from the root side-to-move perspective. The `nodes` field equals the number $n$ of completed simulations, including zero for direct Policy inference. Both `depth` and `seldepth` equal
 
 $$
 \max\left(1,\left\lfloor\log_2\max(1,n)\right\rfloor+1\right).
 $$
 
-These depth fields summarize search effort rather than maximum tree depth. NPS is $1000n/t$, where $t$ is elapsed time in milliseconds with a denominator of at least one millisecond. Melano emits the initial root result, periodic MCTS updates and one final result before `bestmove`. `ProgressIntervalMS=0` suppresses periodic updates.
+These depth fields summarize search effort rather than maximum tree depth. NPS is $1000n/t$, where $t$ is elapsed time in milliseconds with a denominator of at least one millisecond. Melano emits the initial root result, updates at fixed 300-millisecond intervals and one final result before `bestmove`.
 
-The MCTS deadline uses the time allocation defined above. `go nodes <n>` overrides the current simulation cap, and `stop` requests early termination.
+`Sims` supplies the default upper simulation cap and the reference budget used by Melano's uncertainty-controlled stopping rule. `go nodes N` gives the current command an upper cap and reference budget of $N$, taking priority over `Sims`, `depth` and `infinite`; `N=0` selects direct Policy inference. In the absence of `nodes`, `go depth d` uses $2^{d-1}$ simulations for $d\geq1$. A bounded search may finish below its upper cap when its dynamic target is reached, and a clock or `movetime` deadline may stop it earlier. When neither `nodes` nor `depth` is present, `go infinite` removes a positive `Sims` cap and continues until the client sends `stop`.
 
 Melano exposes these options:
 
 - `ModelPath` selects the checkpoint.
-- `Device` selects `auto`, `cpu` or `cuda` and defaults to `auto`.
 - `Threads` controls LibTorch CPU threads and defaults to `2`.
 - `Hash` sets the evaluation-cache capacity in MiB and defaults to `256`.
-- `SearchType` selects `closed` or `only-mcts` and defaults to `only-mcts`.
-- `MCTSSims` sets the simulation cap and defaults to `100`.
-- `MCTSMinSims` sets the nominal simulation floor and defaults to `0`.
-- `MCTSBatchSize` sets the neural leaf-batch capacity and defaults to `32`.
+- `Sims` sets the default upper simulation cap and defaults to `100`.
 - `Move Overhead` reserves time for communication and move submission and defaults to `10`.
-- `CPuct`, `CPuctBase` and `CPuctFactor` configure the visit-dependent exploration coefficient and default to `0.5`, `19652` and `1.0`.
-- `FPUReduction` sets the First Play Urgency reduction and defaults to `0.15`.
-- `VirtualLoss` sets the repeated-path penalty used during batched selection and defaults to `0.0`.
-- `RepetitionPolicyPenalty` sets the RPP coefficient in $[0,1]$ and defaults to `0.0`.
-- `InstantMateFirst` enables IMF and defaults to `false`.
-- `ProgressIntervalMS` sets the periodic report interval and defaults to `750` milliseconds.
 - `MultiPV` sets the number of reported root lines and defaults to `5`.
-- `ScoreScale` sets $c_s$ in the displayed-score equation and defaults to `1000`.
 
-A positive `Hash` capacity retains compact Policy and Value evaluations across successive `go` commands. Melano TLRU records evaluated parent-child transitions and refreshes retained descendants within two transitions of each new root. Cross-command reuse applies to neural-evaluation records, whereas each `go` command constructs a new MCTS tree and new tree statistics. Setting `Hash` to zero creates a call-local cache that deduplicates neural evaluations during one `go` command and releases its records when the command completes. `ucinewgame`, `ModelPath` changes and `Device` changes clear retained cross-search evaluations.
+The UCI adapter uses a neural batch capacity of 32 and leaves Melano's automatic minimum-simulation rule active. It uses $c_{\mathrm{puct}}=1$, a PUCT base of 19652, a PUCT factor of 1, a First Play Urgency reduction of 0.15, zero virtual loss, a Repetition Policy Penalty coefficient of 1 and Instant Mate First. The standalone Melano search command retains command-line controls for these quantities.
+
+A positive `Hash` capacity retains compact Policy and Value evaluations across successive `go` commands. Melano TLRU records normalized tree-visit heat after each search, then restricts the retained trajectory region to the roots requested by the next `go` command before refreshing its eviction order. The cache accounts for evaluation records, trajectory metadata and recorded parent-child links within the same `Hash` capacity. Cross-command reuse applies to neural-evaluation records, whereas each `go` command constructs a new MCTS tree and new tree statistics. Setting `Hash` to zero creates a call-local cache that deduplicates neural evaluations during one `go` command and releases its records when the command completes. `ucinewgame` and `ModelPath` changes clear retained cross-search evaluations.
 
 A UCI client may configure Melano with commands such as:
 
 ```text
 setoption name Threads value 2
 setoption name Hash value 256
-setoption name SearchType value only-mcts
-setoption name MCTSSims value 1000
-setoption name MCTSMinSims value 0
-setoption name MCTSBatchSize value 64
-setoption name CPuct value 0.5
-setoption name RepetitionPolicyPenalty value 1.0
-setoption name InstantMateFirst value true
+setoption name Sims value 1000
+setoption name Move Overhead value 10
+setoption name MultiPV value 5
 ```
 
 ### Eleginus

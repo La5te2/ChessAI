@@ -550,9 +550,9 @@ struct Searcher::Impl {
 	}
 
 	// Remove move objects from the public frozen-model result used by FCPI generation.
-	std::vector<ClosedEvaluation> evaluate_closed(const std::vector<chess::Board> &boards) {
+	std::vector<PolicyEvaluation> evaluate_policy(const std::vector<chess::Board> &boards) {
 		auto rows = evaluate_rows(boards);
-		std::vector<ClosedEvaluation> output(rows.size());
+		std::vector<PolicyEvaluation> output(rows.size());
 		for (std::size_t row = 0; row < rows.size(); ++row) {
 			output[row].legal_indices = std::move(rows[row].legal_indices);
 			output[row].legal_policy = std::move(rows[row].legal_policy);
@@ -679,8 +679,19 @@ struct Searcher::Impl {
 		return std::max(1, static_cast<int>(std::floor(visits / denominator)));
 	}
 
+	// Select from every legal action with the baseline PUCT rule used during root calibration.
+	Node *select_full_width_child(Node *parent) const {
+		Node *selected = nullptr;
+		for (auto &child : parent->children) {
+			if (selected == nullptr || child_precedes(parent, &child, selected)) {
+				selected = &child;
+			}
+		}
+		return selected;
+	}
+
 	// Open internal actions, verify a fully opened node, then continue with PUCT.
-	Node *select_child(Node *parent, double opening_exponent) const {
+	Node *select_progressive_child(Node *parent, double opening_exponent) const {
 		const int augmented_visits = std::max(0, parent->visits + parent->virtual_visits);
 		const auto requested = static_cast<std::size_t>(std::ceil(std::pow(
 			static_cast<double>(augmented_visits) + 1.0, opening_exponent)));
@@ -729,9 +740,10 @@ struct Searcher::Impl {
 		if (actions <= 0 || budget <= 0) {
 			return 0;
 		}
-		const double denominator =
-			static_cast<double>(actions) * std::log(std::exp(1.0) + budget);
-		return std::max(1, static_cast<int>(std::floor(budget / denominator)));
+		constexpr double kFairEvidenceScale = 10.0;
+		const double average_budget = static_cast<double>(budget) / static_cast<double>(actions);
+		return std::max(1, static_cast<int>(std::floor(
+			kFairEvidenceScale * std::log1p(average_budget / kFairEvidenceScale))));
 	}
 
 	// Report whether every legal root action has completed its fair-stage visits.
@@ -863,7 +875,7 @@ struct Searcher::Impl {
 		return selected;
 	}
 
-	// Enter one selected root action, then use PUCT below the root until reaching a leaf.
+	// Enter one selected root action, then descend with calibration or post-fair PUCT.
 	SelectedLeaf select_leaf(std::size_t state_index, TreeState &state, Node *root_action) const {
 		SelectedLeaf selected;
 		selected.state_index = state_index;
@@ -878,9 +890,14 @@ struct Searcher::Impl {
 			selected.board.makeMove(selected.leaf->move);
 			selected.path.push_back(selected.leaf);
 		}
-		const double opening_exponent = internal_opening_exponent(state);
+		const bool fair_stage = !state.root_prior_fixed;
 		while (!selected.leaf->children.empty()) {
-			selected.leaf = select_child(selected.leaf, opening_exponent);
+			if (fair_stage) {
+				selected.leaf = select_full_width_child(selected.leaf);
+			} else {
+				selected.leaf = select_progressive_child(
+					selected.leaf, internal_opening_exponent(state));
+			}
 			selected.leaf->virtual_visits += 1;
 			selected.board.makeMove(selected.leaf->move);
 			selected.path.push_back(selected.leaf);
@@ -985,9 +1002,7 @@ struct Searcher::Impl {
 	// Assemble the final ranked move list and diagnostics from one completed tree.
 	SearchResult make_result(TreeState &state, Clock::time_point start) const {
 		SearchResult result;
-		result.policy = options.type == SearchType::Closed || options.mcts_sims <= 0
-							? dense_policy(state.network)
-							: root_policy(state);
+		result.policy = options.mcts_sims <= 0 ? dense_policy(state.network) : root_policy(state);
 		result.decision_scores = result.policy;
 		result.value = state.root->visits > 0 ? state.root->q() : state.network_value;
 		result.sims_completed = state.sims_completed;
@@ -1106,7 +1121,7 @@ struct Searcher::Impl {
 		const int simulation_limit = options.unbounded_simulations
 			? std::numeric_limits<int>::max()
 			: std::max(0, options.mcts_sims);
-		if (options.type == SearchType::Open && options.mcts_sims > 0) {
+		if (options.mcts_sims > 0) {
 			const int configured_batch_size = std::max(1, options.mcts_batch_size);
 			while (!deadline_reached(deadline) && !(cancel && cancel())) {
 				const int batch_size = deadline_batch_size(deadline, configured_batch_size);
@@ -1266,9 +1281,9 @@ std::vector<SearchResult> Searcher::search_many(const std::vector<chess::Board> 
 }
 
 // Return the compact frozen-model contract used by FCPI generation.
-std::vector<ClosedEvaluation>
-Searcher::evaluate_closed_many(const std::vector<chess::Board> &boards) {
-	return impl_->evaluate_closed(boards);
+std::vector<PolicyEvaluation>
+Searcher::evaluate_policy_many(const std::vector<chess::Board> &boards) {
+	return impl_->evaluate_policy(boards);
 }
 
 // Update search controls while preserving network evaluations that remain model-compatible.
@@ -1276,21 +1291,5 @@ void Searcher::set_options(SearchOptions options) { impl_->set_options(options);
 
 // Clear the cross-search network cache without changing its configured capacity.
 void Searcher::clear_evaluation_cache() { impl_->persistent_evaluation_cache.clear(); }
-
-// Convert the command-line search mode to the strongly typed enum.
-SearchType parse_search_type(const std::string &value) {
-	if (value == "closed") {
-		return SearchType::Closed;
-	}
-	if (value == "open") {
-		return SearchType::Open;
-	}
-	throw std::invalid_argument("search-type must be closed or open");
-}
-
-// Convert a search mode back to its stable external spelling.
-std::string search_type_name(SearchType value) {
-	return value == SearchType::Closed ? "closed" : "open";
-}
 
 } // namespace gadus

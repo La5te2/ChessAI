@@ -13,15 +13,13 @@
 
 namespace melano {
 
-enum class SearchType { Closed, OnlyMcts };
-
 struct SearchOptions {
-	SearchType type = SearchType::OnlyMcts;
 	ComputePrecision precision = ComputePrecision::Fp32;
 	int cpu_threads = 0;
 	int mcts_sims = 100;
 	int mcts_min_sims = 0;
 	int mcts_batch_size = 32;
+	bool unbounded_simulations = false;
 	double movetime_ms = 0.0;
 	double c_puct = 0.5;
 	double c_puct_base = 19652.0;
@@ -83,10 +81,5 @@ class Searcher {
 	struct Impl;
 	std::shared_ptr<Impl> impl_;
 };
-
-/// Parses the exact public names closed and only-mcts.
-SearchType parse_search_type(const std::string &value);
-/// Returns the stable command-line name of a search type.
-std::string search_type_name(SearchType value);
 
 } // namespace melano

@@ -13,10 +13,7 @@
 
 namespace gadus {
 
-enum class SearchType { Closed, Open };
-
 struct SearchOptions {
-	SearchType type = SearchType::Open;
 	ComputePrecision precision = ComputePrecision::Fp32;
 	int cpu_threads = 0;
 	int evaluation_cache_mb = 0;
@@ -60,8 +57,8 @@ struct SearchResult {
 	std::vector<RootMove> root;
 };
 
-// Frozen closed-policy output in legal-action form for high-throughput data generation.
-struct ClosedEvaluation {
+// Frozen direct-policy output in legal-action form for high-throughput data generation.
+struct PolicyEvaluation {
 	std::vector<int> legal_indices;
 	std::vector<float> legal_policy;
 	float value = 0.0F;
@@ -80,9 +77,9 @@ class Searcher {
 						const SearchCancelCallback &cancel = {});
 	/// Searches independent positions together so leaf evaluations share neural batches.
 	std::vector<SearchResult> search_many(const std::vector<chess::Board> &boards);
-	/// Evaluates closed Policy/Value without constructing search trees or dense action vectors.
-	std::vector<ClosedEvaluation>
-	evaluate_closed_many(const std::vector<chess::Board> &boards);
+	/// Evaluates Policy/Value directly without constructing search trees or dense action vectors.
+	std::vector<PolicyEvaluation>
+	evaluate_policy_many(const std::vector<chess::Board> &boards);
 	/// Applies a new search configuration while retaining compatible cached network evaluations.
 	void set_options(SearchOptions options);
 	/// Removes every network evaluation retained across previous search calls.
@@ -92,10 +89,5 @@ class Searcher {
 	struct Impl;
 	std::shared_ptr<Impl> impl_;
 };
-
-/// Parses the exact public names closed and open.
-SearchType parse_search_type(const std::string &value);
-/// Returns the stable command-line name of a search type.
-std::string search_type_name(SearchType value);
 
 } // namespace gadus

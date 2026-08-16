@@ -20,7 +20,7 @@ int main(int argc, char **argv) {
 				<< "  --batch-size <n> --lr <x>\n"
 				<< "  --eval-games <n> --eval-games-in-flight <n> --eval-max-plies <n>\n"
 				<< "  --eval-opening-book <path|empty> --eval-book-plies <n>\n"
-				<< "  --eval-max-book-positions <n> --eval-search-type <closed|open>\n"
+				<< "  --eval-max-book-positions <n>\n"
 				<< "  --eval-sims <n> --eval-mcts-batch-size <n>\n"
 				<< "  --eval-c-puct <x> --eval-c-puct-base <x> --eval-c-puct-factor <x>\n"
 				<< "  --eval-fpu-reduction <x> --eval-repetition-policy-penalty <x>\n"
@@ -68,8 +68,7 @@ int main(int argc, char **argv) {
 		options.min_net_wins = args.get_int("eval-min-net-wins", options.min_net_wins);
 		arena.log_every = options.log_every;
 		auto &search = arena.search;
-		search.type = gadus::parse_search_type(args.get("eval-search-type", "closed"));
-		search.mcts_sims = args.get_int("eval-sims", search.mcts_sims);
+		search.mcts_sims = args.get_int("eval-sims", 0);
 		search.mcts_batch_size = args.get_int("eval-mcts-batch-size", search.mcts_batch_size);
 		search.c_puct = args.get_double("eval-c-puct", search.c_puct);
 		search.c_puct_base = args.get_double("eval-c-puct-base", search.c_puct_base);

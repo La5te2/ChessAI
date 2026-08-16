@@ -739,7 +739,9 @@ u(N_{\mathrm{cap}}-N_{\min})
 \right\rceil.
 $$
 
-The MCTS procedure recalculates $N_{\mathrm{target}}$ after each selection-and-evaluation cycle once the root has reached $N_{\min}$. A new cycle starts for a root only while its completed count is smaller than both the current target and the soft cap. The target and soft cap are checked between cycles, so backups completed within the final cycle may carry the final count beyond either threshold. A root with one legal action uses $u=0$ and admits no new cycle after reaching $N_{\min}$. A zero cap sets both $N_{\min}$ and $N_{\mathrm{target}}$ to zero. A cancellation signal or an expired execution deadline stops further leaf selection and the submission of neural-evaluation requests. Completed backups remain in the tree, while virtual visits attached to unevaluated requests are released as described in Section 5.7.
+The MCTS procedure recalculates $N_{\mathrm{target}}$ after each selection-and-evaluation cycle once the root has reached $N_{\min}$. A new cycle starts for a root only while its completed count is smaller than both the current target and the soft cap. The target and soft cap are checked between cycles, so backups completed within the final cycle may carry the final count beyond either threshold. A root with one legal action uses $u=0$ and admits no new cycle after reaching $N_{\min}$. A zero cap sets both $N_{\min}$ and $N_{\mathrm{target}}$ to zero.
+
+An invocation configured with an unbounded simulation count bypasses $N_{\mathrm{target}}$ and $N_{\mathrm{cap}}$, so its selection-and-evaluation cycles continue until an execution deadline expires or the caller supplies a stop signal. A bounded invocation observes the same two stopping conditions together with $N_{\mathrm{target}}$ and $N_{\mathrm{cap}}$. When any applicable condition ends an invocation, the evaluator stops selecting leaves and submitting neural-evaluation requests. Completed backups remain in the tree, and Section 5.7 describes the release of virtual visits attached to unresolved requests.
 
 ### 5.6 Evaluation Reuse
 
@@ -747,16 +749,19 @@ Repeated network evaluation of the same `PackedState` produces the same compact 
 
 One MCTS invocation receives one or more root states and constructs a separate tree for each root. All trees created by that invocation access the same evaluation cache, which allows simulations within one tree and simulations from different trees to reuse completed network records. Let $M_C\geq0$ be the configured memory capacity for records retained across invocations. When $M_C=0$, the cache exists only for the current invocation. When $M_C>0$, the cache persists across invocations and uses TLRU (trajectory-aware least-recently-used) to order its records. A successful lookup moves the accessed record to the most-recent end of this order, and inserting a new record places it at the same end.
 
-TLRU records a directed link when a cached nonterminal child is reached from a cached parent. Let $\mathcal C$ be the set of retained entries and let $E_C\subseteq\mathcal C\times\mathcal C$ be the set of recorded parent-child links. For a retained root entry $r\in\mathcal C$, the trajectory neighborhood of radius two is
+TLRU records a directed link whenever evaluation of a child state follows evaluation of its parent state. Let $\mathcal C$ be the set of retained entries, let $E_C\subseteq\mathcal C\times\mathcal C$ contain these links and let $\kappa(v)\in\mathcal C$ identify the cache entry used by tree node $v$. After an invocation completes, a root $x_0$ assigns the following heat to each retained entry $c$ reached by its tree:
 
 $$
-\mathcal N_2(r)=
-\lbrace y\in\mathcal C:d_C(r,y)\leq2\rbrace,
+H_{x_0}(c)=
+\sum_{\substack{v\text{ is a visited node}\\\kappa(v)=c}}
+\frac{N(v)}{N(x_0)}.
 $$
 
-where $d_C(r,y)$ is the length of the shortest directed path from $r$ to $y$ in $(\mathcal C,E_C)$. Before evaluating a new root, TLRU touches the retained entries in $\mathcal N_2(r)$ in decreasing order of $d_C(r,y)$. Two-ply descendants are touched first, one-ply descendants next and the root last, leaving the root as the most-recent entry. Ordinary lookups and insertions then continue to update the same order.
+The visit ratio measures how strongly the completed tree used the trajectory through $c$. Contributions from transposed tree nodes and from several roots in one invocation are added. TLRU assigns one generation identifier to the resulting heat values, then refreshes entries in increasing heat order. Entries with greater heat therefore finish nearer the most-recent end of the cache. Equal heat is ordered by decreasing tree depth before the refresh, so states nearer the root finish later in that group.
 
-When the approximate memory use exceeds $M_C$, TLRU removes entries from the least-recent end until the retained records fit within the capacity. The cache retains only compact network-evaluation records. Tree nodes and MCTS statistics are local to a single invocation, and every node starts with zero visits, zero accumulated evaluation and zero virtual reservations. A cache hit supplies the Policy probabilities and Value for the requested state. Root initialization uses this record to expand the root and retain its fallback evaluation, whereas leaf evaluation uses it to expand the selected leaf and back up its Value.
+Before the next invocation evaluates its actual roots, TLRU follows the recorded links from each retained root through entries that belong to the same heat generation. The heat values of descendants reached from multiple roots are added, and the resulting entries are refreshed by the same heat and depth order. Ordinary cache hits and insertions continue to move their entries to the most-recent end.
+
+When the approximate memory use exceeds $M_C$, TLRU removes entries from the least-recent end until the retained data fits within the capacity. The accounting includes compact evaluation arrays, fixed entry fields, trajectory metadata and the allocated capacity of recorded child links. Tree nodes and MCTS statistics remain local to one invocation, so each invocation starts with fresh visits, accumulated evaluations and virtual reservations. A cache hit supplies the Policy probabilities and Value needed to initialize or expand the requested tree node.
 
 ### 5.7 Batched Evaluation
 
@@ -801,7 +806,7 @@ $$
 
 where $R_{\mathrm{cycle}}$ is the remaining time at the start of the cycle. If $B_{\mathrm{cycle}}=0$, the invocation ends before the cycle selects any leaves.
 
-For $B_{\mathrm{cycle}}>0$, the cycle processes each search tree whose root count $N(x_0)$ is smaller than both $N_{\mathrm{target}}$ and $N_{\mathrm{cap}}$. The maximum number of distinct nonterminal leaves requested from one such tree is
+For $B_{\mathrm{cycle}}>0$, a bounded invocation processes each search tree whose root count $N(x_0)$ is smaller than both $N_{\mathrm{target}}$ and $N_{\mathrm{cap}}$. The maximum number of distinct nonterminal leaves requested from one such tree is
 
 $$
 m=\min\left(
@@ -811,7 +816,7 @@ N_{\mathrm{cap}}-N(x_0)
 \right).
 $$
 
-The three terms limit the request by the available cycle capacity, the remaining count to the current target and the remaining count to the simulation cap, respectively.
+The three terms limit the request by the available cycle capacity, the remaining count to the current target and the remaining count to the simulation cap, respectively. An unbounded invocation sets $m=B_{\mathrm{cycle}}$ and continues scheduling cycles until the stopping condition from Section 5.5 occurs.
 
 To build this request set, each selection attempt starts at the root and follows PUCT through expanded nodes until it reaches a terminal node or an unexpanded nonterminal node. A terminal node receives its exact rule outcome, and immediate backup completes one simulation without adding a neural-evaluation request. An unexpanded nonterminal node enters the request set when that tree has not reserved the node earlier in the same cycle, and its selected path retains one virtual visit until the request is resolved. If another attempt from the same tree reaches an already reserved node, the selector removes the virtual visits introduced by that attempt and adds no request. The tree performs at most $\max(5m,m+8)$ attempts while collecting up to $m$ distinct nonterminal leaves.
 

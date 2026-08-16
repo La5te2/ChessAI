@@ -479,13 +479,16 @@ m_{\mathrm{fair}}=
 \max\left(
 1,
 \left\lfloor
-\frac{N_{\mathrm{cap}}}
-{M\log(e+N_{\mathrm{cap}})}
+10\log\left(
+1+\frac{N_{\mathrm{cap}}}{10M}
+\right)
 \right\rfloor
 \right).
 $$
 
-Every legal root action receives this floor, so a completed fair phase uses $Mm_{\mathrm{fair}}$ root visits.
+The scale 10 places the transition between two regimes. The floor is approximately linear in the average root-action budget $N_{\mathrm{cap}}/M$ when that budget is small, while its growth becomes logarithmic as the budget increases. Every legal root action receives this floor, so a completed fair phase uses $Mm_{\mathrm{fair}}$ root visits.
+
+Each fair-stage simulation first enters the root action selected by the allocation deficit. At every subsequent expanded nonterminal state, all legal actions participate immediately in the PUCT ordering from Section 5.3. During this phase, the original Policy prior supplies PUCT directly over the complete legal-action set. Root-prior tempering, progressive action opening and the internal verification floor begin with post-fair allocation.
 
 For $a\in\mathcal A(x_0)$, the fair-allocation deficit is
 
@@ -577,7 +580,7 @@ A configured deadline or a caller-supplied stop signal can end the procedure bef
 
 For an expanded non-root state $x$, let $M_x=|\mathcal A(x)|$ and order its legal actions $a_{(1)},\ldots,a_{(M_x)}$ by decreasing original Policy prior $P(x,a)$. Actions with equal priors retain their order in the legal-action array. The selectable actions form a prefix of this ordering.
 
-Before the root fair phase is complete, the opening exponent is $\beta_{\mathrm{open}}=1/2$. After $\gamma_{\mathrm{fair}}$ has been fixed by Section 5.5, the exponent is
+Internal action opening begins after Section 5.5 fixes $\gamma_{\mathrm{fair}}$. Its exponent is
 
 $$
 \beta_{\mathrm{open}}=
@@ -709,7 +712,7 @@ $$
 
 The two terms limit the request by the available cycle capacity and the remaining simulation budget.
 
-To build the request set, the root scheduler first selects a legal root action with the largest positive fair-allocation deficit. After every legal root action completes the fair floor, it selects the action with the largest fixed-$\alpha$ root PUCT score defined in Section 5.5. After applying the selected root action, the scheduler updates the active prefix at each expanded non-root node according to Section 5.6. It selects a newly active action that lacks a visit, then selects a positive verification deficit after the prefix reaches full width and otherwise applies the PUCT ordering from Section 5.3. This descent ends at a terminal node or an unexpanded nonterminal node.
+To build the request set, the root scheduler first selects a legal root action with the largest positive fair-allocation deficit. After every legal root action completes the fair floor, it selects the action with the largest fixed-$\alpha$ root PUCT score defined in Section 5.5. During the fair phase, the selected root action is followed by full-width PUCT at every expanded non-root node. After the fair phase fixes $\gamma_{\mathrm{fair}}$, the scheduler instead updates the active prefix at each expanded non-root node according to Section 5.6. It selects a newly active action that lacks a visit, then selects a positive verification deficit after the prefix reaches full width and otherwise applies the PUCT ordering from Section 5.3. This descent ends at a terminal node or an unexpanded nonterminal node.
 
 A terminal node receives its exact rule outcome, and immediate backup completes one simulation without adding a neural-evaluation request. An unexpanded nonterminal node enters the request set when that tree has not reserved the node earlier in the same cycle, and its selected path retains one virtual visit until the request is resolved. Immediate terminal backups and accepted neural-leaf reservations both count toward the limit $m$. If another attempt from the same tree reaches an already reserved node, the selector releases the virtual visits introduced by that attempt and ends request selection for that tree in the current cycle. The submitted requests then change the completed tree statistics before the next cycle begins, preventing exact rollback from immediately reconstructing the same deterministic path. The tree performs at most $\max(5m,m+8)$ attempts while scheduling at most $m$ simulations, and a repeated reservation can end its current selection pass earlier.
 

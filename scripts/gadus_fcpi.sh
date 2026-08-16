@@ -37,7 +37,6 @@ EVAL_MAX_PLIES="${EVAL_MAX_PLIES:-240}"
 EVAL_OPENING_BOOK="${EVAL_OPENING_BOOK:-data/openings.gen.bin}"
 EVAL_BOOK_PLIES="${EVAL_BOOK_PLIES:-8}"
 EVAL_MAX_BOOK_POSITIONS="${EVAL_MAX_BOOK_POSITIONS:-1000}"
-EVAL_SEARCH_TYPE="${EVAL_SEARCH_TYPE:-closed}"
 EVAL_SIMS="${EVAL_SIMS:-0}"
 EVAL_MCTS_BATCH_SIZE="${EVAL_MCTS_BATCH_SIZE:-512}"
 EVAL_REPETITION_POLICY_PENALTY="${EVAL_REPETITION_POLICY_PENALTY:-1.0}"
@@ -116,7 +115,6 @@ COMMAND=(
 	--eval-opening-book "${EVAL_OPENING_BOOK}"
 	--eval-book-plies "${EVAL_BOOK_PLIES}"
 	--eval-max-book-positions "${EVAL_MAX_BOOK_POSITIONS}"
-	--eval-search-type "${EVAL_SEARCH_TYPE}"
 	--eval-sims "${EVAL_SIMS}"
 	--eval-mcts-batch-size "${EVAL_MCTS_BATCH_SIZE}"
 	--eval-repetition-policy-penalty "${EVAL_REPETITION_POLICY_PENALTY}"
@@ -178,7 +176,6 @@ run_pipeline() {
 		--opening-book "${EVAL_OPENING_BOOK}" \
 		--book-plies "${EVAL_BOOK_PLIES}" \
 		--max-book-positions "${EVAL_MAX_BOOK_POSITIONS}" \
-		--search-type closed \
 		--sims 0 \
 		--mcts-batch-size "${EVAL_MCTS_BATCH_SIZE}" \
 		--repetition-policy-penalty "${EVAL_REPETITION_POLICY_PENALTY}" \
@@ -225,8 +222,8 @@ echo "model=${MODEL} device=${DEVICE} precision=${PRECISION} iterations=${ITERAT
 echo "sampling: current_self_games=${GAMES_PER_ITER} opening_book=${OPENING_BOOK} unique_opening_limit=${MAX_BOOK_POSITIONS} games_in_flight=${GAMES_IN_FLIGHT} max_plies=${MAX_PLIES}"
 echo "counterfactual: deep_budget_per_root=${COUNTERFACTUAL_BUDGET}"
 echo "training: batch_size=${BATCH_SIZE} epochs=${EPOCHS} max_steps=${TRAIN_MAX_STEPS} lr=${LEARNING_RATE}"
-echo "arena: games=${EVAL_GAMES} search_type=${EVAL_SEARCH_TYPE} sims=${EVAL_SIMS} min_net_wins=${EVAL_MIN_NET_WINS}"
-echo "final arena: current vs initial games=${EVAL_GAMES} search_type=closed informational=true"
+echo "arena: games=${EVAL_GAMES} sims=${EVAL_SIMS} min_net_wins=${EVAL_MIN_NET_WINS}"
+echo "final arena: current vs initial games=${EVAL_GAMES} sims=0 informational=true"
 
 nohup bash "${BASH_SOURCE[0]}" --pipeline >"${LAUNCH_LOG}" 2>&1 < /dev/null &
 PID=$!

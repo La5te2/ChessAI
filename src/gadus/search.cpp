@@ -14,7 +14,6 @@ int main(int argc, char **argv) {
 			std::cout
 				<< "Usage: search --model <gadus.pth> [--fen <fen>] [options]\n"
 				<< "  --device <auto|cpu|cuda> --precision <fp32|bf16> --threads <n|0=auto>\n"
-				<< "  --search-type <closed|open>\n"
 				<< "  --mcts-sims <n> --mcts-batch-size <n>\n"
 				<< "  --c-puct <x> --c-puct-base <x> --c-puct-factor <x> --fpu-reduction <x>\n"
 				<< "  --virtual-loss <x> --repetition-policy-penalty <x>\n"
@@ -27,7 +26,6 @@ int main(int argc, char **argv) {
 		options.precision =
 			gadus::parse_compute_precision(args.get("precision", "fp32"));
 		options.cpu_threads = std::max(0, args.get_int("threads", options.cpu_threads));
-		options.type = gadus::parse_search_type(args.get("search-type", "open"));
 		options.mcts_sims = args.get_int("mcts-sims", options.mcts_sims);
 		options.mcts_batch_size = args.get_int("mcts-batch-size", options.mcts_batch_size);
 		options.c_puct = args.get_double("c-puct", options.c_puct);

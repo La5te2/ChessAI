@@ -6,6 +6,7 @@
 #include <cmath>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -23,13 +24,13 @@ namespace {
 
 struct EngineOptions {
 	std::filesystem::path model_path;
-	std::string device = "auto";
 	gadus::SearchOptions search;
 	int move_overhead_ms = 10;
-	int progress_interval_ms = 750;
 	int multipv = 5;
-	int score_scale = 1000;
 };
+
+constexpr int kProgressIntervalMs = 300;
+constexpr int kScoreScale = 1000;
 
 // Resolve the explicitly packaged Gadus checkpoint beside the executable without
 // introducing a repository fallback or coupling the model name to the EXE name.
@@ -74,18 +75,6 @@ std::string normalized(std::string value) {
 	return output;
 }
 
-// Parse permissive UCI Boolean text while retaining a caller-provided fallback.
-bool parse_bool(const std::string &value, bool fallback) {
-	const auto key = normalized(value);
-	if (key == "1" || key == "true" || key == "yes" || key == "on") {
-		return true;
-	}
-	if (key == "0" || key == "false" || key == "no" || key == "off") {
-		return false;
-	}
-	return fallback;
-}
-
 // Parse an integer option without letting malformed client input terminate the engine.
 int parse_int(const std::string &value, int fallback) {
 	try {
@@ -95,13 +84,24 @@ int parse_int(const std::string &value, int fallback) {
 	}
 }
 
-// Parse a floating option without letting malformed client input terminate the engine.
-double parse_double(const std::string &value, double fallback) {
+// Parse a nonnegative simulation count and clamp it to the search counter range.
+int parse_simulations(const std::string &value, int fallback) {
 	try {
-		return std::stod(value);
+		const auto parsed = std::stoll(value);
+		return static_cast<int>(std::clamp<std::int64_t>(
+			parsed, 0, std::numeric_limits<int>::max()));
 	} catch (...) {
 		return fallback;
 	}
+}
+
+// Map the synthetic UCI depth reported by Gadus back to its simulation count.
+int simulations_for_depth(const std::string &value) {
+	const int depth = std::max(1, parse_int(value, 1));
+	if (depth > std::numeric_limits<int>::digits) {
+		return std::numeric_limits<int>::max();
+	}
+	return 1 << (depth - 1);
 }
 
 class UciEngine {
@@ -186,38 +186,16 @@ class UciEngine {
 		print("id name Gadidae Gadus");
 		print("id author La5te2");
 		print("option name ModelPath type string default " + options_.model_path.string());
-		print("option name Device type string default " + options_.device);
 		print("option name Threads type spin default " +
 			  std::to_string(options_.search.cpu_threads) + " min 1 max 256");
 		print("option name Hash type spin default " +
 			  std::to_string(options_.search.evaluation_cache_mb) + " min 0 max 65536");
-		print("option name SearchType type combo default " +
-			  gadus::search_type_name(options_.search.type) + " var closed var open");
-		print("option name MCTSSims type spin default " + std::to_string(options_.search.mcts_sims) +
-			  " min 0 max 1000000");
-		print("option name MCTSBatchSize type spin default " +
-			  std::to_string(options_.search.mcts_batch_size) + " min 1 max 4096");
+		print("option name Sims type spin default " + std::to_string(options_.search.mcts_sims) +
+			  " min 0 max " + std::to_string(std::numeric_limits<int>::max()));
 		print("option name Move Overhead type spin default " +
 			  std::to_string(options_.move_overhead_ms) + " min 0 max 5000");
-		print("option name CPuct type string default " + std::to_string(options_.search.c_puct));
-		print("option name CPuctBase type string default " +
-			  std::to_string(options_.search.c_puct_base));
-		print("option name CPuctFactor type string default " +
-			  std::to_string(options_.search.c_puct_factor));
-		print("option name FPUReduction type string default " +
-			  std::to_string(options_.search.fpu_reduction));
-		print("option name VirtualLoss type string default " +
-			  std::to_string(options_.search.virtual_loss));
-		print("option name RepetitionPolicyPenalty type string default " +
-			  std::to_string(options_.search.repetition_policy_penalty));
-		print(std::string("option name InstantMateFirst type check default ") +
-			  (options_.search.instant_mate_first ? "true" : "false"));
-		print("option name ProgressIntervalMS type spin default " +
-			  std::to_string(options_.progress_interval_ms) + " min 0 max 60000");
 		print("option name MultiPV type spin default " + std::to_string(options_.multipv) +
 			  " min 1 max 256");
-		print("option name ScoreScale type spin default " + std::to_string(options_.score_scale) +
-			  " min 1 max 100000");
 		print("uciok");
 	}
 
@@ -226,15 +204,13 @@ class UciEngine {
 		if (options_.model_path.empty()) {
 			throw std::runtime_error("ModelPath is empty");
 		}
-		if (model_ && searcher_ && loaded_model_path_ == options_.model_path &&
-			loaded_device_ == options_.device) {
+		if (model_ && searcher_ && loaded_model_path_ == options_.model_path) {
 			return;
 		}
-		device_ = gadus::resolve_device(options_.device);
+		device_ = gadus::resolve_device("auto");
 		model_ = gadus::load_checkpoint(options_.model_path, device_);
 		searcher_ = std::make_shared<gadus::Searcher>(model_, device_, options_.search);
 		loaded_model_path_ = options_.model_path;
-		loaded_device_ = options_.device;
 	}
 
 	// Parse setoption name/value and update the matching typed engine setting.
@@ -253,47 +229,19 @@ class UciEngine {
 			options_.model_path = value;
 			model_ = nullptr;
 			searcher_.reset();
-		} else if (key == "device") {
-			options_.device = value;
-			model_ = nullptr;
-			searcher_.reset();
 		} else if (key == "threads") {
 			options_.search.cpu_threads =
 				std::clamp(parse_int(value, options_.search.cpu_threads), 1, 256);
 		} else if (key == "hash") {
 			options_.search.evaluation_cache_mb =
 				std::clamp(parse_int(value, options_.search.evaluation_cache_mb), 0, 65536);
-		} else if (key == "searchtype") {
-			options_.search.type = gadus::parse_search_type(value);
-		} else if (key == "mctssims") {
-			options_.search.mcts_sims = std::max(0, parse_int(value, options_.search.mcts_sims));
-		} else if (key == "mctsbatchsize") {
-			options_.search.mcts_batch_size = std::max(1, parse_int(value, options_.search.mcts_batch_size));
+		} else if (key == "sims") {
+			options_.search.mcts_sims = parse_simulations(value, options_.search.mcts_sims);
 		} else if (key == "moveoverhead") {
 			options_.move_overhead_ms =
 				std::clamp(parse_int(value, options_.move_overhead_ms), 0, 5000);
-		} else if (key == "cpuct") {
-			options_.search.c_puct = std::max(0.0, parse_double(value, options_.search.c_puct));
-		} else if (key == "cpuctbase") {
-			options_.search.c_puct_base = std::max(1.0, parse_double(value, options_.search.c_puct_base));
-		} else if (key == "cpuctfactor") {
-			options_.search.c_puct_factor = std::max(0.0, parse_double(value, options_.search.c_puct_factor));
-		} else if (key == "fpureduction") {
-			options_.search.fpu_reduction = std::max(0.0, parse_double(value, options_.search.fpu_reduction));
-		} else if (key == "virtualloss") {
-			options_.search.virtual_loss = std::max(0.0, parse_double(value, options_.search.virtual_loss));
-		} else if (key == "repetitionpolicypenalty") {
-			options_.search.repetition_policy_penalty =
-				std::clamp(parse_double(value, options_.search.repetition_policy_penalty), 0.0, 1.0);
-		} else if (key == "instantmatefirst") {
-			options_.search.instant_mate_first = parse_bool(value, options_.search.instant_mate_first);
-		} else if (key == "progressintervalms") {
-			options_.progress_interval_ms =
-				std::clamp(parse_int(value, options_.progress_interval_ms), 0, 60000);
 		} else if (key == "multipv") {
 			options_.multipv = std::clamp(parse_int(value, options_.multipv), 1, 256);
-		} else if (key == "scorescale") {
-			options_.score_scale = std::clamp(parse_int(value, options_.score_scale), 1, 100000);
 		} else {
 			print("info string unknown option: " + name);
 		}
@@ -409,13 +357,13 @@ class UciEngine {
 
 	// Map bounded neural value to a monotonic centipawn-like UCI display score.
 	int score_cp(float value) const {
-		return static_cast<int>(std::lround(std::clamp(value, -0.999F, 0.999F) * options_.score_scale));
+		return static_cast<int>(std::lround(std::clamp(value, -0.999F, 0.999F) * kScoreScale));
 	}
 
 	// Emit final or progressive MultiPV lines using root-side values and search statistics.
 	void emit_info(const gadus::SearchResult &result) const {
 		const int elapsed = std::max(0, static_cast<int>(std::lround(result.elapsed_ms)));
-		const int nodes = std::max(result.sims_completed, result.nn_batches > 0 ? 1 : 0);
+		const int nodes = result.sims_completed;
 		const int nps = static_cast<int>(1000LL * nodes / std::max(1, elapsed));
 		const int depth = std::max(1, static_cast<int>(std::log2(std::max(1, nodes))) + 1);
 		const int count = std::min<int>(options_.multipv, result.root.size());
@@ -441,17 +389,19 @@ class UciEngine {
 		auto search_options = options_.search;
 		const auto go_values = parse_go(line);
 		search_options.movetime_ms = movetime_for(go_values);
-		search_options.unbounded_simulations = go_values.contains("infinite") &&
-			search_options.type == gadus::SearchType::Open && search_options.mcts_sims > 0;
+		search_options.unbounded_simulations = false;
 		if (const auto nodes = go_values.find("nodes"); nodes != go_values.end()) {
-			search_options.mcts_sims = std::max(0, parse_int(nodes->second, search_options.mcts_sims));
-			search_options.unbounded_simulations = false;
+			search_options.mcts_sims = parse_simulations(nodes->second, search_options.mcts_sims);
+		} else if (const auto depth = go_values.find("depth"); depth != go_values.end()) {
+			search_options.mcts_sims = simulations_for_depth(depth->second);
+		} else if (go_values.contains("infinite") && search_options.mcts_sims > 0) {
+			search_options.unbounded_simulations = true;
 		}
 		search_options.root_topn = std::max(options_.multipv, search_options.root_topn);
 		const auto board = board_;
 		searcher_->set_options(search_options);
 		const auto searcher = searcher_;
-		const int progress_interval_ms = options_.progress_interval_ms;
+		const int progress_interval_ms = kProgressIntervalMs;
 		stop_requested_ = false;
 		search_thread_ = std::thread([this, board, searcher, progress_interval_ms] {
 			try {
@@ -481,7 +431,6 @@ class UciEngine {
 	gadus::Model model_{nullptr};
 	std::shared_ptr<gadus::Searcher> searcher_;
 	std::filesystem::path loaded_model_path_;
-	std::string loaded_device_;
 	std::thread search_thread_;
 	std::atomic_bool stop_requested_{false};
 	double original_time_adjust_ = -1.0;
@@ -500,28 +449,11 @@ EngineOptions options_from_args(int argc, char **argv) {
 				options.model_path.string());
 		}
 	}
-	options.device = args.get("device", options.device);
-	options.search.cpu_threads = std::clamp(args.get_int("threads", 2), 1, 256);
-	options.search.evaluation_cache_mb =
-		std::clamp(args.get_int("eval-cache-mb", 256), 0, 65536);
-	options.search.type = gadus::parse_search_type(args.get("search-type", "open"));
-	options.search.mcts_sims = args.get_int("mcts-sims", options.search.mcts_sims);
-	options.search.mcts_batch_size = args.get_int("mcts-batch-size", options.search.mcts_batch_size);
-	options.search.c_puct = args.get_double("c-puct", options.search.c_puct);
-	options.search.c_puct_base = args.get_double("c-puct-base", options.search.c_puct_base);
-	options.search.c_puct_factor = args.get_double("c-puct-factor", options.search.c_puct_factor);
-	options.search.fpu_reduction = args.get_double("fpu-reduction", options.search.fpu_reduction);
-	options.search.virtual_loss = args.get_double("virtual-loss", options.search.virtual_loss);
-	options.search.repetition_policy_penalty =
-		args.get_double("repetition-policy-penalty", options.search.repetition_policy_penalty);
-	options.search.instant_mate_first =
-		args.get_bool("instant-mate-first", options.search.instant_mate_first);
-	options.search.root_topn = args.get_int("root-topn", options.search.root_topn);
-	options.progress_interval_ms =
-		args.get_int("progress-interval-ms", options.progress_interval_ms);
-	options.move_overhead_ms = args.get_int("move-overhead-ms", options.move_overhead_ms);
-	options.multipv = args.get_int("multipv", options.multipv);
-	options.score_scale = args.get_int("score-scale", options.score_scale);
+	options.search.cpu_threads = 2;
+	options.search.evaluation_cache_mb = 256;
+	options.search.c_puct = 1.0;
+	options.search.repetition_policy_penalty = 1.0;
+	options.search.instant_mate_first = true;
 	return options;
 }
 

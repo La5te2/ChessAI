@@ -199,7 +199,6 @@ nlohmann::json evaluate_models(const ArenaOptions &options) {
 			  << " baseline=" << options.baseline.string()
 			  << " baseline_sha256=" << file_sha256(options.baseline) << " games=" << options.games
 			  << " sims=" << options.search.mcts_sims
-			  << " search_type=" << search_type_name(options.search.type)
 			  << " precision=" << compute_precision_name(options.search.precision)
 			  << " device=" << device.str() << " games_in_flight=" << options.games_in_flight
 			  << std::endl;
@@ -277,9 +276,8 @@ nlohmann::json evaluate_models(const ArenaOptions &options) {
 		{"elo_diff", elo_from_score(score)},
 		{"elo_ci_low", elo_from_score(low)},
 		{"elo_ci_high", elo_from_score(high)},
-		{"search_type", search_type_name(options.search.type)},
 		{"precision", compute_precision_name(options.search.precision)},
-		{"sims_soft_cap", options.search.mcts_sims},
+		{"sims", options.search.mcts_sims},
 		{"mcts_batch_size", options.search.mcts_batch_size},
 		{"paired_openings", true},
 		{"unique_start_positions", (options.games + 1) / 2},

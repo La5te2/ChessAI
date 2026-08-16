@@ -281,21 +281,20 @@ int main() {
 				"checkpoint changed policy output");
 		require(torch::allclose(reference_value, loaded_value), "checkpoint changed value output");
 
-		// Closed search ranks legal actions with Policy before optional decision components.
-		melano::SearchOptions closed_options;
-		closed_options.type = melano::SearchType::Closed;
-		closed_options.mcts_sims = 0;
-		closed_options.root_topn = 4;
-		melano::Searcher closed_searcher(loaded, torch::Device(torch::kCPU), closed_options);
-		const auto closed_result = closed_searcher.search(board);
-		require(closed_result.root.size() == 4, "closed search root size mismatch");
-		require(closed_result.sims_completed == 0, "closed search unexpectedly ran MCTS");
-		require(melano::index_to_move(melano::move_to_index(closed_result.move), board) ==
-					closed_result.move,
-				"closed search selected an illegal move");
+		// Zero simulations rank legal actions with Policy before optional decision components.
+		melano::SearchOptions policy_options;
+		policy_options.mcts_sims = 0;
+		policy_options.root_topn = 4;
+		melano::Searcher policy_searcher(loaded, torch::Device(torch::kCPU), policy_options);
+		const auto policy_result = policy_searcher.search(board);
+		require(policy_result.root.size() == 4, "direct Policy root size mismatch");
+		require(policy_result.sims_completed == 0, "direct Policy inference ran MCTS");
+		require(melano::index_to_move(melano::move_to_index(policy_result.move), board) ==
+					policy_result.move,
+				"direct Policy inference selected an illegal move");
 
 		// Duplicate roots share one exact evaluation inside a batched search call.
-		melano::Searcher batched_searcher(loaded, torch::Device(torch::kCPU), closed_options);
+		melano::Searcher batched_searcher(loaded, torch::Device(torch::kCPU), policy_options);
 		const auto batched_results = batched_searcher.search_many({board, board});
 		require(batched_results[0].nn_evaluations + batched_results[1].nn_evaluations == 1,
 				"duplicate roots performed more than one network evaluation");
@@ -304,7 +303,7 @@ int main() {
 
 		// Positive cache capacity reuses network output while each call builds fresh search
 		// statistics.
-		auto cached_options = closed_options;
+		auto cached_options = policy_options;
 		cached_options.evaluation_cache_mb = 1;
 		melano::Searcher cached_searcher(loaded, torch::Device(torch::kCPU), cached_options);
 		const auto first_cached = cached_searcher.search(board);
@@ -326,8 +325,7 @@ int main() {
 				"cache clear did not force root reevaluation");
 
 		// Four simulations cover PUCT selection, neural expansion, and value backup.
-		melano::SearchOptions mcts_options = closed_options;
-		mcts_options.type = melano::SearchType::OnlyMcts;
+		melano::SearchOptions mcts_options = policy_options;
 		mcts_options.mcts_sims = 4;
 		mcts_options.mcts_min_sims = 4;
 		mcts_options.mcts_batch_size = 2;

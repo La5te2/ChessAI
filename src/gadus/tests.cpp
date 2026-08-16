@@ -213,29 +213,28 @@ int main() {
 		require(torch::allclose(loaded_output.second, fused_output.second, 1e-5, 1e-6),
 				"Conv-BN fusion changed value output");
 
-		// Closed search ranks legal policy actions without constructing an MCTS tree.
-		gadus::SearchOptions closed_options;
-		closed_options.type = gadus::SearchType::Closed;
-		closed_options.mcts_sims = 0;
-		closed_options.root_topn = 4;
-		gadus::Searcher closed_searcher(loaded, torch::Device(torch::kCPU), closed_options);
-		const auto closed_result = closed_searcher.search(board);
-		const auto compact_result = closed_searcher.evaluate_closed_many({board});
+		// Zero-simulation search ranks legal policy actions without constructing an MCTS tree.
+		gadus::SearchOptions direct_options;
+		direct_options.mcts_sims = 0;
+		direct_options.root_topn = 4;
+		gadus::Searcher direct_searcher(loaded, torch::Device(torch::kCPU), direct_options);
+		const auto direct_result = direct_searcher.search(board);
+		const auto compact_result = direct_searcher.evaluate_policy_many({board});
 		require(compact_result.size() == 1, "compact Gadus evaluation row count mismatch");
 		require(compact_result[0].legal_indices.size() == compact_result[0].legal_policy.size(),
 				"compact Gadus evaluation width mismatch");
 		for (std::size_t column = 0; column < compact_result[0].legal_indices.size(); ++column) {
 			require(std::abs(compact_result[0].legal_policy[column] -
-							 closed_result.policy[compact_result[0].legal_indices[column]]) < 1e-6F,
+							 direct_result.policy[compact_result[0].legal_indices[column]]) < 1e-6F,
 					"compact Gadus evaluation changed a legal probability");
 		}
-		require(std::abs(compact_result[0].value - closed_result.value) < 1e-6F,
+		require(std::abs(compact_result[0].value - direct_result.value) < 1e-6F,
 				"compact Gadus evaluation changed Value");
-		require(closed_result.root.size() == 4, "closed search root size mismatch");
-		require(closed_result.sims_completed == 0, "closed search unexpectedly ran MCTS");
-		require(gadus::index_to_move(gadus::move_to_index(closed_result.move), board) ==
-					closed_result.move,
-				"closed search selected an illegal move");
+		require(direct_result.root.size() == 4, "direct search root size mismatch");
+		require(direct_result.sims_completed == 0, "direct search unexpectedly ran MCTS");
+		require(gadus::index_to_move(gadus::move_to_index(direct_result.move), board) ==
+					direct_result.move,
+				"direct search selected an illegal move");
 		auto full_probabilities =
 			torch::softmax(reference.first, 1).squeeze(0).to(torch::kCPU).contiguous();
 		std::vector<float> full_policy(gadus::kActionSize);
@@ -243,12 +242,12 @@ int main() {
 					full_policy.begin());
 		const auto expected_policy = gadus::normalize_legal_policy(full_policy, board);
 		for (int action = 0; action < gadus::kActionSize; ++action) {
-			require(std::abs(closed_result.policy[action] - expected_policy[action]) < 1e-5F,
-					"compact legal-policy transfer changed closed search probabilities");
+			require(std::abs(direct_result.policy[action] - expected_policy[action]) < 1e-5F,
+					"compact legal-policy transfer changed direct search probabilities");
 		}
 
 		// A persistent evaluation cache reuses only Policy/Value; every call still builds a new tree.
-		auto cached_options = closed_options;
+		auto cached_options = direct_options;
 		cached_options.evaluation_cache_mb = 1;
 		gadus::Searcher cached_searcher(loaded, torch::Device(torch::kCPU), cached_options);
 		const auto first_cached = cached_searcher.search(board);
@@ -270,8 +269,7 @@ int main() {
 				"clearing the persistent evaluation cache did not force reevaluation");
 
 		// Four simulations exercise root allocation, batched expansion, and value backup.
-		gadus::SearchOptions mcts_options = closed_options;
-		mcts_options.type = gadus::SearchType::Open;
+		gadus::SearchOptions mcts_options = direct_options;
 		mcts_options.mcts_sims = 4;
 		mcts_options.mcts_batch_size = 2;
 		gadus::Searcher mcts_searcher(loaded, torch::Device(torch::kCPU), mcts_options);
@@ -316,10 +314,9 @@ int main() {
 		// A larger budget raises the fair floor above the one-visit bootstrap.
 		const int legal_width = static_cast<int>(start_moves.size());
 		int fair_budget = legal_width;
-		while (static_cast<int>(std::floor(
-				   fair_budget /
-				   (static_cast<double>(legal_width) *
-					std::log(std::exp(1.0) + static_cast<double>(fair_budget))))) < 2) {
+		while (static_cast<int>(std::floor(10.0 * std::log1p(
+				   static_cast<double>(fair_budget) /
+				   (10.0 * static_cast<double>(legal_width))))) < 2) {
 			++fair_budget;
 		}
 		auto fair_options = coverage_options;
