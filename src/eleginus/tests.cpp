@@ -1,4 +1,4 @@
-// CTest entrypoint for codecs, independent Policy/Value inference, storage and PVS invariants.
+// CTest entrypoint for Value inference, storage and PVS invariants.
 
 #include "eleginus/checkpoint.hpp"
 #include "eleginus/dataset.hpp"
@@ -20,14 +20,6 @@ void require(bool condition, const char *message) {
 	}
 }
 
-void require_codec(const chess::Board &board) {
-	for (const auto &move : eleginus::legal_moves(board)) {
-		const int action = eleginus::move_to_index(move, board);
-		require(action >= 0 && action < eleginus::kActionSize, "action index out of range");
-		require(eleginus::index_to_move(action, board) == move, "move codec round trip failed");
-	}
-}
-
 float max_difference(const std::vector<float> &left, const std::vector<float> &right) {
 	require(left.size() == right.size(), "vector size mismatch");
 	float difference = 0.0F;
@@ -37,17 +29,27 @@ float max_difference(const std::vector<float> &left, const std::vector<float> &r
 	return difference;
 }
 
-float max_relation_difference(const eleginus::RelationAccumulator &left,
-							  const eleginus::RelationAccumulator &right) {
+float max_control_difference(const eleginus::ControlAccumulator &left,
+							 const eleginus::ControlAccumulator &right) {
 	float difference = 0.0F;
 	for (int perspective = 0; perspective < eleginus::kPerspectiveCount; ++perspective) {
-		for (int channel = 0; channel < eleginus::kValueAttentionWidth; ++channel) {
+		for (int square = 0; square < 64; ++square)
+			for (int channel = 0; channel < eleginus::kControlLocalWidth; ++channel)
+				difference = std::max(difference, std::abs(
+					left.local[static_cast<std::size_t>(perspective)]
+						[static_cast<std::size_t>(square)][static_cast<std::size_t>(channel)] -
+					right.local[static_cast<std::size_t>(perspective)]
+						[static_cast<std::size_t>(square)][static_cast<std::size_t>(channel)]));
+		for (int channel = 0; channel < eleginus::kControlLocalWidth; ++channel)
 			difference = std::max(difference, std::abs(
-				left.perspective[static_cast<std::size_t>(perspective)]
+				left.mean[static_cast<std::size_t>(perspective)][static_cast<std::size_t>(channel)] -
+				right.mean[static_cast<std::size_t>(perspective)][static_cast<std::size_t>(channel)]));
+		for (int channel = 0; channel < eleginus::kControlAttentionWidth; ++channel)
+			difference = std::max(difference, std::abs(
+				left.attention[static_cast<std::size_t>(perspective)]
 					[static_cast<std::size_t>(channel)] -
-				right.perspective[static_cast<std::size_t>(perspective)]
+				right.attention[static_cast<std::size_t>(perspective)]
 					[static_cast<std::size_t>(channel)]));
-		}
 	}
 	return difference;
 }
@@ -57,9 +59,6 @@ float max_relation_difference(const eleginus::RelationAccumulator &left,
 int main() {
 	try {
 		chess::Board board;
-		require_codec(board);
-		require_codec(chess::Board("8/P7/8/8/8/8/8/k6K w - - 0 1"));
-		require_codec(chess::Board("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1"));
 		const auto encoded = eleginus::encode_features(board);
 		for (const auto &perspective : encoded.perspective) {
 			for (const int feature : perspective) {
@@ -71,96 +70,37 @@ int main() {
 					"canonical feature index out of range");
 			}
 		}
-		const chess::Board left_board("4k3/8/8/8/8/2N5/8/2K5 w - - 0 1");
-		const chess::Board right_board("3k4/8/8/8/8/5N2/8/5K2 w - - 0 1");
-		const auto left = eleginus::encode_features(left_board);
-		const auto right = eleginus::encode_features(right_board);
-		for (int perspective = 0; perspective < eleginus::kPerspectiveCount; ++perspective) {
-			require(eleginus::canonicalize_features(left.perspective[perspective]) ==
-					eleginus::canonicalize_features(right.perspective[perspective]),
-				"horizontal feature canonicalization mismatch");
-		}
-		require(eleginus::move_to_index(chess::uci::uciToMove(left_board, "c3b5"),
-				left_board) ==
-				eleginus::move_to_index(chess::uci::uciToMove(right_board, "f3g5"),
-					right_board),
-			"horizontal action canonicalization mismatch");
-
 		auto model = eleginus::make_model(torch::Device(torch::kCPU), 7);
 		model->eval();
-		eleginus::CpuPolicy policy = eleginus::snapshot_policy(model->policy);
 		eleginus::CpuValue value = eleginus::snapshot_value(model->value);
-		const auto left_moves = eleginus::legal_moves(left_board);
-		const auto right_moves = eleginus::legal_moves(right_board);
-		const auto left_probabilities = policy.evaluate(policy.refresh(left_board), left_moves);
-		const auto right_probabilities = policy.evaluate(policy.refresh(right_board), right_moves);
-		std::array<float, eleginus::kActionSize> left_by_action{};
-		std::array<float, eleginus::kActionSize> right_by_action{};
-		left_by_action.fill(-1.0F);
-		right_by_action.fill(-1.0F);
-		for (std::size_t index = 0; index < left_moves.size(); ++index)
-			left_by_action[static_cast<std::size_t>(
-				eleginus::move_to_index(left_moves[index], left_board))] = left_probabilities[index];
-		for (std::size_t index = 0; index < right_moves.size(); ++index)
-			right_by_action[static_cast<std::size_t>(
-				eleginus::move_to_index(right_moves[index], right_board))] = right_probabilities[index];
-		require(max_difference(
-			std::vector<float>(left_by_action.begin(), left_by_action.end()),
-			std::vector<float>(right_by_action.begin(), right_by_action.end())) < 1.0e-5F,
-			"horizontal canonicalization changed native Policy probabilities");
 		const auto moves = eleginus::legal_moves(board);
-		const auto policy_accumulator = policy.refresh(board);
 		const auto value_accumulator = value.refresh(board);
 		std::vector<eleginus::EncodedFeatures> batch{encoded};
-		auto [features, side] =
+		auto network_batch =
 			eleginus::encode_feature_batch(batch, torch::Device(torch::kCPU));
-		auto [value_batch_features, value_batch_side] =
+		auto value_batch =
 			eleginus::encode_feature_batch({encoded, encoded}, torch::Device(torch::kCPU));
-		auto torch_values = model->value->forward(value_batch_features, value_batch_side);
+		auto torch_values = model->value->forward(value_batch);
 		require(torch_values.dim() == 1 && torch_values.size(0) == 2,
 			"Value batch output shape mismatch");
-		const float torch_value = model->value->forward(features, side).item<float>();
+		const float torch_value = model->value->forward(network_batch).item<float>();
 		require(std::abs(value.evaluate(value_accumulator) - torch_value) < 1.0e-5F,
 				"custom Value inference differs from LibTorch");
-		std::vector<std::int64_t> action_indices;
-		action_indices.reserve(moves.size());
-		for (const auto &move : moves)
-			action_indices.push_back(eleginus::move_to_index(move, board));
-		auto indices = torch::tensor(action_indices, torch::TensorOptions().dtype(torch::kInt64));
-		auto torch_policy = model->policy->forward(features, side)
-			.index_select(1, indices).softmax(1).squeeze(0).contiguous();
-		const auto native_policy = policy.evaluate(policy_accumulator, moves);
-		const std::vector<float> torch_policy_values(
-			torch_policy.data_ptr<float>(), torch_policy.data_ptr<float>() + torch_policy.numel());
-		require(max_difference(native_policy, torch_policy_values) < 1.0e-5F,
-			"custom Policy inference differs from LibTorch");
 
 		auto after = board;
 		after.makeMove(chess::uci::uciToMove(after, "e2e4"));
-		const auto black_e5 = chess::uci::uciToMove(after, "e7e5");
-		require(eleginus::move_to_index(chess::uci::uciToMove(board, "e2e4"), board) ==
-				eleginus::move_to_index(black_e5, after),
-			"side-relative move encoding differs between colors");
-		const auto policy_updated = policy.update(policy_accumulator, board, after);
-		const auto policy_refreshed = policy.refresh(after);
 		const auto value_updated = value.update(value_accumulator, board, after);
 		const auto value_refreshed = value.refresh(after);
-		require(policy_updated.action_mirrored == policy_refreshed.action_mirrored,
-			"incremental Policy action frame differs from refresh");
 		for (int perspective = 0; perspective < eleginus::kPerspectiveCount; ++perspective) {
-			require(max_difference(
-						policy_updated.perspective[static_cast<std::size_t>(perspective)],
-						policy_refreshed.perspective[static_cast<std::size_t>(perspective)]) < 1.0e-5F,
-					"incremental Policy accumulator differs from refresh");
 			require(max_difference(
 						value_updated.features.perspective[static_cast<std::size_t>(perspective)],
 						value_refreshed.features.perspective[static_cast<std::size_t>(perspective)]) <
 					1.0e-5F,
 					"incremental Value accumulator differs from refresh");
 		}
-		require(max_relation_difference(value_updated.relations,
-			value_refreshed.relations) < 1.0e-4F,
-			"incremental Value relation state differs from refresh");
+		require(max_control_difference(value_updated.control,
+			value_refreshed.control) < 1.0e-4F,
+			"incremental Value control state differs from refresh");
 		require(std::abs(value.evaluate(value_updated) - value.evaluate(value_refreshed)) < 1.0e-5F,
 			"incremental Value output differs from refresh");
 
@@ -176,8 +116,8 @@ int main() {
 					1.0e-5F,
 					"incremental Value feature state differs on a special move");
 			}
-			require(max_relation_difference(updated.relations, refreshed.relations) < 1.0e-4F,
-				"incremental Value relation state differs on a special move");
+			require(max_control_difference(updated.control, refreshed.control) < 1.0e-4F,
+				"incremental Value control state differs on a special move");
 			require(std::abs(value.evaluate(updated) - value.evaluate(refreshed)) < 1.0e-5F,
 				"incremental Value output differs on a special move");
 		};
@@ -196,9 +136,9 @@ int main() {
 			next.makeMove(chess::uci::uciToMove(next, uci));
 			sequence_state = value.update(sequence_state, sequence, next);
 			const auto refreshed = value.refresh(next);
-			require(max_relation_difference(sequence_state.relations,
-				refreshed.relations) < 2.0e-4F,
-				"cumulative Value relation updates drifted from refresh");
+			require(max_control_difference(sequence_state.control,
+				refreshed.control) < 2.0e-4F,
+				"cumulative Value control updates drifted from refresh");
 			require(std::abs(value.evaluate(sequence_state) - value.evaluate(refreshed)) < 1.0e-5F,
 				"cumulative Value updates changed the evaluated result");
 			sequence = std::move(next);
@@ -208,14 +148,14 @@ int main() {
 		search_options.depth = 1;
 		search_options.quiescence_depth = 1;
 		search_options.hash_mb = 1;
-		const auto search = eleginus::Searcher(policy, value, search_options).search(board);
+		const auto search = eleginus::Searcher(value, search_options).search(board);
 		require(search.move.move() != chess::Move::NO_MOVE, "PVS returned no move");
 		require(search.depth == 1, "PVS depth mismatch");
 		require(search.nodes >= moves.size(), "PVS node count mismatch");
 		require(search.root.size() == moves.size(), "PVS root move count mismatch");
 		search_options.depth = 4;
 		int completed_depths = 0;
-		const auto cancelled = eleginus::Searcher(policy, value, search_options).search(
+		const auto cancelled = eleginus::Searcher(value, search_options).search(
 			board,
 			[&](const eleginus::SearchResult &) { ++completed_depths; },
 			[&] { return completed_depths >= 1; });
@@ -223,9 +163,9 @@ int main() {
 			"PVS cancellation did not preserve the last completed iteration");
 		search_options.depth = 2;
 		search_options.threads = 1;
-		const auto serial_search = eleginus::Searcher(policy, value, search_options).search(board);
+		const auto serial_search = eleginus::Searcher(value, search_options).search(board);
 		search_options.threads = 2;
-		const auto parallel_search = eleginus::Searcher(policy, value, search_options).search(board);
+		const auto parallel_search = eleginus::Searcher(value, search_options).search(board);
 		require(parallel_search.move == serial_search.move &&
 			parallel_search.score_cp == serial_search.score_cp,
 			"parallel root PVS changed the completed search result");
@@ -233,7 +173,7 @@ int main() {
 			"parallel root PVS omitted legal root moves");
 		search_options.depth = 1;
 		search_options.multipv = 3;
-		const auto multipv_search = eleginus::Searcher(policy, value, search_options).search(board);
+		const auto multipv_search = eleginus::Searcher(value, search_options).search(board);
 		require(multipv_search.root.size() == moves.size(),
 			"MultiPV root search omitted legal root moves");
 		require(std::all_of(multipv_search.root.begin(), multipv_search.root.end(),
@@ -250,18 +190,13 @@ int main() {
 		}
 		eleginus::embed_checkpoint_atomic(checkpoint, executable, embedded);
 		auto runtime_weights = eleginus::load_embedded_runtime_model(embedded);
-		eleginus::CpuPolicy runtime_policy(std::move(runtime_weights.policy));
 		eleginus::CpuValue runtime_value(std::move(runtime_weights.value));
 		require(std::abs(runtime_value.evaluate(runtime_value.refresh(board)) - torch_value) < 1.0e-5F,
 				"native runtime checkpoint changed Value output");
-		require(max_difference(runtime_policy.evaluate(runtime_policy.refresh(board), moves),
-			native_policy) < 1.0e-5F, "native runtime checkpoint changed Policy output");
 		auto loaded = eleginus::load_checkpoint(checkpoint, torch::Device(torch::kCPU));
-		auto loaded_value = loaded->value->forward(features, side);
-		require(torch::allclose(loaded_value, model->value->forward(features, side)),
+		auto loaded_value = loaded->value->forward(network_batch);
+		require(torch::allclose(loaded_value, model->value->forward(network_batch)),
 				"checkpoint changed Value output");
-		require(torch::allclose(loaded->policy->forward(features, side),
-			model->policy->forward(features, side)), "checkpoint changed Policy output");
 		std::filesystem::remove(checkpoint);
 		std::filesystem::remove(executable);
 		std::filesystem::remove(embedded);
@@ -269,17 +204,13 @@ int main() {
 		const auto dataset_path =
 			std::filesystem::temp_directory_path() / "eleginus-value-test.h5";
 		const auto after_encoded = eleginus::encode_features(after);
-		const auto black_move = chess::uci::uciToMove(after, "e7e5");
 		{
 			eleginus::WriterOptions writer_options;
 			writer_options.output = dataset_path;
 			writer_options.compression_level = 0;
 			writer_options.source = "unit_test";
 			eleginus::H5Writer writer(writer_options);
-			writer.append({encoded, after_encoded},
-				{static_cast<std::uint16_t>(eleginus::move_to_index(moves.front(), board)),
-				 static_cast<std::uint16_t>(eleginus::move_to_index(black_move, after))},
-				{0.75F, 0.25F});
+			writer.append({encoded, after_encoded}, {0.75F, 0.25F});
 			writer.flush();
 		}
 		{
@@ -287,27 +218,21 @@ int main() {
 			require(dataset.info().length == 2, "Eleginus HDF5 row count mismatch");
 			require(dataset.info().source == "unit_test", "Eleginus HDF5 source mismatch");
 			auto stored = dataset.read_contiguous(0, 2);
-			require(stored.moves[1].item<std::int64_t>() ==
-				eleginus::move_to_index(black_move, after),
-				"Eleginus HDF5 move mismatch");
 			require(std::abs(stored.values[0].item<float>() - 0.75F) < 1.0e-6F,
 				"Eleginus HDF5 Value mismatch");
-			auto [original_features, original_side] = eleginus::encode_feature_batch(
+			auto original_batch = eleginus::encode_feature_batch(
 				{encoded, after_encoded}, torch::Device(torch::kCPU));
-			auto [stored_features, stored_side] =
+			auto stored_batch =
 				eleginus::encode_feature_batch(stored.features, torch::Device(torch::kCPU));
-			require(torch::allclose(model->value->forward(original_features, original_side),
-				model->value->forward(stored_features, stored_side)),
+			require(torch::allclose(model->value->forward(original_batch),
+				model->value->forward(stored_batch)),
 				"Eleginus HDF5 side-to-move orientation changed Value input");
-			require(torch::allclose(model->policy->forward(original_features, original_side),
-				model->policy->forward(stored_features, stored_side)),
-				"Eleginus HDF5 side-to-move orientation changed Policy input");
 		}
 		auto training_model = eleginus::make_model(torch::Device(torch::kCPU), 11);
 		const auto training_checkpoint =
 			std::filesystem::temp_directory_path() / "eleginus-training-test.pth";
-		const auto attention_before =
-			training_model->value->attention->weight.detach().clone();
+		const auto control_before =
+			training_model->value->control_source->weight.detach().clone();
 		const auto output_before = training_model->value->output->weight.detach().clone();
 		eleginus::TrainOptions training_options;
 		training_options.data = dataset_path;
@@ -327,15 +252,10 @@ int main() {
 		require(torch::allclose(epoch_model->value->output->weight,
 			training_model->value->output->weight),
 			"Eleginus epoch checkpoint does not contain the trained parameters");
-		const auto attention_change =
-			(training_model->value->attention->weight.detach() - attention_before).abs();
-		for (int part = 0; part < 3; ++part) {
-			const auto begin = part * eleginus::kValueAttentionWidth;
-			const auto end = begin + eleginus::kValueAttentionWidth;
-			require(attention_change.index({torch::indexing::Slice(),
-				torch::indexing::Slice(begin, end)}).max().item<float>() > 0.0F,
-				"Eleginus relation parameters received no Value gradient");
-		}
+		const auto control_change =
+			(training_model->value->control_source->weight.detach() - control_before).abs();
+		require(control_change.max().item<float>() > 0.0F,
+			"Eleginus control parameters received no Value gradient");
 		require((training_model->value->output->weight.detach() - output_before)
 				.abs().max().item<float>() > 0.0F,
 			"Eleginus Value output received no gradient");
@@ -380,23 +300,13 @@ int main() {
 			require(stored.values[2].item<float>() > 0.5F &&
 					stored.values[3].item<float>() < 0.5F,
 				"Eleginus preprocessing lost multiline evaluation comments");
-			chess::Board replay;
-			for (std::int64_t row = 0; row < 4; ++row) {
-				const auto expected = chess::uci::parseSan(
-					replay, std::array<std::string_view, 4>{"e4", "e5", "Nf3", "Nc6"}
-						[static_cast<std::size_t>(row)]);
-				require(stored.moves[row].item<std::int64_t>() ==
-						eleginus::move_to_index(expected, replay),
-					"Eleginus preprocessing changed a move after a root comment");
-				replay.makeMove(expected);
-			}
 		}
 		std::filesystem::remove(pgn_path);
 		std::filesystem::remove(preprocessed_path);
 
 		chess::Board mate("7k/6Q1/6K1/8/8/8/8/8 b - - 0 1");
 		require(eleginus::game_is_over(mate), "checkmate not detected");
-		const auto mate_search = eleginus::Searcher(policy, value, search_options).search(mate);
+		const auto mate_search = eleginus::Searcher(value, search_options).search(mate);
 		require(mate_search.score_cp < -29000, "checkmate score mismatch");
 		std::cout << "eleginustests passed\n";
 		return 0;

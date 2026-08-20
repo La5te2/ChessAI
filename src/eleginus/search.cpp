@@ -1,8 +1,9 @@
-// Implements Policy-ordered principal-variation search over incremental Value states.
+// Implements principal-variation search over incremental Value states.
 
 #include "eleginus/search.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstddef>
@@ -30,7 +31,6 @@ inline constexpr float kValueCentipawnScale = 150.0F;
 
 struct Position {
 	chess::Board board;
-	FloatAccumulator policy_accumulator;
 	ValueAccumulator value_accumulator;
 };
 
@@ -68,6 +68,10 @@ std::uint64_t mix_key(std::uint64_t value) noexcept {
 	value ^= value >> 27;
 	value *= 0x94d049bb133111ebULL;
 	return value ^ (value >> 31);
+}
+
+int history_index(const chess::Move &move) noexcept {
+	return move.from().index() * kBoardSquares + move.to().index();
 }
 
 std::uint64_t transposition_key(const chess::Board &board) noexcept {
@@ -175,10 +179,10 @@ int late_move_reduction(int depth, std::size_t move_index) noexcept {
 
 class PvsContext {
 	public:
-	PvsContext(const CpuPolicy &policy, const CpuValue &value, SearchOptions options,
+	PvsContext(const CpuValue &value, SearchOptions options,
 			   SearchCancelCallback cancel, std::atomic_uint64_t *shared_nodes = nullptr,
 			   std::size_t hash_shards = 1)
-		: policy_(policy), value_(value), options_(std::move(options)), cancel_(std::move(cancel)),
+		: value_(value), options_(std::move(options)), cancel_(std::move(cancel)),
 		  table_(options_.hash_mb, hash_shards), shared_nodes_(shared_nodes) {}
 
 	void check_stop(bool force = false) const {
@@ -198,19 +202,24 @@ class PvsContext {
 	}
 
 	std::vector<OrderedMove> ordered_moves(const Position &position,
-									   std::vector<chess::Move> moves, bool use_policy,
+									   std::vector<chess::Move> moves, int ply,
 									   const chess::Move &preferred = chess::Move::NO_MOVE) {
 		if (moves.empty())
 			return {};
 		std::vector<OrderedMove> ordered;
 		ordered.reserve(moves.size());
-		if (use_policy) {
-			const auto priors = policy_.evaluate(position.policy_accumulator, moves);
-			for (std::size_t index = 0; index < moves.size(); ++index)
-				ordered.push_back({moves[index], priors[index]});
-		} else {
-			for (const auto &move : moves)
-				ordered.push_back({move, static_cast<float>(tactical_order(position.board, move))});
+		for (const auto &move : moves) {
+			int score = tactical_order(position.board, move) * 1024;
+			if (!position.board.isCapture(move) && move.typeOf() != chess::Move::PROMOTION) {
+				score += history_[static_cast<std::size_t>(history_index(move))];
+				if (ply >= 0 && ply < static_cast<int>(killers_.size())) {
+					if (move == killers_[static_cast<std::size_t>(ply)][0])
+						score += 900000;
+					else if (move == killers_[static_cast<std::size_t>(ply)][1])
+						score += 800000;
+				}
+			}
+			ordered.push_back({move, static_cast<float>(score)});
 		}
 		std::sort(ordered.begin(), ordered.end(), [](const OrderedMove &left,
 													  const OrderedMove &right) {
@@ -231,8 +240,6 @@ class PvsContext {
 		Position child;
 		child.board = position.board;
 		child.board.makeMove(move);
-		child.policy_accumulator = policy_.update(
-			position.policy_accumulator, position.board, child.board);
 		child.value_accumulator = value_.update(
 			position.value_accumulator, position.board, child.board);
 		return child;
@@ -278,7 +285,7 @@ class PvsContext {
 				return stand_pat;
 		}
 
-		const auto ordered = ordered_moves(position, std::move(moves), false);
+		const auto ordered = ordered_moves(position, std::move(moves), ply);
 		for (const auto &candidate : ordered) {
 			if (!in_check && candidate.move.typeOf() != chess::Move::PROMOTION &&
 				position.board.givesCheck(candidate.move) == chess::CheckType::NO_CHECK) {
@@ -329,7 +336,7 @@ class PvsContext {
 		if (moves.empty())
 			return empty_move_score(position.board, ply);
 		const bool in_check = position.board.inCheck();
-		const auto ordered = ordered_moves(position, std::move(moves), true, preferred);
+		const auto ordered = ordered_moves(position, std::move(moves), ply, preferred);
 		int best = -kInfinity;
 		chess::Move best_move{chess::Move::NO_MOVE};
 		for (std::size_t move_index = 0; move_index < ordered.size(); ++move_index) {
@@ -361,8 +368,19 @@ class PvsContext {
 				best_move = candidate.move;
 			}
 			alpha = std::max(alpha, score);
-			if (alpha >= beta)
+			if (alpha >= beta) {
+				if (quiet) {
+					auto &history = history_[static_cast<std::size_t>(history_index(candidate.move))];
+					history = std::clamp(history + depth * depth, -16000, 16000);
+					if (ply < static_cast<int>(killers_.size()) &&
+						candidate.move != killers_[static_cast<std::size_t>(ply)][0]) {
+						killers_[static_cast<std::size_t>(ply)][1] =
+							killers_[static_cast<std::size_t>(ply)][0];
+						killers_[static_cast<std::size_t>(ply)][0] = candidate.move;
+					}
+				}
 				break;
+			}
 		}
 
 		Bound bound = Bound::exact;
@@ -387,7 +405,7 @@ class PvsContext {
 		const auto hint = ordering_hints_.find(root.board.hash());
 		if (hint != ordering_hints_.end())
 			preferred = hint->second;
-		const auto ordered = ordered_moves(root, std::move(moves), true, preferred);
+		const auto ordered = ordered_moves(root, std::move(moves), 0, preferred);
 		result.root.reserve(ordered.size());
 		const bool exact_root_lines = options_.multipv > 1;
 		for (std::size_t move_index = 0; move_index < ordered.size(); ++move_index) {
@@ -430,8 +448,8 @@ class PvsContext {
 				return left.score_cp > right.score_cp;
 			if (left.exact_score != right.exact_score)
 				return left.exact_score;
-			if (left.prior != right.prior)
-				return left.prior > right.prior;
+			if (left.order != right.order)
+				return left.order > right.order;
 			return move_uci(left.move) < move_uci(right.move);
 		});
 		return result;
@@ -450,7 +468,7 @@ class PvsContext {
 		const auto hint = ordering_hints_.find(root.board.hash());
 		if (hint != ordering_hints_.end())
 			preferred = hint->second;
-		const auto ordered = ordered_moves(root, std::move(moves), true, preferred);
+		const auto ordered = ordered_moves(root, std::move(moves), 0, preferred);
 		std::vector<std::optional<RootMove>> rows(ordered.size());
 		const bool exact_root_lines = options_.multipv > 1;
 
@@ -547,19 +565,20 @@ class PvsContext {
 				return left.score_cp > right.score_cp;
 			if (left.exact_score != right.exact_score)
 				return left.exact_score;
-			if (left.prior != right.prior)
-				return left.prior > right.prior;
+			if (left.order != right.order)
+				return left.order > right.order;
 			return move_uci(left.move) < move_uci(right.move);
 		});
 		return result;
 	}
 
-	const CpuPolicy &policy_;
 	const CpuValue &value_;
 	SearchOptions options_;
 	SearchCancelCallback cancel_;
 	TranspositionTable table_;
 	std::unordered_map<std::uint64_t, chess::Move> ordering_hints_;
+	std::array<int, kBoardSquares * kBoardSquares> history_{};
+	std::array<std::array<chess::Move, 2>, 64> killers_{};
 	std::atomic_uint64_t *shared_nodes_ = nullptr;
 	std::uint64_t nodes = 0;
 	std::uint64_t evaluated_nodes = 0;
@@ -568,8 +587,8 @@ class PvsContext {
 
 } // namespace
 
-Searcher::Searcher(const CpuPolicy &policy, const CpuValue &value, SearchOptions options)
-	: policy_(&policy), value_(&value), options_(options) {
+Searcher::Searcher(const CpuValue &value, SearchOptions options)
+	: value_(&value), options_(options) {
 	if (options_.depth <= 0 || options_.depth > 64 ||
 		options_.quiescence_depth < 0 || options_.quiescence_depth > 32 ||
 		options_.hash_mb == 0 || options_.hash_mb > 4096 ||
@@ -593,7 +612,7 @@ SearchResult Searcher::search(const chess::Board &board,
 	}
 
 	const auto root_moves = legal_moves(board);
-	Position root{board, policy_->refresh(board), value_->refresh(board)};
+	Position root{board, value_->refresh(board)};
 	const std::size_t worker_count = std::min<std::size_t>(
 		static_cast<std::size_t>(options_.threads), std::max<std::size_t>(1, root_moves.size()));
 	std::atomic_uint64_t shared_nodes{0};
@@ -605,7 +624,7 @@ SearchResult Searcher::search(const chess::Board &board,
 	contexts.reserve(worker_count);
 	for (std::size_t index = 0; index < worker_count; ++index) {
 		contexts.push_back(std::make_unique<PvsContext>(
-			*policy_, *value_, options_, combined_cancel, &shared_nodes, worker_count));
+			*value_, options_, combined_cancel, &shared_nodes, worker_count));
 	}
 	IterationResult completed;
 	for (int depth = 1; depth <= options_.depth; ++depth) {

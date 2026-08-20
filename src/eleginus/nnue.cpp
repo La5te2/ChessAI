@@ -1,4 +1,4 @@
-// Implements sparse feature deltas and independent incremental Policy/Value inference.
+// Implements sparse feature deltas and incremental Value inference.
 
 #include "eleginus/nnue.hpp"
 
@@ -19,14 +19,6 @@ int oriented_square(int square, chess::Color perspective) {
 
 int horizontally_mirrored_square(int square, int king_square) {
 	return king_square % 8 < 4 ? square ^ 7 : square;
-}
-
-bool perspective_is_mirrored(const PerspectiveFeatures &features) {
-	for (const int feature : features) {
-		if (feature >= 0 && feature < kEncodedPieceFeatureCount)
-			return (feature / (12 * 64)) % 8 < 4;
-	}
-	throw std::runtime_error("Eleginus encoded perspective contains no king bucket");
 }
 
 int relative_piece_index(const chess::Piece &piece, chess::Color perspective) {
@@ -79,9 +71,6 @@ FloatAccumulator refresh_accumulator(const EncodedFeatures &encoded,
 									 const std::vector<float> &bias, int width) {
 	FloatAccumulator result;
 	result.white_to_move = encoded.white_to_move;
-	const int mover = encoded.white_to_move ? 0 : 1;
-	result.action_mirrored = perspective_is_mirrored(
-		encoded.perspective[static_cast<std::size_t>(mover)]);
 	for (const int feature : encoded.perspective[0])
 		result.piece_count += feature != kEncodedPaddingFeature;
 	result.piece_count -= 2;
@@ -99,20 +88,12 @@ FloatAccumulator refresh_accumulator(const EncodedFeatures &encoded,
 	return result;
 }
 
-FloatAccumulator refresh_accumulator(const chess::Board &board, const std::vector<float> &table,
-									 const std::vector<float> &bias, int width) {
-	return refresh_accumulator(encode_features(board), table, bias, width);
-}
-
 FloatAccumulator update_accumulator(const FloatAccumulator &current,
 									const EncodedFeatures &old_features,
 									const EncodedFeatures &new_features,
 									const std::vector<float> &table, int width) {
 	FloatAccumulator result = current;
 	result.white_to_move = new_features.white_to_move;
-	const int mover = new_features.white_to_move ? 0 : 1;
-	result.action_mirrored = perspective_is_mirrored(
-		new_features.perspective[static_cast<std::size_t>(mover)]);
 	result.piece_count = 0;
 	for (const int feature : new_features.perspective[0])
 		result.piece_count += feature != kEncodedPaddingFeature;
@@ -139,139 +120,301 @@ FloatAccumulator update_accumulator(const FloatAccumulator &current,
 	return result;
 }
 
-FloatAccumulator update_accumulator(const FloatAccumulator &current, const chess::Board &before,
-									const chess::Board &after,
-									const std::vector<float> &table, int width) {
-	return update_accumulator(current, encode_features(before), encode_features(after), table,
-		width);
-}
+struct PieceToken {
+	int type = 0;
+	int square = 0;
+};
 
-std::vector<int> piece_features(const EncodedFeatures &encoded, int perspective) {
-	const auto canonical = canonicalize_features(
-		encoded.perspective[static_cast<std::size_t>(perspective)]);
-	std::vector<int> result;
+std::vector<PieceToken> piece_tokens(const PerspectiveFeatures &features) {
+	std::vector<PieceToken> result;
 	result.reserve(kFeatureSlots - 2);
-	for (const int feature : canonical) {
-		if (feature >= 0 && feature < kPieceFeatureCount)
-			result.push_back(feature);
+	for (const int feature : features) {
+		if (feature >= 0 && feature < kPieceFeatureCount) {
+			const int code = feature % (12 * 64);
+			result.push_back(PieceToken{code / 64, code % 64});
+		}
 	}
 	return result;
 }
 
-bool contains_feature(const std::vector<int> &features, int feature) {
-	return std::find(features.begin(), features.end(), feature) != features.end();
+bool inside(int rank, int file) {
+	return rank >= 0 && rank < 8 && file >= 0 && file < 8;
 }
 
-void add_relation_pair(std::array<float, kValueAttentionWidth> &accumulator,
-						   const std::vector<float> &table, int source, int target, float sign) {
-	const auto source_offset = static_cast<std::size_t>(source) * kValueAttentionTableWidth;
-	const auto target_offset = static_cast<std::size_t>(target) * kValueAttentionTableWidth;
-	float score = 0.0F;
-	for (int channel = 0; channel < kValueAttentionWidth; ++channel) {
-		score += table[source_offset + static_cast<std::size_t>(channel)] *
-			table[target_offset + kValueAttentionWidth + static_cast<std::size_t>(channel)];
+template <typename Add>
+void attack_targets(const PieceToken &piece, const std::array<std::uint8_t, 64> &occupancy,
+					Add add) {
+	const int rank = piece.square / 8;
+	const int file = piece.square % 8;
+	const int kind = piece.type % 6;
+	if (kind == 0) {
+		const int direction = piece.type < 6 ? 1 : -1;
+		for (const int df : {-1, 1}) {
+			if (inside(rank + direction, file + df))
+				add((rank + direction) * 8 + file + df);
+		}
+		return;
 	}
-	score = std::clamp(score / std::sqrt(static_cast<float>(kValueAttentionWidth)),
+	if (kind == 1) {
+		constexpr std::array offsets{
+			std::pair{-2, -1}, std::pair{-2, 1}, std::pair{-1, -2}, std::pair{-1, 2},
+			std::pair{1, -2}, std::pair{1, 2}, std::pair{2, -1}, std::pair{2, 1},
+		};
+		for (const auto [dr, df] : offsets) {
+			if (inside(rank + dr, file + df))
+				add((rank + dr) * 8 + file + df);
+		}
+		return;
+	}
+	if (kind == 5) {
+		for (int dr = -1; dr <= 1; ++dr) {
+			for (int df = -1; df <= 1; ++df) {
+				if ((dr != 0 || df != 0) && inside(rank + dr, file + df))
+					add((rank + dr) * 8 + file + df);
+			}
+		}
+		return;
+	}
+	const bool diagonal = kind == 2 || kind == 4;
+	const bool straight = kind == 3 || kind == 4;
+	for (int dr = -1; dr <= 1; ++dr) {
+		for (int df = -1; df <= 1; ++df) {
+			if (dr == 0 && df == 0)
+				continue;
+			if ((dr != 0 && df != 0 && !diagonal) || ((dr == 0 || df == 0) && !straight))
+				continue;
+			for (int distance = 1; distance < 8; ++distance) {
+				const int target_rank = rank + dr * distance;
+				const int target_file = file + df * distance;
+				if (!inside(target_rank, target_file))
+					break;
+				const int target = target_rank * 8 + target_file;
+				add(target);
+				if (occupancy[static_cast<std::size_t>(target)] != 0)
+					break;
+			}
+		}
+	}
+}
+
+void add_control_message(std::array<float, kControlWidth> &field,
+						 const ValueWeights &weights, const ControlEdge &edge, float sign) {
+	const auto source = static_cast<std::size_t>(edge.source) * kControlWidth;
+	const auto target = static_cast<std::size_t>(edge.target) * kControlWidth;
+	const auto geometry = static_cast<std::size_t>(edge.geometry) * kControlWidth;
+	for (int channel = 0; channel < kControlWidth; ++channel) {
+		const auto index = static_cast<std::size_t>(channel);
+		const float latent = std::clamp(weights.control_source[source + index] +
+			weights.control_target[target + index] + weights.control_geometry[geometry + index],
+			0.0F, 1.0F);
+		field[index] += sign * latent * latent;
+	}
+}
+
+std::array<float, kControlLocalWidth> local_square(
+	const ControlAccumulator &control, const ValueWeights &weights, int perspective, int square) {
+	constexpr int input_width = kControlWidth * 2 + kControlCountWidth * 2 +
+		kControlOccupancyWidth + kControlSquareWidth;
+	std::array<float, input_width> input{};
+	int cursor = 0;
+	for (int ownership = 0; ownership < 2; ++ownership) {
+		const auto &field = control.field[static_cast<std::size_t>(perspective * 2 + ownership)]
+			[static_cast<std::size_t>(square)];
+		for (const float value : field)
+			input[static_cast<std::size_t>(cursor++)] = value;
+	}
+	for (int ownership = 0; ownership < 2; ++ownership) {
+		const int count = std::min<int>(control.count[static_cast<std::size_t>(perspective)]
+			[static_cast<std::size_t>(ownership)][static_cast<std::size_t>(square)], 7);
+		const auto offset = static_cast<std::size_t>(count * kControlCountWidth);
+		for (int channel = 0; channel < kControlCountWidth; ++channel)
+			input[static_cast<std::size_t>(cursor++)] =
+				weights.control_count[offset + static_cast<std::size_t>(channel)];
+	}
+	const auto occupancy_offset = static_cast<std::size_t>(
+		control.occupancy[static_cast<std::size_t>(perspective)][static_cast<std::size_t>(square)] *
+		kControlOccupancyWidth);
+	for (int channel = 0; channel < kControlOccupancyWidth; ++channel)
+		input[static_cast<std::size_t>(cursor++)] =
+			weights.control_occupancy[occupancy_offset + static_cast<std::size_t>(channel)];
+	const auto square_offset = static_cast<std::size_t>(square * kControlSquareWidth);
+	for (int channel = 0; channel < kControlSquareWidth; ++channel)
+		input[static_cast<std::size_t>(cursor++)] =
+			weights.control_square[square_offset + static_cast<std::size_t>(channel)];
+
+	std::array<float, kControlLocalWidth> result{};
+	for (int row = 0; row < kControlLocalWidth; ++row) {
+		float value = weights.control_local_bias[static_cast<std::size_t>(row)];
+		const auto offset = static_cast<std::size_t>(row * input_width);
+		for (int column = 0; column < input_width; ++column)
+			value += weights.control_local_weight[offset + static_cast<std::size_t>(column)] *
+				input[static_cast<std::size_t>(column)];
+		value = std::clamp(value, 0.0F, 1.0F);
+		result[static_cast<std::size_t>(row)] = value * value;
+	}
+	return result;
+}
+
+void add_pooling_contribution(ControlAccumulator &control, const ValueWeights &weights,
+							  int perspective,
+							  const std::array<float, kControlLocalWidth> &local, float sign) {
+	std::array<float, kControlAttentionKeyWidth> key{};
+	std::array<float, kControlAttentionWidth> value{};
+	for (int row = 0; row < kControlAttentionKeyWidth; ++row) {
+		float total = weights.attention_key_bias[static_cast<std::size_t>(row)];
+		for (int column = 0; column < kControlLocalWidth; ++column)
+			total += weights.attention_key_weight[static_cast<std::size_t>(
+				row * kControlLocalWidth + column)] * local[static_cast<std::size_t>(column)];
+		key[static_cast<std::size_t>(row)] = total;
+	}
+	for (int row = 0; row < kControlAttentionWidth; ++row) {
+		float total = weights.attention_value_bias[static_cast<std::size_t>(row)];
+		for (int column = 0; column < kControlLocalWidth; ++column)
+			total += weights.attention_value_weight[static_cast<std::size_t>(
+				row * kControlLocalWidth + column)] * local[static_cast<std::size_t>(column)];
+		value[static_cast<std::size_t>(row)] = total;
+	}
+	const auto query_offset = static_cast<std::size_t>(control.bucket * kControlAttentionKeyWidth);
+	float logit = 0.0F;
+	for (int channel = 0; channel < kControlAttentionKeyWidth; ++channel)
+		logit += weights.attention_query[query_offset + static_cast<std::size_t>(channel)] *
+			key[static_cast<std::size_t>(channel)];
+	logit = std::clamp(logit / std::sqrt(static_cast<float>(kControlAttentionKeyWidth)),
 		-8.0F, 8.0F);
-	const float coefficient = 2.0F / (1.0F + std::exp(-score)) - 1.0F;
-	for (int channel = 0; channel < kValueAttentionWidth; ++channel) {
-		accumulator[static_cast<std::size_t>(channel)] += sign * coefficient *
-			table[target_offset + 2 * kValueAttentionWidth +
-				static_cast<std::size_t>(channel)];
+	const float attention_weight = std::exp(logit);
+	auto &mean = control.mean[static_cast<std::size_t>(perspective)];
+	auto &numerator = control.attention_numerator[static_cast<std::size_t>(perspective)];
+	for (int channel = 0; channel < kControlLocalWidth; ++channel)
+		mean[static_cast<std::size_t>(channel)] +=
+			sign * local[static_cast<std::size_t>(channel)] / 64.0F;
+	for (int channel = 0; channel < kControlAttentionWidth; ++channel)
+		numerator[static_cast<std::size_t>(channel)] +=
+			sign * attention_weight * value[static_cast<std::size_t>(channel)];
+	control.attention_denominator[static_cast<std::size_t>(perspective)] +=
+		sign * attention_weight;
+}
+
+void finish_pooling(ControlAccumulator &control, int perspective) {
+	const float denominator = std::max(
+		control.attention_denominator[static_cast<std::size_t>(perspective)], 1.0e-12F);
+	for (int channel = 0; channel < kControlAttentionWidth; ++channel)
+		control.attention[static_cast<std::size_t>(perspective)]
+			[static_cast<std::size_t>(channel)] =
+			control.attention_numerator[static_cast<std::size_t>(perspective)]
+				[static_cast<std::size_t>(channel)] / denominator;
+}
+
+void refresh_pooling(ControlAccumulator &control, const ValueWeights &weights) {
+	for (int perspective = 0; perspective < kPerspectiveCount; ++perspective) {
+		control.mean[static_cast<std::size_t>(perspective)].fill(0.0F);
+		control.attention_numerator[static_cast<std::size_t>(perspective)].fill(0.0F);
+		control.attention_denominator[static_cast<std::size_t>(perspective)] = 0.0F;
+		for (int square = 0; square < 64; ++square)
+			add_pooling_contribution(control, weights, perspective,
+				control.local[static_cast<std::size_t>(perspective)]
+					[static_cast<std::size_t>(square)], 1.0F);
+		finish_pooling(control, perspective);
 	}
 }
 
-RelationAccumulator refresh_relations(const EncodedFeatures &encoded,
-									  const std::vector<float> &table) {
-	RelationAccumulator result;
-	for (int perspective = 0; perspective < kPerspectiveCount; ++perspective) {
-		const auto pieces = piece_features(encoded, perspective);
-		auto &total = result.perspective[static_cast<std::size_t>(perspective)];
-		for (std::size_t source = 0; source < pieces.size(); ++source) {
-			for (std::size_t target = 0; target < pieces.size(); ++target) {
-				if (source != target)
-					add_relation_pair(total, table, pieces[source], pieces[target], 1.0F);
-			}
-		}
+ControlAccumulator refresh_control(const ControlFeatures &features, const ValueWeights &weights,
+								   int bucket) {
+	ControlAccumulator result;
+	result.edges = features.edges;
+	result.occupancy = features.occupancy;
+	result.material = features.material;
+	result.bucket = bucket;
+	for (const auto &edge : result.edges) {
+		add_control_message(result.field[static_cast<std::size_t>(edge.perspective * 2 +
+			edge.ownership)][static_cast<std::size_t>(edge.square)], weights, edge, 1.0F);
+		auto &count = result.count[static_cast<std::size_t>(edge.perspective)]
+			[static_cast<std::size_t>(edge.ownership)][static_cast<std::size_t>(edge.square)];
+		if (count < std::numeric_limits<std::uint8_t>::max())
+			++count;
 	}
+	for (int perspective = 0; perspective < kPerspectiveCount; ++perspective)
+		for (int square = 0; square < 64; ++square)
+			result.local[static_cast<std::size_t>(perspective)][static_cast<std::size_t>(square)] =
+				local_square(result, weights, perspective, square);
+	refresh_pooling(result, weights);
 	return result;
 }
 
-RelationAccumulator update_relations(const RelationAccumulator &current,
-									 const EncodedFeatures &old_encoded,
-									 const EncodedFeatures &new_encoded,
-									 const std::vector<float> &table) {
-	RelationAccumulator result = current;
+ControlAccumulator update_control(const ControlAccumulator &current,
+								  const ControlFeatures &features,
+								  const ValueWeights &weights, int bucket) {
+	ControlAccumulator result = current;
+	std::array<std::array<bool, 64>, kPerspectiveCount> dirty{};
+	std::size_t old_index = 0;
+	std::size_t new_index = 0;
+	while (old_index < current.edges.size() || new_index < features.edges.size()) {
+		if (new_index == features.edges.size() ||
+			(old_index < current.edges.size() && current.edges[old_index] < features.edges[new_index])) {
+			const auto &edge = current.edges[old_index++];
+			add_control_message(result.field[static_cast<std::size_t>(edge.perspective * 2 +
+				edge.ownership)][static_cast<std::size_t>(edge.square)], weights, edge, -1.0F);
+			auto &count = result.count[static_cast<std::size_t>(edge.perspective)]
+				[static_cast<std::size_t>(edge.ownership)][static_cast<std::size_t>(edge.square)];
+			if (count == 0)
+				throw std::runtime_error("Eleginus control count underflow");
+			--count;
+			dirty[static_cast<std::size_t>(edge.perspective)][static_cast<std::size_t>(edge.square)] = true;
+		} else if (old_index == current.edges.size() ||
+			features.edges[new_index] < current.edges[old_index]) {
+			const auto &edge = features.edges[new_index++];
+			add_control_message(result.field[static_cast<std::size_t>(edge.perspective * 2 +
+				edge.ownership)][static_cast<std::size_t>(edge.square)], weights, edge, 1.0F);
+			auto &count = result.count[static_cast<std::size_t>(edge.perspective)]
+				[static_cast<std::size_t>(edge.ownership)][static_cast<std::size_t>(edge.square)];
+			if (count < std::numeric_limits<std::uint8_t>::max())
+				++count;
+			dirty[static_cast<std::size_t>(edge.perspective)][static_cast<std::size_t>(edge.square)] = true;
+		} else {
+			++old_index;
+			++new_index;
+		}
+	}
 	for (int perspective = 0; perspective < kPerspectiveCount; ++perspective) {
-		const auto old_pieces = piece_features(old_encoded, perspective);
-		const auto new_pieces = piece_features(new_encoded, perspective);
-		std::vector<int> removed;
-		std::vector<int> added;
-		for (const int feature : old_pieces) {
-			if (!contains_feature(new_pieces, feature))
-				removed.push_back(feature);
-		}
-		for (const int feature : new_pieces) {
-			if (!contains_feature(old_pieces, feature))
-				added.push_back(feature);
-		}
-
-		auto &total = result.perspective[static_cast<std::size_t>(perspective)];
-		// Remove every old ordered pair with at least one endpoint in removed.
-		for (const int source : removed) {
-			for (const int target : old_pieces) {
-				if (source != target)
-					add_relation_pair(total, table, source, target, -1.0F);
-			}
-		}
-		for (const int source : old_pieces) {
-			if (contains_feature(removed, source))
-				continue;
-			for (const int target : removed)
-				add_relation_pair(total, table, source, target, -1.0F);
-		}
-
-		// Add every new ordered pair with at least one endpoint in added.
-		for (const int source : added) {
-			for (const int target : new_pieces) {
-				if (source != target)
-					add_relation_pair(total, table, source, target, 1.0F);
-			}
-		}
-		for (const int source : new_pieces) {
-			if (contains_feature(added, source))
-				continue;
-			for (const int target : added)
-				add_relation_pair(total, table, source, target, 1.0F);
+		for (int square = 0; square < 64; ++square) {
+			if (result.occupancy[static_cast<std::size_t>(perspective)]
+				[static_cast<std::size_t>(square)] !=
+				features.occupancy[static_cast<std::size_t>(perspective)]
+				[static_cast<std::size_t>(square)])
+				dirty[static_cast<std::size_t>(perspective)][static_cast<std::size_t>(square)] = true;
 		}
 	}
+	result.edges = features.edges;
+	result.occupancy = features.occupancy;
+	result.material = features.material;
+	const bool bucket_changed = result.bucket != bucket;
+	result.bucket = bucket;
+	for (int perspective = 0; perspective < kPerspectiveCount; ++perspective) {
+		for (int square = 0; square < 64; ++square) {
+			if (dirty[static_cast<std::size_t>(perspective)][static_cast<std::size_t>(square)]) {
+				if (!bucket_changed)
+					add_pooling_contribution(result, weights, perspective,
+						result.local[static_cast<std::size_t>(perspective)]
+							[static_cast<std::size_t>(square)], -1.0F);
+				result.local[static_cast<std::size_t>(perspective)][static_cast<std::size_t>(square)] =
+					local_square(result, weights, perspective, square);
+				if (!bucket_changed)
+					add_pooling_contribution(result, weights, perspective,
+						result.local[static_cast<std::size_t>(perspective)]
+							[static_cast<std::size_t>(square)], 1.0F);
+			}
+		}
+		if (!bucket_changed)
+			finish_pooling(result, perspective);
+	}
+	if (bucket_changed)
+		refresh_pooling(result, weights);
 	return result;
-}
-
-std::vector<float> oriented_input(const FloatAccumulator &accumulator, int width,
-								  bool squared) {
-	std::vector<float> input(static_cast<std::size_t>(width * 2));
-	const int first = accumulator.white_to_move ? 0 : 1;
-	const int second = 1 - first;
-	for (int channel = 0; channel < width; ++channel) {
-		const float first_value = std::clamp(
-			accumulator.perspective[static_cast<std::size_t>(first)]
-				[static_cast<std::size_t>(channel)], 0.0F, 1.0F);
-		const float second_value = std::clamp(
-			accumulator.perspective[static_cast<std::size_t>(second)]
-				[static_cast<std::size_t>(channel)], 0.0F, 1.0F);
-		input[static_cast<std::size_t>(channel)] = squared ? first_value * first_value : first_value;
-		input[static_cast<std::size_t>(width + channel)] =
-			squared ? second_value * second_value : second_value;
-	}
-	return input;
 }
 
 std::vector<float> oriented_value_input(const ValueAccumulator &accumulator) {
 	std::vector<float> input(static_cast<std::size_t>(kValueDenseWidth * 2));
 	const int first = accumulator.features.white_to_move ? 0 : 1;
 	const int second = 1 - first;
-	const float source_count = std::max(1, accumulator.features.piece_count);
 	for (int side = 0; side < kPerspectiveCount; ++side) {
 		const int perspective = side == 0 ? first : second;
 		const auto output_offset = static_cast<std::size_t>(side * kValueDenseWidth);
@@ -281,28 +424,17 @@ std::vector<float> oriented_value_input(const ValueAccumulator &accumulator) {
 					[static_cast<std::size_t>(channel)], 0.0F, 1.0F);
 			input[output_offset + static_cast<std::size_t>(channel)] = value * value;
 		}
-		for (int channel = 0; channel < kValueAttentionWidth; ++channel) {
+		for (int channel = 0; channel < kControlLocalWidth; ++channel)
 			input[output_offset + kValueAccumulatorWidth + static_cast<std::size_t>(channel)] =
-				accumulator.relations.perspective[static_cast<std::size_t>(perspective)]
-					[static_cast<std::size_t>(channel)] / source_count;
-		}
+				accumulator.control.mean[static_cast<std::size_t>(perspective)]
+					[static_cast<std::size_t>(channel)];
+		for (int channel = 0; channel < kControlAttentionWidth; ++channel)
+			input[output_offset + kValueAccumulatorWidth + kControlLocalWidth +
+				static_cast<std::size_t>(channel)] =
+				accumulator.control.attention[static_cast<std::size_t>(perspective)]
+					[static_cast<std::size_t>(channel)];
 	}
 	return input;
-}
-
-std::vector<float> linear_relu(const std::vector<float> &input,
-							   const std::vector<float> &weight,
-							   const std::vector<float> &bias, int output_width) {
-	std::vector<float> output(static_cast<std::size_t>(output_width));
-	for (int row = 0; row < output_width; ++row) {
-		float sum = bias[static_cast<std::size_t>(row)];
-		const auto offset = static_cast<std::size_t>(row) * input.size();
-		for (std::size_t column = 0; column < input.size(); ++column) {
-			sum += weight[offset + column] * input[column];
-		}
-		output[static_cast<std::size_t>(row)] = std::max(0.0F, sum);
-	}
-	return output;
 }
 
 std::vector<float> linear_relu_bucket(const std::vector<float> &input,
@@ -320,37 +452,6 @@ std::vector<float> linear_relu_bucket(const std::vector<float> &input,
 		output[static_cast<std::size_t>(row)] = std::max(0.0F, sum);
 	}
 	return output;
-}
-
-std::vector<float> legal_softmax(const std::vector<float> &hidden,
-								 const PolicyWeights &weights,
-								 const std::vector<chess::Move> &moves,
-								 chess::Color side_to_move, bool horizontal_mirror) {
-	if (moves.empty()) {
-		return {};
-	}
-	std::vector<float> logits(moves.size());
-	float maximum = -std::numeric_limits<float>::infinity();
-	for (std::size_t move_index = 0; move_index < moves.size(); ++move_index) {
-		const int action = move_to_index(moves[move_index], side_to_move, horizontal_mirror);
-		float logit = weights.output_bias[static_cast<std::size_t>(action)];
-		const auto offset = static_cast<std::size_t>(action) * kPolicyHiddenWidth;
-		for (int channel = 0; channel < kPolicyHiddenWidth; ++channel) {
-			logit += weights.output_weight[offset + static_cast<std::size_t>(channel)] *
-				hidden[static_cast<std::size_t>(channel)];
-		}
-		logits[move_index] = logit;
-		maximum = std::max(maximum, logit);
-	}
-	float denominator = 0.0F;
-	for (float &logit : logits) {
-		logit = std::exp(logit - maximum);
-		denominator += logit;
-	}
-	for (float &probability : logits) {
-		probability /= denominator;
-	}
-	return logits;
 }
 
 } // namespace
@@ -432,45 +533,50 @@ PerspectiveFeatures canonicalize_features(const PerspectiveFeatures &features) {
 	return result;
 }
 
+ControlFeatures control_features(const EncodedFeatures &encoded) {
+	ControlFeatures result;
+	for (int perspective = 0; perspective < kPerspectiveCount; ++perspective) {
+		const auto canonical = canonicalize_features(
+			encoded.perspective[static_cast<std::size_t>(perspective)]);
+		const auto pieces = piece_tokens(canonical);
+		auto &occupancy = result.occupancy[static_cast<std::size_t>(perspective)];
+		for (const auto &piece : pieces)
+			occupancy[static_cast<std::size_t>(piece.square)] =
+				static_cast<std::uint8_t>(piece.type + 1);
+		std::array<int, 6> own{};
+		std::array<int, 6> opponent{};
+		for (const auto &piece : pieces) {
+			auto &counts = piece.type < 6 ? own : opponent;
+			++counts[static_cast<std::size_t>(piece.type % 6)];
+			attack_targets(piece, occupancy, [&](int target_square) {
+				const int from_rank = piece.square / 8;
+				const int from_file = piece.square % 8;
+				const int target_rank = target_square / 8;
+				const int target_file = target_square % 8;
+				result.edges.push_back(ControlEdge{
+					static_cast<std::uint16_t>(piece.type * 64 + piece.square),
+					static_cast<std::uint16_t>(piece.type * 64 + target_square),
+					static_cast<std::uint16_t>(piece.type * 225 +
+						(target_rank - from_rank + 7) * 15 + target_file - from_file + 7),
+					static_cast<std::uint8_t>(perspective),
+					static_cast<std::uint8_t>(target_square),
+					static_cast<std::uint8_t>(piece.type < 6 ? 0 : 1),
+				});
+			});
+		}
+		auto &material = result.material[static_cast<std::size_t>(perspective)];
+		for (int type = 0; type < 5; ++type)
+			material[static_cast<std::size_t>(type)] =
+				static_cast<float>(own[static_cast<std::size_t>(type)] -
+					opponent[static_cast<std::size_t>(type)]);
+		material[5] = static_cast<float>((own[2] >= 2) - (opponent[2] >= 2));
+	}
+	std::sort(result.edges.begin(), result.edges.end());
+	return result;
+}
+
 int value_bucket(int piece_count) noexcept {
 	return std::clamp((piece_count - 1) / 4, 0, kValueBucketCount - 1);
-}
-
-CpuPolicy::CpuPolicy(PolicyWeights weights) : weights_(std::move(weights)) {
-	require_size(weights_.feature_table,
-		static_cast<std::size_t>(kFeatureVocabulary) * kPolicyAccumulatorWidth,
-		"Policy feature table");
-	require_size(weights_.accumulator_bias, kPolicyAccumulatorWidth,
-		"Policy accumulator bias");
-	require_size(weights_.hidden_weight,
-		static_cast<std::size_t>(kPolicyHiddenWidth) * kPolicyAccumulatorWidth * 2,
-		"Policy hidden weight");
-	require_size(weights_.hidden_bias, kPolicyHiddenWidth, "Policy hidden bias");
-	require_size(weights_.output_weight,
-		static_cast<std::size_t>(kActionSize) * kPolicyHiddenWidth,
-		"Policy output weight");
-	require_size(weights_.output_bias, kActionSize, "Policy output bias");
-}
-
-FloatAccumulator CpuPolicy::refresh(const chess::Board &board) const {
-	return refresh_accumulator(board, weights_.feature_table, weights_.accumulator_bias,
-		kPolicyAccumulatorWidth);
-}
-
-FloatAccumulator CpuPolicy::update(const FloatAccumulator &current, const chess::Board &before,
-								   const chess::Board &after) const {
-	return update_accumulator(current, before, after, weights_.feature_table,
-		kPolicyAccumulatorWidth);
-}
-
-std::vector<float> CpuPolicy::evaluate(const FloatAccumulator &accumulator,
-									   const std::vector<chess::Move> &moves) const {
-	const auto input = oriented_input(accumulator, kPolicyAccumulatorWidth, false);
-	const auto hidden =
-		linear_relu(input, weights_.hidden_weight, weights_.hidden_bias, kPolicyHiddenWidth);
-	return legal_softmax(hidden, weights_, moves,
-		accumulator.white_to_move ? chess::Color::WHITE : chess::Color::BLACK,
-		accumulator.action_mirrored);
 }
 
 CpuValue::CpuValue(ValueWeights weights) : weights_(std::move(weights)) {
@@ -478,9 +584,42 @@ CpuValue::CpuValue(ValueWeights weights) : weights_(std::move(weights)) {
 		static_cast<std::size_t>(kFeatureVocabulary) * kValueFeatureWidth,
 		"Value feature table");
 	require_size(weights_.accumulator_bias, kValueFeatureWidth, "Value accumulator bias");
-	require_size(weights_.attention_table,
-		static_cast<std::size_t>(kFeatureVocabulary) * kValueAttentionTableWidth,
-		"Value attention table");
+	require_size(weights_.control_source,
+		static_cast<std::size_t>(kControlSourceVocabulary) * kControlWidth,
+		"control source table");
+	require_size(weights_.control_target,
+		static_cast<std::size_t>(kControlSourceVocabulary) * kControlWidth,
+		"control target table");
+	require_size(weights_.control_geometry,
+		static_cast<std::size_t>(kControlGeometryVocabulary) * kControlWidth,
+		"control geometry table");
+	require_size(weights_.control_occupancy,
+		static_cast<std::size_t>(kControlOccupancyVocabulary) * kControlOccupancyWidth,
+		"control occupancy table");
+	require_size(weights_.control_count,
+		static_cast<std::size_t>(kControlCountVocabulary) * kControlCountWidth,
+		"control count table");
+	require_size(weights_.control_square, 64 * kControlSquareWidth, "control square table");
+	require_size(weights_.control_local_weight,
+		static_cast<std::size_t>(kControlLocalWidth) *
+			(kControlWidth * 2 + kControlCountWidth * 2 + kControlOccupancyWidth +
+			 kControlSquareWidth),
+		"control local weight");
+	require_size(weights_.control_local_bias, kControlLocalWidth, "control local bias");
+	require_size(weights_.attention_key_weight,
+		static_cast<std::size_t>(kControlAttentionKeyWidth) * kControlLocalWidth,
+		"attention key weight");
+	require_size(weights_.attention_key_bias, kControlAttentionKeyWidth, "attention key bias");
+	require_size(weights_.attention_value_weight,
+		static_cast<std::size_t>(kControlAttentionWidth) * kControlLocalWidth,
+		"attention value weight");
+	require_size(weights_.attention_value_bias, kControlAttentionWidth, "attention value bias");
+	require_size(weights_.attention_query,
+		static_cast<std::size_t>(kValueBucketCount) * kControlAttentionKeyWidth,
+		"attention query");
+	require_size(weights_.material_weight,
+		static_cast<std::size_t>(kValueBucketCount) * kMaterialFeatureWidth,
+		"material weight");
 	require_size(weights_.hidden_weight,
 		static_cast<std::size_t>(kValueBucketCount) * kValueHiddenWidth *
 			kValueDenseWidth * 2,
@@ -500,10 +639,13 @@ CpuValue::CpuValue(ValueWeights weights) : weights_(std::move(weights)) {
 
 ValueAccumulator CpuValue::refresh(const chess::Board &board) const {
 	const auto encoded = encode_features(board);
+	const auto pieces = control_features(encoded);
+	auto feature_accumulator = refresh_accumulator(
+		encoded, weights_.feature_table, weights_.accumulator_bias, kValueFeatureWidth);
+	const int bucket = value_bucket(feature_accumulator.piece_count);
 	return ValueAccumulator{
-		refresh_accumulator(encoded, weights_.feature_table, weights_.accumulator_bias,
-			kValueFeatureWidth),
-		refresh_relations(encoded, weights_.attention_table),
+		std::move(feature_accumulator),
+		refresh_control(pieces, weights_, bucket),
 	};
 }
 
@@ -511,11 +653,12 @@ ValueAccumulator CpuValue::update(const ValueAccumulator &current, const chess::
 								  const chess::Board &after) const {
 	const auto old_encoded = encode_features(before);
 	const auto new_encoded = encode_features(after);
+	auto feature_accumulator = update_accumulator(current.features, old_encoded, new_encoded,
+		weights_.feature_table, kValueFeatureWidth);
+	const int bucket = value_bucket(feature_accumulator.piece_count);
 	return ValueAccumulator{
-		update_accumulator(current.features, old_encoded, new_encoded,
-			weights_.feature_table, kValueFeatureWidth),
-		update_relations(current.relations, old_encoded, new_encoded,
-			weights_.attention_table),
+		std::move(feature_accumulator),
+		update_control(current.control, control_features(new_encoded), weights_, bucket),
 	};
 }
 
@@ -534,6 +677,11 @@ float CpuValue::evaluate(const ValueAccumulator &accumulator) const {
 	}
 	const int first = accumulator.features.white_to_move ? 0 : 1;
 	const int second = 1 - first;
+	const auto material_offset = static_cast<std::size_t>(bucket * kMaterialFeatureWidth);
+	for (int feature = 0; feature < kMaterialFeatureWidth; ++feature)
+		output += weights_.material_weight[material_offset + static_cast<std::size_t>(feature)] *
+			accumulator.control.material[static_cast<std::size_t>(first)]
+				[static_cast<std::size_t>(feature)];
 	const auto psqt = static_cast<std::size_t>(kValueAccumulatorWidth + bucket);
 	output += 0.5F *
 		(accumulator.features.perspective[static_cast<std::size_t>(first)][psqt] -

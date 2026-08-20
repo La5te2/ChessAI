@@ -1,6 +1,6 @@
 #pragma once
 
-// Eleginus independent Policy/Value checkpoint and executable embedding bridge.
+// Eleginus Value checkpoint and executable embedding bridge.
 
 #include <cstdint>
 #include <filesystem>

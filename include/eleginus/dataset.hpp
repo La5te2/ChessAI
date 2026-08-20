@@ -1,6 +1,6 @@
 #pragma once
 
-// Eleginus sparse supervised datasets, PGN preprocessing, and joint Policy/Value fitting.
+// Eleginus sparse supervised datasets, PGN preprocessing, and Value fitting.
 
 #include <cstdint>
 #include <filesystem>
@@ -15,7 +15,7 @@
 namespace eleginus {
 
 inline constexpr const char *kStateEncoding = "eleginus_sparse_features_v1";
-inline constexpr const char *kTargetSchema = "policy_value_perspective_resolved";
+inline constexpr const char *kTargetSchema = "value_perspective_resolved";
 
 struct DatasetInfo {
 	std::int64_t length = 0;
@@ -25,7 +25,6 @@ struct DatasetInfo {
 
 struct Batch {
 	std::vector<EncodedFeatures> features;
-	torch::Tensor moves;
 	torch::Tensor values;
 };
 
@@ -66,7 +65,7 @@ class H5Writer {
 	H5Writer &operator=(H5Writer &&) noexcept;
 
 	void append(const std::vector<EncodedFeatures> &features,
-				const std::vector<std::uint16_t> &moves, const std::vector<float> &values);
+				const std::vector<float> &values);
 	std::int64_t size() const noexcept;
 	void flush();
 

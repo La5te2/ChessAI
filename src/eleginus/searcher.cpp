@@ -1,4 +1,4 @@
-// Read-only command-line PVS analysis with embedded independent Policy/Value models.
+// Read-only command-line PVS analysis with an embedded Value model.
 
 #include "eleginus/runtime.hpp"
 #include "eleginus/search.hpp"
@@ -40,7 +40,6 @@ int main(int argc, char **argv) {
 				throw std::invalid_argument("unknown argument: " + argument);
 		}
 		auto weights = eleginus::load_embedded_runtime_model();
-		eleginus::CpuPolicy policy(std::move(weights.policy));
 		eleginus::CpuValue value(std::move(weights.value));
 		eleginus::SearchOptions options;
 		options.depth = depth;
@@ -48,7 +47,7 @@ int main(int argc, char **argv) {
 		options.multipv = multipv;
 		options.hash_mb = hash_mb;
 		const chess::Board board = fen == "startpos" ? chess::Board() : chess::Board(fen);
-		const auto result = eleginus::Searcher(policy, value, options).search(board);
+		const auto result = eleginus::Searcher(value, options).search(board);
 		std::cout << "bestmove " << eleginus::move_uci(result.move)
 				  << " score_cp=" << result.score_cp
 				  << " depth=" << result.depth
@@ -56,7 +55,7 @@ int main(int argc, char **argv) {
 				  << " nodes=" << result.nodes
 				  << " evaluated=" << result.evaluated_nodes << '\n';
 		for (const auto &root : result.root) {
-			std::cout << eleginus::move_uci(root.move) << " p=" << root.prior
+			std::cout << eleginus::move_uci(root.move) << " order=" << root.order
 					  << " score_cp=" << root.score_cp
 					  << " bound=" << (root.exact_score ? "exact" : "upper")
 					  << " nodes=" << root.nodes << '\n';

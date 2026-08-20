@@ -1,4 +1,4 @@
-// Implements the architecture-locked HDF5 format and joint Policy/Value fitting.
+// Implements the architecture-locked HDF5 format and Value fitting.
 
 #include "eleginus/dataset.hpp"
 
@@ -269,7 +269,6 @@ class PreprocessVisitor : public chess::pgn::Visitor {
 		game_has_eval_ = false;
 		game_invalid_ = false;
 		game_features_.clear();
-		game_moves_.clear();
 		game_values_.clear();
 		game_comment_scores_.clear();
 		game_movers_are_white_.clear();
@@ -304,7 +303,6 @@ class PreprocessVisitor : public chess::pgn::Visitor {
 		try {
 			const auto parsed = chess::uci::parseSan(board_, san);
 			game_features_.push_back(encode_features(board_));
-			game_moves_.push_back(static_cast<std::uint16_t>(move_to_index(parsed, board_)));
 			const auto score = comment_score(std::string(comment));
 			game_comment_scores_.push_back(score);
 			game_movers_are_white_.push_back(board_.sideToMove() == chess::Color::WHITE);
@@ -358,7 +356,7 @@ class PreprocessVisitor : public chess::pgn::Visitor {
 				game_values_[state] = result_value(result_, turn);
 			}
 		}
-		writer_.append(game_features_, game_moves_, game_values_);
+		writer_.append(game_features_, game_values_);
 		++games_;
 		if (options_.log_every > 0 && games_ % options_.log_every == 0) {
 			std::cout << "preprocess progress: games=" << games_
@@ -410,7 +408,6 @@ class PreprocessVisitor : public chess::pgn::Visitor {
 	bool game_has_eval_ = false;
 	bool game_invalid_ = false;
 	std::vector<EncodedFeatures> game_features_;
-	std::vector<std::uint16_t> game_moves_;
 	std::vector<float> game_values_;
 	std::vector<std::optional<double>> game_comment_scores_;
 	std::vector<bool> game_movers_are_white_;
@@ -439,7 +436,6 @@ struct H5Writer::Impl {
 			H5P_DEFAULT, H5P_DEFAULT), "create Eleginus HDF5 file");
 		write_string_attribute(file, "arch_type", kArchType);
 		write_string_attribute(file, "state_encoding", kStateEncoding);
-		write_string_attribute(file, "move_encoding", kMoveEncoding);
 		write_string_attribute(file, "target_schema", kTargetSchema);
 		write_string_attribute(file, "value_perspective", "side_to_move");
 		write_string_attribute(file, "source", options.source);
@@ -455,8 +451,6 @@ struct H5Writer::Impl {
 			{H5S_UNLIMITED, kPerspectiveCount, kFeatureSlots},
 			{chunk, kPerspectiveCount, kFeatureSlots}, H5T_STD_U16LE,
 			options.compression_level);
-		moves = create_dataset(file, "moves", {0}, {H5S_UNLIMITED}, {chunk},
-			H5T_STD_U16LE, options.compression_level);
 		values = create_dataset(file, "values", {0}, {H5S_UNLIMITED}, {chunk},
 			H5T_IEEE_F32LE, options.compression_level);
 	}
@@ -464,8 +458,6 @@ struct H5Writer::Impl {
 	~Impl() {
 		if (states >= 0)
 			H5Dclose(states);
-		if (moves >= 0)
-			H5Dclose(moves);
 		if (values >= 0)
 			H5Dclose(values);
 		if (file >= 0)
@@ -475,7 +467,6 @@ struct H5Writer::Impl {
 	WriterOptions options;
 	hid_t file = -1;
 	hid_t states = -1;
-	hid_t moves = -1;
 	hid_t values = -1;
 	std::int64_t length = 0;
 };
@@ -488,10 +479,9 @@ H5Writer::H5Writer(H5Writer &&) noexcept = default;
 H5Writer &H5Writer::operator=(H5Writer &&) noexcept = default;
 
 void H5Writer::append(const std::vector<EncodedFeatures> &features,
-						   const std::vector<std::uint16_t> &moves,
 						   const std::vector<float> &target_values) {
-	if (features.size() != moves.size() || features.size() != target_values.size())
-		throw std::invalid_argument("Eleginus HDF5 state/move/value rows are misaligned");
+	if (features.size() != target_values.size())
+		throw std::invalid_argument("Eleginus HDF5 state/value rows are misaligned");
 	if (features.empty())
 		return;
 	std::vector<std::uint16_t> packed(
@@ -512,8 +502,6 @@ void H5Writer::append(const std::vector<EncodedFeatures> &features,
 		if (!std::isfinite(target_values[row]) || target_values[row] < 0.0F ||
 			target_values[row] > 1.0F)
 			throw std::invalid_argument("Eleginus Value target must be finite and in [0,1]");
-		if (moves[row] >= kActionSize)
-			throw std::invalid_argument("Eleginus HDF5 move index is out of range");
 	}
 	const hsize_t old_length = static_cast<hsize_t>(impl_->length);
 	const hsize_t count = static_cast<hsize_t>(features.size());
@@ -521,11 +509,9 @@ void H5Writer::append(const std::vector<EncodedFeatures> &features,
 	const hsize_t state_dimensions[] = {next, kPerspectiveCount, kFeatureSlots};
 	const hsize_t scalar_dimensions[] = {next};
 	require_h5(H5Dset_extent(impl_->states, state_dimensions), "extend Eleginus states");
-	require_h5(H5Dset_extent(impl_->moves, scalar_dimensions), "extend Eleginus moves");
 	require_h5(H5Dset_extent(impl_->values, scalar_dimensions), "extend Eleginus values");
 	write_slice(impl_->states, H5T_NATIVE_UINT16, packed.data(), {old_length, 0, 0},
 		{count, kPerspectiveCount, kFeatureSlots});
-	write_slice(impl_->moves, H5T_NATIVE_UINT16, moves.data(), {old_length}, {count});
 	write_slice(impl_->values, H5T_NATIVE_FLOAT, target_values.data(), {old_length}, {count});
 	impl_->length += static_cast<std::int64_t>(features.size());
 }
@@ -542,14 +528,12 @@ struct H5Dataset::Impl {
 			"open Eleginus HDF5 file");
 		if (read_string_attribute(file, "arch_type") != kArchType ||
 			read_string_attribute(file, "state_encoding") != kStateEncoding ||
-			read_string_attribute(file, "move_encoding") != kMoveEncoding ||
 			read_string_attribute(file, "target_schema") != kTargetSchema ||
 			read_string_attribute(file, "value_perspective") != "side_to_move")
 			throw std::runtime_error("HDF5 file is not an Eleginus supervised dataset");
 		info.has_comments = static_cast<int>(read_int_attribute(file, "has_cmt"));
 		info.source = read_optional_string_attribute(file, "source");
 		states = require_id(H5Dopen2(file, "states", H5P_DEFAULT), "open Eleginus states");
-		moves = require_id(H5Dopen2(file, "moves", H5P_DEFAULT), "open Eleginus moves");
 		values = require_id(H5Dopen2(file, "values", H5P_DEFAULT), "open Eleginus values");
 		const hid_t state_space = require_id(H5Dget_space(states), "get Eleginus state shape");
 		if (H5Sget_simple_extent_ndims(state_space) != 3)
@@ -561,7 +545,6 @@ struct H5Dataset::Impl {
 			throw std::runtime_error("Eleginus state dimensions do not match [N,2,34]");
 		info.length = static_cast<std::int64_t>(state_dimensions[0]);
 		for (const auto &[dataset, name] : {
-				 std::pair<hid_t, const char *>{moves, "moves"},
 				 std::pair<hid_t, const char *>{values, "values"}}) {
 			const hid_t space = require_id(H5Dget_space(dataset), std::string("get ") + name);
 			if (H5Sget_simple_extent_ndims(space) != 1)
@@ -577,8 +560,6 @@ struct H5Dataset::Impl {
 	~Impl() {
 		if (states >= 0)
 			H5Dclose(states);
-		if (moves >= 0)
-			H5Dclose(moves);
 		if (values >= 0)
 			H5Dclose(values);
 		if (file >= 0)
@@ -587,7 +568,6 @@ struct H5Dataset::Impl {
 
 	hid_t file = -1;
 	hid_t states = -1;
-	hid_t moves = -1;
 	hid_t values = -1;
 	DatasetInfo info;
 };
@@ -604,28 +584,22 @@ Batch H5Dataset::read_contiguous(std::int64_t begin, std::int64_t count) const {
 		throw std::out_of_range("Eleginus HDF5 read range is out of bounds");
 	Batch batch;
 	batch.features.resize(static_cast<std::size_t>(count));
-	batch.moves = torch::empty({count}, torch::TensorOptions().dtype(torch::kInt64));
 	batch.values = torch::empty({count}, torch::TensorOptions().dtype(torch::kFloat32));
 	if (count == 0)
 		return batch;
 	std::vector<std::uint16_t> packed(static_cast<std::size_t>(count) *
 		static_cast<std::size_t>(kPerspectiveCount * kFeatureSlots));
-	std::vector<std::uint16_t> packed_moves(static_cast<std::size_t>(count));
 	read_slice(impl_->states, H5T_NATIVE_UINT16, packed.data(),
 		{static_cast<hsize_t>(begin), 0, 0},
 		{static_cast<hsize_t>(count), kPerspectiveCount, kFeatureSlots});
-	read_slice(impl_->moves, H5T_NATIVE_UINT16, packed_moves.data(), {static_cast<hsize_t>(begin)},
-		{static_cast<hsize_t>(count)});
 	read_slice(impl_->values, H5T_NATIVE_FLOAT, batch.values.data_ptr<float>(),
 		{static_cast<hsize_t>(begin)}, {static_cast<hsize_t>(count)});
 	std::size_t cursor = 0;
-	auto *move_data = batch.moves.data_ptr<std::int64_t>();
 	for (std::int64_t row = 0; row < count; ++row) {
 		for (auto &perspective : batch.features[static_cast<std::size_t>(row)].perspective)
 			for (auto &feature : perspective)
 				feature = packed[cursor++];
 		batch.features[static_cast<std::size_t>(row)].white_to_move = true;
-		move_data[row] = packed_moves[static_cast<std::size_t>(row)];
 	}
 	return batch;
 }
@@ -673,8 +647,6 @@ TrainStats train_from_h5(Model &model, const TrainOptions &options,
 		throw std::runtime_error("Eleginus supervised dataset is empty: " + options.data.string());
 	torch::manual_seed(static_cast<std::int64_t>(options.seed));
 	std::mt19937_64 rng(options.seed);
-	torch::optim::AdamW policy_optimizer(model->policy->parameters(),
-		torch::optim::AdamWOptions(options.learning_rate).weight_decay(options.weight_decay));
 	torch::optim::AdamW value_optimizer(model->value->parameters(),
 		torch::optim::AdamWOptions(options.learning_rate).weight_decay(options.weight_decay));
 	model->train();
@@ -696,7 +668,6 @@ TrainStats train_from_h5(Model &model, const TrainOptions &options,
 			std::iota(order.begin(), order.end(), 0);
 			std::shuffle(order.begin(), order.end(), rng);
 			const auto *chunk_targets = chunk.values.data_ptr<float>();
-			const auto *chunk_moves = chunk.moves.data_ptr<std::int64_t>();
 			for (std::int64_t offset = 0; offset < chunk_count; offset += options.batch_size) {
 				if (options.max_steps > 0 && stats.steps >= options.max_steps) {
 					stop = true;
@@ -707,30 +678,22 @@ TrainStats train_from_h5(Model &model, const TrainOptions &options,
 				encoded.reserve(static_cast<std::size_t>(count));
 				auto value_targets =
 					torch::empty({count}, torch::TensorOptions().dtype(torch::kFloat32));
-				auto move_targets =
-					torch::empty({count}, torch::TensorOptions().dtype(torch::kInt64));
 				auto *value_data = value_targets.data_ptr<float>();
-				auto *move_data = move_targets.data_ptr<std::int64_t>();
 				for (std::int64_t row = 0; row < count; ++row) {
 					const auto source = order[static_cast<std::size_t>(offset + row)];
 					encoded.push_back(chunk.features[static_cast<std::size_t>(source)]);
 					value_data[row] = chunk_targets[source];
-					move_data[row] = chunk_moves[source];
 				}
-				auto [features, side] = encode_feature_batch(encoded, device);
+				auto network_batch = encode_feature_batch(encoded, device);
 				value_targets = value_targets.to(device);
-				move_targets = move_targets.to(device);
 				if (value_targets.dim() != 1 || value_targets.size(0) != count) {
 					throw std::runtime_error("Eleginus Value target must have shape [batch]");
 				}
-				policy_optimizer.zero_grad();
 				value_optimizer.zero_grad();
-				auto logits = model->policy->forward(features, side);
-				auto value_prediction = model->value->forward(features, side);
+				auto value_prediction = model->value->forward(network_batch);
 				if (value_prediction.dim() != 1 || value_prediction.size(0) != count) {
 					throw std::runtime_error("Eleginus Value output must have shape [batch]");
 				}
-				auto policy_loss = torch::nn::functional::cross_entropy(logits, move_targets);
 				auto value_bce = torch::nn::functional::binary_cross_entropy_with_logits(
 					value_prediction, value_targets);
 				auto bounded_targets = value_targets.clamp(
@@ -740,8 +703,7 @@ TrainStats train_from_h5(Model &model, const TrainOptions &options,
 				auto value_logit_loss = torch::nn::functional::smooth_l1_loss(
 					value_prediction, value_logit_targets);
 				auto value_loss = value_bce + kValueLogitLossWeight * value_logit_loss;
-				auto loss = policy_loss + value_loss;
-				loss.backward();
+				value_loss.backward();
 				{
 					torch::NoGradGuard no_grad;
 					auto probabilities = value_prediction.detach().sigmoid().to(torch::kFloat64);
@@ -762,9 +724,7 @@ TrainStats train_from_h5(Model &model, const TrainOptions &options,
 							parameter.key());
 					}
 				}
-				torch::nn::utils::clip_grad_norm_(model->policy->parameters(), 1.0);
 				torch::nn::utils::clip_grad_norm_(model->value->parameters(), 1.0);
-				policy_optimizer.step();
 				value_optimizer.step();
 				++stats.steps;
 				stats.samples += count;

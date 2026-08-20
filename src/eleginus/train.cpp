@@ -1,4 +1,4 @@
-// Eleginus joint supervised Policy/Value training command-line entry point.
+// Eleginus supervised Value training command-line entry point.
 
 #include <iostream>
 

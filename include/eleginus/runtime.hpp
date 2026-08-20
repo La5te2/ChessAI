@@ -1,6 +1,6 @@
 #pragma once
 
-// Torch-free Eleginus Policy/Value inference and executable-embedded representation.
+// Torch-free Eleginus Value inference and executable-embedded representation.
 
 #include <cstdint>
 #include <filesystem>
@@ -10,7 +10,6 @@
 namespace eleginus {
 
 struct RuntimeWeights {
-	PolicyWeights policy;
 	ValueWeights value;
 };
 

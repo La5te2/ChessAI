@@ -1,4 +1,4 @@
-// Implements the Torch-free Policy/Value representation embedded in an executable.
+// Implements the Torch-free Value representation embedded in an executable.
 
 #include "eleginus/runtime.hpp"
 
@@ -80,49 +80,51 @@ std::vector<float> read_vector(std::ifstream &input, const std::filesystem::path
 	return values;
 }
 
-void write_policy(std::ofstream &output, const PolicyWeights &weights) {
-	write_vector(output, weights.feature_table,
-		static_cast<std::size_t>(kFeatureVocabulary) * kPolicyAccumulatorWidth,
-		"Policy feature table");
-	write_vector(output, weights.accumulator_bias, kPolicyAccumulatorWidth,
-		"Policy accumulator bias");
-	write_vector(output, weights.hidden_weight,
-		static_cast<std::size_t>(kPolicyHiddenWidth) * kPolicyAccumulatorWidth * 2,
-		"Policy hidden weight");
-	write_vector(output, weights.hidden_bias, kPolicyHiddenWidth, "Policy hidden bias");
-	write_vector(output, weights.output_weight,
-		static_cast<std::size_t>(kActionSize) * kPolicyHiddenWidth,
-		"Policy output weight");
-	write_vector(output, weights.output_bias, kActionSize, "Policy output bias");
-}
-
-PolicyWeights read_policy(std::ifstream &input, const std::filesystem::path &path) {
-	PolicyWeights weights;
-	weights.feature_table = read_vector(input, path,
-		static_cast<std::size_t>(kFeatureVocabulary) * kPolicyAccumulatorWidth,
-		"Policy feature table");
-	weights.accumulator_bias = read_vector(input, path, kPolicyAccumulatorWidth,
-		"Policy accumulator bias");
-	weights.hidden_weight = read_vector(input, path,
-		static_cast<std::size_t>(kPolicyHiddenWidth) * kPolicyAccumulatorWidth * 2,
-		"Policy hidden weight");
-	weights.hidden_bias = read_vector(input, path, kPolicyHiddenWidth, "Policy hidden bias");
-	weights.output_weight = read_vector(input, path,
-		static_cast<std::size_t>(kActionSize) * kPolicyHiddenWidth,
-		"Policy output weight");
-	weights.output_bias = read_vector(input, path, kActionSize, "Policy output bias");
-	return weights;
-}
-
 void write_value(std::ofstream &output, const ValueWeights &weights) {
 	write_vector(output, weights.feature_table,
 		static_cast<std::size_t>(kFeatureVocabulary) * kValueFeatureWidth,
 		"Value feature table");
 	write_vector(output, weights.accumulator_bias, kValueFeatureWidth,
 		"Value accumulator bias");
-	write_vector(output, weights.attention_table,
-		static_cast<std::size_t>(kFeatureVocabulary) * kValueAttentionTableWidth,
-		"Value attention table");
+	write_vector(output, weights.control_source,
+		static_cast<std::size_t>(kControlSourceVocabulary) * kControlWidth,
+		"control source table");
+	write_vector(output, weights.control_target,
+		static_cast<std::size_t>(kControlSourceVocabulary) * kControlWidth,
+		"control target table");
+	write_vector(output, weights.control_geometry,
+		static_cast<std::size_t>(kControlGeometryVocabulary) * kControlWidth,
+		"control geometry table");
+	write_vector(output, weights.control_occupancy,
+		static_cast<std::size_t>(kControlOccupancyVocabulary) * kControlOccupancyWidth,
+		"control occupancy table");
+	write_vector(output, weights.control_count,
+		static_cast<std::size_t>(kControlCountVocabulary) * kControlCountWidth,
+		"control count table");
+	write_vector(output, weights.control_square, 64 * kControlSquareWidth,
+		"control square table");
+	write_vector(output, weights.control_local_weight,
+		static_cast<std::size_t>(kControlLocalWidth) *
+			(kControlWidth * 2 + kControlCountWidth * 2 + kControlOccupancyWidth +
+			 kControlSquareWidth), "control local weight");
+	write_vector(output, weights.control_local_bias, kControlLocalWidth,
+		"control local bias");
+	write_vector(output, weights.attention_key_weight,
+		static_cast<std::size_t>(kControlAttentionKeyWidth) * kControlLocalWidth,
+		"attention key weight");
+	write_vector(output, weights.attention_key_bias, kControlAttentionKeyWidth,
+		"attention key bias");
+	write_vector(output, weights.attention_value_weight,
+		static_cast<std::size_t>(kControlAttentionWidth) * kControlLocalWidth,
+		"attention value weight");
+	write_vector(output, weights.attention_value_bias, kControlAttentionWidth,
+		"attention value bias");
+	write_vector(output, weights.attention_query,
+		static_cast<std::size_t>(kValueBucketCount) * kControlAttentionKeyWidth,
+		"attention query");
+	write_vector(output, weights.material_weight,
+		static_cast<std::size_t>(kValueBucketCount) * kMaterialFeatureWidth,
+		"material weight");
 	write_vector(output, weights.hidden_weight,
 		static_cast<std::size_t>(kValueBucketCount) * kValueHiddenWidth *
 			kValueDenseWidth * 2,
@@ -148,9 +150,45 @@ ValueWeights read_value(std::ifstream &input, const std::filesystem::path &path)
 		"Value feature table");
 	weights.accumulator_bias = read_vector(input, path, kValueFeatureWidth,
 		"Value accumulator bias");
-	weights.attention_table = read_vector(input, path,
-		static_cast<std::size_t>(kFeatureVocabulary) * kValueAttentionTableWidth,
-		"Value attention table");
+	weights.control_source = read_vector(input, path,
+		static_cast<std::size_t>(kControlSourceVocabulary) * kControlWidth,
+		"control source table");
+	weights.control_target = read_vector(input, path,
+		static_cast<std::size_t>(kControlSourceVocabulary) * kControlWidth,
+		"control target table");
+	weights.control_geometry = read_vector(input, path,
+		static_cast<std::size_t>(kControlGeometryVocabulary) * kControlWidth,
+		"control geometry table");
+	weights.control_occupancy = read_vector(input, path,
+		static_cast<std::size_t>(kControlOccupancyVocabulary) * kControlOccupancyWidth,
+		"control occupancy table");
+	weights.control_count = read_vector(input, path,
+		static_cast<std::size_t>(kControlCountVocabulary) * kControlCountWidth,
+		"control count table");
+	weights.control_square = read_vector(input, path, 64 * kControlSquareWidth,
+		"control square table");
+	weights.control_local_weight = read_vector(input, path,
+		static_cast<std::size_t>(kControlLocalWidth) *
+			(kControlWidth * 2 + kControlCountWidth * 2 + kControlOccupancyWidth +
+			 kControlSquareWidth), "control local weight");
+	weights.control_local_bias = read_vector(input, path, kControlLocalWidth,
+		"control local bias");
+	weights.attention_key_weight = read_vector(input, path,
+		static_cast<std::size_t>(kControlAttentionKeyWidth) * kControlLocalWidth,
+		"attention key weight");
+	weights.attention_key_bias = read_vector(input, path, kControlAttentionKeyWidth,
+		"attention key bias");
+	weights.attention_value_weight = read_vector(input, path,
+		static_cast<std::size_t>(kControlAttentionWidth) * kControlLocalWidth,
+		"attention value weight");
+	weights.attention_value_bias = read_vector(input, path, kControlAttentionWidth,
+		"attention value bias");
+	weights.attention_query = read_vector(input, path,
+		static_cast<std::size_t>(kValueBucketCount) * kControlAttentionKeyWidth,
+		"attention query");
+	weights.material_weight = read_vector(input, path,
+		static_cast<std::size_t>(kValueBucketCount) * kMaterialFeatureWidth,
+		"material weight");
 	weights.hidden_weight = read_vector(input, path,
 		static_cast<std::size_t>(kValueBucketCount) * kValueHiddenWidth *
 			kValueDenseWidth * 2,
@@ -232,17 +270,17 @@ void embed_runtime_model_atomic(const std::filesystem::path &input,
 		output.write(kMagic.data(), static_cast<std::streamsize>(kMagic.size()));
 		write_scalar(output, kEndianMarker);
 		write_scalar(output, kRuntimeFormat);
-		write_scalar(output, static_cast<std::uint32_t>(kActionSize));
 		write_scalar(output, static_cast<std::uint32_t>(kFeatureVocabulary));
-		write_scalar(output, static_cast<std::uint32_t>(kPolicyAccumulatorWidth));
-		write_scalar(output, static_cast<std::uint32_t>(kPolicyHiddenWidth));
+		write_scalar(output, static_cast<std::uint32_t>(kControlSourceVocabulary));
+		write_scalar(output, static_cast<std::uint32_t>(kControlGeometryVocabulary));
 		write_scalar(output, static_cast<std::uint32_t>(kValueAccumulatorWidth));
-		write_scalar(output, static_cast<std::uint32_t>(kValueAttentionWidth));
-		write_scalar(output, static_cast<std::uint32_t>(kValueRelationFormula));
+		write_scalar(output, static_cast<std::uint32_t>(kControlWidth));
+		write_scalar(output, static_cast<std::uint32_t>(kControlLocalWidth));
+		write_scalar(output, static_cast<std::uint32_t>(kControlAttentionWidth));
+		write_scalar(output, static_cast<std::uint32_t>(kMaterialFeatureWidth));
 		write_scalar(output, static_cast<std::uint32_t>(kValueHiddenWidth));
 		write_scalar(output, static_cast<std::uint32_t>(kValueBottleneckWidth));
 		write_scalar(output, static_cast<std::uint32_t>(kValueBucketCount));
-		write_policy(output, weights.policy);
 		write_value(output, weights.value);
 		const auto payload_end = output.tellp();
 		if (payload_begin < 0 || payload_end < payload_begin)
@@ -295,31 +333,33 @@ RuntimeWeights load_embedded_runtime_model(const std::filesystem::path &executab
 	}
 	const auto endian = read_scalar<std::uint32_t>(input, path);
 	const auto format = read_scalar<std::uint32_t>(input, path);
-	const auto action_size = read_scalar<std::uint32_t>(input, path);
 	const auto feature_count = read_scalar<std::uint32_t>(input, path);
-	const auto policy_accumulator = read_scalar<std::uint32_t>(input, path);
-	const auto policy_hidden = read_scalar<std::uint32_t>(input, path);
+	const auto control_source_count = read_scalar<std::uint32_t>(input, path);
+	const auto control_geometry_count = read_scalar<std::uint32_t>(input, path);
 	const auto value_accumulator = read_scalar<std::uint32_t>(input, path);
-	const auto value_attention = read_scalar<std::uint32_t>(input, path);
-	const auto value_relation_formula = read_scalar<std::uint32_t>(input, path);
+	const auto control_width = read_scalar<std::uint32_t>(input, path);
+	const auto control_local = read_scalar<std::uint32_t>(input, path);
+	const auto control_attention = read_scalar<std::uint32_t>(input, path);
+	const auto material_features = read_scalar<std::uint32_t>(input, path);
 	const auto value_hidden = read_scalar<std::uint32_t>(input, path);
 	const auto value_bottleneck = read_scalar<std::uint32_t>(input, path);
 	const auto value_buckets = read_scalar<std::uint32_t>(input, path);
 	if (endian != kEndianMarker || format != kRuntimeFormat ||
-		action_size != kActionSize || feature_count != kFeatureVocabulary ||
-		policy_accumulator != kPolicyAccumulatorWidth || policy_hidden != kPolicyHiddenWidth ||
-		value_accumulator != kValueAccumulatorWidth || value_attention != kValueAttentionWidth ||
-		value_relation_formula != kValueRelationFormula ||
+		feature_count != kFeatureVocabulary ||
+		control_source_count != kControlSourceVocabulary ||
+		control_geometry_count != kControlGeometryVocabulary ||
+		value_accumulator != kValueAccumulatorWidth || control_width != kControlWidth ||
+		control_local != kControlLocalWidth || control_attention != kControlAttentionWidth ||
+		material_features != kMaterialFeatureWidth ||
 		value_hidden != kValueHiddenWidth ||
 		value_bottleneck != kValueBottleneckWidth || value_buckets != kValueBucketCount) {
 		throw std::runtime_error("embedded Eleginus model does not match this build: " +
 			path.string());
 	}
-	auto policy = read_policy(input, path);
 	auto value = read_value(input, path);
 	if (input.tellg() != file_end - footer_size)
 		throw std::runtime_error("embedded Eleginus model length does not match its executable");
-	return RuntimeWeights{std::move(policy), std::move(value)};
+	return RuntimeWeights{std::move(value)};
 }
 
 } // namespace eleginus

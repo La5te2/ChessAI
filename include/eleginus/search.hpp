@@ -1,6 +1,6 @@
 #pragma once
 
-// Value-led principal-variation search with Policy move ordering.
+// Value-led principal-variation search.
 
 #include <cstddef>
 #include <cstdint>
@@ -22,7 +22,7 @@ struct SearchOptions {
 
 struct RootMove {
 	chess::Move move;
-	float prior = 0.0F;
+	float order = 0.0F;
 	int score_cp = 0;
 	std::uint64_t nodes = 0;
 	bool exact_score = false;
@@ -43,13 +43,12 @@ using SearchCancelCallback = std::function<bool()>;
 
 class Searcher {
 	public:
-	Searcher(const CpuPolicy &policy, const CpuValue &value, SearchOptions options = {});
+	Searcher(const CpuValue &value, SearchOptions options = {});
 	SearchResult search(const chess::Board &board,
 						const SearchProgressCallback &progress = {},
 						const SearchCancelCallback &cancel = {}) const;
 
 	private:
-	const CpuPolicy *policy_;
 	const CpuValue *value_;
 	SearchOptions options_;
 };

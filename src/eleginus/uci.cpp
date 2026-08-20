@@ -137,10 +137,9 @@ class Engine {
 	}
 
 	void ensure_model() {
-		if (policy_ && value_)
+		if (value_)
 			return;
 		auto weights = eleginus::load_embedded_runtime_model();
-		policy_ = std::make_unique<eleginus::CpuPolicy>(std::move(weights.policy));
 		value_ = std::make_unique<eleginus::CpuValue>(std::move(weights.value));
 	}
 
@@ -294,12 +293,11 @@ class Engine {
 		const auto deadline = movetime_ms > 0
 			? start + std::chrono::milliseconds(movetime_ms)
 			: Clock::time_point::max();
-		const auto *policy = policy_.get();
 		const auto *value = value_.get();
 		stop_requested_ = false;
-		search_thread_ = std::thread([this, board, options, start, deadline, policy, value] {
+		search_thread_ = std::thread([this, board, options, start, deadline, value] {
 			try {
-				const auto result = eleginus::Searcher(*policy, *value, options).search(
+				const auto result = eleginus::Searcher(*value, options).search(
 					board,
 					[this, start](const eleginus::SearchResult &partial) {
 						emit_info(partial, start);
@@ -324,7 +322,6 @@ class Engine {
 	int move_overhead_ms_ = 10;
 	double original_time_adjust_ = -1.0;
 	chess::Board board_;
-	std::unique_ptr<eleginus::CpuPolicy> policy_;
 	std::unique_ptr<eleginus::CpuValue> value_;
 	std::thread search_thread_;
 	std::atomic_bool stop_requested_{false};

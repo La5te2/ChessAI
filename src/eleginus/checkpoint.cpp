@@ -1,4 +1,4 @@
-// Implements Eleginus Policy/Value checkpoints and executable embedding.
+// Implements Eleginus Value checkpoints and executable embedding.
 
 #include "eleginus/checkpoint.hpp"
 
@@ -37,32 +37,34 @@ void write_architecture(torch::serialize::OutputArchive &archive) {
 	archive.write("type_id", scalar(kEleginusCheckpointType), true);
 	archive.write("feature_count", scalar(kFeatureVocabulary), true);
 	archive.write("feature_slots", scalar(kFeatureSlots), true);
-	archive.write("policy_accumulator", scalar(kPolicyAccumulatorWidth), true);
-	archive.write("policy_hidden", scalar(kPolicyHiddenWidth), true);
 	archive.write("value_accumulator", scalar(kValueAccumulatorWidth), true);
-	archive.write("value_attention", scalar(kValueAttentionWidth), true);
-	archive.write("value_relation_formula", scalar(kValueRelationFormula), true);
+	archive.write("control_source_count", scalar(kControlSourceVocabulary), true);
+	archive.write("control_geometry_count", scalar(kControlGeometryVocabulary), true);
+	archive.write("control_width", scalar(kControlWidth), true);
+	archive.write("control_local", scalar(kControlLocalWidth), true);
+	archive.write("control_attention", scalar(kControlAttentionWidth), true);
+	archive.write("material_features", scalar(kMaterialFeatureWidth), true);
 	archive.write("value_dense", scalar(kValueDenseWidth), true);
 	archive.write("value_hidden", scalar(kValueHiddenWidth), true);
 	archive.write("value_bottleneck", scalar(kValueBottleneckWidth), true);
 	archive.write("value_buckets", scalar(kValueBucketCount), true);
-	archive.write("action_size", scalar(kActionSize), true);
 }
 
 void validate_architecture(torch::serialize::InputArchive &archive) {
 	require_scalar(archive, "type_id", kEleginusCheckpointType);
 	require_scalar(archive, "feature_count", kFeatureVocabulary);
 	require_scalar(archive, "feature_slots", kFeatureSlots);
-	require_scalar(archive, "policy_accumulator", kPolicyAccumulatorWidth);
-	require_scalar(archive, "policy_hidden", kPolicyHiddenWidth);
 	require_scalar(archive, "value_accumulator", kValueAccumulatorWidth);
-	require_scalar(archive, "value_attention", kValueAttentionWidth);
-	require_scalar(archive, "value_relation_formula", kValueRelationFormula);
+	require_scalar(archive, "control_source_count", kControlSourceVocabulary);
+	require_scalar(archive, "control_geometry_count", kControlGeometryVocabulary);
+	require_scalar(archive, "control_width", kControlWidth);
+	require_scalar(archive, "control_local", kControlLocalWidth);
+	require_scalar(archive, "control_attention", kControlAttentionWidth);
+	require_scalar(archive, "material_features", kMaterialFeatureWidth);
 	require_scalar(archive, "value_dense", kValueDenseWidth);
 	require_scalar(archive, "value_hidden", kValueHiddenWidth);
 	require_scalar(archive, "value_bottleneck", kValueBottleneckWidth);
 	require_scalar(archive, "value_buckets", kValueBucketCount);
-	require_scalar(archive, "action_size", kActionSize);
 }
 
 void replace_file(const std::filesystem::path &temporary, const std::filesystem::path &target) {
@@ -137,7 +139,6 @@ void embed_checkpoint_atomic(const std::filesystem::path &model_path,
 							 const std::filesystem::path &output) {
 	auto model = load_checkpoint(model_path, torch::Device(torch::kCPU));
 	embed_runtime_model_atomic(input, output, RuntimeWeights{
-		snapshot_policy(model->policy).weights(),
 		snapshot_value(model->value).weights(),
 	});
 }

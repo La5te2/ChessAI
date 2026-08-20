@@ -2,7 +2,7 @@
 
 Gadidae is a family of experimental chess engines.
 
-This README and [Graphics.md](Graphics.md) explain installation, commands and user-facing interfaces. [Gadus.md](Gadus.md), [Melano.md](Melano.md) and [Eleginus.md](Eleginus.md) specify the corresponding architectures, training methods and search algorithms.
+This README and [Graphics.md](Graphics.md) explain installation, commands and user-facing interfaces. [Gadus.md](Gadus.md) and [Melano.md](Melano.md) specify their architectures, training methods and search algorithms, while [Eleginus.md](Eleginus.md) records the dated development history of the experimental Eleginus architecture.
 
 ## Dependencies
 
@@ -316,7 +316,7 @@ The [UCI](#uci) section describes runtime options, output fields and time manage
 
 ### Eleginus
 
-Preprocess a PGN into the architecture-locked Eleginus Policy/Value schema with:
+Preprocess a PGN into the architecture-locked Eleginus Value schema with:
 
 ```bash
 build/eleginus/preprocess \
@@ -327,24 +327,22 @@ build/eleginus/preprocess \
 	--max-games 100000
 ```
 
-The HDF5 file uses the same `states`, `moves` and `values` dataset names as Gadus and Melano, but
-its root metadata identifies `arch_type=eleginus` together with Eleginus-specific state, move and
-target encodings. Eleginus moves use side-to-move-relative coordinates, and the reader accepts only
-`target_schema=policy_value_perspective_resolved`. Generate the HDF5 file with the Eleginus preprocessor
-before training.
+The HDF5 file stores `states` and `values`. Its root metadata identifies `arch_type=eleginus`, the
+Eleginus state encoding and `target_schema=value_perspective_resolved`. Generate this file with the
+Eleginus preprocessor before training.
 With `--has-cmt 1`, the preprocessor determines whether each game's numerical pawn evaluations use
 White or mover perspective, converts them to side-to-move targets and maps them into `[0,1]`. With
 `--has-cmt 0`, completed game results supply targets in `{0, 0.5, 1}`. A game with an unparseable move
 is rejected as an `invalid_game`, while a game lacking the target required by the selected mode is
 counted as a `missing_target_game`.
 
-Train independent Eleginus Policy and Value networks with:
+Train the Eleginus Value network with:
 
 ```bash
 build/eleginus/train \
 	--data data/games.eleginus.h5 \
 	--out models/eleginus/eleginus.pth \
-	--epochs 2 \
+	--epochs 4 \
 	--batch-size 512 \
 	--lr 0.001 \
 	--device cuda \
@@ -353,14 +351,14 @@ build/eleginus/train \
 
 Eleginus uses the same `--max-steps` convention: a positive value caps optimizer updates, while `0` lets `--epochs` determine the training length. The trainer atomically updates the checkpoint selected by `--out` after every epoch.
 
-The Policy network learns the recorded PGN moves, while the Value network learns the selected
-comment- or result-derived targets. Their parameter sets and AdamW states are independent. Supplying
-`--model existing.pth` initializes both networks from that checkpoint, while omitting it initializes
+The Value network learns the selected comment- or result-derived targets. Supplying
+`--model existing.pth` initializes the network from that checkpoint, while omitting it initializes
 a new model. Every training invocation constructs fresh optimizer state.
 
 The `.pth` checkpoint is the only standalone Eleginus weight file. Like the other architecture
 checkpoints, its top level contains `model` and `arch`; the latter identifies Eleginus with
-`type_id=3` and records every fixed network dimension. Inspect it with:
+`type_id=3` and records its fixed Value dimensions. The FP32 checkpoint remains below 20 MiB.
+Inspect it with:
 
 ```bash
 python scripts/check.py --model models/eleginus/eleginus.pth
@@ -379,9 +377,11 @@ models/eleginus/eleginus \
 	--depth 4
 ```
 
-`--fen` accepts `startpos` or one quoted six-field FEN. The embedded search program uses statically
-linked float32 Policy and Value evaluators. Policy orders legal actions, while Value supplies the
-static scores used by iterative deepening, PVS and quiescence search. The resulting executable contains its model parameters and all inference code required for search.
+`--fen` accepts `startpos` or one quoted six-field FEN. The embedded search program uses a statically
+linked float32 Value evaluator. Transposition-table moves, tactical scores, killer moves and history
+scores order legal actions, while Value supplies the static scores used by iterative deepening, PVS
+and quiescence search. The resulting executable contains its model parameters and all inference code
+required for search.
 
 Create and launch the Eleginus UCI engine on Windows with:
 
@@ -540,9 +540,9 @@ setoption name MultiPV value 5
 
 ### Eleginus
 
-An embedded Eleginus UCI executable loads its independent Policy and Value parameters when `isready` or `go` first requires them. `Depth` sets the default iterative-deepening limit, `Hash` sets the transposition-table capacity, `Threads` sets the number of root PVS workers and `MultiPV` sets the number of reported principal variations. Their defaults are 4 plies, 64 MiB, one worker and five variations. `Move Overhead` uses the common UCI time-allocation rule above.
+An embedded Eleginus UCI executable loads its Value parameters when `isready` or `go` first requires them. `Depth` sets the default iterative-deepening limit, `Hash` sets the transposition-table capacity, `Threads` sets the number of root PVS workers and `MultiPV` sets the number of reported principal variations. Their defaults are 4 plies, 64 MiB, one worker and five variations. `Move Overhead` uses the common UCI time-allocation rule above.
 
-Each `go` command starts iterative deepening on a worker thread, allowing the UCI loop to process `stop`, a replacement position or `quit` while PVS is running. `go depth <n>` overrides `Depth` for one search, `go nodes <n>` sets a cumulative node limit and the standard clock fields activate the deadline described above. Policy orders legal actions, and PVS uses the Value network to establish static centipawn scores at quiescent leaves. Exact terminal scores use the range near $\pm30000$, while ongoing static scores use $150v_{\theta_V}(s)$. The reported `score cp` is expressed from the root side-to-move perspective.
+Each `go` command starts iterative deepening on a worker thread, allowing the UCI loop to process `stop`, a replacement position or `quit` while PVS is running. `go depth <n>` overrides `Depth` for one search, `go nodes <n>` sets a cumulative node limit and the standard clock fields activate the deadline described above. PVS orders moves from transposition-table results, tactical properties, killer moves and history scores, while the Value network establishes static centipawn scores at quiescent leaves. Exact terminal scores use the range near $\pm30000$, while ongoing static scores use $150v_{\theta_V}(s)$. The reported `score cp` is expressed from the root side-to-move perspective.
 
 With `MultiPV=1`, the first root action establishes the principal-variation bound and the remaining actions use null-window probes followed by full-window re-search when they exceed that bound. With `MultiPV=k>1`, every root action receives a full-window score so the engine can identify and report the best $k$ variations. Root actions are distributed among at most `Threads` workers, and the configured `Hash` capacity is divided among their transposition tables.
 
@@ -679,7 +679,7 @@ Gadus and Melano packages contain the UCI executable, checkpoint and required ru
 
 ### Checkpoint Inspection
 
-`scripts/check.py` performs a read-only inspection of a Gadus, Melano or Eleginus checkpoint. The report includes its architecture, heads, architecture dimensions, action-space size, parameter counts, tensor data types, tensor memory, devices, finite-value status, file size and SHA-256 digest.
+`scripts/check.py` performs a read-only inspection of a Gadus, Melano or Eleginus checkpoint. The report includes its architecture, heads, architecture dimensions, parameter counts, tensor data types, tensor memory, devices, finite-value status, file size and SHA-256 digest.
 
 ```bash
 python scripts/check.py --model models/gadus/gadus.pth

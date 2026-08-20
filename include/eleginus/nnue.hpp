@@ -1,8 +1,9 @@
 #pragma once
 
-// Eleginus sparse chess features and independent incremental Policy/Value evaluators.
+// Eleginus sparse chess features and incremental Value evaluator.
 
 #include <array>
+#include <compare>
 #include <cstdint>
 #include <vector>
 
@@ -26,13 +27,22 @@ inline constexpr int kFeatureCount = kEnPassantFeatureBase + 9;
 inline constexpr int kFeatureSlots = 34; // 32 pieces plus castling and en-passant context.
 inline constexpr int kPaddingFeature = kFeatureCount;
 inline constexpr int kFeatureVocabulary = kFeatureCount + 1;
-inline constexpr int kPolicyAccumulatorWidth = 128;
-inline constexpr int kPolicyHiddenWidth = 128;
-inline constexpr int kValueAccumulatorWidth = 512;
-inline constexpr int kValueAttentionWidth = 16;
-inline constexpr int kValueAttentionTableWidth = kValueAttentionWidth * 3;
-inline constexpr int kValueRelationFormula = 2;
-inline constexpr int kValueDenseWidth = kValueAccumulatorWidth + kValueAttentionWidth;
+inline constexpr int kControlPieceTypes = 12;
+inline constexpr int kControlSourceVocabulary = kControlPieceTypes * 64;
+inline constexpr int kControlGeometryVocabulary = kControlPieceTypes * 15 * 15;
+inline constexpr int kControlWidth = 16;
+inline constexpr int kControlCountVocabulary = 8;
+inline constexpr int kControlCountWidth = 4;
+inline constexpr int kControlOccupancyVocabulary = 13;
+inline constexpr int kControlOccupancyWidth = 4;
+inline constexpr int kControlSquareWidth = 4;
+inline constexpr int kControlLocalWidth = 16;
+inline constexpr int kControlAttentionKeyWidth = 8;
+inline constexpr int kControlAttentionWidth = 16;
+inline constexpr int kMaterialFeatureWidth = 6;
+inline constexpr int kValueAccumulatorWidth = 144;
+inline constexpr int kValueDenseWidth =
+	kValueAccumulatorWidth + kControlLocalWidth + kControlAttentionWidth;
 inline constexpr int kValueHiddenWidth = 32;
 inline constexpr int kValueBottleneckWidth = 32;
 inline constexpr int kValueBucketCount = 8;
@@ -54,34 +64,69 @@ PerspectiveFeatures canonicalize_features(const PerspectiveFeatures &features);
 struct FloatAccumulator {
 	std::array<std::vector<float>, kPerspectiveCount> perspective;
 	bool white_to_move = true;
-	bool action_mirrored = false;
 	int piece_count = 0;
 };
 
-/// Incrementally maintained sum of gated ordered-piece-pair messages.
-struct RelationAccumulator {
-	std::array<std::array<float, kValueAttentionWidth>, kPerspectiveCount> perspective{};
+struct ControlEdge {
+	std::uint16_t source = 0;
+	std::uint16_t target = 0;
+	std::uint16_t geometry = 0;
+	std::uint8_t perspective = 0;
+	std::uint8_t square = 0;
+	std::uint8_t ownership = 0;
+
+	auto operator<=>(const ControlEdge &) const = default;
+};
+
+struct ControlFeatures {
+	std::vector<ControlEdge> edges;
+	std::array<std::array<std::uint8_t, 64>, kPerspectiveCount> occupancy{};
+	std::array<std::array<float, kMaterialFeatureWidth>, kPerspectiveCount> material{};
+};
+
+/// Derives canonical pseudo-attack edges, occupancy and material from sparse features.
+ControlFeatures control_features(const EncodedFeatures &encoded);
+
+struct ControlAccumulator {
+	std::array<std::array<std::array<float, kControlWidth>, 64>,
+		kPerspectiveCount * 2> field{};
+	std::array<std::array<std::array<std::uint8_t, 64>, 2>, kPerspectiveCount> count{};
+	std::array<std::array<std::uint8_t, 64>, kPerspectiveCount> occupancy{};
+	std::array<std::array<std::array<float, kControlLocalWidth>, 64>,
+		kPerspectiveCount> local{};
+	std::array<std::array<float, kControlLocalWidth>, kPerspectiveCount> mean{};
+	std::array<std::array<float, kControlAttentionWidth>, kPerspectiveCount> attention{};
+	std::array<std::array<float, kControlAttentionWidth>, kPerspectiveCount>
+		attention_numerator{};
+	std::array<float, kPerspectiveCount> attention_denominator{};
+	std::array<std::array<float, kMaterialFeatureWidth>, kPerspectiveCount> material{};
+	std::vector<ControlEdge> edges;
+	int bucket = 0;
 };
 
 /// Complete incremental state consumed by the Value network.
 struct ValueAccumulator {
 	FloatAccumulator features;
-	RelationAccumulator relations;
-};
-
-struct PolicyWeights {
-	std::vector<float> feature_table;
-	std::vector<float> accumulator_bias;
-	std::vector<float> hidden_weight;
-	std::vector<float> hidden_bias;
-	std::vector<float> output_weight;
-	std::vector<float> output_bias;
+	ControlAccumulator control;
 };
 
 struct ValueWeights {
 	std::vector<float> feature_table;
 	std::vector<float> accumulator_bias;
-	std::vector<float> attention_table;
+	std::vector<float> control_source;
+	std::vector<float> control_target;
+	std::vector<float> control_geometry;
+	std::vector<float> control_occupancy;
+	std::vector<float> control_count;
+	std::vector<float> control_square;
+	std::vector<float> control_local_weight;
+	std::vector<float> control_local_bias;
+	std::vector<float> attention_key_weight;
+	std::vector<float> attention_key_bias;
+	std::vector<float> attention_value_weight;
+	std::vector<float> attention_value_bias;
+	std::vector<float> attention_query;
+	std::vector<float> material_weight;
 	std::vector<float> hidden_weight;
 	std::vector<float> hidden_bias;
 	std::vector<float> bottleneck_weight;
@@ -93,22 +138,7 @@ struct ValueWeights {
 /// Selects one of eight material-dependent Value subnetworks.
 int value_bucket(int piece_count) noexcept;
 
-/// Immutable, Torch-free evaluator for the independent Policy network.
-class CpuPolicy {
-	public:
-	explicit CpuPolicy(PolicyWeights weights);
-	FloatAccumulator refresh(const chess::Board &board) const;
-	FloatAccumulator update(const FloatAccumulator &current, const chess::Board &before,
-							const chess::Board &after) const;
-	std::vector<float> evaluate(const FloatAccumulator &accumulator,
-							const std::vector<chess::Move> &moves) const;
-	const PolicyWeights &weights() const noexcept { return weights_; }
-
-	private:
-	PolicyWeights weights_;
-};
-
-/// Immutable, Torch-free evaluator for the independent Value network.
+/// Immutable, Torch-free evaluator for the Value network.
 class CpuValue {
 	public:
 	explicit CpuValue(ValueWeights weights);
