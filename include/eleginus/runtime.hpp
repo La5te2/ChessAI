@@ -9,8 +9,6 @@
 
 namespace eleginus {
 
-inline constexpr std::int64_t kEleginusCheckpointType = 3;
-
 struct RuntimeWeights {
 	PolicyWeights policy;
 	ValueWeights value;

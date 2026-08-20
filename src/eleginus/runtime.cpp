@@ -24,7 +24,7 @@ namespace {
 constexpr std::array<char, 8> kMagic{'E', 'L', 'E', 'G', 'I', 'N', 'U', 'S'};
 constexpr std::array<char, 8> kFooterMagic{'E', 'L', 'E', 'G', 'E', 'M', 'B', 'D'};
 constexpr std::uint32_t kEndianMarker = 0x01020304U;
-constexpr std::uint32_t kRuntimeFormat = 4U;
+constexpr std::uint32_t kRuntimeFormat = 3U;
 
 static_assert(std::endian::native == std::endian::little,
 	"Eleginus native weights currently require a little-endian target");
@@ -232,7 +232,6 @@ void embed_runtime_model_atomic(const std::filesystem::path &input,
 		output.write(kMagic.data(), static_cast<std::streamsize>(kMagic.size()));
 		write_scalar(output, kEndianMarker);
 		write_scalar(output, kRuntimeFormat);
-		write_scalar(output, static_cast<std::uint32_t>(kEleginusCheckpointType));
 		write_scalar(output, static_cast<std::uint32_t>(kActionSize));
 		write_scalar(output, static_cast<std::uint32_t>(kFeatureVocabulary));
 		write_scalar(output, static_cast<std::uint32_t>(kPolicyAccumulatorWidth));
@@ -296,7 +295,6 @@ RuntimeWeights load_embedded_runtime_model(const std::filesystem::path &executab
 	}
 	const auto endian = read_scalar<std::uint32_t>(input, path);
 	const auto format = read_scalar<std::uint32_t>(input, path);
-	const auto architecture = read_scalar<std::uint32_t>(input, path);
 	const auto action_size = read_scalar<std::uint32_t>(input, path);
 	const auto feature_count = read_scalar<std::uint32_t>(input, path);
 	const auto policy_accumulator = read_scalar<std::uint32_t>(input, path);
@@ -308,7 +306,6 @@ RuntimeWeights load_embedded_runtime_model(const std::filesystem::path &executab
 	const auto value_bottleneck = read_scalar<std::uint32_t>(input, path);
 	const auto value_buckets = read_scalar<std::uint32_t>(input, path);
 	if (endian != kEndianMarker || format != kRuntimeFormat ||
-		architecture != kEleginusCheckpointType ||
 		action_size != kActionSize || feature_count != kFeatureVocabulary ||
 		policy_accumulator != kPolicyAccumulatorWidth || policy_hidden != kPolicyHiddenWidth ||
 		value_accumulator != kValueAccumulatorWidth || value_attention != kValueAttentionWidth ||
