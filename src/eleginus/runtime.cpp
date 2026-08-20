@@ -24,7 +24,7 @@ namespace {
 constexpr std::array<char, 8> kMagic{'E', 'L', 'E', 'G', 'I', 'N', 'U', 'S'};
 constexpr std::array<char, 8> kFooterMagic{'E', 'L', 'E', 'G', 'E', 'M', 'B', 'D'};
 constexpr std::uint32_t kEndianMarker = 0x01020304U;
-constexpr std::uint32_t kRuntimeFormat = 3U;
+constexpr std::uint32_t kRuntimeFormat = 4U;
 
 static_assert(std::endian::native == std::endian::little,
 	"Eleginus native weights currently require a little-endian target");

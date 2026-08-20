@@ -54,6 +54,7 @@ PerspectiveFeatures canonicalize_features(const PerspectiveFeatures &features);
 struct FloatAccumulator {
 	std::array<std::vector<float>, kPerspectiveCount> perspective;
 	bool white_to_move = true;
+	bool action_mirrored = false;
 	int piece_count = 0;
 };
 

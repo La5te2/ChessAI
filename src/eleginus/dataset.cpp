@@ -27,6 +27,19 @@ namespace eleginus {
 
 namespace {
 
+constexpr double kValueLogitLossWeight = 0.25;
+constexpr double kValueTargetEpsilon = 1.0e-4;
+
+enum TrainingMetric : std::int64_t {
+	kMetricSamples,
+	kMetricPredictionSum,
+	kMetricTargetSum,
+	kMetricPredictionSquareSum,
+	kMetricTargetSquareSum,
+	kMetricPredictionTargetSum,
+	kTrainingMetricCount
+};
+
 void require_h5(herr_t status, const std::string &operation) {
 	if (status < 0)
 		throw std::runtime_error("HDF5 failed to " + operation);
@@ -291,8 +304,7 @@ class PreprocessVisitor : public chess::pgn::Visitor {
 		try {
 			const auto parsed = chess::uci::parseSan(board_, san);
 			game_features_.push_back(encode_features(board_));
-			game_moves_.push_back(
-				static_cast<std::uint16_t>(move_to_index(parsed, board_.sideToMove())));
+			game_moves_.push_back(static_cast<std::uint16_t>(move_to_index(parsed, board_)));
 			const auto score = comment_score(std::string(comment));
 			game_comment_scores_.push_back(score);
 			game_movers_are_white_.push_back(board_.sideToMove() == chess::Color::WHITE);
@@ -667,6 +679,8 @@ TrainStats train_from_h5(Model &model, const TrainOptions &options,
 		torch::optim::AdamWOptions(options.learning_rate).weight_decay(options.weight_decay));
 	model->train();
 	TrainStats stats;
+	auto metric_sums = torch::zeros({kTrainingMetricCount},
+		torch::TensorOptions().dtype(torch::kFloat64).device(device));
 	const std::int64_t chunk_rows =
 		std::max<std::int64_t>(4096, static_cast<std::int64_t>(options.batch_size) * 16);
 	std::vector<std::int64_t> chunks;
@@ -717,13 +731,30 @@ TrainStats train_from_h5(Model &model, const TrainOptions &options,
 					throw std::runtime_error("Eleginus Value output must have shape [batch]");
 				}
 				auto policy_loss = torch::nn::functional::cross_entropy(logits, move_targets);
-				// The targets are expected scores in [0,1]. BCEWithLogits supplies the
-				// proper Bernoulli loss directly on the raw Value logit and avoids the
-				// extra sigmoid derivative that weakened corrections under squared error.
-				auto value_loss = torch::nn::functional::binary_cross_entropy_with_logits(
+				auto value_bce = torch::nn::functional::binary_cross_entropy_with_logits(
 					value_prediction, value_targets);
+				auto bounded_targets = value_targets.clamp(
+					kValueTargetEpsilon, 1.0 - kValueTargetEpsilon);
+				auto value_logit_targets = torch::log(
+					bounded_targets / (1.0 - bounded_targets));
+				auto value_logit_loss = torch::nn::functional::smooth_l1_loss(
+					value_prediction, value_logit_targets);
+				auto value_loss = value_bce + kValueLogitLossWeight * value_logit_loss;
 				auto loss = policy_loss + value_loss;
 				loss.backward();
+				{
+					torch::NoGradGuard no_grad;
+					auto probabilities = value_prediction.detach().sigmoid().to(torch::kFloat64);
+					auto targets = value_targets.detach().to(torch::kFloat64);
+					metric_sums.add_(torch::stack({
+						torch::full({}, static_cast<double>(count), metric_sums.options()),
+						probabilities.sum().to(torch::kFloat64),
+						targets.sum().to(torch::kFloat64),
+						probabilities.square().sum().to(torch::kFloat64),
+						targets.square().sum().to(torch::kFloat64),
+						(probabilities * targets).sum().to(torch::kFloat64)
+					}));
+				}
 				for (const auto &parameter : model->named_parameters()) {
 					if (parameter.value().grad().defined() &&
 						parameter.value().grad().sizes() != parameter.value().sizes()) {
@@ -737,9 +768,28 @@ TrainStats train_from_h5(Model &model, const TrainOptions &options,
 				value_optimizer.step();
 				++stats.steps;
 				stats.samples += count;
-				if (options.log_every > 0 && stats.steps % options.log_every == 0)
+				if (options.log_every > 0 && stats.steps % options.log_every == 0) {
+					auto metrics = metric_sums.to(torch::kCPU).contiguous();
+					const auto *m = metrics.data_ptr<double>();
+					const double samples = std::max(1.0, m[kMetricSamples]);
+					const double prediction_mean = m[kMetricPredictionSum] / samples;
+					const double target_mean = m[kMetricTargetSum] / samples;
+					const double prediction_variance = std::max(0.0,
+						m[kMetricPredictionSquareSum] / samples - prediction_mean * prediction_mean);
+					const double target_variance = std::max(0.0,
+						m[kMetricTargetSquareSum] / samples - target_mean * target_mean);
+					const double covariance = m[kMetricPredictionTargetSum] / samples -
+						prediction_mean * target_mean;
+					const double correlation = prediction_variance > 1.0e-12 &&
+						target_variance > 1.0e-12
+						? covariance / std::sqrt(prediction_variance * target_variance)
+						: 0.0;
 					std::cout << "Eleginus training: epoch=" << (epoch + 1)
-							  << " step=" << stats.steps << std::endl;
+							  << " step=" << stats.steps
+							  << " value_corr=" << correlation
+							  << std::endl;
+					metric_sums.zero_();
+				}
 			}
 			if (stop)
 				break;

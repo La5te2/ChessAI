@@ -22,7 +22,7 @@ void require(bool condition, const char *message) {
 
 void require_codec(const chess::Board &board) {
 	for (const auto &move : eleginus::legal_moves(board)) {
-		const int action = eleginus::move_to_index(move, board.sideToMove());
+		const int action = eleginus::move_to_index(move, board);
 		require(action >= 0 && action < eleginus::kActionSize, "action index out of range");
 		require(eleginus::index_to_move(action, board) == move, "move codec round trip failed");
 	}
@@ -71,20 +71,43 @@ int main() {
 					"canonical feature index out of range");
 			}
 		}
-		const auto left = eleginus::encode_features(
-			chess::Board("4k3/8/8/8/8/2N5/8/2K5 w - - 0 1"));
-		const auto right = eleginus::encode_features(
-			chess::Board("3k4/8/8/8/8/5N2/8/5K2 w - - 0 1"));
+		const chess::Board left_board("4k3/8/8/8/8/2N5/8/2K5 w - - 0 1");
+		const chess::Board right_board("3k4/8/8/8/8/5N2/8/5K2 w - - 0 1");
+		const auto left = eleginus::encode_features(left_board);
+		const auto right = eleginus::encode_features(right_board);
 		for (int perspective = 0; perspective < eleginus::kPerspectiveCount; ++perspective) {
 			require(eleginus::canonicalize_features(left.perspective[perspective]) ==
 					eleginus::canonicalize_features(right.perspective[perspective]),
 				"horizontal feature canonicalization mismatch");
 		}
+		require(eleginus::move_to_index(chess::uci::uciToMove(left_board, "c3b5"),
+				left_board) ==
+				eleginus::move_to_index(chess::uci::uciToMove(right_board, "f3g5"),
+					right_board),
+			"horizontal action canonicalization mismatch");
 
 		auto model = eleginus::make_model(torch::Device(torch::kCPU), 7);
 		model->eval();
 		eleginus::CpuPolicy policy = eleginus::snapshot_policy(model->policy);
 		eleginus::CpuValue value = eleginus::snapshot_value(model->value);
+		const auto left_moves = eleginus::legal_moves(left_board);
+		const auto right_moves = eleginus::legal_moves(right_board);
+		const auto left_probabilities = policy.evaluate(policy.refresh(left_board), left_moves);
+		const auto right_probabilities = policy.evaluate(policy.refresh(right_board), right_moves);
+		std::array<float, eleginus::kActionSize> left_by_action{};
+		std::array<float, eleginus::kActionSize> right_by_action{};
+		left_by_action.fill(-1.0F);
+		right_by_action.fill(-1.0F);
+		for (std::size_t index = 0; index < left_moves.size(); ++index)
+			left_by_action[static_cast<std::size_t>(
+				eleginus::move_to_index(left_moves[index], left_board))] = left_probabilities[index];
+		for (std::size_t index = 0; index < right_moves.size(); ++index)
+			right_by_action[static_cast<std::size_t>(
+				eleginus::move_to_index(right_moves[index], right_board))] = right_probabilities[index];
+		require(max_difference(
+			std::vector<float>(left_by_action.begin(), left_by_action.end()),
+			std::vector<float>(right_by_action.begin(), right_by_action.end())) < 1.0e-5F,
+			"horizontal canonicalization changed native Policy probabilities");
 		const auto moves = eleginus::legal_moves(board);
 		const auto policy_accumulator = policy.refresh(board);
 		const auto value_accumulator = value.refresh(board);
@@ -102,7 +125,7 @@ int main() {
 		std::vector<std::int64_t> action_indices;
 		action_indices.reserve(moves.size());
 		for (const auto &move : moves)
-			action_indices.push_back(eleginus::move_to_index(move, board.sideToMove()));
+			action_indices.push_back(eleginus::move_to_index(move, board));
 		auto indices = torch::tensor(action_indices, torch::TensorOptions().dtype(torch::kInt64));
 		auto torch_policy = model->policy->forward(features, side)
 			.index_select(1, indices).softmax(1).squeeze(0).contiguous();
@@ -115,14 +138,15 @@ int main() {
 		auto after = board;
 		after.makeMove(chess::uci::uciToMove(after, "e2e4"));
 		const auto black_e5 = chess::uci::uciToMove(after, "e7e5");
-		require(eleginus::move_to_index(chess::uci::uciToMove(board, "e2e4"),
-					board.sideToMove()) ==
-				eleginus::move_to_index(black_e5, after.sideToMove()),
+		require(eleginus::move_to_index(chess::uci::uciToMove(board, "e2e4"), board) ==
+				eleginus::move_to_index(black_e5, after),
 			"side-relative move encoding differs between colors");
 		const auto policy_updated = policy.update(policy_accumulator, board, after);
 		const auto policy_refreshed = policy.refresh(after);
 		const auto value_updated = value.update(value_accumulator, board, after);
 		const auto value_refreshed = value.refresh(after);
+		require(policy_updated.action_mirrored == policy_refreshed.action_mirrored,
+			"incremental Policy action frame differs from refresh");
 		for (int perspective = 0; perspective < eleginus::kPerspectiveCount; ++perspective) {
 			require(max_difference(
 						policy_updated.perspective[static_cast<std::size_t>(perspective)],
@@ -253,10 +277,8 @@ int main() {
 			writer_options.source = "unit_test";
 			eleginus::H5Writer writer(writer_options);
 			writer.append({encoded, after_encoded},
-				{static_cast<std::uint16_t>(eleginus::move_to_index(
-					 moves.front(), board.sideToMove())),
-				 static_cast<std::uint16_t>(eleginus::move_to_index(
-					 black_move, after.sideToMove()))},
+				{static_cast<std::uint16_t>(eleginus::move_to_index(moves.front(), board)),
+				 static_cast<std::uint16_t>(eleginus::move_to_index(black_move, after))},
 				{0.75F, 0.25F});
 			writer.flush();
 		}
@@ -266,7 +288,7 @@ int main() {
 			require(dataset.info().source == "unit_test", "Eleginus HDF5 source mismatch");
 			auto stored = dataset.read_contiguous(0, 2);
 			require(stored.moves[1].item<std::int64_t>() ==
-				eleginus::move_to_index(black_move, after.sideToMove()),
+				eleginus::move_to_index(black_move, after),
 				"Eleginus HDF5 move mismatch");
 			require(std::abs(stored.values[0].item<float>() - 0.75F) < 1.0e-6F,
 				"Eleginus HDF5 Value mismatch");
@@ -293,7 +315,7 @@ int main() {
 		training_options.epochs = 1;
 		training_options.batch_size = 2;
 		training_options.max_steps = 1;
-		training_options.log_every = 0;
+		training_options.log_every = 1;
 		const auto training_stats = eleginus::train_from_h5(
 			training_model, training_options, torch::Device(torch::kCPU));
 		require(training_stats.steps == 1 && training_stats.samples == 2,
@@ -364,7 +386,7 @@ int main() {
 					replay, std::array<std::string_view, 4>{"e4", "e5", "Nf3", "Nc6"}
 						[static_cast<std::size_t>(row)]);
 				require(stored.moves[row].item<std::int64_t>() ==
-						eleginus::move_to_index(expected, replay.sideToMove()),
+						eleginus::move_to_index(expected, replay),
 					"Eleginus preprocessing changed a move after a root comment");
 				replay.makeMove(expected);
 			}

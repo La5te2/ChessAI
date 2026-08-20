@@ -13,6 +13,8 @@ namespace eleginus {
 
 namespace {
 
+constexpr std::int64_t kActionEncodingVersion = 2;
+
 torch::Tensor scalar(std::int64_t value) {
 	return torch::tensor(value, torch::TensorOptions().dtype(torch::kInt64));
 }
@@ -45,6 +47,7 @@ void write_architecture(torch::serialize::OutputArchive &archive) {
 	archive.write("value_bottleneck", scalar(kValueBottleneckWidth), true);
 	archive.write("value_buckets", scalar(kValueBucketCount), true);
 	archive.write("action_size", scalar(kActionSize), true);
+	archive.write("action_encoding_version", scalar(kActionEncodingVersion), true);
 }
 
 void validate_architecture(torch::serialize::InputArchive &archive) {
@@ -61,6 +64,7 @@ void validate_architecture(torch::serialize::InputArchive &archive) {
 	require_scalar(archive, "value_bottleneck", kValueBottleneckWidth);
 	require_scalar(archive, "value_buckets", kValueBucketCount);
 	require_scalar(archive, "action_size", kActionSize);
+	require_scalar(archive, "action_encoding_version", kActionEncodingVersion);
 }
 
 void replace_file(const std::filesystem::path &temporary, const std::filesystem::path &target) {

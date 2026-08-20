@@ -93,27 +93,35 @@ The complete state $x$ also retains move counters and repetition history. These 
 
 ### 2.2 Action Encoding
 
-The action codec applies the vertical orientation $\omega_{c_x}$ to express every legal action from the perspective of the side to move. Its fixed action space preserves distinct kingside and queenside moves.
-
-Let $q_{\mathrm{from}}(a)$ be the absolute source square of action $a$. Let $q_{\mathrm{to}}(a)$ be its absolute destination square, except that castling uses the king destination `g1`, `c1`, `g8` or `c8` when the rules library internally stores the rook square. The oriented squares are
+The action codec places each legal action in the same canonical frame as the Policy features. It first applies the vertical orientation $\omega_{c_x}$, which makes the side to move advance toward increasing ranks. Let $\kappa_{c_x}(x)$ be that side's king square after this orientation, and define the horizontal transformation
 
 $$
-\widetilde q_{\mathrm{from}}(x,a)=
-\omega_{c_x}\left(q_{\mathrm{from}}(a)\right),
+\mu_x(q(r,f))=
+\begin{cases}
+q(r,7-f),&\kappa_{c_x}(x)\bmod8<4,\\
+q(r,f),&\kappa_{c_x}(x)\bmod8\geq4.
+\end{cases}
+$$
+
+Thus the king of the side to move lies on files `e` through `h` in the canonical frame. Let $q_{\mathrm{from}}(a)$ be the absolute source square of action $a$, and let $q_{\mathrm{to}}(a)$ be its absolute destination square. For castling, $q_{\mathrm{to}}(a)$ is the king destination `g1`, `c1`, `g8` or `c8`, even when the rules library internally stores the rook square. The canonical source and destination squares are
+
+$$
+\widehat q_{\mathrm{from}}(x,a)=
+\mu_x\left(\omega_{c_x}\left(q_{\mathrm{from}}(a)\right)\right),
 \qquad
-\widetilde q_{\mathrm{to}}(x,a)=
-\omega_{c_x}\left(q_{\mathrm{to}}(a)\right).
+\widehat q_{\mathrm{to}}(x,a)=
+\mu_x\left(\omega_{c_x}\left(q_{\mathrm{to}}(a)\right)\right).
 $$
 
-Ordinary moves and queen promotions use one index for each oriented source-destination pair:
+Ordinary moves and queen promotions use one index for each canonical source-destination pair:
 
 $$
 i_E(x,a)=
-64\widetilde q_{\mathrm{from}}(x,a)
-+\widetilde q_{\mathrm{to}}(x,a).
+64\widehat q_{\mathrm{from}}(x,a)
++\widehat q_{\mathrm{to}}(x,a).
 $$
 
-These actions occupy indices $0$ through $4095$. An underpromotion additionally distinguishes its destination-file displacement and promoted piece. Let $\Delta_f(a)\in\lbrace-1,0,1\rbrace$ be the destination file minus the source file, and define
+These actions occupy indices $0$ through $4095$. An underpromotion additionally distinguishes its canonical destination-file displacement and promoted piece. Let $\widehat\Delta_f(x,a)\in\lbrace-1,0,1\rbrace$ be the file of $\widehat q_{\mathrm{to}}(x,a)$ minus the file of $\widehat q_{\mathrm{from}}(x,a)$, and define
 
 $$
 r(a)=
@@ -129,8 +137,8 @@ The underpromotion index is
 $$
 i_E(x,a)=
 4096
-+9\widetilde q_{\mathrm{from}}(x,a)
-+3\bigl(\Delta_f(a)+1\bigr)
++9\widehat q_{\mathrm{from}}(x,a)
++3\bigl(\widehat\Delta_f(x,a)+1\bigr)
 +r(a).
 $$
 
@@ -150,7 +158,7 @@ The Policy and Value networks receive the same encoded state and use separate pa
 
 ### 3.1 Sparse Accumulators
 
-Before table lookup, Eleginus maps each 64-king-square feature sequence to a horizontally canonical 32-bucket sequence. Write the oriented king square as $\kappa_c(x)=q(r_c,f_c)$, and define
+Before table lookup, Eleginus maps each 64-king-square feature sequence to a horizontally canonical 32-bucket sequence. This mapping uses the same king-file condition as the action frame in Section 2.2. Write the oriented king square as $\kappa_c(x)=q(r_c,f_c)$, and define
 
 $$
 \chi_c(q(r,f))=
@@ -452,10 +460,10 @@ L_{P,\mathrm{sup}}^{(\mathcal B)}=
 \log R_{\theta_P}(i\mid s).
 $$
 
-The supervised Value loss treats the expected-score target as a soft Bernoulli label and applies binary cross-entropy to the raw Value logit:
+The expected-score target $y$ first defines a binary-cross-entropy component on the raw Value logit:
 
 $$
-L_{V,\mathrm{sup}}^{(\mathcal B)}=
+L_{V,\mathrm{BCE}}^{(\mathcal B)}=
 -\frac{1}{|\mathcal B|}
 \sum_{(s,i,y)\in\mathcal B}
 \left[
@@ -466,13 +474,48 @@ $$
 
 The implementation evaluates this expression with a numerically stable binary-cross-entropy-with-logits operator. Its derivative with respect to the raw logit is proportional to $V_{\theta_V}(s)-y$, so corrections near either end of the expected-score range retain their gradient strength.
 
-For one record, write $p=V_{\theta_V}(s)$ and define its target entropy by
+Search consumes the raw score $v_{\theta_V}(s)$ rather than its sigmoid. The same target $y$ determines a raw-score target
+
+$$
+z(y)=\log\frac{\mathrm{clip}(y,\epsilon_V,1-\epsilon_V)}
+{1-\mathrm{clip}(y,\epsilon_V,1-\epsilon_V)},
+\qquad \epsilon_V=10^{-4}.
+$$
+
+Let
+
+$$
+\mathrm{SL1}(e)=
+\begin{cases}
+\frac12e^2,&|e|<1,\\
+|e|-\frac12,&|e|\geq1.
+\end{cases}
+$$
+
+The raw-score component directly constrains the quantity used by tree search:
+
+$$
+L_{V,\mathrm{raw}}^{(\mathcal B)}=
+\frac{1}{|\mathcal B|}
+\sum_{(s,i,y)\in\mathcal B}
+\mathrm{SL1}\left(v_{\theta_V}(s)-z(y)\right).
+$$
+
+Both components have the same optimum for each target, since $\sigma(z(y))$ equals the clipped target. Their weighted sum defines the supervised Value loss:
+
+$$
+L_{V,\mathrm{sup}}^{(\mathcal B)}=
+L_{V,\mathrm{BCE}}^{(\mathcal B)}
++\frac14L_{V,\mathrm{raw}}^{(\mathcal B)}.
+$$
+
+The absolute magnitude of the BCE component requires a separate interpretation. For one record, write $p=V_{\theta_V}(s)$ and define its target entropy by
 
 $$
 h(y)=-y\log y-(1-y)\log(1-y),
 $$
 
-where $0\log0$ is defined as $0$. The record's Value loss decomposes as
+where $0\log0$ is defined as $0$. The record's BCE component decomposes as
 
 $$
 -y\log p-(1-y)\log(1-p)
@@ -504,17 +547,24 @@ $$
 \nabla_{\theta_V}L_{V,\mathrm{sup}}^{(\mathcal B)}.
 $$
 
-For a fixed distribution of supervised records, the population minimizers are
+For a fixed distribution of supervised records, the Policy population minimizer is
 
 $$
 R^*(i\mid s)=
-\Pr(i_n=i\mid s_n=s),
-\qquad
-V^*(s)=
-\mathbb E(y_n\mid s_n=s).
+\Pr(i_n=i\mid s_n=s).
 $$
 
-The Policy objective fits the conditional distribution of recorded action indices, and the Value objective fits the conditional mean expected score.
+The Value optimum combines expected-score calibration with direct raw-score fitting. For a fixed state $s$, its stationary raw score $v^*(s)$ satisfies
+
+$$
+\sigma(v^*(s))-\mathbb E[y_n\mid s_n=s]
++\frac14\mathbb E\left[
+\mathrm{clip}\left(v^*(s)-z(y_n),-1,1\right)
+\mathrel{\big|}s_n=s
+\right]=0.
+$$
+
+When every occurrence of $s$ has the same target $y$, the unique solution is $v^*(s)=z(y)$. Variation among annotations for the same encoded state produces a compromise determined by the equation above.
 
 ### 4.3 Parameter Optimization
 

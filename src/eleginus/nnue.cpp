@@ -21,6 +21,14 @@ int horizontally_mirrored_square(int square, int king_square) {
 	return king_square % 8 < 4 ? square ^ 7 : square;
 }
 
+bool perspective_is_mirrored(const PerspectiveFeatures &features) {
+	for (const int feature : features) {
+		if (feature >= 0 && feature < kEncodedPieceFeatureCount)
+			return (feature / (12 * 64)) % 8 < 4;
+	}
+	throw std::runtime_error("Eleginus encoded perspective contains no king bucket");
+}
+
 int relative_piece_index(const chess::Piece &piece, chess::Color perspective) {
 	const int type = static_cast<int>(piece.type().internal());
 	if (type < 0 || type > 5) {
@@ -71,6 +79,9 @@ FloatAccumulator refresh_accumulator(const EncodedFeatures &encoded,
 									 const std::vector<float> &bias, int width) {
 	FloatAccumulator result;
 	result.white_to_move = encoded.white_to_move;
+	const int mover = encoded.white_to_move ? 0 : 1;
+	result.action_mirrored = perspective_is_mirrored(
+		encoded.perspective[static_cast<std::size_t>(mover)]);
 	for (const int feature : encoded.perspective[0])
 		result.piece_count += feature != kEncodedPaddingFeature;
 	result.piece_count -= 2;
@@ -99,6 +110,9 @@ FloatAccumulator update_accumulator(const FloatAccumulator &current,
 									const std::vector<float> &table, int width) {
 	FloatAccumulator result = current;
 	result.white_to_move = new_features.white_to_move;
+	const int mover = new_features.white_to_move ? 0 : 1;
+	result.action_mirrored = perspective_is_mirrored(
+		new_features.perspective[static_cast<std::size_t>(mover)]);
 	result.piece_count = 0;
 	for (const int feature : new_features.perspective[0])
 		result.piece_count += feature != kEncodedPaddingFeature;
@@ -311,14 +325,14 @@ std::vector<float> linear_relu_bucket(const std::vector<float> &input,
 std::vector<float> legal_softmax(const std::vector<float> &hidden,
 								 const PolicyWeights &weights,
 								 const std::vector<chess::Move> &moves,
-								 chess::Color side_to_move) {
+								 chess::Color side_to_move, bool horizontal_mirror) {
 	if (moves.empty()) {
 		return {};
 	}
 	std::vector<float> logits(moves.size());
 	float maximum = -std::numeric_limits<float>::infinity();
 	for (std::size_t move_index = 0; move_index < moves.size(); ++move_index) {
-		const int action = move_to_index(moves[move_index], side_to_move);
+		const int action = move_to_index(moves[move_index], side_to_move, horizontal_mirror);
 		float logit = weights.output_bias[static_cast<std::size_t>(action)];
 		const auto offset = static_cast<std::size_t>(action) * kPolicyHiddenWidth;
 		for (int channel = 0; channel < kPolicyHiddenWidth; ++channel) {
@@ -455,7 +469,8 @@ std::vector<float> CpuPolicy::evaluate(const FloatAccumulator &accumulator,
 	const auto hidden =
 		linear_relu(input, weights_.hidden_weight, weights_.hidden_bias, kPolicyHiddenWidth);
 	return legal_softmax(hidden, weights_, moves,
-		accumulator.white_to_move ? chess::Color::WHITE : chess::Color::BLACK);
+		accumulator.white_to_move ? chess::Color::WHITE : chess::Color::BLACK,
+		accumulator.action_mirrored);
 }
 
 CpuValue::CpuValue(ValueWeights weights) : weights_(std::move(weights)) {
