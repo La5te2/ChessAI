@@ -38,16 +38,21 @@ class AutocastGuard {
 	public:
 	/// Enables CUDA BF16 autocast for one forward scope and preserves nested caller state.
 	AutocastGuard(ComputePrecision precision, const torch::Device &device)
-		: active_(precision == ComputePrecision::Bf16) {
+		: active_(device.is_cuda()) {
 		if (!active_) {
 			return;
 		}
-		validate_compute_precision(precision, device);
 		previous_enabled_ = at::autocast::is_autocast_enabled(at::kCUDA);
 		previous_dtype_ = at::autocast::get_autocast_dtype(at::kCUDA);
+		if (precision == ComputePrecision::Bf16) {
+			validate_compute_precision(precision, device);
+		}
 		at::autocast::increment_nesting();
-		at::autocast::set_autocast_dtype(at::kCUDA, at::kBFloat16);
-		at::autocast::set_autocast_enabled(at::kCUDA, true);
+		if (precision == ComputePrecision::Bf16) {
+			at::autocast::set_autocast_dtype(at::kCUDA, at::kBFloat16);
+		}
+		at::autocast::set_autocast_enabled(
+			at::kCUDA, precision == ComputePrecision::Bf16);
 	}
 
 	/// Restores the prior thread-local autocast state and clears the outermost cast cache.

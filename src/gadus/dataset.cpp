@@ -13,12 +13,52 @@
 #include <stdexcept>
 #include <tuple>
 #include <utility>
+#include <nlohmann/json.hpp>
+#include <torch/csrc/autograd/autograd.h>
 #include <torch/optim.h>
 #include "gadus/checkpoint.hpp"
 
 namespace gadus {
 
 namespace {
+
+constexpr std::int64_t kValueWeightProbeInterval = 200;
+constexpr double kValueGradientRatio = 0.5;
+constexpr double kValueHeadLearningRateRatio = 0.25;
+constexpr double kValueHeadGradientClip = 1.0;
+constexpr double kValueWeightSmoothing = 0.05;
+constexpr double kMinValueWeight = 0.05;
+constexpr double kMaxValueWeight = 4.0;
+constexpr double kGradientEpsilon = 1e-12;
+constexpr double kConflictMargin = 1e-3;
+
+struct GradientBalanceStats {
+	double policy_squared_norm = 0.0;
+	double value_squared_norm = 0.0;
+	double inner_product = 0.0;
+};
+
+GradientBalanceStats shared_gradient_stats(const torch::Tensor &policy_loss,
+											const torch::Tensor &value_loss,
+											const Model &model) {
+	const auto parameters = model->backbone->parameters();
+	const auto policy_gradients =
+		torch::autograd::grad({policy_loss}, parameters, {}, true, false, false);
+	const auto value_gradients =
+		torch::autograd::grad({value_loss}, parameters, {}, true, false, false);
+	auto totals = torch::zeros(
+		{3}, torch::TensorOptions().dtype(torch::kFloat64).device(policy_loss.device()));
+	for (std::size_t index = 0; index < parameters.size(); ++index) {
+		const auto policy = policy_gradients[index].detach().to(torch::kFloat32);
+		const auto value = value_gradients[index].detach().to(torch::kFloat32);
+		totals.add_(torch::stack(
+			{policy.square().sum(), value.square().sum(), (policy * value).sum()})
+					.to(torch::kFloat64));
+	}
+	totals = totals.to(torch::kCPU).contiguous();
+	const auto values = totals.accessor<double, 1>();
+	return {values[0], values[1], values[2]};
+}
 
 // Turn a negative HDF5 status into an operation-specific C++ exception.
 void require_h5(herr_t status, const std::string &operation) {
@@ -100,11 +140,17 @@ class H5Writer {
 		write_string_attribute(file_, "move_encoding", kMoveEncoding);
 		write_string_attribute(file_, "target_schema", kTargetSchema);
 		write_string_attribute(file_, "value_perspective", "side_to_move");
-		write_int_attribute(file_, "has_cmt", options.has_comments);
-		if (options.has_comments) {
+		const bool lichess_eval = options.source == "lichess-eval";
+		write_int_attribute(file_, "has_cmt", lichess_eval ? 1 : options.has_comments);
+		if (!lichess_eval && options.has_comments) {
 			write_string_attribute(file_, "comment_eval_perspective", "white");
 			write_string_attribute(file_, "comment_value_transform",
 								   "tanh(side_to_move_pawn_score/3)");
+		} else if (lichess_eval) {
+			write_string_attribute(file_, "evaluation_source", "lichess_cloud_eval");
+			write_string_attribute(file_, "evaluation_perspective", "white");
+			write_string_attribute(file_, "evaluation_value_transform",
+								   "tanh(side_to_move_centipawn_score/300)");
 		}
 		states_ = create_dataset(
 			"states", {0, kStatePlanes, 8}, {H5S_UNLIMITED, kStatePlanes, 8},
@@ -156,6 +202,16 @@ class H5Writer {
 		write_int_attribute(file_, "games", games);
 		write_int_attribute(file_, "positions", static_cast<std::int64_t>(size_));
 		write_int_attribute(file_, "skipped_games", skipped_games);
+		require_h5(H5Fflush(file_, H5F_SCOPE_GLOBAL), "flush output file");
+	}
+
+	// Record source-line counters for a position-oriented evaluation export.
+	void finish_evaluations(std::int64_t source_records, std::int64_t skipped_records) {
+		write_int_attribute(file_, "games", 0);
+		write_int_attribute(file_, "positions", static_cast<std::int64_t>(size_));
+		write_int_attribute(file_, "source_records", source_records);
+		write_int_attribute(file_, "skipped_records", skipped_records);
+		write_int_attribute(file_, "skipped_games", 0);
 		require_h5(H5Fflush(file_, H5F_SCOPE_GLOBAL), "flush output file");
 	}
 
@@ -238,6 +294,89 @@ float result_value(const std::string &result, chess::Color turn) {
 	if (result == "0-1")
 		white = -1.0F;
 	return turn == chess::Color::WHITE ? white : -white;
+}
+
+// Lichess cloud evaluations use White's point of view; convert cp to the existing target scale.
+float lichess_cp_value(int centipawns, chess::Color turn) {
+	const double white = static_cast<double>(centipawns) / 100.0;
+	const double side = turn == chess::Color::WHITE ? white : -white;
+	return static_cast<float>(std::tanh(side / 3.0));
+}
+
+// Convert a White-perspective mate sign to an exact side-to-move endpoint.
+float lichess_mate_value(int mate, chess::Color turn) {
+	const float white = mate > 0 ? 1.0F : -1.0F;
+	return turn == chess::Color::WHITE ? white : -white;
+}
+
+// Lichess FEN keys omit move counters, which chess-library expects in its full FEN parser.
+std::string complete_lichess_fen(const std::string &fen) {
+	const auto fields = static_cast<int>(std::count(fen.begin(), fen.end(), ' ')) + 1;
+	if (fields == 4)
+		return fen + " 0 1";
+	if (fields == 6)
+		return fen;
+	throw std::invalid_argument("FEN must contain four or six fields");
+}
+
+// Match both ordinary UCI and UCI_Chess960 notation against the generated legal moves.
+chess::Move parse_lichess_pv_move(const chess::Board &board, std::string_view token) {
+	for (const auto &move : legal_moves(board)) {
+		if (chess::uci::moveToUci(move) == token || chess::uci::moveToUci(move, true) == token)
+			return move;
+	}
+	throw std::invalid_argument("PV starts with an illegal move: " + std::string(token));
+}
+
+struct LichessTarget {
+	chess::Move move;
+	float value = 0.0F;
+};
+
+// Select the deepest evaluation, breaking equal depths by searched nodes, then use its first PV.
+LichessTarget lichess_target(const nlohmann::json &record, const chess::Board &board) {
+	if (!record.contains("evals") || !record.at("evals").is_array())
+		throw std::invalid_argument("record has no evaluation array");
+	const nlohmann::json *selected = nullptr;
+	int selected_depth = -1;
+	std::int64_t selected_knodes = -1;
+	for (const auto &evaluation : record.at("evals")) {
+		if (!evaluation.is_object() || !evaluation.contains("pvs") ||
+			!evaluation.at("pvs").is_array() || evaluation.at("pvs").empty()) {
+			continue;
+		}
+		const int depth = evaluation.value("depth", -1);
+		const std::int64_t knodes = evaluation.value("knodes", std::int64_t{-1});
+		if (selected == nullptr || depth > selected_depth ||
+			(depth == selected_depth && knodes > selected_knodes)) {
+			selected = &evaluation;
+			selected_depth = depth;
+			selected_knodes = knodes;
+		}
+	}
+	if (selected == nullptr)
+		throw std::invalid_argument("record has no principal variation");
+
+	const auto &pv = selected->at("pvs").front();
+	if (!pv.is_object() || !pv.contains("line") || !pv.at("line").is_string())
+		throw std::invalid_argument("selected principal variation has no line");
+	const std::string line = pv.at("line").get<std::string>();
+	const auto separator = line.find(' ');
+	const auto first_move_length = separator == std::string::npos ? line.size() : separator;
+	const std::string_view first_move(line.data(), first_move_length);
+	if (first_move.empty())
+		throw std::invalid_argument("selected principal variation is empty");
+
+	float value = 0.0F;
+	if (pv.contains("cp") && pv.at("cp").is_number_integer()) {
+		value = lichess_cp_value(pv.at("cp").get<int>(), board.sideToMove());
+	} else if (pv.contains("mate") && pv.at("mate").is_number_integer() &&
+			   pv.at("mate").get<int>() != 0) {
+		value = lichess_mate_value(pv.at("mate").get<int>(), board.sideToMove());
+	} else {
+		throw std::invalid_argument("selected principal variation has no cp or mate score");
+	}
+	return {parse_lichess_pv_move(board, first_move), value};
 }
 
 struct StopPgnParsing {};
@@ -508,16 +647,20 @@ SupervisedBatch SupervisedH5::read(const std::vector<std::int64_t> &requested,
 			throw std::out_of_range("HDF5 row index");
 	}
 	const hsize_t batch = indices.size();
-	std::vector<std::uint8_t> packed(batch * kStatePlanes * 8);
 	std::vector<std::uint16_t> moves(batch);
+	auto state_options =
+		torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU);
 	auto move_options =
 		torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
 	auto value_options =
 		torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
 	if (pinned_memory) {
+		state_options = state_options.pinned_memory(true);
 		move_options = move_options.pinned_memory(true);
 		value_options = value_options.pinned_memory(true);
 	}
+	auto state_tensor = torch::empty(
+		{static_cast<std::int64_t>(batch), kStatePlanes, 8}, state_options);
 	auto move_tensor = torch::empty({static_cast<std::int64_t>(batch)}, move_options);
 	auto value_tensor = torch::empty({static_cast<std::int64_t>(batch)}, value_options);
 
@@ -526,7 +669,7 @@ SupervisedBatch SupervisedH5::read(const std::vector<std::int64_t> &requested,
 	const hsize_t state_dims[] = {batch, kStatePlanes, 8};
 	const hid_t state_memory = require_id(H5Screate_simple(3, state_dims, nullptr), "state memory");
 	require_h5(H5Dread(impl_->states, H5T_NATIVE_UINT8, state_memory, state_space, H5P_DEFAULT,
-					   packed.data()),
+					   state_tensor.data_ptr<std::uint8_t>()),
 			   "read state rows");
 	H5Sclose(state_memory);
 	H5Sclose(state_space);
@@ -551,7 +694,7 @@ SupervisedBatch SupervisedH5::read(const std::vector<std::int64_t> &requested,
 	}
 
 	return {
-		decode_states(packed.data(), static_cast<std::int64_t>(batch), pinned_memory),
+		std::move(state_tensor),
 		std::move(move_tensor),
 		std::move(value_tensor),
 	};
@@ -563,14 +706,16 @@ SupervisedBatch SupervisedH5::read_contiguous(std::int64_t begin, std::int64_t c
 	if (begin < 0 || count <= 0 || begin > impl_->info.length - count)
 		throw std::out_of_range("contiguous HDF5 row range");
 	const hsize_t batch = static_cast<hsize_t>(count);
-	std::vector<std::uint8_t> packed(batch * kStatePlanes * 8);
 	std::vector<std::uint16_t> moves(batch);
+	auto state_options = torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU);
 	auto move_options = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
 	auto value_options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
 	if (pinned_memory) {
+		state_options = state_options.pinned_memory(true);
 		move_options = move_options.pinned_memory(true);
 		value_options = value_options.pinned_memory(true);
 	}
+	auto state_tensor = torch::empty({count, kStatePlanes, 8}, state_options);
 	auto move_tensor = torch::empty({count}, move_options);
 	auto value_tensor = torch::empty({count}, value_options);
 
@@ -583,7 +728,7 @@ SupervisedBatch SupervisedH5::read_contiguous(std::int64_t begin, std::int64_t c
 	const hid_t state_memory =
 		require_id(H5Screate_simple(3, state_count, nullptr), "create states range memory");
 	require_h5(H5Dread(impl_->states, H5T_NATIVE_UINT8, state_memory, state_space, H5P_DEFAULT,
-					   packed.data()),
+					   state_tensor.data_ptr<std::uint8_t>()),
 			   "read states range");
 	H5Sclose(state_memory);
 	H5Sclose(state_space);
@@ -611,7 +756,7 @@ SupervisedBatch SupervisedH5::read_contiguous(std::int64_t begin, std::int64_t c
 		move_destination[index] = moves[index];
 
 	return {
-		decode_states(packed.data(), count, pinned_memory),
+		std::move(state_tensor),
 		std::move(move_tensor),
 		std::move(value_tensor),
 	};
@@ -644,7 +789,135 @@ void preprocess_pgn(const PreprocessOptions &options) {
 			  << " output=" << options.output.string() << std::endl;
 }
 
-// Optimize CE(policy)+value_weight*MSE(value) from a newly initialized Gadus model.
+// Stream position-oriented Lichess cloud evaluations into the Gadus supervised schema.
+void preprocess_lichess_evaluations(const PreprocessOptions &options) {
+	if (options.input != std::filesystem::path{"-"} && options.input.extension() == ".zst") {
+		throw std::invalid_argument(
+			"compressed Lichess input must be streamed with zstdcat and --input -");
+	}
+
+	std::ifstream file;
+	std::istream *input = &std::cin;
+	if (options.input != std::filesystem::path{"-"}) {
+		file.open(options.input);
+		if (!file)
+			throw std::runtime_error("evaluation JSONL not found: " + options.input.string());
+		input = &file;
+	}
+
+	PreprocessOptions writer_options = options;
+	writer_options.source = "lichess-eval";
+	H5Writer writer(writer_options);
+	std::vector<PackedState> states;
+	std::vector<std::uint16_t> moves;
+	std::vector<float> values;
+	const auto buffer_capacity = static_cast<std::size_t>(std::max(1, options.chunk_size));
+	states.reserve(buffer_capacity);
+	moves.reserve(buffer_capacity);
+	values.reserve(buffer_capacity);
+	auto flush = [&] {
+		writer.append(states, moves, values);
+		states.clear();
+		moves.clear();
+		values.clear();
+	};
+
+	std::cout << "Lichess evaluation preprocess start: input=" << options.input.string()
+			  << " output=" << options.output.string() << " arch_type=" << kArchType
+			  << std::endl;
+	std::int64_t source_records = 0;
+	std::int64_t accepted_records = 0;
+	std::int64_t skipped_records = 0;
+	std::string line;
+	while ((options.max_positions < 0 || accepted_records < options.max_positions) &&
+		   std::getline(*input, line)) {
+		++source_records;
+		const auto state_count = states.size();
+		const auto move_count = moves.size();
+		const auto value_count = values.size();
+		try {
+			if (line.empty())
+				throw std::invalid_argument("empty record");
+			const auto record = nlohmann::json::parse(line);
+			if (!record.is_object() || !record.contains("fen") ||
+				!record.at("fen").is_string()) {
+				throw std::invalid_argument("record has no FEN");
+			}
+			chess::Board board(complete_lichess_fen(record.at("fen").get<std::string>()));
+			const auto target = lichess_target(record, board);
+			const auto state = encode_state(board);
+			const auto move = static_cast<std::uint16_t>(move_to_index(target.move));
+			states.push_back(state);
+			moves.push_back(move);
+			values.push_back(target.value);
+			++accepted_records;
+			if (states.size() >= buffer_capacity)
+				flush();
+			if (options.log_every > 0 && accepted_records % options.log_every == 0) {
+				std::cout << "Lichess evaluation preprocess progress: positions="
+						  << accepted_records << " skipped=" << skipped_records << std::endl;
+			}
+		} catch (const std::exception &error) {
+			states.resize(state_count);
+			moves.resize(move_count);
+			values.resize(value_count);
+			++skipped_records;
+			if (skipped_records <= 8) {
+				std::cerr << "Lichess evaluation preprocess skipped record " << source_records
+						  << ": " << error.what() << std::endl;
+			}
+		}
+	}
+	flush();
+	writer.finish_evaluations(source_records, skipped_records);
+	std::cout << "Lichess evaluation preprocess summary: records=" << source_records
+			  << " positions=" << accepted_records << " skipped=" << skipped_records
+			  << " output=" << options.output.string() << std::endl;
+}
+
+ValueWeightController::ValueWeightController(double initial_weight) : value_(initial_weight) {
+	if (!std::isfinite(initial_weight) || initial_weight < 0.0) {
+		throw std::invalid_argument("value weight must be finite and nonnegative");
+	}
+	if (value_ > 0.0) {
+		value_ = std::clamp(value_, kMinValueWeight, kMaxValueWeight);
+	}
+}
+
+double ValueWeightController::update(double policy_squared_norm,
+									 double value_squared_norm, double inner_product) {
+	if (value_ == 0.0 || !std::isfinite(policy_squared_norm) ||
+		!std::isfinite(value_squared_norm) || !std::isfinite(inner_product) ||
+		policy_squared_norm <= kGradientEpsilon ||
+		value_squared_norm <= kGradientEpsilon) {
+		return value_;
+	}
+
+	double target = kValueGradientRatio * std::sqrt(policy_squared_norm) /
+		(std::sqrt(value_squared_norm) + kGradientEpsilon);
+	target = std::clamp(target, kMinValueWeight, kMaxValueWeight);
+	double lower = kMinValueWeight;
+	double upper = kMaxValueWeight;
+	if (inner_product < 0.0) {
+		lower = std::max(lower, (-inner_product / value_squared_norm) *
+									 (1.0 + kConflictMargin));
+		upper = std::min(upper, (policy_squared_norm / -inner_product) *
+									 (1.0 - kConflictMargin));
+		if (lower > upper) {
+			return value_;
+		}
+		target = std::clamp(target, lower, upper);
+	}
+
+	const double smoothed = std::exp((1.0 - kValueWeightSmoothing) * std::log(value_) +
+									 kValueWeightSmoothing * std::log(target));
+	value_ = std::clamp(smoothed, lower, upper);
+	return value_;
+}
+
+double ValueWeightController::value() const noexcept { return value_; }
+
+// Optimize the supervised Policy and adaptively weighted Value objectives.
 void train_supervised(const TrainOptions &options) {
 	torch::manual_seed(static_cast<std::int64_t>(options.seed));
 	const auto device = resolve_device(options.device);
@@ -652,14 +925,36 @@ void train_supervised(const TrainOptions &options) {
 	SupervisedH5 data(options.data);
 	auto model = Model(options.channels, options.blocks);
 	model->to(device);
+	for (auto &parameter : model->parameters()) {
+		if (parameter.dim() == 4) {
+			parameter.set_data(parameter.contiguous(torch::MemoryFormat::ChannelsLast));
+		}
+	}
 	model->train();
+	std::vector<torch::Tensor> shared_policy_parameters;
+	std::vector<torch::Tensor> value_parameters;
+	for (const auto &parameter : model->named_parameters()) {
+		if (parameter.key().starts_with("value_head.")) {
+			value_parameters.push_back(parameter.value());
+		} else {
+			shared_policy_parameters.push_back(parameter.value());
+		}
+	}
+	auto value_optimizer_options = std::make_unique<torch::optim::AdamWOptions>(
+		options.learning_rate * kValueHeadLearningRateRatio);
+	value_optimizer_options->weight_decay(options.weight_decay);
+	std::vector<torch::optim::OptimizerParamGroup> parameter_groups;
+	parameter_groups.emplace_back(std::move(shared_policy_parameters));
+	parameter_groups.emplace_back(value_parameters,
+							  std::move(value_optimizer_options));
 	torch::optim::AdamW optimizer(
-		model->parameters(),
+		parameter_groups,
 		torch::optim::AdamWOptions(options.learning_rate).weight_decay(options.weight_decay));
 
 	std::mt19937_64 rng(options.seed);
 	std::int64_t global_step = 0;
 	bool stop = false;
+	ValueWeightController value_weight(options.value_weight);
 	std::cout << "training start: data=" << options.data.string()
 			  << " out=" << options.output.string() << " arch_type=" << kArchType
 			  << " device=" << device.str() << " epochs=" << options.epochs
@@ -667,7 +962,9 @@ void train_supervised(const TrainOptions &options) {
 			  << " precision=" << compute_precision_name(options.precision)
 			  << std::endl;
 	std::cout << "created model: channels=" << options.channels << " blocks=" << options.blocks
-			  << " parameters=" << parameter_count(model) << std::endl;
+			  << " parameters=" << parameter_count(model)
+			  << " value_head_lr="
+			  << options.learning_rate * kValueHeadLearningRateRatio << std::endl;
 	std::cout << "training input: rows=" << data.info().length
 			  << " hdf5_chunk_rows=" << data.info().chunk_rows
 			  << " loader=chunk_shuffle_prefetch" << std::endl;
@@ -705,16 +1002,19 @@ void train_supervised(const TrainOptions &options) {
 				torch::from_blob(local_order.data(), {chunk_rows},
 								 torch::TensorOptions().dtype(torch::kInt64))
 					.clone();
-			chunk.states = chunk.states.index_select(0, permutation);
-			chunk.moves = chunk.moves.index_select(0, permutation);
-			chunk.values = chunk.values.index_select(0, permutation);
+			permutation = permutation.to(device, true);
+			chunk.states = chunk.states.to(device, true).index_select(0, permutation);
+			chunk.moves = chunk.moves.to(device, true).index_select(0, permutation);
+			chunk.values = chunk.values.to(device, true).index_select(0, permutation);
 
 			for (std::int64_t begin = 0; begin < chunk_rows; begin += options.batch_size) {
 				const auto count =
 					std::min<std::int64_t>(options.batch_size, chunk_rows - begin);
-				auto states = chunk.states.narrow(0, begin, count).to(device, true);
-				auto moves = chunk.moves.narrow(0, begin, count).to(device, true);
-				auto values = chunk.values.narrow(0, begin, count).to(device, true);
+				auto states = decode_states_device(
+					chunk.states.narrow(0, begin, count), device)
+						  .contiguous(torch::MemoryFormat::ChannelsLast);
+				auto moves = chunk.moves.narrow(0, begin, count);
+				auto values = chunk.values.narrow(0, begin, count);
 				optimizer.zero_grad();
 
 				torch::Tensor logits;
@@ -727,8 +1027,16 @@ void train_supervised(const TrainOptions &options) {
 				predicted = predicted.to(torch::kFloat32);
 				auto policy_loss = torch::nn::functional::cross_entropy(logits, moves);
 				auto value_loss = torch::mse_loss(predicted.squeeze(1), values);
-				auto loss = policy_loss + options.value_weight * value_loss;
+				if (value_weight.value() > 0.0 &&
+					(global_step == 0 || (global_step + 1) % kValueWeightProbeInterval == 0)) {
+					const auto stats = shared_gradient_stats(policy_loss, value_loss, model);
+					value_weight.update(stats.policy_squared_norm, stats.value_squared_norm,
+									stats.inner_product);
+				}
+				auto loss = policy_loss + value_weight.value() * value_loss;
 				loss.backward();
+				torch::nn::utils::clip_grad_norm_(value_parameters,
+											  kValueHeadGradientClip);
 				optimizer.step();
 
 				++global_step;
@@ -746,6 +1054,7 @@ void train_supervised(const TrainOptions &options) {
 							  << " global_step=" << global_step
 							  << " policy=" << metric_values[0]
 							  << " value=" << metric_values[1]
+							  << " value_weight=" << value_weight.value()
 							  << " loss=" << metric_values[2] << std::endl;
 				}
 				if (options.save_every > 0 && global_step % options.save_every == 0) {

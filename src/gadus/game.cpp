@@ -282,6 +282,27 @@ torch::Tensor decode_states(const std::uint8_t *packed, std::int64_t count,
 	return output;
 }
 
+// Expand compact binary planes after they reach the inference or training device.
+torch::Tensor decode_states_device(const torch::Tensor &packed,
+								   const torch::Device &device) {
+	if (packed.scalar_type() != torch::kUInt8 || packed.dim() != 3 ||
+		packed.size(1) != kStatePlanes || packed.size(2) != 8) {
+		throw std::invalid_argument("packed Gadus states must have shape [count, 18, 8]");
+	}
+	auto contiguous = packed.contiguous();
+	if (!device.is_cuda()) {
+		auto host = contiguous.to(torch::kCPU);
+		return decode_states(host.data_ptr<std::uint8_t>(), host.size(0), false).to(device);
+	}
+	auto device_packed = contiguous.device() == device ? contiguous : contiguous.to(device, true);
+	auto masks = torch::tensor(
+		{128, 64, 32, 16, 8, 4, 2, 1},
+		torch::TensorOptions().dtype(torch::kUInt8).device(device));
+	return torch::bitwise_and(device_packed.unsqueeze(-1), masks)
+		.ne(0)
+		.to(torch::kFloat32);
+}
+
 // Keep the compact 144-byte representation across PCIe, then expand its bits in parallel.
 torch::Tensor decode_states_device(const std::uint8_t *packed, std::int64_t count,
 								   const torch::Device &device) {
@@ -293,13 +314,7 @@ torch::Tensor decode_states_device(const std::uint8_t *packed, std::int64_t coun
 		torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU).pinned_memory(true));
 	std::memcpy(host.data_ptr<std::uint8_t>(), packed,
 				static_cast<std::size_t>(count) * kStatePlanes * 8);
-	auto device_packed = host.to(device, true);
-	auto masks = torch::tensor(
-		{128, 64, 32, 16, 8, 4, 2, 1},
-		torch::TensorOptions().dtype(torch::kUInt8).device(device));
-	return torch::bitwise_and(device_packed.unsqueeze(-1), masks)
-		.ne(0)
-		.to(torch::kFloat32);
+	return decode_states_device(host, device);
 }
 
 // Pack a live batch first, then use the same decoder as persisted training data.

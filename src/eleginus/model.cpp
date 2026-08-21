@@ -6,9 +6,16 @@
 #include <cstring>
 #include <stdexcept>
 
+#include <torch/nn/init.h>
+
 namespace eleginus {
 
 namespace {
+
+constexpr double kControlEdgeInitializationStd = 0.10;
+constexpr double kControlContextInitializationStd = 0.05;
+constexpr double kControlLocalInitializationBias = 0.25;
+constexpr double kAttentionQueryInitializationStd = 0.05;
 
 std::vector<float> tensor_vector(const torch::Tensor &source) {
 	auto tensor = source.detach().to(torch::kCPU).to(torch::kFloat32).contiguous().view({-1});
@@ -166,14 +173,16 @@ ValueNetworkImpl::ValueNetworkImpl() {
 		kControlWidth * 2 + kControlCountWidth * 2 + kControlOccupancyWidth +
 			kControlSquareWidth, kControlLocalWidth));
 	attention_key = register_module("attention_key",
-		torch::nn::Linear(kControlLocalWidth, kControlAttentionKeyWidth));
+		torch::nn::Linear(kControlLocalWidth,
+			kControlAttentionHeads * kControlAttentionKeyWidth));
 	attention_value = register_module("attention_value",
 		torch::nn::Linear(kControlLocalWidth, kControlAttentionWidth));
 	attention_query = register_module("attention_query",
 		torch::nn::Embedding(torch::nn::EmbeddingOptions(
-			kValueBucketCount, kControlAttentionKeyWidth)));
+			kValueBucketCount,
+			kControlAttentionHeads * kControlAttentionKeyWidth)));
 	material = register_module("material", torch::nn::Linear(
-		torch::nn::LinearOptions(kMaterialFeatureWidth, kValueBucketCount).bias(false)));
+		torch::nn::LinearOptions(kMaterialFeatureWidth, 1).bias(false)));
 	hidden = register_module("hidden", torch::nn::Linear(kValueDenseWidth * 2,
 		kValueBucketCount * kValueHiddenWidth));
 	bottleneck = register_module(
@@ -187,10 +196,19 @@ ValueNetworkImpl::ValueNetworkImpl() {
 		 torch::indexing::Slice(kValueAccumulatorWidth, kValueFeatureWidth)}, 0.0F);
 	encoder->bias.index_put_(
 		{torch::indexing::Slice(kValueAccumulatorWidth, kValueFeatureWidth)}, 0.0F);
-	control_source->weight.normal_(0.0, 0.02);
-	control_target->weight.normal_(0.0, 0.02);
-	control_geometry->weight.normal_(0.0, 0.02);
-	attention_query->weight.normal_(0.0, 0.1);
+	control_source->weight.normal_(0.0, kControlEdgeInitializationStd);
+	control_target->weight.normal_(0.0, kControlEdgeInitializationStd);
+	control_geometry->weight.normal_(0.0, kControlEdgeInitializationStd);
+	control_occupancy->weight.normal_(0.0, kControlContextInitializationStd);
+	control_count->weight.normal_(0.0, kControlContextInitializationStd);
+	control_square->weight.normal_(0.0, kControlContextInitializationStd);
+	torch::nn::init::xavier_uniform_(control_local->weight);
+	control_local->bias.fill_(kControlLocalInitializationBias);
+	torch::nn::init::xavier_uniform_(attention_key->weight);
+	attention_key->bias.zero_();
+	torch::nn::init::xavier_uniform_(attention_value->weight);
+	attention_value->bias.zero_();
+	attention_query->weight.normal_(0.0, kAttentionQueryInitializationStd);
 	material->weight.zero_();
 	output->weight.normal_(0.0, 0.01);
 	output->bias.zero_();
@@ -198,9 +216,9 @@ ValueNetworkImpl::ValueNetworkImpl() {
 
 torch::Tensor ValueNetworkImpl::control_state(const NetworkBatch &batch, torch::Tensor buckets) {
 	const auto batch_size = batch.features.size(0);
-	auto messages = (control_source->forward(batch.edge_source) +
+	auto messages = control_source->forward(batch.edge_source) +
 		control_target->forward(batch.edge_target) +
-		control_geometry->forward(batch.edge_geometry)).clamp(0.0, 1.0).square();
+		control_geometry->forward(batch.edge_geometry);
 	auto field = torch::zeros({batch_size * kPerspectiveCount * 2 * 64, kControlWidth},
 		messages.options());
 	field.index_add_(0, batch.edge_destination, messages);
@@ -225,14 +243,17 @@ torch::Tensor ValueNetworkImpl::control_state(const NetworkBatch &batch, torch::
 		{own, opponent, own_count, opponent_count, occupancy, squares}, -1);
 	auto local = control_local->forward(local_input).clamp(0.0, 1.0).square();
 	auto mean = local.mean(-2);
-	auto key = attention_key->forward(local);
-	auto value = attention_value->forward(local);
+	auto key = attention_key->forward(local).view({batch_size, kPerspectiveCount, 64,
+		kControlAttentionHeads, kControlAttentionKeyWidth});
+	auto value = attention_value->forward(local).view({batch_size, kPerspectiveCount, 64,
+		kControlAttentionHeads, kControlAttentionHeadWidth});
 	auto query = attention_query->forward(buckets).view(
-		{batch_size, 1, 1, kControlAttentionKeyWidth});
+		{batch_size, 1, 1, kControlAttentionHeads, kControlAttentionKeyWidth});
 	auto logits = (key * query).sum(-1) /
 		std::sqrt(static_cast<double>(kControlAttentionKeyWidth));
-	auto weights = torch::softmax(logits.clamp(-8.0, 8.0), -1);
-	auto attention = (weights.unsqueeze(-1) * value).sum(-2);
+	auto weights = torch::softmax(logits.clamp(-8.0, 8.0), 2);
+	auto attention = (weights.unsqueeze(-1) * value).sum(2).reshape(
+		{batch_size, kPerspectiveCount, kControlAttentionWidth});
 	return torch::cat({mean, attention}, -1);
 }
 
@@ -264,7 +285,7 @@ torch::Tensor ValueNetworkImpl::forward(const NetworkBatch &batch) {
 	auto white_material = batch.material.index({torch::indexing::Slice(), 0});
 	auto black_material = batch.material.index({torch::indexing::Slice(), 1});
 	auto first_material = torch::where(mask, white_material, black_material);
-	auto material_value = select_bucket_scalar(material->forward(first_material), buckets);
+	auto material_value = material->forward(first_material).squeeze(1);
 	auto psqt = 0.5F * select_bucket_scalar(
 		first.index({torch::indexing::Slice(),
 			torch::indexing::Slice(kValueAccumulatorWidth, kValueFeatureWidth)}) -

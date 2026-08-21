@@ -13,6 +13,7 @@
 namespace gadus {
 
 struct SupervisedBatch {
+	// Packed binary planes shaped [count, 18, 8].
 	torch::Tensor states;
 	torch::Tensor moves;
 	torch::Tensor values;
@@ -45,7 +46,7 @@ class SupervisedH5 {
 
 	/// Returns immutable schema and row-count metadata.
 	const DatasetInfo &info() const noexcept;
-	/// Reads arbitrary rows and decodes them into state, move, and value tensors.
+	/// Reads arbitrary rows into packed state, move, and value tensors.
 	SupervisedBatch read(const std::vector<std::int64_t> &indices,
 						 bool pinned_memory = false) const;
 	/// Reads one contiguous row range so HDF5 decompresses each storage chunk only once.
@@ -60,7 +61,9 @@ class SupervisedH5 {
 struct PreprocessOptions {
 	std::filesystem::path input = "data/games.pgn";
 	std::filesystem::path output = "data/games.gadus.h5";
+	std::string source = "pgn";
 	std::int64_t max_games = -1;
+	std::int64_t max_positions = -1;
 	int chunk_size = 16384;
 	int has_comments = 1;
 	int compression_level = 1;
@@ -69,6 +72,9 @@ struct PreprocessOptions {
 
 /// Parses PGN games and writes Gadus-specific state, policy, and value targets.
 void preprocess_pgn(const PreprocessOptions &options);
+
+/// Converts Lichess cloud-evaluation JSONL records into Gadus supervision rows.
+void preprocess_lichess_evaluations(const PreprocessOptions &options);
 
 struct TrainOptions {
 	std::filesystem::path data = "data/games.gadus.h5";
@@ -86,6 +92,19 @@ struct TrainOptions {
 	std::uint64_t seed = 2026;
 	std::string device = "auto";
 	ComputePrecision precision = ComputePrecision::Fp32;
+};
+
+struct ValueWeightController {
+	explicit ValueWeightController(double initial_weight);
+
+	/// Updates the effective Value coefficient from shared-trunk gradient statistics.
+	double update(double policy_squared_norm, double value_squared_norm,
+				  double inner_product);
+	/// Returns the coefficient applied to the supervised Value loss.
+	double value() const noexcept;
+
+	private:
+	double value_;
 };
 
 /// Trains a new Gadus model from scratch and atomically writes the final checkpoint.

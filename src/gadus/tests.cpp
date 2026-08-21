@@ -54,6 +54,20 @@ int main() {
 	try {
 		chess::Board board;
 
+		gadus::ValueWeightController aligned_weight(0.25);
+		const double aligned = aligned_weight.update(4.0, 1.0, 1.0);
+		require(aligned > 0.25 && aligned < 1.0,
+				"aligned gradients did not smoothly increase the Value weight");
+
+		gadus::ValueWeightController conflicting_weight(0.25);
+		const double conflicting = conflicting_weight.update(4.0, 1.0, -1.5);
+		require(conflicting > 1.5 && conflicting < 4.0 / 1.5,
+				"conflicting gradients escaped the joint-descent interval");
+
+		gadus::ValueWeightController disabled_weight(0.0);
+		require(disabled_weight.update(4.0, 1.0, -1.5) == 0.0,
+				"zero Value weight did not disable adaptive balancing");
+
 		// Detached CCRL comments and clock fields are metadata; invalid SAN rejects its game.
 		const auto preprocess_pgn =
 			std::filesystem::temp_directory_path() / "gadus-preprocess-test.pgn";
@@ -84,6 +98,13 @@ int main() {
 			require(supervised.info().length == 6,
 					"Gadus preprocessing rejected detached comments or retained invalid SAN");
 			const auto batch = supervised.read_contiguous(0, 6);
+			require(batch.states.scalar_type() == torch::kUInt8 && batch.states.dim() == 3 &&
+					batch.states.size(0) == 6 &&
+					batch.states.size(1) == gadus::kStatePlanes && batch.states.size(2) == 8,
+					"Gadus HDF5 reader did not retain packed state rows");
+			const auto decoded = gadus::decode_states_device(batch.states, torch::kCPU);
+			require(decoded.sizes() == torch::IntArrayRef({6, gadus::kStatePlanes, 8, 8}),
+					"Gadus packed tensor decoder produced the wrong shape");
 			require(std::abs(batch.values.index({0}).item<float>()) < 1e-6F &&
 						std::abs(batch.values.index({1}).item<float>()) < 1e-6F &&
 						std::abs(batch.values.index({2}).item<float>()) < 1e-6F,
@@ -92,8 +113,75 @@ int main() {
 						batch.values.index({5}).item<float>() < 0.0F,
 					"Gadus preprocessing lost detached numerical comments");
 		}
+		const auto trained_checkpoint =
+			std::filesystem::temp_directory_path() / "gadus-adaptive-weight-test.pth";
+		gadus::TrainOptions train_options;
+		train_options.data = preprocess_h5;
+		train_options.output = trained_checkpoint;
+		train_options.channels = 4;
+		train_options.blocks = 1;
+		train_options.epochs = 1;
+		train_options.batch_size = 6;
+		train_options.max_steps = 1;
+		train_options.save_every = 0;
+		train_options.log_every = 0;
+		train_options.device = "cpu";
+		gadus::train_supervised(train_options);
+		require(std::filesystem::exists(trained_checkpoint),
+				"adaptive Value-weight training did not produce a checkpoint");
 		std::filesystem::remove(preprocess_pgn);
 		std::filesystem::remove(preprocess_h5);
+		std::filesystem::remove(trained_checkpoint);
+
+		// Lichess evaluation JSONL selects the deepest first PV and preserves score perspective.
+		const auto evaluation_jsonl =
+			std::filesystem::temp_directory_path() / "gadus-lichess-eval-test.jsonl";
+		const auto evaluation_h5 =
+			std::filesystem::temp_directory_path() / "gadus-lichess-eval-test.h5";
+		{
+			std::ofstream jsonl(evaluation_jsonl);
+			jsonl << R"({"fen":"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -","evals":[{"depth":12,"knodes":20,"pvs":[{"cp":10,"line":"e2e4 e7e5"}]},{"depth":20,"knodes":10,"pvs":[{"cp":30,"line":"d2d4 d7d5"}]}]})"
+				  << '\n';
+			jsonl << R"({"fen":"r1k5/8/8/8/8/8/8/4K3 b q -","evals":[{"depth":18,"pvs":[{"cp":0,"line":"c8c8"}]}]})"
+				  << '\n';
+			jsonl << R"({"fen":"rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq -","evals":[{"depth":18,"pvs":[{"cp":120,"line":"e7e5 g1f3"}]}]})"
+				  << '\n';
+			jsonl << R"({"fen":"rnbqkbnr/pppp1ppp/8/4p3/6P1/5P2/PPPPP2P/RNBQKBNR b KQkq -","evals":[{"depth":30,"pvs":[{"mate":-1,"line":"d8h4"}]}]})"
+				  << '\n';
+			jsonl << R"({"fen":"r3k2r/8/8/8/8/8/8/R3K2R w KQkq -","evals":[{"depth":16,"pvs":[{"cp":0,"line":"e1h1"}]}]})"
+				  << '\n';
+			jsonl << R"({"fen":"not a fen","evals":[]})" << '\n';
+		}
+		gadus::PreprocessOptions evaluation_options;
+		evaluation_options.source = "lichess-eval";
+		evaluation_options.input = evaluation_jsonl;
+		evaluation_options.output = evaluation_h5;
+		evaluation_options.compression_level = 0;
+		evaluation_options.log_every = 0;
+		gadus::preprocess_lichess_evaluations(evaluation_options);
+		{
+			gadus::SupervisedH5 supervised(evaluation_h5);
+			require(supervised.info().length == 4,
+					"Lichess evaluation preprocessing retained a malformed record");
+			const auto batch = supervised.read_contiguous(0, 4);
+			const auto moves = batch.moves.to(torch::kCPU).contiguous();
+			const auto values = batch.values.to(torch::kCPU).contiguous();
+			require(moves.index({0}).item<std::int64_t>() ==
+						gadus::move_to_index(chess::uci::uciToMove(board, "d2d4")),
+					"Lichess evaluation preprocessing did not select the deepest PV");
+			require(std::abs(values.index({0}).item<float>() - std::tanh(0.1F)) < 1e-6F,
+					"Lichess centipawn conversion changed the Gadus Value scale");
+			require(values.index({1}).item<float>() < 0.0F,
+					"Lichess centipawn conversion lost side-to-move perspective");
+			require(std::abs(values.index({2}).item<float>() - 1.0F) < 1e-6F,
+					"Lichess mate conversion lost side-to-move perspective");
+			chess::Board castling_record("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1");
+			require(moves.index({3}).item<std::int64_t>() ==
+						gadus::move_to_index(chess::uci::uciToMove(castling_record, "e1g1")),
+					"Lichess UCI_Chess960 castling notation was not decoded");
+		}
+		std::filesystem::remove(evaluation_jsonl);
+		std::filesystem::remove(evaluation_h5);
 		require(gadus::parse_compute_precision("fp32") == gadus::ComputePrecision::Fp32,
 				"fp32 precision parsing failed");
 		require(gadus::parse_compute_precision("bf16") == gadus::ComputePrecision::Bf16,
@@ -165,6 +253,31 @@ int main() {
 		require(gadus::game_termination(repetition) == "threefold repetition",
 				"threefold-repetition termination mismatch");
 
+		// The action-plane layout must flatten as source square * 73 + motion pattern.
+		auto layout_model = gadus::Model(8, 1);
+		{
+			torch::NoGradGuard guard;
+			for (const auto &parameter : layout_model->named_parameters()) {
+				if (parameter.key() == "policy_output.weight") {
+					parameter.value().zero_();
+				}
+				if (parameter.key() == "policy_action_bias") {
+					auto expected = torch::arange(
+						gadus::kActionSize, parameter.value().options())
+						.view({8, 8, gadus::kPolicyPlanes})
+						.permute({2, 0, 1})
+						.unsqueeze(0);
+					parameter.value().copy_(expected);
+				}
+			}
+		}
+		auto layout_logits =
+			layout_model->forward(gadus::encode_boards({board})).first.squeeze(0);
+		require(torch::equal(
+				layout_logits,
+				torch::arange(gadus::kActionSize, layout_logits.options())),
+			"action planes were flattened in the wrong index order");
+
 		auto model = gadus::Model(8, 1);
 		auto [policy, value] = model->forward(gadus::encode_boards({board, board}));
 		require(policy.sizes() == torch::IntArrayRef({2, gadus::kActionSize}),
@@ -173,6 +286,9 @@ int main() {
 		require(torch::isfinite(policy).all().item<bool>(), "policy contains a non-finite value");
 		require(torch::isfinite(value).all().item<bool>(), "value contains a non-finite value");
 		require(value.abs().max().item<float>() <= 1.000001F, "value range mismatch");
+		require(value.scalar_type() == torch::kFloat32, "Value output is not FP32");
+		require(torch::allclose(value, torch::zeros_like(value)),
+				"newly initialized Value output is not neutral");
 		(policy.mean() + value.mean()).backward();
 		require_finite_gradients(model);
 
@@ -208,10 +324,17 @@ int main() {
 				"checkpoint changed value output");
 		loaded->fuse_for_inference();
 		auto fused_output = loaded->forward(gadus::encode_boards({board}));
+		auto fused_legal_output =
+			loaded->forward_legal(gadus::encode_boards({board}), legal_indices);
 		require(torch::allclose(loaded_output.first, fused_output.first, 1e-4, 1e-5),
 				"Conv-BN fusion changed policy output");
 		require(torch::allclose(loaded_output.second, fused_output.second, 1e-5, 1e-6),
 				"Conv-BN fusion changed value output");
+		require(torch::allclose(fused_legal_output.first,
+								 fused_output.first.gather(1, legal_indices), 1e-4, 1e-5),
+				"fused legal-action forward changed a requested policy logit");
+		require(torch::allclose(fused_legal_output.second, fused_output.second, 1e-5, 1e-6),
+				"fused legal-action forward changed Value");
 
 		// Zero-simulation search ranks legal policy actions without constructing an MCTS tree.
 		gadus::SearchOptions direct_options;

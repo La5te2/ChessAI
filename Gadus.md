@@ -187,9 +187,44 @@ Section 3.2 defines both heads and the legal-move normalization that converts $\
 
 ### 3.2 Policy and Value Heads
 
-The Policy head assigns one unnormalized score, called a logit, to every action index in $\mathcal I_G$. It maps $h_B$ through a bias-free $1\times1$ convolution from $C$ channels to 32 channels, followed by batch normalization and ReLU. Flattening the resulting $32\times8\times8$ tensor produces a 2048-dimensional vector, and a linear map converts that vector into 4672 logits.
+The Policy head assigns one unnormalized score, called a logit, to every action index in $\mathcal I_G$. It first maps $h_B$ through a bias-free $1\times1$ convolution from $C$ channels to 128 channels and applies batch normalization. A learned position tensor $E_P\in\mathbb R^{128\times8\times8}$ is added before ReLU, so the feature at each square can depend explicitly on its absolute board location. Writing the resulting tensor as $u_0$, this first stage is
 
-The Value head produces an estimate of the expected game result from the perspective of the player to move. It maps $h_B$ through a separate bias-free $1\times1$ convolution from $C$ channels to 32 channels, followed by batch normalization, ReLU and flattening. A $2048\rightarrow256$ linear map and ReLU produce an intermediate vector. A final linear map produces one scalar, and the hyperbolic tangent restricts that scalar to $[-1,1]$.
+$$
+u_0=\mathrm{ReLU}\left(
+\mathrm{BN}_P\left(
+\mathrm{Conv}^{C\rightarrow128}_{1\times1,P}(h_B)
+\right)+E_P
+\right).
+$$
+
+Two Policy residual blocks transform $u_0$. Each block has the two-convolution structure defined for the residual trunk in Section 3.1, but its parameters belong to the Policy head and both convolutions preserve 128 channels. If $G_j$ denotes the learned transform in Policy block $j$, the two blocks produce
+
+$$
+u_{j+1}=\mathrm{ReLU}\left(u_j+G_j(u_j)\right),
+\qquad 0\leq j<2.
+$$
+
+A bias-free $1\times1$ convolution maps $u_2$ to 73 action-pattern planes. The learned tensor $B_P\in\mathbb R^{73\times8\times8}$ supplies a separate bias for every combination of motion pattern and source square, giving
+
+$$
+L_\theta(s)=
+\mathrm{Conv}^{128\rightarrow73}_{1\times1,\mathrm{out}}(u_2)+B_P
+\in\mathbb R^{73\times8\times8}.
+$$
+
+For source square $q=8r+f$ and motion pattern $p$, the component at channel $p$, rank $r$ and file $f$ defines the logit whose action index is $73q+p$:
+
+$$
+\ell_\theta(s,73q+p)=L_\theta(s)_{p,r,f}.
+$$
+
+The Value head produces an estimate of the expected game result from the perspective of the player to move. It first applies one $C$-channel residual block to $h_B$. This block has its own parameters and receives gradients only from losses that depend on $V_\theta$. If $H_V$ denotes its learned two-convolution transform, the Value-specific board representation is
+
+$$
+v_0=\mathrm{ReLU}\left(h_B+H_V(h_B)\right).
+$$
+
+A bias-free $1\times1$ convolution maps $v_0$ from $C$ channels to 48 channels, followed by batch normalization, ReLU and flattening. A $3072\rightarrow512$ linear map and ReLU produce an intermediate vector. A final linear map produces one scalar, and the hyperbolic tangent restricts that scalar to $[-1,1]$.
 
 Writing $f_\theta$ for the complete network gives
 
@@ -214,13 +249,27 @@ The denominator ranges over $\mathcal A(x)$, so $P_\theta(\cdot\mid s)$ is a pro
 
 ### 3.3 Inference Evaluation
 
-The final Policy layer contains one weight row and one bias value for each action index in $\mathcal I_G$. For complete state $x$, the legal-move distribution $P_\theta(\cdot\mid s)$ uses only the rows indexed by $i_G(a)$ for actions $a\in\mathcal A(x)$. Let $h_P(s)\in\mathbb R^{2048}$ be the flattened Policy features, and let $W_{P,i}$ and $b_{P,i}$ be the weight row and bias associated with action index $i$. The logit of legal action $a$ is
+The action-plane tensor stores the logit for source square $q=8r+f$ and motion pattern $p$ at component $(p,r,f)$. Complete Policy evaluation permutes $L_\theta(s)$ from action-pattern-major order to source-square-major order before flattening it into $\ell_\theta(s)$. This permutation makes component $73q+p$ of the flattened vector equal to $L_\theta(s)_{p,r,f}$, as required by the action encoding in Section 2.2.
+
+The final $1\times1$ Policy convolution associates action pattern $p$ with a weight vector $w_p\in\mathbb R^{128}$. For requested action index $i$, define
 
 $$
-\ell_\theta(s,i_G(a))=W_{P,i_G(a)}h_P(s)+b_{P,i_G(a)}.
+q=\left\lfloor\frac{i}{73}\right\rfloor,
+\qquad
+p=i\bmod73,
+\qquad
+r=\left\lfloor\frac{q}{8}\right\rfloor,
+\qquad
+f=q\bmod8.
 $$
 
-Evaluating the selected rows produces the same legal-action logits as evaluating the complete 4672-row linear map. For a batch of complete states, the inference path pads every legal-index array to the largest legal-action count in that batch. It evaluates that many selected rows for each state and masks the padded positions before applying softmax. The resulting distribution for each state contains exactly the probabilities of its legal actions.
+Legal-action inference gathers the Policy feature $u_2[:,r,f]$, the corresponding weight vector $w_p$ and the action-position bias $B_{P,p,r,f}$, then evaluates
+
+$$
+\ell_\theta(s,i)=w_p^{\mathsf T}u_2[:,r,f]+B_{P,p,r,f}.
+$$
+
+This expression equals $L_\theta(s)_{p,r,f}$ and computes the requested logit without materializing the other action-plane components. For a batch of complete states, the inference path pads every legal-index array to the largest legal-action count in that batch, evaluates the requested logits and masks the padded positions before applying softmax. The resulting distribution for each state contains exactly the probabilities of its legal actions.
 
 During inference, each batch-normalization layer uses a fixed running mean, running variance, learned scale and learned bias. These fixed quantities allow a convolution and its following batch-normalization layer to be replaced by one convolution with transformed weights and an added bias. For output channel $o$, let $W_o$ be the original bias-free convolution weights, $\mu_o$ and $\sigma_o^2$ be the stored batch-normalization mean and variance, $\gamma_o$ and $\beta_o$ be its learned scale and bias and let $\epsilon$ be its numerical constant. The equivalent convolution parameters are
 
@@ -230,7 +279,7 @@ W'_o=\frac{\gamma_o}{\sqrt{\sigma_o^2+\epsilon}}W_o,
 b'_o=\beta_o-\frac{\gamma_o\mu_o}{\sqrt{\sigma_o^2+\epsilon}}.
 $$
 
-Substituting $W'_o$ and $b'_o$ preserves the evaluation-mode output of every convolution-batch-normalization pair. Batch-normalization fusion and selected-row Policy evaluation therefore reduce the computation performed during inference while preserving $P_\theta(\cdot\mid s)$ and $V_\theta(s)$.
+Substituting $W'_o$ and $b'_o$ preserves the evaluation-mode output of every convolution-batch-normalization pair. Batch-normalization fusion therefore reduces the computation performed during inference while preserving $P_\theta(\cdot\mid s)$ and $V_\theta(s)$.
 
 ## 4. Supervised Training
 
@@ -294,33 +343,88 @@ L_{V,\mathrm{sup}}^{(\mathcal B)}=
 \left(V_\theta(s)-y\right)^2.
 $$
 
-The nonnegative coefficient $w_V$ sets the contribution of the supervised Value loss to the complete minibatch objective:
+Let $w_{V,k}\geq0$ denote the Value-loss coefficient used at optimizer step $k$. The supplied initial coefficient determines $w_{V,0}$ as follows: zero remains zero, and a positive value is clipped to $[0.05,4]$. The complete objective for minibatch $\mathcal B_k$ is
 
 $$
-L_{\mathrm{sup}}^{(\mathcal B)}=
-L_{P,\mathrm{sup}}^{(\mathcal B)}+
-w_VL_{V,\mathrm{sup}}^{(\mathcal B)}.
+L_{\mathrm{sup}}^{(\mathcal B_k)}=
+L_{P,\mathrm{sup}}^{(\mathcal B_k)}+
+w_{V,k}L_{V,\mathrm{sup}}^{(\mathcal B_k)}.
 $$
 
-To express how the two losses contribute gradients to the network, partition the network parameters as $\theta=(\theta_T,\theta_P,\theta_V)$, where $\theta_T$ contains the residual-trunk parameters and $\theta_P$ and $\theta_V$ contain the parameters of the two output heads. The gradient of the complete objective satisfies
+The coefficient is adjusted from the two loss gradients in the shared residual trunk. Define these gradient vectors by
 
 $$
-\nabla_{\theta_P}L_{\mathrm{sup}}^{(\mathcal B)}=
-\nabla_{\theta_P}L_{P,\mathrm{sup}}^{(\mathcal B)},
+g_{P,k}=\nabla_{\theta_T}L_{P,\mathrm{sup}}^{(\mathcal B_k)},
+\qquad
+g_{V,k}=\nabla_{\theta_T}L_{V,\mathrm{sup}}^{(\mathcal B_k)}.
+$$
+
+Their norms and inner product are
+
+$$
+n_{P,k}=\lVert g_{P,k}\rVert_2,
+\qquad
+n_{V,k}=\lVert g_{V,k}\rVert_2,
+\qquad
+c_k=g_{P,k}^{\mathsf T}g_{V,k}.
+$$
+
+With $\epsilon_g=10^{-12}$, the norm-balanced proposal is
+
+$$
+\widetilde w_{V,k}=
+\mathrm{clip}_{[0.05,4]}
+\left(0.5\frac{n_{P,k}}{n_{V,k}+\epsilon_g}\right).
+$$
+
+When $c_k<0$, a step along the negative combined gradient decreases both minibatch losses to first order precisely when
+
+$$
+\frac{-c_k}{n_{V,k}^2}<w_{V,k}<\frac{n_{P,k}^2}{-c_k}.
+$$
+
+The controller applies an interior margin $\delta_g=10^{-3}$ and intersects this interval with the global coefficient range:
+
+$$
+I_k=
+\left[
+\max\left(0.05,(1+\delta_g)\frac{-c_k}{n_{V,k}^2}\right),
+\min\left(4,(1-\delta_g)\frac{n_{P,k}^2}{-c_k}\right)
+\right].
+$$
+
+For $c_k\geq0$, define $I_k=[0.05,4]$. When $I_k$ is nonempty, the controller projects $\widetilde w_{V,k}$ into $I_k$, smooths the projected value in logarithmic space with update rate $\gamma=0.05$ and projects the result into $I_k$ once more:
+
+$$
+\widehat w_{V,k}=\mathrm{proj}_{I_k}(\widetilde w_{V,k}),
 $$
 
 $$
-\nabla_{\theta_V}L_{\mathrm{sup}}^{(\mathcal B)}=
-w_V\nabla_{\theta_V}L_{V,\mathrm{sup}}^{(\mathcal B)},
+w_{V,k}=\mathrm{proj}_{I_k}\left(
+\exp\left((1-\gamma)\log w_{V,k-1}+\gamma\log\widehat w_{V,k}\right)
+\right).
+$$
+
+An empty $I_k$, a nonfinite gradient statistic or a squared gradient norm no greater than $10^{-12}$ leaves the preceding coefficient unchanged. The controller periodically performs this calculation during optimization. An initial coefficient of zero removes the Value term and disables subsequent adaptation.
+
+To express how the resulting objective acts on the complete network, partition its parameters as $\theta=(\theta_T,\theta_P,\theta_V)$, where $\theta_T$ contains the residual-trunk parameters and $\theta_P$ and $\theta_V$ contain the parameters of the two output heads. Its gradients satisfy
+
+$$
+\nabla_{\theta_P}L_{\mathrm{sup}}^{(\mathcal B_k)}=
+\nabla_{\theta_P}L_{P,\mathrm{sup}}^{(\mathcal B_k)},
 $$
 
 $$
-\nabla_{\theta_T}L_{\mathrm{sup}}^{(\mathcal B)}=
-\nabla_{\theta_T}L_{P,\mathrm{sup}}^{(\mathcal B)}+
-w_V\nabla_{\theta_T}L_{V,\mathrm{sup}}^{(\mathcal B)}.
+\nabla_{\theta_V}L_{\mathrm{sup}}^{(\mathcal B_k)}=
+w_{V,k}\nabla_{\theta_V}L_{V,\mathrm{sup}}^{(\mathcal B_k)},
 $$
 
-The Policy loss contributes gradients to the Policy head and the residual trunk, whereas the Value loss contributes gradients to the Value head and the residual trunk. Their contributions add in the shared trunk according to the final equation above.
+$$
+\nabla_{\theta_T}L_{\mathrm{sup}}^{(\mathcal B_k)}=
+g_{P,k}+w_{V,k}g_{V,k}.
+$$
+
+The Policy loss therefore updates the Policy head and the residual trunk, and the Value loss updates the Value head and contributes its adaptively weighted gradient to the residual trunk.
 
 ### 4.3 Parameter Optimization
 

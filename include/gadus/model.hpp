@@ -44,16 +44,24 @@ struct ModelImpl : torch::nn::Module {
 	int blocks() const noexcept;
 
 	torch::nn::Sequential backbone{nullptr};
-	torch::nn::Sequential policy_head{nullptr};
 	torch::nn::Sequential value_head{nullptr};
 
 private:
+	torch::Tensor policy_logits(torch::Tensor features);
+	torch::Tensor policy_planes(torch::Tensor features);
+	torch::Tensor policy_features(torch::Tensor features);
+	torch::Tensor value(torch::Tensor features);
+
 	// Shared handles expose layers that remain registered through their Sequential containers.
 	torch::nn::Conv2d backbone_conv{nullptr};
 	torch::nn::BatchNorm2d backbone_norm{nullptr};
 	torch::nn::Conv2d policy_conv{nullptr};
 	torch::nn::BatchNorm2d policy_norm{nullptr};
-	torch::nn::Linear policy_projection{nullptr};
+	torch::nn::Sequential policy_blocks{nullptr};
+	torch::nn::Conv2d policy_output{nullptr};
+	torch::Tensor policy_position;
+	torch::Tensor policy_action_bias;
+	ResidualBlock value_block{nullptr};
 	torch::nn::Conv2d value_conv{nullptr};
 	torch::nn::BatchNorm2d value_norm{nullptr};
 	torch::nn::Linear value_hidden{nullptr};

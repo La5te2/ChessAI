@@ -37,8 +37,12 @@ inline constexpr int kControlOccupancyVocabulary = 13;
 inline constexpr int kControlOccupancyWidth = 4;
 inline constexpr int kControlSquareWidth = 4;
 inline constexpr int kControlLocalWidth = 16;
+inline constexpr int kControlAttentionHeads = 4;
 inline constexpr int kControlAttentionKeyWidth = 8;
 inline constexpr int kControlAttentionWidth = 16;
+inline constexpr int kControlAttentionHeadWidth =
+	kControlAttentionWidth / kControlAttentionHeads;
+static_assert(kControlAttentionWidth % kControlAttentionHeads == 0);
 inline constexpr int kMaterialFeatureWidth = 6;
 inline constexpr int kValueAccumulatorWidth = 144;
 inline constexpr int kValueDenseWidth =
@@ -49,6 +53,7 @@ inline constexpr int kValueBucketCount = 8;
 inline constexpr int kValueFeatureWidth = kValueAccumulatorWidth + kValueBucketCount;
 
 using PerspectiveFeatures = std::array<std::int32_t, kFeatureSlots>;
+using FeatureAccumulator = std::array<float, kValueFeatureWidth>;
 
 struct EncodedFeatures {
 	std::array<PerspectiveFeatures, kPerspectiveCount> perspective{};
@@ -62,7 +67,7 @@ PerspectiveFeatures canonicalize_features(const PerspectiveFeatures &features);
 
 /// Floating-point accumulator used by the first custom CPU inference path.
 struct FloatAccumulator {
-	std::array<std::vector<float>, kPerspectiveCount> perspective;
+	std::array<FeatureAccumulator, kPerspectiveCount> perspective{};
 	bool white_to_move = true;
 	int piece_count = 0;
 };
@@ -86,6 +91,9 @@ struct ControlFeatures {
 
 /// Derives canonical pseudo-attack edges, occupancy and material from sparse features.
 ControlFeatures control_features(const EncodedFeatures &encoded);
+/// Returns the six signed material features for both canonical perspectives.
+std::array<std::array<float, kMaterialFeatureWidth>, kPerspectiveCount>
+material_features(const EncodedFeatures &encoded);
 
 struct ControlAccumulator {
 	std::array<std::array<std::array<float, kControlWidth>, 64>,
@@ -96,18 +104,26 @@ struct ControlAccumulator {
 		kPerspectiveCount> local{};
 	std::array<std::array<float, kControlLocalWidth>, kPerspectiveCount> mean{};
 	std::array<std::array<float, kControlAttentionWidth>, kPerspectiveCount> attention{};
-	std::array<std::array<float, kControlAttentionWidth>, kPerspectiveCount>
-		attention_numerator{};
-	std::array<float, kPerspectiveCount> attention_denominator{};
+	std::array<std::array<std::array<float, kControlAttentionHeadWidth>,
+		kControlAttentionHeads>, kPerspectiveCount> attention_numerator{};
+	std::array<std::array<float, kControlAttentionHeads>, kPerspectiveCount>
+		attention_denominator{};
 	std::array<std::array<float, kMaterialFeatureWidth>, kPerspectiveCount> material{};
-	std::vector<ControlEdge> edges;
+	std::array<std::array<std::uint8_t, 64>, kPerspectiveCount> piece_type{};
+	std::array<std::array<std::uint64_t, 64>, kPerspectiveCount> attacks{};
 	int bucket = 0;
 };
 
 /// Complete incremental state consumed by the Value network.
 struct ValueAccumulator {
+	EncodedFeatures encoded;
 	FloatAccumulator features;
 	ControlAccumulator control;
+	int incremental_updates = 0;
+};
+
+struct ValueUndoState {
+	EncodedFeatures encoded;
 };
 
 struct ValueWeights {
@@ -145,6 +161,8 @@ class CpuValue {
 	ValueAccumulator refresh(const chess::Board &board) const;
 	ValueAccumulator update(const ValueAccumulator &current, const chess::Board &before,
 							const chess::Board &after) const;
+	ValueUndoState apply(ValueAccumulator &current, const chess::Board &after) const;
+	void undo(ValueAccumulator &current, const ValueUndoState &undo) const;
 	float evaluate(const ValueAccumulator &accumulator) const;
 	const ValueWeights &weights() const noexcept { return weights_; }
 

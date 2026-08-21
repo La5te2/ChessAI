@@ -110,9 +110,11 @@ void write_value(std::ofstream &output, const ValueWeights &weights) {
 	write_vector(output, weights.control_local_bias, kControlLocalWidth,
 		"control local bias");
 	write_vector(output, weights.attention_key_weight,
-		static_cast<std::size_t>(kControlAttentionKeyWidth) * kControlLocalWidth,
+		static_cast<std::size_t>(kControlAttentionHeads * kControlAttentionKeyWidth) *
+			kControlLocalWidth,
 		"attention key weight");
-	write_vector(output, weights.attention_key_bias, kControlAttentionKeyWidth,
+	write_vector(output, weights.attention_key_bias,
+		kControlAttentionHeads * kControlAttentionKeyWidth,
 		"attention key bias");
 	write_vector(output, weights.attention_value_weight,
 		static_cast<std::size_t>(kControlAttentionWidth) * kControlLocalWidth,
@@ -120,11 +122,10 @@ void write_value(std::ofstream &output, const ValueWeights &weights) {
 	write_vector(output, weights.attention_value_bias, kControlAttentionWidth,
 		"attention value bias");
 	write_vector(output, weights.attention_query,
-		static_cast<std::size_t>(kValueBucketCount) * kControlAttentionKeyWidth,
+		static_cast<std::size_t>(kValueBucketCount * kControlAttentionHeads) *
+			kControlAttentionKeyWidth,
 		"attention query");
-	write_vector(output, weights.material_weight,
-		static_cast<std::size_t>(kValueBucketCount) * kMaterialFeatureWidth,
-		"material weight");
+	write_vector(output, weights.material_weight, kMaterialFeatureWidth, "material weight");
 	write_vector(output, weights.hidden_weight,
 		static_cast<std::size_t>(kValueBucketCount) * kValueHiddenWidth *
 			kValueDenseWidth * 2,
@@ -174,9 +175,11 @@ ValueWeights read_value(std::ifstream &input, const std::filesystem::path &path)
 	weights.control_local_bias = read_vector(input, path, kControlLocalWidth,
 		"control local bias");
 	weights.attention_key_weight = read_vector(input, path,
-		static_cast<std::size_t>(kControlAttentionKeyWidth) * kControlLocalWidth,
+		static_cast<std::size_t>(kControlAttentionHeads * kControlAttentionKeyWidth) *
+			kControlLocalWidth,
 		"attention key weight");
-	weights.attention_key_bias = read_vector(input, path, kControlAttentionKeyWidth,
+	weights.attention_key_bias = read_vector(input, path,
+		kControlAttentionHeads * kControlAttentionKeyWidth,
 		"attention key bias");
 	weights.attention_value_weight = read_vector(input, path,
 		static_cast<std::size_t>(kControlAttentionWidth) * kControlLocalWidth,
@@ -184,11 +187,10 @@ ValueWeights read_value(std::ifstream &input, const std::filesystem::path &path)
 	weights.attention_value_bias = read_vector(input, path, kControlAttentionWidth,
 		"attention value bias");
 	weights.attention_query = read_vector(input, path,
-		static_cast<std::size_t>(kValueBucketCount) * kControlAttentionKeyWidth,
+		static_cast<std::size_t>(kValueBucketCount * kControlAttentionHeads) *
+			kControlAttentionKeyWidth,
 		"attention query");
-	weights.material_weight = read_vector(input, path,
-		static_cast<std::size_t>(kValueBucketCount) * kMaterialFeatureWidth,
-		"material weight");
+	weights.material_weight = read_vector(input, path, kMaterialFeatureWidth, "material weight");
 	weights.hidden_weight = read_vector(input, path,
 		static_cast<std::size_t>(kValueBucketCount) * kValueHiddenWidth *
 			kValueDenseWidth * 2,

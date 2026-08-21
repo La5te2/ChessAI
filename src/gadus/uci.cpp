@@ -30,7 +30,7 @@ struct EngineOptions {
 };
 
 constexpr int kProgressIntervalMs = 300;
-constexpr int kScoreScale = 1000;
+constexpr float kValueCpScale = 300.0F;
 
 // Resolve the explicitly packaged Gadus checkpoint beside the executable without
 // introducing a repository fallback or coupling the model name to the EXE name.
@@ -355,9 +355,10 @@ class UciEngine {
 		return 0;
 	}
 
-	// Map bounded neural value to a monotonic centipawn-like UCI display score.
+	// Invert the supervised V=tanh(cp/300) transform for UCI score display.
 	int score_cp(float value) const {
-		return static_cast<int>(std::lround(std::clamp(value, -0.999F, 0.999F) * kScoreScale));
+		return static_cast<int>(std::lround(
+			kValueCpScale * std::atanh(std::clamp(value, -0.999F, 0.999F))));
 	}
 
 	// Emit final or progressive MultiPV lines using root-side values and search statistics.

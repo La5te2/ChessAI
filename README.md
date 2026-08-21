@@ -148,14 +148,29 @@ build/gadus/preprocess \
 
 `--has-cmt 1` derives Value targets from numerical PGN comments, while `--has-cmt 0` derives them from final game results. `--max-games` limits the number of PGN games read. `--chunk-size` controls HDF5 dataset extension units. `--compression-level` selects the deflate level. `--log-every` controls progress reporting by game count.
 
+The Gadus preprocessor can also consume the position-oriented [Lichess evaluation database](https://database.lichess.org/#evals). Stream the compressed JSONL file into the preprocessor so decompression and HDF5 writing proceed concurrently:
+
+```bash
+zstdcat data/lichess_db_eval.jsonl.zst | build/gadus/preprocess \
+	--source lichess-eval \
+	--input - \
+	--output data/lichess.gadus.h5 \
+	--chunk-size 16384 \
+	--compression-level 1 \
+	--max-positions 100000000 \
+	--log-every 10000
+```
+
+For each position, the preprocessor selects the evaluation with the greatest search depth and uses its first principal variation. The first move supplies the Policy target, while its White-perspective `cp` or `mate` score is converted to the side-to-move Value scale used by Gadus. `--max-positions` places an optional limit on the number of accepted positions. An uncompressed JSONL file may be passed directly through `--input`.
+
 Train a new Gadus model with:
 
 ```bash
 build/gadus/train \
-	--data data/games.gadus.h5 \
+	--data data/lichess.gadus.h5 \
 	--out models/gadus/gadus.pth \
-	--channels 192 \
-	--blocks 20 \
+	--channels 128 \
+	--blocks 12 \
 	--epochs 10 \
 	--batch-size 512 \
 	--max-steps 500000 \
@@ -324,7 +339,7 @@ build/eleginus/preprocess \
 	--output data/games.eleginus.h5 \
 	--has-cmt 1 \
 	--compression-level 4 \
-	--max-games 100000
+	--max-games 2400000
 ```
 
 The HDF5 file stores `states` and `values`. Its root metadata identifies `arch_type=eleginus`, the
@@ -342,7 +357,8 @@ Train the Eleginus Value network with:
 build/eleginus/train \
 	--data data/games.eleginus.h5 \
 	--out models/eleginus/eleginus.pth \
-	--epochs 4 \
+	--epochs 2 \
+	--max-steps 20000 \
 	--batch-size 512 \
 	--lr 0.001 \
 	--device cuda \
@@ -450,11 +466,13 @@ The Gadus UCI executable loads its checkpoint when `isready` or `go` first requi
 
 The UCI worker performs neural inference and tree search while the protocol loop remains available for `stop`. A `position`, `setoption` or `ucinewgame` command first stops and joins an active worker before changing engine state. Closing the process also joins the worker.
 
-Gadus reports MultiPV rows containing `score cp`, nodes, NPS, elapsed time and a one-move principal variation. With `Sims=0`, the reported root evaluation is the network Value $V_\theta(s)$. After at least one simulation, it is the mean return backed up to the root. A visited root edge reports its backed-up $Q(s,a)$, while an unvisited edge reports the root evaluation. The displayed score uses the fixed scale $c_s=1000$:
+Gadus reports MultiPV rows containing `score cp`, nodes, NPS, elapsed time and a one-move principal variation. With `Sims=0`, the reported root evaluation is the network Value $V_\theta(s)$. After at least one simulation, it is the mean return backed up to the root. A visited root edge reports its backed-up $Q(s,a)$, while an unvisited edge reports the root evaluation. The displayed score inverts the supervised target transform $V=\tanh(\mathrm{cp}/300)$:
 
 $$
 \text{score cp}=\mathrm{round}\left(
-c_s\,\mathrm{clip}(q_{\mathrm{line}},-0.999,0.999)
+300\operatorname{atanh}\left(
+\mathrm{clip}(q_{\mathrm{line}},-0.999,0.999)
+\right)
 \right).
 $$
 

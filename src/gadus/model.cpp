@@ -1,11 +1,17 @@
 // Implements Gadus's residual convolutional policy/value network.
 
 #include "gadus/model.hpp"
+#include "gadus/precision.hpp"
 #include <stdexcept>
 
 namespace gadus {
 
 namespace {
+
+constexpr int kPolicyChannels = 128;
+constexpr int kPolicyBlocks = 2;
+constexpr int kValueChannels = 48;
+constexpr int kValueHidden = 512;
 
 // Fold y = gamma * (conv(x) - mean) / sqrt(var + eps) + beta into one biased convolution.
 torch::nn::Conv2d fuse_conv_bn(const torch::nn::Conv2d &conv,
@@ -86,23 +92,39 @@ ModelImpl::ModelImpl(int channels, int blocks) : channels_(channels), blocks_(bl
 	}
 
 	policy_conv =
-		torch::nn::Conv2d(torch::nn::Conv2dOptions(channels_, 32, 1).bias(false));
-	policy_norm = torch::nn::BatchNorm2d(32);
-	policy_projection = torch::nn::Linear(32 * 8 * 8, kActionSize);
-	policy_head = register_module(
-		"policy_head",
-		torch::nn::Sequential(policy_conv, policy_norm,
-							  torch::nn::ReLU(torch::nn::ReLUOptions(true)),
-							  torch::nn::Flatten(), policy_projection));
+		torch::nn::Conv2d(torch::nn::Conv2dOptions(channels_, kPolicyChannels, 1).bias(false));
+	policy_norm = torch::nn::BatchNorm2d(kPolicyChannels);
+	register_module("policy_conv", policy_conv);
+	register_module("policy_norm", policy_norm);
+	policy_blocks = register_module("policy_blocks", torch::nn::Sequential());
+	for (int index = 0; index < kPolicyBlocks; ++index) {
+		policy_blocks->push_back(ResidualBlock(kPolicyChannels));
+	}
+	policy_output = register_module(
+		"policy_output",
+		torch::nn::Conv2d(torch::nn::Conv2dOptions(kPolicyChannels, kPolicyPlanes, 1)
+							  .bias(false)));
+	policy_position = register_parameter(
+		"policy_position", torch::empty({1, kPolicyChannels, 8, 8}));
+	policy_action_bias = register_parameter(
+		"policy_action_bias", torch::zeros({1, kPolicyPlanes, 8, 8}));
+	torch::nn::init::normal_(policy_position, 0.0, 0.02);
 
+	value_block = ResidualBlock(channels_);
 	value_conv =
-		torch::nn::Conv2d(torch::nn::Conv2dOptions(channels_, 32, 1).bias(false));
-	value_norm = torch::nn::BatchNorm2d(32);
-	value_hidden = torch::nn::Linear(32 * 8 * 8, 256);
-	value_output = torch::nn::Linear(256, 1);
+		torch::nn::Conv2d(torch::nn::Conv2dOptions(channels_, kValueChannels, 1).bias(false));
+	value_norm = torch::nn::BatchNorm2d(kValueChannels);
+	value_hidden = torch::nn::Linear(kValueChannels * 8 * 8, kValueHidden);
+	value_output = torch::nn::Linear(kValueHidden, 1);
+	{
+		torch::NoGradGuard guard;
+		value_output->weight.zero_();
+		value_output->bias.zero_();
+	}
 	value_head = register_module(
 		"value_head", torch::nn::Sequential(
-						  value_conv, value_norm, torch::nn::ReLU(torch::nn::ReLUOptions(true)),
+						  value_block, value_conv, value_norm,
+						  torch::nn::ReLU(torch::nn::ReLUOptions(true)),
 						  torch::nn::Flatten(), value_hidden,
 						  torch::nn::ReLU(torch::nn::ReLUOptions(true)), value_output,
 						  torch::nn::Tanh()));
@@ -111,11 +133,10 @@ ModelImpl::ModelImpl(int channels, int blocks) : channels_(channels), blocks_(bl
 // Evaluate the shared features once, then return action logits and bounded V(s).
 std::pair<torch::Tensor, torch::Tensor> ModelImpl::forward(torch::Tensor x) {
 	auto features = backbone->forward(x);
-	return {policy_head->forward(features), value_head->forward(features)};
+	return {policy_logits(features), value(features)};
 }
 
-// Apply the existing policy projection only to requested action rows, avoiding the 4672-way
-// matrix product during legal-move inference while preserving checkpoint parameters exactly.
+// Convert source-major action indices q * 73 + p to plane-major NCHW offsets p * 64 + q.
 std::pair<torch::Tensor, torch::Tensor>
 ModelImpl::forward_legal(torch::Tensor x, torch::Tensor legal_indices) {
 	if (legal_indices.dim() != 2 || legal_indices.size(0) != x.size(0)) {
@@ -128,23 +149,50 @@ ModelImpl::forward_legal(torch::Tensor x, torch::Tensor legal_indices) {
 	}
 
 	auto features = backbone->forward(x);
+	auto source_squares = torch::floor_divide(legal_indices, kPolicyPlanes);
+	auto patterns = torch::remainder(legal_indices, kPolicyPlanes);
+	auto compact_features = policy_features(features);
+	auto source_features = compact_features.flatten(2)
+						   .transpose(1, 2)
+						   .gather(1, source_squares.unsqueeze(2).expand(
+									  {-1, -1, kPolicyChannels}));
+	auto selected_weights = policy_output->weight.flatten(1)
+							.index_select(0, patterns.reshape({-1}))
+							.view({legal_indices.size(0), legal_indices.size(1),
+								   kPolicyChannels});
+	auto legal_logits = (source_features * selected_weights).sum(2);
+	auto plane_offsets = patterns * 64 + source_squares;
+	legal_logits = legal_logits + policy_action_bias.flatten(1)
+								 .expand({legal_indices.size(0), -1})
+								 .gather(1, plane_offsets);
+	return {legal_logits, value(features)};
+}
+
+// Keep the bounded Value readout in FP32 even when the shared trunk uses CUDA BF16.
+torch::Tensor ModelImpl::value(torch::Tensor features) {
+	AutocastGuard fp32(ComputePrecision::Fp32, features.device());
+	return value_head->forward(features.to(torch::kFloat32));
+}
+
+// Produce position-aware Policy features before the final action-pattern projection.
+torch::Tensor ModelImpl::policy_features(torch::Tensor features) {
 	auto policy_features = policy_conv->forward(features);
 	if (!inference_fused_) {
 		policy_features = policy_norm->forward(policy_features);
 	}
-	policy_features = torch::relu(policy_features).flatten(1);
+	policy_features = torch::relu(policy_features + policy_position);
+	return policy_blocks->forward(policy_features);
+}
 
-	auto flat_indices = legal_indices.reshape({-1});
-	auto selected_weights = policy_projection->weight.index_select(0, flat_indices)
-								.reshape({legal_indices.size(0), legal_indices.size(1),
-										  policy_features.size(1)});
-	auto legal_logits =
-		torch::bmm(selected_weights, policy_features.unsqueeze(2)).squeeze(2);
-	if (policy_projection->bias.defined()) {
-		legal_logits = legal_logits +
-			policy_projection->bias.index_select(0, flat_indices).reshape_as(legal_indices);
-	}
-	return {legal_logits, value_head->forward(features)};
+// Produce one action-pattern channel per source square in NCHW board order.
+torch::Tensor ModelImpl::policy_planes(torch::Tensor features) {
+	return policy_output->forward(policy_features(features)) + policy_action_bias;
+}
+
+// Reorder [pattern, rank, file] to the source-major action index 73 * square + pattern.
+torch::Tensor ModelImpl::policy_logits(torch::Tensor features) {
+	auto planes = policy_planes(features);
+	return planes.permute({0, 2, 3, 1}).contiguous().view({planes.size(0), kActionSize});
 }
 
 // Rebuild only the in-memory inference graph; checkpoint construction and training stay unfused.
@@ -168,16 +216,19 @@ void ModelImpl::fuse_for_inference() {
 	backbone_norm = nullptr;
 
 	policy_conv = fuse_conv_bn(policy_conv, policy_norm);
-	policy_head = replace_module(
-		"policy_head", torch::nn::Sequential(
-							   policy_conv, torch::nn::ReLU(torch::nn::ReLUOptions(true)),
-							   torch::nn::Flatten(), policy_projection));
+	replace_module("policy_conv", policy_conv);
 	policy_norm = nullptr;
+	for (int index = 0; index < kPolicyBlocks; ++index) {
+		policy_blocks->ptr<ResidualBlockImpl>(static_cast<std::size_t>(index))
+			->fuse_for_inference();
+	}
 
+	value_block->fuse_for_inference();
 	value_conv = fuse_conv_bn(value_conv, value_norm);
 	value_head = replace_module(
 		"value_head", torch::nn::Sequential(
-						  value_conv, torch::nn::ReLU(torch::nn::ReLUOptions(true)),
+						  value_block, value_conv,
+						  torch::nn::ReLU(torch::nn::ReLUOptions(true)),
 						  torch::nn::Flatten(), value_hidden,
 						  torch::nn::ReLU(torch::nn::ReLUOptions(true)), value_output,
 						  torch::nn::Tanh()));

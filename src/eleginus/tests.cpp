@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <random>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
@@ -20,8 +21,9 @@ void require(bool condition, const char *message) {
 	}
 }
 
-float max_difference(const std::vector<float> &left, const std::vector<float> &right) {
-	require(left.size() == right.size(), "vector size mismatch");
+template <typename Left, typename Right>
+float max_difference(const Left &left, const Right &right) {
+	require(left.size() == right.size(), "array size mismatch");
 	float difference = 0.0F;
 	for (std::size_t index = 0; index < left.size(); ++index) {
 		difference = std::max(difference, std::abs(left[index] - right[index]));
@@ -33,13 +35,24 @@ float max_control_difference(const eleginus::ControlAccumulator &left,
 							 const eleginus::ControlAccumulator &right) {
 	float difference = 0.0F;
 	for (int perspective = 0; perspective < eleginus::kPerspectiveCount; ++perspective) {
-		for (int square = 0; square < 64; ++square)
+		for (int ownership = 0; ownership < 2; ++ownership) {
+			for (int square = 0; square < 64; ++square) {
+				for (int channel = 0; channel < eleginus::kControlWidth; ++channel)
+					difference = std::max(difference, std::abs(
+						left.field[static_cast<std::size_t>(perspective * 2 + ownership)]
+							[static_cast<std::size_t>(square)][static_cast<std::size_t>(channel)] -
+						right.field[static_cast<std::size_t>(perspective * 2 + ownership)]
+							[static_cast<std::size_t>(square)][static_cast<std::size_t>(channel)]));
+			}
+		}
+		for (int square = 0; square < 64; ++square) {
 			for (int channel = 0; channel < eleginus::kControlLocalWidth; ++channel)
 				difference = std::max(difference, std::abs(
 					left.local[static_cast<std::size_t>(perspective)]
 						[static_cast<std::size_t>(square)][static_cast<std::size_t>(channel)] -
 					right.local[static_cast<std::size_t>(perspective)]
 						[static_cast<std::size_t>(square)][static_cast<std::size_t>(channel)]));
+		}
 		for (int channel = 0; channel < eleginus::kControlLocalWidth; ++channel)
 			difference = std::max(difference, std::abs(
 				left.mean[static_cast<std::size_t>(perspective)][static_cast<std::size_t>(channel)] -
@@ -50,14 +63,60 @@ float max_control_difference(const eleginus::ControlAccumulator &left,
 					[static_cast<std::size_t>(channel)] -
 				right.attention[static_cast<std::size_t>(perspective)]
 					[static_cast<std::size_t>(channel)]));
+		for (int head = 0; head < eleginus::kControlAttentionHeads; ++head) {
+			for (int channel = 0; channel < eleginus::kControlAttentionHeadWidth; ++channel)
+				difference = std::max(difference, std::abs(
+					left.attention_numerator[static_cast<std::size_t>(perspective)]
+						[static_cast<std::size_t>(head)][static_cast<std::size_t>(channel)] -
+					right.attention_numerator[static_cast<std::size_t>(perspective)]
+						[static_cast<std::size_t>(head)][static_cast<std::size_t>(channel)]));
+			difference = std::max(difference, std::abs(
+				left.attention_denominator[static_cast<std::size_t>(perspective)]
+					[static_cast<std::size_t>(head)] -
+				right.attention_denominator[static_cast<std::size_t>(perspective)]
+					[static_cast<std::size_t>(head)]));
+		}
+		for (int channel = 0; channel < eleginus::kMaterialFeatureWidth; ++channel)
+			difference = std::max(difference, std::abs(
+				left.material[static_cast<std::size_t>(perspective)]
+					[static_cast<std::size_t>(channel)] -
+				right.material[static_cast<std::size_t>(perspective)]
+					[static_cast<std::size_t>(channel)]));
 	}
 	return difference;
+}
+
+void require_accumulator_close(const eleginus::ValueAccumulator &left,
+							   const eleginus::ValueAccumulator &right, float tolerance,
+							   const char *context) {
+	require(left.encoded.perspective == right.encoded.perspective &&
+		left.encoded.white_to_move == right.encoded.white_to_move,
+		"incremental Value encoded state differs from refresh");
+	require(left.features.white_to_move == right.features.white_to_move &&
+		left.features.piece_count == right.features.piece_count,
+		"incremental Value feature metadata differs from refresh");
+	for (int perspective = 0; perspective < eleginus::kPerspectiveCount; ++perspective) {
+		require(max_difference(
+			left.features.perspective[static_cast<std::size_t>(perspective)],
+			right.features.perspective[static_cast<std::size_t>(perspective)]) < tolerance,
+			"incremental Value feature accumulator differs from refresh");
+	}
+	require(left.control.count == right.control.count &&
+		left.control.occupancy == right.control.occupancy &&
+		left.control.piece_type == right.control.piece_type &&
+		left.control.attacks == right.control.attacks &&
+		left.control.bucket == right.control.bucket,
+		"incremental Value discrete control state differs from refresh");
+	(void)context;
+	require(max_control_difference(left.control, right.control) < tolerance,
+		"incremental Value floating control state differs from refresh");
 }
 
 } // namespace
 
 int main() {
 	try {
+		torch::manual_seed(20260820);
 		chess::Board board;
 		const auto encoded = eleginus::encode_features(board);
 		for (const auto &perspective : encoded.perspective) {
@@ -72,6 +131,23 @@ int main() {
 		}
 		auto model = eleginus::make_model(torch::Device(torch::kCPU), 7);
 		model->eval();
+		const float edge_std = model->value->control_source->weight.std().item<float>();
+		const float context_std = model->value->control_occupancy->weight.std().item<float>();
+		require(edge_std > 0.08F && edge_std < 0.12F,
+			"Eleginus control-edge initialization scale changed");
+		require(context_std > 0.03F && context_std < 0.08F,
+			"Eleginus control-context initialization scale changed");
+		require(torch::allclose(model->value->control_local->bias,
+			torch::full_like(model->value->control_local->bias, 0.25F)),
+			"Eleginus local control bias changed");
+		require(model->value->material->weight.numel() == eleginus::kMaterialFeatureWidth,
+			"Eleginus material residual is not shared across Value buckets");
+		require(model->value->attention_key->weight.size(0) ==
+			eleginus::kControlAttentionHeads * eleginus::kControlAttentionKeyWidth,
+			"Eleginus control attention does not expose every key head");
+		require(model->value->attention_query->weight.size(1) ==
+			eleginus::kControlAttentionHeads * eleginus::kControlAttentionKeyWidth,
+			"Eleginus material bucket does not provide every attention query");
 		eleginus::CpuValue value = eleginus::snapshot_value(model->value);
 		const auto moves = eleginus::legal_moves(board);
 		const auto value_accumulator = value.refresh(board);
@@ -144,6 +220,50 @@ int main() {
 			sequence = std::move(next);
 		}
 
+		std::mt19937 random(20260820U);
+		chess::Board random_board;
+		auto random_state = value.refresh(random_board);
+		std::vector<eleginus::EncodedFeatures> parity_positions;
+		std::vector<float> parity_values;
+		for (int transition = 0; transition < 2000; ++transition) {
+			auto random_moves = eleginus::legal_moves(random_board);
+			if (random_moves.empty()) {
+				random_board = chess::Board{};
+				random_state = value.refresh(random_board);
+				random_moves = eleginus::legal_moves(random_board);
+			}
+			const auto move = random_moves[static_cast<std::size_t>(random() % random_moves.size())];
+			const auto parent_state = random_state;
+			random_board.makeMove(move);
+			const auto undo = value.apply(random_state, random_board);
+			const auto refreshed = value.refresh(random_board);
+			require_accumulator_close(random_state, refreshed, 4.0e-3F,
+				"random incremental Value state differs from refresh");
+			value.undo(random_state, undo);
+			random_board.unmakeMove(move);
+			require_accumulator_close(random_state, parent_state, 4.0e-3F,
+				"random Value undo failed to restore the parent state");
+			require(std::abs(value.evaluate(random_state) - value.evaluate(parent_state)) < 2.0e-5F,
+				"random Value undo changed the parent evaluation");
+			random_board.makeMove(move);
+			(void)value.apply(random_state, random_board);
+			if (transition % 32 == 0) {
+				parity_positions.push_back(random_state.encoded);
+				parity_values.push_back(value.evaluate(random_state));
+			}
+		}
+		auto parity_batch = eleginus::encode_feature_batch(
+			parity_positions, torch::Device(torch::kCPU));
+		auto parity_tensor = model->value->forward(parity_batch).contiguous();
+		require(parity_tensor.dim() == 1 &&
+			parity_tensor.size(0) == static_cast<std::int64_t>(parity_values.size()),
+			"random Value parity batch has the wrong shape");
+		const auto *parity_data = parity_tensor.data_ptr<float>();
+		for (std::size_t index = 0; index < parity_values.size(); ++index) {
+			require(std::abs(parity_data[index] - parity_values[index]) < 2.0e-5F,
+				"custom Value inference differs from LibTorch on a random position");
+		}
+
 		eleginus::SearchOptions search_options;
 		search_options.depth = 1;
 		search_options.quiescence_depth = 1;
@@ -204,24 +324,26 @@ int main() {
 		const auto dataset_path =
 			std::filesystem::temp_directory_path() / "eleginus-value-test.h5";
 		const auto after_encoded = eleginus::encode_features(after);
+		const auto material_encoded = eleginus::encode_features(chess::Board(
+			"rnb1kbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"));
 		{
 			eleginus::WriterOptions writer_options;
 			writer_options.output = dataset_path;
 			writer_options.compression_level = 0;
 			writer_options.source = "unit_test";
 			eleginus::H5Writer writer(writer_options);
-			writer.append({encoded, after_encoded}, {0.75F, 0.25F});
+			writer.append({encoded, after_encoded, material_encoded}, {0.75F, 0.25F, 0.90F});
 			writer.flush();
 		}
 		{
 			eleginus::H5Dataset dataset(dataset_path);
-			require(dataset.info().length == 2, "Eleginus HDF5 row count mismatch");
+			require(dataset.info().length == 3, "Eleginus HDF5 row count mismatch");
 			require(dataset.info().source == "unit_test", "Eleginus HDF5 source mismatch");
-			auto stored = dataset.read_contiguous(0, 2);
+			auto stored = dataset.read_contiguous(0, 3);
 			require(std::abs(stored.values[0].item<float>() - 0.75F) < 1.0e-6F,
 				"Eleginus HDF5 Value mismatch");
 			auto original_batch = eleginus::encode_feature_batch(
-				{encoded, after_encoded}, torch::Device(torch::kCPU));
+				{encoded, after_encoded, material_encoded}, torch::Device(torch::kCPU));
 			auto stored_batch =
 				eleginus::encode_feature_batch(stored.features, torch::Device(torch::kCPU));
 			require(torch::allclose(model->value->forward(original_batch),
@@ -238,13 +360,15 @@ int main() {
 		training_options.data = dataset_path;
 		training_options.output = training_checkpoint;
 		training_options.epochs = 1;
-		training_options.batch_size = 2;
+		training_options.batch_size = 3;
 		training_options.max_steps = 1;
 		training_options.log_every = 1;
 		const auto training_stats = eleginus::train_from_h5(
 			training_model, training_options, torch::Device(torch::kCPU));
-		require(training_stats.steps == 1 && training_stats.samples == 2,
+		require(training_stats.steps == 1 && training_stats.samples == 3,
 			"Eleginus training batch mismatch");
+		require(training_model->value->material->weight.index({0, 4}).item<float>() > 0.0F,
+			"Eleginus material calibration did not learn a positive queen coefficient");
 		require(std::filesystem::exists(training_checkpoint),
 			"Eleginus epoch checkpoint was not written");
 		const auto epoch_model = eleginus::load_checkpoint(

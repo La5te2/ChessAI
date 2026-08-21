@@ -42,6 +42,9 @@ torch::Tensor decode_states(const std::uint8_t *packed, std::int64_t count,
 /// Transfers packed rows first and expands their bits on the destination device.
 torch::Tensor decode_states_device(const std::uint8_t *packed, std::int64_t count,
 								   const torch::Device &device);
+/// Expands a contiguous uint8 tensor shaped [count, 18, 8] on its destination device.
+torch::Tensor decode_states_device(const torch::Tensor &packed,
+								   const torch::Device &device);
 /// Encodes live boards directly into a batched Gadus input tensor.
 torch::Tensor encode_boards(const std::vector<chess::Board> &boards,
 							bool pinned_memory = false);

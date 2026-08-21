@@ -29,6 +29,8 @@ namespace {
 
 constexpr double kValueLogitLossWeight = 0.25;
 constexpr double kValueTargetEpsilon = 1.0e-4;
+constexpr std::int64_t kMaterialCalibrationSamples = 1 << 20;
+constexpr std::int64_t kMaterialCalibrationBlock = 4096;
 
 enum TrainingMetric : std::int64_t {
 	kMetricSamples,
@@ -39,6 +41,113 @@ enum TrainingMetric : std::int64_t {
 	kMetricPredictionTargetSum,
 	kTrainingMetricCount
 };
+
+using MaterialMatrix = std::array<std::array<double, kMaterialFeatureWidth>,
+	kMaterialFeatureWidth>;
+using MaterialVector = std::array<double, kMaterialFeatureWidth>;
+
+MaterialVector solve_material_system(MaterialMatrix matrix, MaterialVector right) {
+	double trace = 0.0;
+	for (int index = 0; index < kMaterialFeatureWidth; ++index)
+		trace += matrix[static_cast<std::size_t>(index)][static_cast<std::size_t>(index)];
+	const double ridge = std::max(1.0e-6,
+		trace * 1.0e-6 / static_cast<double>(kMaterialFeatureWidth));
+	for (int index = 0; index < kMaterialFeatureWidth; ++index)
+		matrix[static_cast<std::size_t>(index)][static_cast<std::size_t>(index)] += ridge;
+
+	for (int column = 0; column < kMaterialFeatureWidth; ++column) {
+		int pivot = column;
+		for (int row = column + 1; row < kMaterialFeatureWidth; ++row) {
+			if (std::abs(matrix[static_cast<std::size_t>(row)][static_cast<std::size_t>(column)]) >
+				std::abs(matrix[static_cast<std::size_t>(pivot)][static_cast<std::size_t>(column)]))
+				pivot = row;
+		}
+		if (pivot != column) {
+			std::swap(matrix[static_cast<std::size_t>(pivot)],
+				matrix[static_cast<std::size_t>(column)]);
+			std::swap(right[static_cast<std::size_t>(pivot)],
+				right[static_cast<std::size_t>(column)]);
+		}
+		const double diagonal = matrix[static_cast<std::size_t>(column)]
+			[static_cast<std::size_t>(column)];
+		if (std::abs(diagonal) < 1.0e-12)
+			continue;
+		for (int row = column + 1; row < kMaterialFeatureWidth; ++row) {
+			const double factor = matrix[static_cast<std::size_t>(row)]
+				[static_cast<std::size_t>(column)] / diagonal;
+			for (int inner = column; inner < kMaterialFeatureWidth; ++inner)
+				matrix[static_cast<std::size_t>(row)][static_cast<std::size_t>(inner)] -=
+					factor * matrix[static_cast<std::size_t>(column)]
+						[static_cast<std::size_t>(inner)];
+			right[static_cast<std::size_t>(row)] -=
+				factor * right[static_cast<std::size_t>(column)];
+		}
+	}
+
+	MaterialVector result{};
+	for (int row = kMaterialFeatureWidth - 1; row >= 0; --row) {
+		double value = right[static_cast<std::size_t>(row)];
+		for (int column = row + 1; column < kMaterialFeatureWidth; ++column)
+			value -= matrix[static_cast<std::size_t>(row)][static_cast<std::size_t>(column)] *
+				result[static_cast<std::size_t>(column)];
+		const double diagonal = matrix[static_cast<std::size_t>(row)]
+			[static_cast<std::size_t>(row)];
+		result[static_cast<std::size_t>(row)] = std::abs(diagonal) < 1.0e-12
+			? 0.0 : std::max(0.0, value / diagonal);
+	}
+	return result;
+}
+
+MaterialVector fit_material_baseline(const H5Dataset &data) {
+	MaterialMatrix matrix{};
+	MaterialVector right{};
+	const auto samples = std::min(data.info().length, kMaterialCalibrationSamples);
+	const auto blocks = std::max<std::int64_t>(1,
+		(samples + kMaterialCalibrationBlock - 1) / kMaterialCalibrationBlock);
+	std::int64_t consumed = 0;
+	for (std::int64_t block = 0; block < blocks && consumed < samples; ++block) {
+		const auto count = std::min(kMaterialCalibrationBlock, samples - consumed);
+		const auto maximum_begin = std::max<std::int64_t>(0, data.info().length - count);
+		const auto begin = blocks == 1 ? 0 : block * maximum_begin / (blocks - 1);
+		auto batch = data.read_contiguous(begin, count);
+		const auto *targets = batch.values.data_ptr<float>();
+		for (std::int64_t row = 0; row < count; ++row) {
+			const auto &encoded = batch.features[static_cast<std::size_t>(row)];
+			const auto all_material = material_features(encoded);
+			const auto &features = all_material[encoded.white_to_move ? 0U : 1U];
+			const double target = std::clamp(static_cast<double>(targets[row]),
+				kValueTargetEpsilon, 1.0 - kValueTargetEpsilon);
+			const double logit = std::log(target / (1.0 - target));
+			const double weight = 1.0 + 2.0 * std::abs(2.0 * target - 1.0);
+			for (int outer = 0; outer < kMaterialFeatureWidth; ++outer) {
+				const double x = features[static_cast<std::size_t>(outer)];
+				right[static_cast<std::size_t>(outer)] += weight * x * logit;
+				for (int inner = 0; inner < kMaterialFeatureWidth; ++inner)
+					matrix[static_cast<std::size_t>(outer)][static_cast<std::size_t>(inner)] +=
+						weight * x * features[static_cast<std::size_t>(inner)];
+			}
+		}
+		consumed += count;
+	}
+	return solve_material_system(matrix, right);
+}
+
+void initialize_material_baseline(const ValueNetwork &value, const H5Dataset &data) {
+	const auto fitted = fit_material_baseline(data);
+	auto weights = torch::empty({1, kMaterialFeatureWidth}, torch::kFloat32);
+	auto *output = weights.data_ptr<float>();
+	for (int index = 0; index < kMaterialFeatureWidth; ++index)
+		output[index] = static_cast<float>(fitted[static_cast<std::size_t>(index)]);
+	{
+		torch::NoGradGuard no_grad;
+		value->material->weight.copy_(weights.to(value->material->weight.device()));
+	}
+	value->material->weight.set_requires_grad(false);
+	std::cout << "Eleginus material baseline:";
+	for (const double coefficient : fitted)
+		std::cout << ' ' << coefficient;
+	std::cout << std::endl;
+}
 
 void require_h5(herr_t status, const std::string &operation) {
 	if (status < 0)
@@ -647,6 +756,7 @@ TrainStats train_from_h5(Model &model, const TrainOptions &options,
 		throw std::runtime_error("Eleginus supervised dataset is empty: " + options.data.string());
 	torch::manual_seed(static_cast<std::int64_t>(options.seed));
 	std::mt19937_64 rng(options.seed);
+	initialize_material_baseline(model->value, data);
 	torch::optim::AdamW value_optimizer(model->value->parameters(),
 		torch::optim::AdamWOptions(options.learning_rate).weight_decay(options.weight_decay));
 	model->train();
@@ -694,14 +804,22 @@ TrainStats train_from_h5(Model &model, const TrainOptions &options,
 				if (value_prediction.dim() != 1 || value_prediction.size(0) != count) {
 					throw std::runtime_error("Eleginus Value output must have shape [batch]");
 				}
-				auto value_bce = torch::nn::functional::binary_cross_entropy_with_logits(
-					value_prediction, value_targets);
+				auto sample_weights = 1.0F + 2.0F * (2.0F * value_targets - 1.0F).abs();
+				sample_weights = sample_weights / sample_weights.mean();
+				auto value_bce = (
+					torch::nn::functional::binary_cross_entropy_with_logits(
+						value_prediction, value_targets,
+						torch::nn::functional::BinaryCrossEntropyWithLogitsFuncOptions()
+							.reduction(torch::kNone)) * sample_weights).mean();
 				auto bounded_targets = value_targets.clamp(
 					kValueTargetEpsilon, 1.0 - kValueTargetEpsilon);
 				auto value_logit_targets = torch::log(
 					bounded_targets / (1.0 - bounded_targets));
-				auto value_logit_loss = torch::nn::functional::smooth_l1_loss(
-					value_prediction, value_logit_targets);
+				auto value_logit_loss = (
+					torch::nn::functional::smooth_l1_loss(
+						value_prediction, value_logit_targets,
+						torch::nn::functional::SmoothL1LossFuncOptions()
+							.reduction(torch::kNone)) * sample_weights).mean();
 				auto value_loss = value_bce + kValueLogitLossWeight * value_logit_loss;
 				value_loss.backward();
 				{
