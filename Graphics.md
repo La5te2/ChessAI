@@ -71,13 +71,13 @@ Appearance settings include dark and light application themes, base font size, b
 
 ## 6. Piece Import
 
-`scripts/import_pieces.py` converts one Scalable Vector Graphics (SVG) set into pre-triangulated indexed meshes stored in `src/graphics/pieces.gpack`. The input directory must contain `wK.svg`, `wQ.svg`, `wR.svg`, `wB.svg`, `wN.svg`, `wP.svg`, `bK.svg`, `bQ.svg`, `bR.svg`, `bB.svg`, `bN.svg` and `bP.svg`. A valid style name begins with a lowercase letter and contains only lowercase letters, digits or hyphens.
+`scripts/pieces.py` converts one Scalable Vector Graphics (SVG) set into pre-triangulated indexed meshes stored in `src/graphics/pieces.gpack`. The input directory must contain `wK.svg`, `wQ.svg`, `wR.svg`, `wB.svg`, `wN.svg`, `wP.svg`, `bK.svg`, `bQ.svg`, `bR.svg`, `bB.svg`, `bN.svg` and `bP.svg`. A valid style name begins with a lowercase letter and contains only lowercase letters, digits or hyphens.
 
 Import a style and rebuild the client on Windows with
 
 ```powershell
-python -m pip install -r scripts\requirements.txt
-python scripts\import_pieces.py `
+python -m pip install shapely svgelements
+python scripts\pieces.py `
 	--input data\pieces\my-style `
 	--name my-style
 scripts\build.bat
@@ -86,8 +86,8 @@ scripts\build.bat
 Import and rebuild on Linux with
 
 ```bash
-python -m pip install -r scripts/requirements.txt
-python scripts/import_pieces.py \
+python -m pip install shapely svgelements
+python scripts/pieces.py \
 	--input data/pieces/my-style \
 	--name my-style
 GADIDAE_BUILD_GRAPHICS=1 bash scripts/build.sh

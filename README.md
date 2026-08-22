@@ -2,7 +2,7 @@
 
 Gadidae is a family of experimental chess engines.
 
-This README and [Graphics.md](Graphics.md) explain installation, commands and user-facing interfaces. [Gadus.md](Gadus.md) and [Melano.md](Melano.md) specify their architectures, training methods and search algorithms, while [Eleginus.md](Eleginus.md) records the dated development history of the experimental Eleginus architecture.
+This README and [Graphics.md](Graphics.md) explain installation, commands and user-facing interfaces. [Gadus.md](Gadus.md) and [Melano.md](Melano.md) specify their architectures, training methods and search algorithms.
 
 ## Dependencies
 
@@ -11,7 +11,7 @@ This README and [Graphics.md](Graphics.md) explain installation, commands and us
 Install the Python dependencies used by the repository scripts with:
 
 ```bash
-python -m pip install -r scripts/requirements.txt
+python -m pip install torch shapely svgelements
 ```
 
 ### C++
@@ -59,20 +59,7 @@ Build on Windows with:
 
 The Windows build script locates Visual Studio through `vswhere`, initializes an x64 compiler environment and invokes CMake with the Ninja generator.
 
-Each component can be enabled independently with `GADIDAE_BUILD_GADUS`,
-`GADIDAE_BUILD_MELANO`, `GADIDAE_BUILD_ELEGINUS`, and `GADIDAE_BUILD_GRAPHICS`. Values `0` and `1`
-disable and enable a component. Eleginus additionally provides
-`GADIDAE_BUILD_ELEGINUS_TRAINING`; setting it to `0` builds only its statically linked, Torch-free
-`search` and `uci` programs. For example, an Eleginus inference-only Windows build is:
-
-```powershell
-$env:GADIDAE_BUILD_GADUS = "0"
-$env:GADIDAE_BUILD_MELANO = "0"
-$env:GADIDAE_BUILD_ELEGINUS = "1"
-$env:GADIDAE_BUILD_ELEGINUS_TRAINING = "0"
-$env:GADIDAE_BUILD_GRAPHICS = "0"
-.\scripts\build.bat
-```
+Gadus, Melano and the graphical client can be enabled independently with `GADIDAE_BUILD_GADUS`, `GADIDAE_BUILD_MELANO` and `GADIDAE_BUILD_GRAPHICS`. Values `0` and `1` disable and enable a component.
 
 Build on Linux with:
 
@@ -95,8 +82,6 @@ The build scripts use CMake and Ninja to produce the following command-line exec
 build/gadus/preprocess
 build/gadus/train
 build/gadus/search
-build/gadus/arena
-build/gadus/fcpi
 build/gadus/uci
 
 build/melano/preprocess
@@ -104,30 +89,21 @@ build/melano/train
 build/melano/search
 build/melano/uci
 
-build/eleginus/preprocess
-build/eleginus/train
-build/eleginus/embed
-build/eleginus/search
-build/eleginus/uci
-build/eleginus/tests
 ```
 
-The Eleginus `preprocess`, `train`, `embed` and `tests` programs are omitted when
-`GADIDAE_BUILD_ELEGINUS_TRAINING=0`; `search` and `uci` remain available and do not depend on
-LibTorch at runtime.
 
 A graphics-enabled build also produces `build/graphics/Gadidae`. Windows executables use the `.exe` suffix. [Graphics.md](Graphics.md) describes the graphical client, its operating modes and its piece-import pipeline.
 
 The `build/.build-work/` directory stores the CMake and Ninja state used for incremental builds. Subsequent builds reuse compatible object files from this directory. A failed build leaves its diagnostic files in this directory.
 
-The `preprocess`, `train`, `embed`, `search`, `arena` and Gadus `fcpi` entry points provide their current argument lists through `--help`:
+The `preprocess`, `train` and `search` entry points provide their current argument lists through `--help`:
 
 ```bash
 build/gadus/search --help
 build/melano/train --help
 ```
 
-The Gadus, Melano and Eleginus UCI executables publish their configurable engine options in response to the UCI `uci` command rather than through `--help`.
+The Gadus and Melano UCI executables publish their configurable engine options in response to the UCI `uci` command rather than through `--help`.
 
 ## Commands
 
@@ -157,7 +133,7 @@ zstdcat data/lichess_db_eval.jsonl.zst | build/gadus/preprocess \
 	--output data/lichess.gadus.h5 \
 	--chunk-size 16384 \
 	--compression-level 1 \
-	--max-positions 100000000 \
+	--max-positions 300000000 \
 	--log-every 10000
 ```
 
@@ -176,7 +152,7 @@ build/gadus/train \
 	--max-steps 500000 \
 	--lr 0.001 \
 	--weight-decay 0.0001 \
-	--value-weight 0.25 \
+	--value-weight 0.5 \
 	--save-every 5000 \
 	--device cuda \
 	--precision bf16 \
@@ -207,35 +183,6 @@ build/gadus/search \
 ```
 
 `--fen` accepts a complete FEN or the value `startpos`, which selects the standard initial position.
-
-Run a paired Gadus arena with:
-
-```bash
-build/gadus/arena \
-	--candidate models/gadus/candidate.pth \
-	--baseline models/gadus/champion.pth \
-	--device cuda \
-	--precision bf16 \
-	--games 400 \
-	--games-in-flight 32 \
-	--max-plies 240 \
-	--opening-book data/openings.gen.bin \
-	--book-plies 8 \
-	--max-book-positions 50000 \
-	--sims 0 \
-	--mcts-batch-size 64 \
-	--c-puct 0.5 \
-	--c-puct-base 19652 \
-	--c-puct-factor 1.0 \
-	--fpu-reduction 0.15 \
-	--virtual-loss 0.0 \
-	--repetition-policy-penalty 0.0 \
-	--instant-mate-first 0 \
-	--pgn-output data/gadus-arena.pgn \
-	--log-every 1
-```
-
-Passing an empty value to `--opening-book` starts every game from the standard initial position.
 
 Launch the Gadus UCI engine on Windows with:
 
@@ -329,100 +276,6 @@ build/melano/uci \
 
 The [UCI](#uci) section describes runtime options, output fields and time management.
 
-### Eleginus
-
-Preprocess a PGN into the architecture-locked Eleginus Value schema with:
-
-```bash
-build/eleginus/preprocess \
-	--input data/ccrl.pgn \
-	--output data/games.eleginus.h5 \
-	--has-cmt 1 \
-	--compression-level 4 \
-	--max-games 2400000
-```
-
-The HDF5 file stores `states` and `values`. Its root metadata identifies `arch_type=eleginus`, the
-Eleginus state encoding and `target_schema=value_perspective_resolved`. Generate this file with the
-Eleginus preprocessor before training.
-With `--has-cmt 1`, the preprocessor determines whether each game's numerical pawn evaluations use
-White or mover perspective, converts them to side-to-move targets and maps them into `[0,1]`. With
-`--has-cmt 0`, completed game results supply targets in `{0, 0.5, 1}`. A game with an unparseable move
-is rejected as an `invalid_game`, while a game lacking the target required by the selected mode is
-counted as a `missing_target_game`.
-
-Train the Eleginus Value network with:
-
-```bash
-build/eleginus/train \
-	--data data/games.eleginus.h5 \
-	--out models/eleginus/eleginus.pth \
-	--epochs 2 \
-	--max-steps 20000 \
-	--batch-size 512 \
-	--lr 0.001 \
-	--device cuda \
-	--seed 2026
-```
-
-Eleginus uses the same `--max-steps` convention: a positive value caps optimizer updates, while `0` lets `--epochs` determine the training length. The trainer atomically updates the checkpoint selected by `--out` after every epoch.
-
-The Value network learns the selected comment- or result-derived targets. Supplying
-`--model existing.pth` initializes the network from that checkpoint, while omitting it initializes
-a new model. Every training invocation constructs fresh optimizer state.
-
-The `.pth` checkpoint is the only standalone Eleginus weight file. Like the other architecture
-checkpoints, its top level contains `model` and `arch`; the latter identifies Eleginus with
-`type_id=3` and records its fixed Value dimensions. The FP32 checkpoint remains below 20 MiB.
-Inspect it with:
-
-```bash
-python scripts/check.py --model models/eleginus/eleginus.pth
-```
-
-Search and UCI are built first as weightless, Torch-free executable templates. Select the standalone search template while embedding the checkpoint, then analyze one position:
-
-```bash
-build/eleginus/embed \
-	--model models/eleginus/eleginus.pth \
-	--type search \
-	--output models/eleginus/eleginus
-
-models/eleginus/eleginus \
-	--fen startpos \
-	--depth 4
-```
-
-`--fen` accepts `startpos` or one quoted six-field FEN. The embedded search program uses a statically
-linked float32 Value evaluator. Transposition-table moves, tactical scores, killer moves and history
-scores order legal actions, while Value supplies the static scores used by iterative deepening, PVS
-and quiescence search. The resulting executable contains its model parameters and all inference code
-required for search.
-
-Create and launch the Eleginus UCI engine on Windows with:
-
-```powershell
-build\eleginus\embed.exe `
-	--model models\eleginus\eleginus.pth `
-	--type uci `
-	--output models\eleginus\eleginus.exe
-
-models\eleginus\eleginus.exe --depth 4
-```
-
-The corresponding Linux command is:
-
-```bash
-build/eleginus/embed \
-	--model models/eleginus/eleginus.pth \
-	--type uci \
-	--output models/eleginus/eleginus
-
-models/eleginus/eleginus --depth 4
-```
-
-The final Eleginus UCI and standalone search executables are self-contained. The `train` and `embed` tools use LibTorch during model production.
-
 ## UCI
 
 Each architecture implements UCI time management within its own engine code. The three engines accept `go wtime`, `btime`, `winc`, `binc` and `movestogo`, and their allocation equations follow the optimum-time calculation in Stockfish's [Time Management](https://github.com/official-stockfish/Stockfish/blob/master/src/timeman.cpp). Let $t$ be the active side's remaining time in milliseconds, $i$ its increment, $o$ the `Move Overhead`, $p$ the number of plies played and $m$ the move horizon. An explicit `movestogo` sets $m$ up to a maximum of 50; otherwise $m=50$. When $t<1000$, the engines replace $m$ by $max(1,\lfloor0.05t\rfloor)$. They then compute
@@ -466,13 +319,11 @@ The Gadus UCI executable loads its checkpoint when `isready` or `go` first requi
 
 The UCI worker performs neural inference and tree search while the protocol loop remains available for `stop`. A `position`, `setoption` or `ucinewgame` command first stops and joins an active worker before changing engine state. Closing the process also joins the worker.
 
-Gadus reports MultiPV rows containing `score cp`, nodes, NPS, elapsed time and a one-move principal variation. With `Sims=0`, the reported root evaluation is the network Value $V_\theta(s)$. After at least one simulation, it is the mean return backed up to the root. A visited root edge reports its backed-up $Q(s,a)$, while an unvisited edge reports the root evaluation. The displayed score inverts the supervised target transform $V=\tanh(\mathrm{cp}/300)$:
+Gadus reports MultiPV rows containing `score cp`, nodes, NPS, elapsed time and a one-move principal variation. With `Sims=0`, the reported root evaluation is the network Value $V_\theta(s)$. After at least one simulation, it is the mean return backed up to the root. A visited root edge reports its backed-up $Q(s,a)$, while an unvisited edge reports the root evaluation. Let $q_{\mathrm{line}}\in[-1,1]$ denote the Value reported for one row. Gadus converts this bounded quantity to the centipawn display scale by
 
 $$
 \text{score cp}=\mathrm{round}\left(
-300\operatorname{atanh}\left(
-\mathrm{clip}(q_{\mathrm{line}},-0.999,0.999)
-\right)
+90\tan\left(1.5637541897q_{\mathrm{line}}\right)
 \right).
 $$
 
@@ -556,155 +407,19 @@ setoption name Move Overhead value 10
 setoption name MultiPV value 5
 ```
 
-### Eleginus
-
-An embedded Eleginus UCI executable loads its Value parameters when `isready` or `go` first requires them. `Depth` sets the default iterative-deepening limit, `Hash` sets the transposition-table capacity, `Threads` sets the number of root PVS workers and `MultiPV` sets the number of reported principal variations. Their defaults are 4 plies, 64 MiB, one worker and five variations. `Move Overhead` uses the common UCI time-allocation rule above.
-
-Each `go` command starts iterative deepening on a worker thread, allowing the UCI loop to process `stop`, a replacement position or `quit` while PVS is running. `go depth <n>` overrides `Depth` for one search, `go nodes <n>` sets a cumulative node limit and the standard clock fields activate the deadline described above. PVS orders moves from transposition-table results, tactical properties, killer moves and history scores, while the Value network establishes static centipawn scores at quiescent leaves. Exact terminal scores use the range near $\pm30000$, while ongoing static scores use $150v_{\theta_V}(s)$. The reported `score cp` is expressed from the root side-to-move perspective.
-
-With `MultiPV=1`, the first root action establishes the principal-variation bound and the remaining actions use null-window probes followed by full-window re-search when they exceed that bound. With `MultiPV=k>1`, every root action receives a full-window score so the engine can identify and report the best $k$ variations. Root actions are distributed among at most `Threads` workers, and the configured `Hash` capacity is divided among their transposition tables.
-
-The engine emits one numbered `info` row for each requested variation after every completed depth. `depth` reports the completed principal depth, `seldepth` reports the greatest ply reached by PVS or quiescence search and `nodes` includes visits made by all root workers during every completed iteration. Cancellation discards an incomplete iteration and returns the selected action from the latest completed depth.
-
-```text
-setoption name Depth value 6
-setoption name Hash value 256
-setoption name Threads value 2
-setoption name MultiPV value 3
-setoption name Move Overhead value 10
-```
-
-## Opening Books
-
-Gadus Arena reads Polyglot books by traversing legal book moves breadth-first from the standard initial position. The effective depth is at least one ply. The reader treats each outgoing legal book move uniformly, randomizes their order from the selected seed and emits unique nonterminal frontier positions. Position identity is the tuple of piece placement, side to move, castling rights and the en-passant field.
-
-An empty arena book path starts every game from the standard initial position and alternates the candidate's color. A nonempty book must provide at least one unique position for each game pair. The arena shuffles the available positions, selects one position per pair and plays both color assignments.
-
-Gadus FCPI reads every reachable nonterminal position in a sampling book as a possible starting state, including the standard initial position. It removes transpositions using the same position identity, limits the resulting pool to the requested size and treats outgoing Polyglot moves uniformly.
-
-`scripts/opening_book.py` creates two kinds of Polyglot books. A sampling book supplies positions from ply zero through ply eight to Gadus FCPI. The generator assigns each position to one ply, asks a UCI engine to evaluate every noninitial position and includes only positions whose absolute evaluation does not exceed 80 centipawns. The `--sampling-source` option accepts a PGN or an existing Polyglot book, and sampling generation requires at least 10,000 unique readable positions. The following command creates `openings.sam.bin` from a PGN:
-
-```bash
-python scripts/opening_book.py \
-	--sampling-source data/games.pgn \
-	--uci models/stockfish/stockfish \
-	--output data/openings.sam.bin \
-	--min-fens 10000 \
-	--book-plies 8 \
-	--max-abs-cp 80 \
-	--log-every 1000
-```
-
-The same command accepts a Polyglot source by replacing `data/games.pgn` with its `.bin` path. Sampling generation accepts stricter evaluation bounds but rejects a bound above 80 centipawns or a ply limit above eight. Its final validation checks the minimum position count, the maximum reachable ply and the absence of outgoing edges from the final layer.
-
-An arena book contains positions from one fixed ply whose absolute UCI evaluation lies within a selected bound. The following launcher invocations request 1,000 positions at ply eight with the default bound of 80 centipawns:
-
-```bash
-bash scripts/run_opening.sh data/games.pgn 1000 data/openings.gen.bin
-```
-
-```powershell
-scripts\run_opening.bat data\games.pgn 1000 data\openings.gen.bin
-```
-
-The corresponding explicit command is:
-
-```bash
-python scripts/opening_book.py \
-	--pgn data/games.pgn \
-	--uci models/stockfish/stockfish \
-	--output data/openings.gen.bin \
-	--max-abs-cp 80 \
-	--book-plies 8 \
-	--min-fens 1000 \
-	--uci-depth 10 \
-	--uci-threads 4 \
-	--uci-hash-mb 512 \
-	--log-every 1000
-```
-
 ## Scripts
 
-The `scripts/` directory contains repository-level launchers and data-preparation tools. The architecture documents specify the models and algorithms implemented by the compiled executables. The following sections describe the scripts shared across those executables.
-
-### PGN Analysis
-
-`scripts/analyze.py` analyzes every mainline position in a PGN with a UCI engine. For each recorded move, the script compares the engine's best side-to-move centipawn score with the score assigned to the recorded move and reports their nonnegative difference as centipawn regret. Its primary output is a `.cmt` report beside the input PGN.
-
-The `--pgn-comments` option also writes an annotated PGN. Each generated `{+x}` or `{-x}` comment gives the post-move evaluation from White's perspective. The default annotated path is `<input-name>_cmt.pgn`, and `--pgn-output` selects another path.
-
-```bash
-python scripts/analyze.py \
-	--input data/user-pgn/game.pgn \
-	--uci models/stockfish/stockfish \
-	--uci-depth 16 \
-	--uci-multipv 8 \
-	--analysis-cache data/user-pgn/analysis.sqlite \
-	--pgn-comments
-```
-
-On Windows, the UCI path commonly ends in `.exe`, as in `models\stockfish\stockfish.exe`.
-
-### Gadus FCPI Launcher
-
-`scripts/gadus_fcpi.sh` launches Gadus FCPI as a background process and then runs an informational closed-search match between the final `current.pth` and the run's `initial.pth`. The launcher records the background process ID in `data/runs/<run-id>/pid`, writes combined output to `data/runs/<run-id>/info.log` and merges the final match report into `summary.json` under `final_arena`.
-
-FCPI stores the aggregated targets for iteration `<NNN>` in `data/runs/<run-id>/fcpi_iter_<NNN>.h5`. Under `models/runs/<run-id>/`, it stores `initial.pth`, `current.pth` and each `candidate_iter_<NNN>.pth`.
-
-```bash
-bash scripts/gadus_fcpi.sh
-```
-
-The launcher prints the run ID, process ID, log path, monitoring command and stop command. A running job can be monitored and stopped with:
-
-```bash
-tail -n 100 -f data/runs/<run-id>/info.log
-kill "$(cat data/runs/<run-id>/pid)"
-```
-
-The launcher's production defaults are `bf16` precision, 10 iterations, 6,000 self-play games per iteration, 512 games in flight, 512 positions per inference batch, 512 target records per batch, 30 training epochs, a batch size of 1,024 and at most 6,000 training steps per iteration. Self-play uses at most 10,000 positions from `data/openings.sam.bin`. Arena evaluation uses at most 1,000 positions from `data/openings.gen.bin`, applies an RPP coefficient of `1.0` and enables IMF.
-
-Environment variables provide per-run overrides for individual launcher settings:
-
-```bash
-MODEL=models/gadus/gadus.pth \
-ITERATIONS=5 \
-GAMES_PER_ITER=2000 \
-TRAIN_MAX_STEPS=3000 \
-EVAL_GAMES=400 \
-bash scripts/gadus_fcpi.sh
-```
-
-Running `build/gadus/fcpi` directly executes FCPI and its per-iteration promotion matches in the foreground. The launcher adds background execution, a combined log, a PID file and the final current-versus-initial match.
-
-### Engine Packaging
-
-`scripts/package_engine.bat` and `scripts/package_engine.sh` package a checkpoint for its architecture. The first argument selects the architecture, and the second supplies the source checkpoint. For Eleginus, an optional third argument selects the embedded `uci` or `search` executable and defaults to `uci`.
-
-```powershell
-scripts\package_engine.bat gadus models\gadus\gadus.pth
-scripts\package_engine.bat melano models\melano\melano.pth
-scripts\package_engine.bat eleginus models\eleginus\eleginus.pth uci
-```
-
-```bash
-bash scripts/package_engine.sh gadus models/gadus/candidate.pth
-bash scripts/package_engine.sh melano models/melano/candidate.pth
-bash scripts/package_engine.sh eleginus models/eleginus/eleginus.pth uci
-```
-
-Gadus and Melano packages contain the UCI executable, checkpoint and required runtime libraries under `models/<architecture>/`. An Eleginus package is a single self-contained executable named `eleginus` for UCI or `eleginus_search` for standalone analysis, with the platform executable suffix where applicable.
+The `scripts/` directory contains the Windows and Linux build launchers, checkpoint inspection and graphical piece preparation.
 
 ### Checkpoint Inspection
 
-`scripts/check.py` performs a read-only inspection of a Gadus, Melano or Eleginus checkpoint. The report includes its architecture, heads, architecture dimensions, parameter counts, tensor data types, tensor memory, devices, finite-value status, file size and SHA-256 digest.
+`scripts/check.py` performs a read-only inspection of a Gadus or Melano checkpoint. The report includes its architecture, heads, architecture dimensions, parameter counts, tensor data types, tensor memory, devices, finite-value status, file size and SHA-256 digest.
 
 ```bash
 python scripts/check.py --model models/gadus/gadus.pth
 python scripts/check.py --model models/melano/melano.pth
-python scripts/check.py --model models/eleginus/eleginus.pth
 ```
 
 ### Piece Import
 
-`scripts/import_pieces.py` converts an SVG chess-piece set into the pre-triangulated mesh archive used by the graphical client. [Graphics.md](Graphics.md) specifies the required filenames, style naming rules and import commands.
+`scripts/pieces.py` converts an SVG chess-piece set into the pre-triangulated mesh archive used by the graphical client. [Graphics.md](Graphics.md) specifies the required filenames, style naming rules and import commands.

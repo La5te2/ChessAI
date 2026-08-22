@@ -30,7 +30,8 @@ struct EngineOptions {
 };
 
 constexpr int kProgressIntervalMs = 300;
-constexpr float kValueCpScale = 300.0F;
+constexpr float kCentipawnScale = 90.0F;
+constexpr float kCentipawnAngle = 1.5637541897F;
 
 // Resolve the explicitly packaged Gadus checkpoint beside the executable without
 // introducing a repository fallback or coupling the model name to the EXE name.
@@ -355,10 +356,10 @@ class UciEngine {
 		return 0;
 	}
 
-	// Invert the supervised V=tanh(cp/300) transform for UCI score display.
+	// Expand bounded root values into the conventional centipawn display range.
 	int score_cp(float value) const {
 		return static_cast<int>(std::lround(
-			kValueCpScale * std::atanh(std::clamp(value, -0.999F, 0.999F))));
+			kCentipawnScale * std::tan(kCentipawnAngle * std::clamp(value, -1.0F, 1.0F))));
 	}
 
 	// Emit final or progressive MultiPV lines using root-side values and search statistics.

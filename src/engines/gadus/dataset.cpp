@@ -1,4 +1,4 @@
-// Implements Gadus PGN parsing, schema-checked HDF5 I/O, and fresh supervised training.
+// Implements Gadus PGN parsing, schema-checked HDF5 I/O, and supervised training.
 
 #include "gadus/dataset.hpp"
 #include <hdf5.h>
@@ -22,13 +22,12 @@ namespace gadus {
 
 namespace {
 
-constexpr std::int64_t kValueWeightProbeInterval = 200;
+constexpr std::int64_t kValueWeightProbeInterval = 500;
 constexpr double kValueGradientRatio = 0.5;
-constexpr double kValueHeadLearningRateRatio = 0.25;
 constexpr double kValueHeadGradientClip = 1.0;
-constexpr double kValueWeightSmoothing = 0.05;
-constexpr double kMinValueWeight = 0.05;
-constexpr double kMaxValueWeight = 4.0;
+constexpr double kValueWeightSmoothing = 0.08;
+constexpr double kMinValueWeight = 0.2;
+constexpr double kMaxValueWeight = 2.0;
 constexpr double kGradientEpsilon = 1e-12;
 constexpr double kConflictMargin = 1e-3;
 
@@ -911,19 +910,20 @@ double ValueWeightController::update(double policy_squared_norm,
 
 	const double smoothed = std::exp((1.0 - kValueWeightSmoothing) * std::log(value_) +
 									 kValueWeightSmoothing * std::log(target));
-	value_ = std::clamp(smoothed, lower, upper);
+	value_ = std::clamp(smoothed, kMinValueWeight, kMaxValueWeight);
 	return value_;
 }
 
 double ValueWeightController::value() const noexcept { return value_; }
 
-// Optimize the supervised Policy and adaptively weighted Value objectives.
+// Optimize a newly initialized model with the joint supervised objective.
 void train_supervised(const TrainOptions &options) {
 	torch::manual_seed(static_cast<std::int64_t>(options.seed));
 	const auto device = resolve_device(options.device);
 	validate_compute_precision(options.precision, device);
 	SupervisedH5 data(options.data);
-	auto model = Model(options.channels, options.blocks);
+	ArchitectureInfo architecture{options.channels, options.blocks};
+	Model model(architecture.channels, architecture.blocks);
 	model->to(device);
 	for (auto &parameter : model->parameters()) {
 		if (parameter.dim() == 4) {
@@ -931,24 +931,9 @@ void train_supervised(const TrainOptions &options) {
 		}
 	}
 	model->train();
-	std::vector<torch::Tensor> shared_policy_parameters;
-	std::vector<torch::Tensor> value_parameters;
-	for (const auto &parameter : model->named_parameters()) {
-		if (parameter.key().starts_with("value_head.")) {
-			value_parameters.push_back(parameter.value());
-		} else {
-			shared_policy_parameters.push_back(parameter.value());
-		}
-	}
-	auto value_optimizer_options = std::make_unique<torch::optim::AdamWOptions>(
-		options.learning_rate * kValueHeadLearningRateRatio);
-	value_optimizer_options->weight_decay(options.weight_decay);
-	std::vector<torch::optim::OptimizerParamGroup> parameter_groups;
-	parameter_groups.emplace_back(std::move(shared_policy_parameters));
-	parameter_groups.emplace_back(value_parameters,
-							  std::move(value_optimizer_options));
+	auto value_head_parameters = model->value_head->parameters();
 	torch::optim::AdamW optimizer(
-		parameter_groups,
+		model->parameters(),
 		torch::optim::AdamWOptions(options.learning_rate).weight_decay(options.weight_decay));
 
 	std::mt19937_64 rng(options.seed);
@@ -961,10 +946,10 @@ void train_supervised(const TrainOptions &options) {
 			  << " batch_size=" << options.batch_size << " max_steps=" << options.max_steps
 			  << " precision=" << compute_precision_name(options.precision)
 			  << std::endl;
-	std::cout << "created model: channels=" << options.channels << " blocks=" << options.blocks
+	std::cout << "model ready: channels=" << architecture.channels
+			  << " blocks=" << architecture.blocks
 			  << " parameters=" << parameter_count(model)
-			  << " value_head_lr="
-			  << options.learning_rate * kValueHeadLearningRateRatio << std::endl;
+			  << std::endl;
 	std::cout << "training input: rows=" << data.info().length
 			  << " hdf5_chunk_rows=" << data.info().chunk_rows
 			  << " loader=chunk_shuffle_prefetch" << std::endl;
@@ -1023,8 +1008,8 @@ void train_supervised(const TrainOptions &options) {
 					AutocastGuard autocast(options.precision, device);
 					std::tie(logits, predicted) = model->forward(states);
 				}
-				logits = logits.to(torch::kFloat32);
 				predicted = predicted.to(torch::kFloat32);
+				logits = logits.to(torch::kFloat32);
 				auto policy_loss = torch::nn::functional::cross_entropy(logits, moves);
 				auto value_loss = torch::mse_loss(predicted.squeeze(1), values);
 				if (value_weight.value() > 0.0 &&
@@ -1035,7 +1020,7 @@ void train_supervised(const TrainOptions &options) {
 				}
 				auto loss = policy_loss + value_weight.value() * value_loss;
 				loss.backward();
-				torch::nn::utils::clip_grad_norm_(value_parameters,
+				torch::nn::utils::clip_grad_norm_(value_head_parameters,
 											  kValueHeadGradientClip);
 				optimizer.step();
 
@@ -1051,15 +1036,15 @@ void train_supervised(const TrainOptions &options) {
 									   .contiguous();
 					auto metric_values = metrics.accessor<float, 1>();
 					std::cout << "train step: epoch=" << epoch
-							  << " global_step=" << global_step
-							  << " policy=" << metric_values[0]
-							  << " value=" << metric_values[1]
-							  << " value_weight=" << value_weight.value()
+							  << " global_step=" << global_step;
+					std::cout << " policy=" << metric_values[0]
+							  << " value_weight=" << value_weight.value();
+					std::cout << " value=" << metric_values[1]
 							  << " loss=" << metric_values[2] << std::endl;
 				}
 				if (options.save_every > 0 && global_step % options.save_every == 0) {
 					save_checkpoint_atomic(options.output, model,
-										   {options.channels, options.blocks});
+										   architecture);
 					std::cout << "checkpoint saved: path=" << options.output.string()
 							  << " global_step=" << global_step << std::endl;
 				}
@@ -1069,13 +1054,14 @@ void train_supervised(const TrainOptions &options) {
 				}
 			}
 		}
-		save_checkpoint_atomic(options.output, model, {options.channels, options.blocks});
+		save_checkpoint_atomic(options.output, model, architecture);
 		auto epoch_metrics = metric_totals.to(torch::kCPU).contiguous();
 		auto epoch_values = epoch_metrics.accessor<float, 1>();
-		std::cout << "epoch=" << epoch << ", steps=" << global_step
-				  << ", policy=" << epoch_values[0] / std::max<std::int64_t>(1, batches)
-				  << ", value=" << epoch_values[1] / std::max<std::int64_t>(1, batches)
-				  << std::endl;
+		std::cout << "epoch=" << epoch << ", steps=" << global_step;
+		std::cout << ", policy="
+				  << epoch_values[0] / std::max<std::int64_t>(1, batches);
+		std::cout << ", value="
+				  << epoch_values[1] / std::max<std::int64_t>(1, batches) << std::endl;
 	}
 	std::cout << "training finished: " << options.output.string() << std::endl;
 }

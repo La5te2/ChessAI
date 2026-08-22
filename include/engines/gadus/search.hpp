@@ -57,7 +57,7 @@ struct SearchResult {
 	std::vector<RootMove> root;
 };
 
-// Frozen direct-policy output in legal-action form for high-throughput data generation.
+// Direct Policy and Value output in compact legal-action form.
 struct PolicyEvaluation {
 	std::vector<int> legal_indices;
 	std::vector<float> legal_policy;

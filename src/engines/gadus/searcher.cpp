@@ -549,7 +549,7 @@ struct Searcher::Impl {
 		return output;
 	}
 
-	// Remove move objects from the public frozen-model result used by FCPI generation.
+	// Return compact legal-action evaluations for callers that do not need tree search.
 	std::vector<PolicyEvaluation> evaluate_policy(const std::vector<chess::Board> &boards) {
 		auto rows = evaluate_rows(boards);
 		std::vector<PolicyEvaluation> output(rows.size());
@@ -1275,12 +1275,12 @@ SearchResult Searcher::search(const chess::Board &board, const SearchProgressCal
 	return impl_->search_many({board}, progress, progress_interval_ms, cancel)[0];
 }
 
-// Search a batch without progress callbacks, as used by arena and FCPI.
+// Search a batch without progress callbacks.
 std::vector<SearchResult> Searcher::search_many(const std::vector<chess::Board> &boards) {
 	return impl_->search_many(boards);
 }
 
-// Return the compact frozen-model contract used by FCPI generation.
+// Return compact legal-action Policy and Value evaluations.
 std::vector<PolicyEvaluation>
 Searcher::evaluate_policy_many(const std::vector<chess::Board> &boards) {
 	return impl_->evaluate_policy(boards);

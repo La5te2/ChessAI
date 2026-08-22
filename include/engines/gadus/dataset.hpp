@@ -86,7 +86,7 @@ struct TrainOptions {
 	std::int64_t max_steps = -1;
 	double learning_rate = 1e-3;
 	double weight_decay = 1e-4;
-	double value_weight = 0.25;
+	double value_weight = 0.5;
 	int save_every = 5000;
 	int log_every = 100;
 	std::uint64_t seed = 2026;
@@ -107,7 +107,7 @@ struct ValueWeightController {
 	double value_;
 };
 
-/// Trains a new Gadus model from scratch and atomically writes the final checkpoint.
+/// Trains a new Gadus model with joint Policy and Value supervision.
 void train_supervised(const TrainOptions &options);
 
 } // namespace gadus

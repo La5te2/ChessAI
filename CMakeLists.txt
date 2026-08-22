@@ -4,28 +4,22 @@ project(GadidaeCpp LANGUAGES C CXX)
 
 option(GADIDAE_BUILD_GADUS "Build the Gadus architecture" ON)
 option(GADIDAE_BUILD_MELANO "Build the Melano architecture" ON)
-option(GADIDAE_BUILD_ELEGINUS "Build the Eleginus architecture" ON)
-option(GADIDAE_BUILD_ELEGINUS_TRAINING "Build Eleginus LibTorch training tools" ON)
 option(GADIDAE_BUILD_GRAPHICS "Build the GLFW/OpenGL desktop application" ON)
 
-if(NOT GADIDAE_BUILD_GADUS AND NOT GADIDAE_BUILD_MELANO AND
-	NOT GADIDAE_BUILD_ELEGINUS AND NOT GADIDAE_BUILD_GRAPHICS)
+if(NOT GADIDAE_BUILD_GADUS AND NOT GADIDAE_BUILD_MELANO AND NOT GADIDAE_BUILD_GRAPHICS)
 	message(FATAL_ERROR "At least one Gadidae architecture must be enabled")
 endif()
 
 set(GADIDAE_NEEDS_TORCH OFF)
-if(GADIDAE_BUILD_GADUS OR GADIDAE_BUILD_MELANO OR
-	(GADIDAE_BUILD_ELEGINUS AND GADIDAE_BUILD_ELEGINUS_TRAINING))
+if(GADIDAE_BUILD_GADUS OR GADIDAE_BUILD_MELANO)
 	set(GADIDAE_NEEDS_TORCH ON)
 endif()
 set(GADIDAE_NEEDS_HDF5 OFF)
-if(GADIDAE_BUILD_GADUS OR GADIDAE_BUILD_MELANO OR
-	(GADIDAE_BUILD_ELEGINUS AND GADIDAE_BUILD_ELEGINUS_TRAINING))
+if(GADIDAE_BUILD_GADUS OR GADIDAE_BUILD_MELANO)
 	set(GADIDAE_NEEDS_HDF5 ON)
 endif()
 set(GADIDAE_NEEDS_ZLIB OFF)
-if(GADIDAE_BUILD_GADUS OR GADIDAE_BUILD_MELANO OR GADIDAE_BUILD_GRAPHICS OR
-	(GADIDAE_BUILD_ELEGINUS AND GADIDAE_BUILD_ELEGINUS_TRAINING))
+if(GADIDAE_BUILD_GADUS OR GADIDAE_BUILD_MELANO OR GADIDAE_BUILD_GRAPHICS)
 	set(GADIDAE_NEEDS_ZLIB ON)
 endif()
 
@@ -127,26 +121,17 @@ if(MSVC AND GADIDAE_NEEDS_TORCH)
 			)
 		endif()
 	endforeach()
-	if(GADIDAE_BUILD_ELEGINUS AND GADIDAE_BUILD_ELEGINUS_TRAINING)
-		add_custom_command(TARGET torchruntime POST_BUILD
-			COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/eleginus"
-			COMMAND ${CMAKE_COMMAND} -E copy_if_different
-				${TORCH_DLLS} "${CMAKE_BINARY_DIR}/eleginus"
-		)
-	endif()
 endif()
 
 if(GADIDAE_BUILD_GADUS)
 
 add_library(gadus
-	src/gadus/checkpoint.cpp
-	src/gadus/args.cpp
-	src/gadus/dataset.cpp
-	src/gadus/evolution.cpp
-	src/gadus/game.cpp
-	src/gadus/match.cpp
-	src/gadus/model.cpp
-	src/gadus/searcher.cpp
+	src/engines/gadus/checkpoint.cpp
+	src/engines/gadus/args.cpp
+	src/engines/gadus/dataset.cpp
+	src/engines/gadus/game.cpp
+	src/engines/gadus/model.cpp
+	src/engines/gadus/searcher.cpp
 )
 set_target_properties(gadus PROPERTIES
 	ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/gadus"
@@ -155,7 +140,7 @@ set_target_properties(gadus PROPERTIES
 )
 
 target_include_directories(gadus
-	PUBLIC "${CMAKE_SOURCE_DIR}/include"
+	PUBLIC "${CMAKE_SOURCE_DIR}/include/engines"
 )
 target_include_directories(gadus
 	SYSTEM PUBLIC
@@ -196,14 +181,12 @@ function(gadusexecutable name source)
 	endif()
 endfunction()
 
-gadusexecutable(preprocess src/gadus/preprocess.cpp)
-gadusexecutable(train src/gadus/train.cpp)
-gadusexecutable(search src/gadus/search.cpp)
-gadusexecutable(arena src/gadus/arena.cpp)
-gadusexecutable(fcpi src/gadus/fcpi.cpp)
-gadusexecutable(uci src/gadus/uci.cpp)
+gadusexecutable(preprocess src/engines/gadus/preprocess.cpp)
+gadusexecutable(train src/engines/gadus/train.cpp)
+gadusexecutable(search src/engines/gadus/search.cpp)
+gadusexecutable(uci src/engines/gadus/uci.cpp)
 
-add_executable(gadustests src/gadus/tests.cpp)
+add_executable(gadustests src/engines/gadus/tests.cpp)
 set_target_properties(gadustests PROPERTIES
 	RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/gadus"
 	ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/gadus"
@@ -221,19 +204,19 @@ endif()
 if(GADIDAE_BUILD_MELANO)
 
 add_library(melano
-	src/melano/checkpoint.cpp
-	src/melano/args.cpp
-	src/melano/dataset.cpp
-	src/melano/game.cpp
-	src/melano/model.cpp
-	src/melano/searcher.cpp
+	src/engines/melano/checkpoint.cpp
+	src/engines/melano/args.cpp
+	src/engines/melano/dataset.cpp
+	src/engines/melano/game.cpp
+	src/engines/melano/model.cpp
+	src/engines/melano/searcher.cpp
 )
 set_target_properties(melano PROPERTIES
 	ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/melano"
 	LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/melano"
 	PDB_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/melano"
 )
-target_include_directories(melano PUBLIC "${CMAKE_SOURCE_DIR}/include")
+target_include_directories(melano PUBLIC "${CMAKE_SOURCE_DIR}/include/engines")
 target_include_directories(melano SYSTEM PUBLIC
 	"${GADIDAE_API_DIR}/chess"
 	${HDF5_INCLUDE_DIRS}
@@ -267,12 +250,12 @@ function(melanoexecutable name source)
 	endif()
 endfunction()
 
-melanoexecutable(preprocess src/melano/preprocess.cpp)
-melanoexecutable(train src/melano/train.cpp)
-melanoexecutable(search src/melano/search.cpp)
-melanoexecutable(uci src/melano/uci.cpp)
+melanoexecutable(preprocess src/engines/melano/preprocess.cpp)
+melanoexecutable(train src/engines/melano/train.cpp)
+melanoexecutable(search src/engines/melano/search.cpp)
+melanoexecutable(uci src/engines/melano/uci.cpp)
 
-add_executable(melanotests src/melano/tests.cpp)
+add_executable(melanotests src/engines/melano/tests.cpp)
 set_target_properties(melanotests PROPERTIES
 	RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/melano"
 	ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/melano"
@@ -285,99 +268,6 @@ if(MSVC)
 endif()
 add_test(NAME melanotests COMMAND melanotests)
 
-endif()
-
-if(GADIDAE_BUILD_ELEGINUS)
-	add_library(eleginus_runtime STATIC
-		src/eleginus/game.cpp
-		src/eleginus/nnue.cpp
-		src/eleginus/runtime.cpp
-		src/eleginus/search.cpp
-	)
-	set_target_properties(eleginus_runtime PROPERTIES
-		ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/eleginus"
-		LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/eleginus"
-		PDB_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/eleginus"
-	)
-	target_include_directories(eleginus_runtime PUBLIC "${CMAKE_SOURCE_DIR}/include")
-	target_include_directories(eleginus_runtime SYSTEM PUBLIC "${GADIDAE_API_DIR}/chess")
-	target_precompile_headers(eleginus_runtime PRIVATE <chess.hpp>)
-	if(MSVC)
-		target_compile_options(eleginus_runtime PRIVATE /MP /W4 /permissive- /utf-8)
-	else()
-		target_compile_options(eleginus_runtime PRIVATE -Wall -Wextra -Wpedantic)
-	endif()
-
-	function(eleginusruntimeexecutable name source)
-		set(target "eleginus${name}")
-		add_executable(${target} ${source})
-		set_target_properties(${target} PROPERTIES
-			OUTPUT_NAME "${name}"
-			RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/eleginus"
-			ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/eleginus"
-			LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/eleginus"
-			PDB_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/eleginus"
-		)
-		target_link_libraries(${target} PRIVATE eleginus_runtime)
-	endfunction()
-
-	eleginusruntimeexecutable(search src/eleginus/searcher.cpp)
-	eleginusruntimeexecutable(uci src/eleginus/uci.cpp)
-
-	if(GADIDAE_BUILD_ELEGINUS_TRAINING)
-		add_library(eleginus_training STATIC
-			src/eleginus/args.cpp
-			src/eleginus/checkpoint.cpp
-			src/eleginus/dataset.cpp
-			src/eleginus/model.cpp
-		)
-		set_target_properties(eleginus_training PROPERTIES
-			ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/eleginus"
-			LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/eleginus"
-			PDB_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/eleginus"
-		)
-		target_include_directories(eleginus_training PUBLIC "${CMAKE_SOURCE_DIR}/include")
-		target_include_directories(eleginus_training SYSTEM PUBLIC
-			"${GADIDAE_API_DIR}/chess"
-			${HDF5_INCLUDE_DIRS}
-		)
-		target_precompile_headers(eleginus_training PRIVATE <chess.hpp>)
-		if(MSVC)
-			target_link_libraries(eleginus_training PUBLIC eleginus_runtime ${TORCH_LIBRARIES}
-				${HDF5_LIBRARIES} "${GADIDAE_ZLIB_STATIC}" Threads::Threads Shlwapi)
-		else()
-			target_link_libraries(eleginus_training PUBLIC eleginus_runtime ${TORCH_LIBRARIES}
-				${HDF5_LIBRARIES} ZLIB::ZLIB Threads::Threads)
-		endif()
-		target_compile_definitions(eleginus_training PRIVATE H5_USE_110_API)
-		if(MSVC)
-			target_compile_options(eleginus_training PRIVATE /MP /W4 /permissive- /utf-8)
-		else()
-			target_compile_options(eleginus_training PRIVATE -Wall -Wextra -Wpedantic)
-		endif()
-
-		function(eleginustrainingexecutable name source)
-			set(target "eleginus${name}")
-			add_executable(${target} ${source})
-			set_target_properties(${target} PROPERTIES
-				OUTPUT_NAME "${name}"
-				RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/eleginus"
-				ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/eleginus"
-				LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/eleginus"
-				PDB_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/eleginus"
-			)
-			target_link_libraries(${target} PRIVATE eleginus_training)
-			if(MSVC)
-				add_dependencies(${target} torchruntime)
-			endif()
-		endfunction()
-
-		eleginustrainingexecutable(preprocess src/eleginus/preprocess.cpp)
-		eleginustrainingexecutable(train src/eleginus/train.cpp)
-		eleginustrainingexecutable(embed src/eleginus/embed.cpp)
-		eleginustrainingexecutable(tests src/eleginus/tests.cpp)
-		add_test(NAME eleginustests COMMAND eleginustests)
-	endif()
 endif()
 
 if(GADIDAE_BUILD_GRAPHICS)

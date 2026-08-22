@@ -54,15 +54,15 @@ int main() {
 	try {
 		chess::Board board;
 
-		gadus::ValueWeightController aligned_weight(0.25);
+		gadus::ValueWeightController aligned_weight(0.5);
 		const double aligned = aligned_weight.update(4.0, 1.0, 1.0);
-		require(aligned > 0.25 && aligned < 1.0,
+		require(aligned > 0.5 && aligned < 1.0,
 				"aligned gradients did not smoothly increase the Value weight");
 
-		gadus::ValueWeightController conflicting_weight(0.25);
+		gadus::ValueWeightController conflicting_weight(0.5);
 		const double conflicting = conflicting_weight.update(4.0, 1.0, -1.5);
-		require(conflicting > 1.5 && conflicting < 4.0 / 1.5,
-				"conflicting gradients escaped the joint-descent interval");
+		require(conflicting > 0.5 && conflicting < 1.5,
+				"conflicting gradients did not move smoothly toward the feasible interval");
 
 		gadus::ValueWeightController disabled_weight(0.0);
 		require(disabled_weight.update(4.0, 1.0, -1.5) == 0.0,

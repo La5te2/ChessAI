@@ -44,14 +44,9 @@ resolve_architecture_mode() {
 
 BUILD_GADUS="$(resolve_architecture_mode GADIDAE_BUILD_GADUS "${GADIDAE_BUILD_GADUS:-1}")"
 BUILD_MELANO="$(resolve_architecture_mode GADIDAE_BUILD_MELANO "${GADIDAE_BUILD_MELANO:-1}")"
-BUILD_ELEGINUS="$(resolve_architecture_mode GADIDAE_BUILD_ELEGINUS "${GADIDAE_BUILD_ELEGINUS:-1}")"
-BUILD_ELEGINUS_TRAINING="$(resolve_architecture_mode GADIDAE_BUILD_ELEGINUS_TRAINING "${GADIDAE_BUILD_ELEGINUS_TRAINING:-1}")"
 BUILD_GRAPHICS="$(resolve_graphics_mode)"
-if [[ "${BUILD_ELEGINUS}" == "OFF" ]]; then
-	BUILD_ELEGINUS_TRAINING=OFF
-fi
 if [[ "${BUILD_GADUS}" == "OFF" && "${BUILD_MELANO}" == "OFF" &&
-	  "${BUILD_ELEGINUS}" == "OFF" && "${BUILD_GRAPHICS}" == "OFF" ]]; then
+	  "${BUILD_GRAPHICS}" == "OFF" ]]; then
 	echo "At least one Gadidae architecture must be enabled." >&2
 	exit 1
 fi
@@ -59,18 +54,13 @@ VERIFY_TORCH=OFF
 VERIFY_HDF5=OFF
 VERIFY_ZLIB=OFF
 VERIFY_JSON=OFF
-if [[ "${BUILD_GADUS}" == "ON" || "${BUILD_MELANO}" == "ON" ||
-	  ("${BUILD_ELEGINUS}" == "ON" && "${BUILD_ELEGINUS_TRAINING}" == "ON") ]]; then
+if [[ "${BUILD_GADUS}" == "ON" || "${BUILD_MELANO}" == "ON" ]]; then
 	VERIFY_TORCH=ON
 fi
 if [[ "${BUILD_GADUS}" == "ON" || "${BUILD_MELANO}" == "ON" ]]; then
 	VERIFY_HDF5=ON
 	VERIFY_ZLIB=ON
 	VERIFY_JSON=ON
-fi
-if [[ "${BUILD_ELEGINUS}" == "ON" && "${BUILD_ELEGINUS_TRAINING}" == "ON" ]]; then
-	VERIFY_HDF5=ON
-	VERIFY_ZLIB=ON
 fi
 if [[ "${BUILD_GRAPHICS}" == "ON" ]]; then
 	VERIFY_ZLIB=ON
@@ -123,8 +113,6 @@ cmake \
 	-DCMAKE_BUILD_TYPE=Release \
 	"-DGADIDAE_BUILD_GADUS=${BUILD_GADUS}" \
 	"-DGADIDAE_BUILD_MELANO=${BUILD_MELANO}" \
-	"-DGADIDAE_BUILD_ELEGINUS=${BUILD_ELEGINUS}" \
-	"-DGADIDAE_BUILD_ELEGINUS_TRAINING=${BUILD_ELEGINUS_TRAINING}" \
 	"-DGADIDAE_BUILD_GRAPHICS=${BUILD_GRAPHICS}" \
 	"-DGADIDAE_TORCH_DIR=${TORCH_DIR}"
 cmake --build "${WORK_DIR}" --parallel "$(nproc 2>/dev/null || echo 2)"
@@ -133,7 +121,7 @@ ctest --test-dir "${WORK_DIR}" --output-on-failure
 if [[ "${BUILD_GADUS}" == "ON" ]]; then
 	rm -rf -- "${PUBLISH_DIR}/gadus"
 	mkdir -p "${PUBLISH_DIR}/gadus"
-	for executable in preprocess train search arena fcpi uci; do
+	for executable in preprocess train search uci; do
 		test -x "${WORK_DIR}/gadus/${executable}"
 		cp "${WORK_DIR}/gadus/${executable}" "${PUBLISH_DIR}/gadus/"
 	done
@@ -146,20 +134,6 @@ if [[ "${BUILD_MELANO}" == "ON" ]]; then
 		cp "${WORK_DIR}/melano/${executable}" "${PUBLISH_DIR}/melano/"
 	done
 fi
-if [[ "${BUILD_ELEGINUS}" == "ON" ]]; then
-	rm -rf -- "${PUBLISH_DIR}/eleginus"
-	mkdir -p "${PUBLISH_DIR}/eleginus"
-	for executable in search uci; do
-		test -x "${WORK_DIR}/eleginus/${executable}"
-		cp "${WORK_DIR}/eleginus/${executable}" "${PUBLISH_DIR}/eleginus/"
-	done
-	if [[ "${BUILD_ELEGINUS_TRAINING}" == "ON" ]]; then
-		for executable in preprocess train embed tests; do
-			test -x "${WORK_DIR}/eleginus/${executable}"
-			cp "${WORK_DIR}/eleginus/${executable}" "${PUBLISH_DIR}/eleginus/"
-		done
-	fi
-fi
 if [[ "${BUILD_GRAPHICS}" == "ON" ]]; then
 	rm -rf -- "${PUBLISH_DIR}/graphics"
 	mkdir -p "${PUBLISH_DIR}/graphics"
@@ -169,10 +143,6 @@ fi
 
 if [[ "${BUILD_GADUS}" == "ON" ]]; then echo "Gadus build finished: ${PUBLISH_DIR}/gadus"; fi
 if [[ "${BUILD_MELANO}" == "ON" ]]; then echo "Melano build finished: ${PUBLISH_DIR}/melano"; fi
-if [[ "${BUILD_ELEGINUS}" == "ON" ]]; then echo "Eleginus build finished: ${PUBLISH_DIR}/eleginus"; fi
-if [[ "${BUILD_ELEGINUS}" == "ON" && "${BUILD_ELEGINUS_TRAINING}" == "OFF" ]]; then
-	echo "Eleginus LibTorch training tools skipped."
-fi
 if [[ "${BUILD_GRAPHICS}" == "ON" ]]; then
 	echo "Gadidae graphics finished: ${PUBLISH_DIR}/graphics"
 else

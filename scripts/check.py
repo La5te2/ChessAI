@@ -22,27 +22,6 @@ ARCHITECTURES = {
         "heads": "policy, value",
         "fields": ("type_id", "channels", "blocks", "action_size"),
     },
-    3: {
-        "name": "eleginus",
-        "heads": "value",
-        "fields": (
-            "type_id",
-            "feature_count",
-            "feature_slots",
-            "value_accumulator",
-            "control_source_count",
-            "control_geometry_count",
-            "control_width",
-            "control_local",
-            "control_attention",
-            "material_features",
-            "value_dense",
-            "value_hidden",
-            "value_bottleneck",
-            "value_buckets",
-        ),
-        "model_children": ("value",),
-    },
 }
 
 
