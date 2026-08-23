@@ -64,9 +64,24 @@ int main() {
 		require(conflicting > 0.5 && conflicting < 1.5,
 				"conflicting gradients did not move smoothly toward the feasible interval");
 
-		gadus::ValueWeightController disabled_weight(0.0);
-		require(disabled_weight.update(4.0, 1.0, -1.5) == 0.0,
-				"zero Value weight did not disable adaptive balancing");
+		bool rejected_zero_weight = false;
+		try {
+			gadus::ValueWeightController invalid_weight(0.0);
+		} catch (const std::invalid_argument &) {
+			rejected_zero_weight = true;
+		}
+		require(rejected_zero_weight, "zero Value weight was accepted");
+		gadus::ValueWeightController minimum_weight(0.2);
+		gadus::ValueWeightController maximum_weight(2.0);
+		require(minimum_weight.value() == 0.2 && maximum_weight.value() == 2.0,
+				"Value-weight boundary was not preserved");
+		bool rejected_large_weight = false;
+		try {
+			gadus::ValueWeightController invalid_weight(2.1);
+		} catch (const std::invalid_argument &) {
+			rejected_large_weight = true;
+		}
+		require(rejected_large_weight, "out-of-range Value weight was accepted");
 
 		// Detached CCRL comments and clock fields are metadata; invalid SAN rejects its game.
 		const auto preprocess_pgn =
@@ -265,27 +280,33 @@ int main() {
 		require(gadus::game_termination(repetition) == "threefold repetition",
 				"threefold-repetition termination mismatch");
 
-		// The action-plane layout must flatten as source square * 73 + motion pattern.
+		// The Policy vector must follow source square * 73 + motion pattern.
 		auto relation_block = gadus::ResidualBlock(8, 1);
 		const auto initial_relations = relation_block->relation_matrices();
 		require(initial_relations.sizes() == torch::IntArrayRef({8, 64, 64}),
 				"relation initialization produced the wrong shape");
 		require(torch::allclose(initial_relations.index({0}), torch::eye(64), 1e-6, 1e-7),
 				"identity geometry did not initialize the first relation group");
+		relation_block->eval();
+		auto relation_input = torch::randn({2, 8, 8, 8});
+		auto relation_reference = relation_block->forward(relation_input);
+		auto zero_corrections = torch::zeros({2, 8, 8});
+		auto relation_zero =
+			relation_block->forward_with_relation(relation_input, zero_corrections);
+		require(torch::allclose(relation_reference, relation_zero, 1e-6, 1e-7),
+				"zero dynamic relation correction changed a residual block");
 
 		auto layout_model = gadus::Model(8, 1);
 		{
 			torch::NoGradGuard guard;
 			for (const auto &parameter : layout_model->named_parameters()) {
-				if (parameter.key() == "policy_output.weight") {
+				if (parameter.key() == "policy_motion_vectors" ||
+					parameter.key() == "policy_action_corrections") {
 					parameter.value().zero_();
 				}
 				if (parameter.key() == "policy_action_bias") {
 					auto expected = torch::arange(
-						gadus::kActionSize, parameter.value().options())
-						.view({8, 8, gadus::kPolicyPlanes})
-						.permute({2, 0, 1})
-						.unsqueeze(0);
+						gadus::kActionSize, parameter.value().options());
 					parameter.value().copy_(expected);
 				}
 			}

@@ -883,18 +883,16 @@ void preprocess_lichess_evaluations(const PreprocessOptions &options) {
 }
 
 ValueWeightController::ValueWeightController(double initial_weight) : value_(initial_weight) {
-	if (!std::isfinite(initial_weight) || initial_weight < 0.0) {
-		throw std::invalid_argument("value weight must be finite and nonnegative");
-	}
-	if (value_ > 0.0) {
-		value_ = std::clamp(value_, kMinValueWeight, kMaxValueWeight);
+	if (!std::isfinite(initial_weight) || initial_weight < kMinValueWeight ||
+		initial_weight > kMaxValueWeight) {
+		throw std::invalid_argument("value weight must be in [0.2, 2]");
 	}
 }
 
 double ValueWeightController::update(double policy_squared_norm,
 									 double value_squared_norm, double inner_product) {
-	if (value_ == 0.0 || !std::isfinite(policy_squared_norm) ||
-		!std::isfinite(value_squared_norm) || !std::isfinite(inner_product) ||
+	if (!std::isfinite(policy_squared_norm) || !std::isfinite(value_squared_norm) ||
+		!std::isfinite(inner_product) ||
 		policy_squared_norm <= kGradientEpsilon ||
 		value_squared_norm <= kGradientEpsilon) {
 		return value_;
@@ -957,6 +955,7 @@ OutputTargetStatistics collect_output_target_statistics(const SupervisedH5 &data
 
 // Optimize a newly initialized model with the joint supervised objective.
 void train_supervised(const TrainOptions &options) {
+	ValueWeightController value_weight(options.value_weight);
 	torch::manual_seed(static_cast<std::int64_t>(options.seed));
 	const auto device = resolve_device(options.device);
 	validate_compute_precision(options.precision, device);
@@ -984,7 +983,6 @@ void train_supervised(const TrainOptions &options) {
 	std::mt19937_64 rng(options.seed);
 	std::int64_t global_step = 0;
 	bool stop = false;
-	ValueWeightController value_weight(options.value_weight);
 	std::cout << "training start: data=" << options.data.string()
 			  << " out=" << options.output.string() << " arch_type=" << kArchType
 			  << " device=" << device.str() << " epochs=" << options.epochs
@@ -1057,8 +1055,7 @@ void train_supervised(const TrainOptions &options) {
 				logits = logits.to(torch::kFloat32);
 				auto policy_loss = torch::nn::functional::cross_entropy(logits, moves);
 				auto value_loss = torch::mse_loss(predicted.squeeze(1), values);
-				if (value_weight.value() > 0.0 &&
-					(global_step == 0 || (global_step + 1) % kValueWeightProbeInterval == 0)) {
+				if (global_step == 0 || (global_step + 1) % kValueWeightProbeInterval == 0) {
 					const auto stats = shared_gradient_stats(policy_loss, value_loss, model);
 					value_weight.update(stats.policy_squared_norm, stats.value_squared_norm,
 									stats.inner_product);

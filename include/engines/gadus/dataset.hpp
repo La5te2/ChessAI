@@ -80,7 +80,7 @@ struct TrainOptions {
 	std::filesystem::path data = "data/games.gadus.h5";
 	std::filesystem::path output = "models/gadus/gadus.pth";
 	int channels = 128;
-	int blocks = 12;
+	int blocks = 10;
 	int epochs = 10;
 	int batch_size = 512;
 	std::int64_t max_steps = -1;
