@@ -1,6 +1,6 @@
 # Gadus
 
-Gadus is a residual convolutional chess network that jointly predicts a move policy and a side-to-move position evaluation.
+Gadus is a chess-structured residual network that predicts a legal-move Policy and a side-to-move Value from a canonical representation of the current position.
 
 ## 1. Notation
 
@@ -9,12 +9,13 @@ Gadus is a residual convolutional chess network that jointly predicts a move pol
 - $\mathcal A(x)$ is the set of legal actions in state $x$.
 - $T(x,a)$ is the complete state reached by applying legal action $a\in\mathcal A(x)$ to state $x$.
 - $z(x)\in\lbrace-1,0,1\rbrace$ is the exact outcome of terminal state $x$ from the perspective of its side to move, with $1$, $0$ and $-1$ representing a win, draw and loss.
-- $\phi_G$ is the Gadus state encoder that maps a complete chess state to a network input.
-- $s=\phi_G(x)$ is the Gadus network input obtained from complete state $x$.
+- $\phi_G$ is the canonical state encoder that converts a complete chess state to the side-to-move network representation.
+- $s=\phi_G(x)$ is the canonical Gadus network input obtained from complete state $x$.
 - $\mathcal I_G=\lbrace0,\ldots,4671\rbrace$ is the fixed set of Gadus action indices.
-- $i_G(a)\in\mathcal I_G$ is the action index assigned to legal action $a$.
+- $\widetilde i_G(a)\in\mathcal I_G$ is the physical-board index of legal action $a$.
+- $i_G(x,a)\in\mathcal I_G$ is the canonical index of $a\in\mathcal A(x)$ after applying the side-to-move transformation associated with $x$.
 - $\theta$ denotes the trainable network parameters.
-- $\ell_\theta(s)\in\mathbb R^{4672}$ is the complete vector of Policy logits produced by the network with parameters $\theta$ and $\ell_\theta(s,i)$ is its scalar component for action index $i\in\mathcal I_G$.
+- $\ell_\theta(s)\in\mathbb R^{4672}$ is the complete vector of Policy logits produced by the network with parameters $\theta$, and $\ell_\theta(s,i)$ is its scalar component for action index $i\in\mathcal I_G$.
 - $\text{P}$, which stands for Policy, is the network output that assigns a probability distribution over the legal actions available in each encoded state.
 - $\text{V}$, which stands for Value, is a scalar network output in $[-1,1]$ that estimates the expected game result from the perspective of the side to move.
 - $Q$ denotes a state or action evaluation defined by a particular procedure. Each definition specifies its arguments and observation perspective.
@@ -24,23 +25,23 @@ Gadus is a residual convolutional chess network that jointly predicts a move pol
 
 ### 2.1 State Encoding
 
-The network requires a fixed numerical representation of each complete chess state. Gadus represents a state with 18 binary feature maps called planes. Each plane is an $8\times8$ grid aligned with the chessboard, and each square corresponds to one scalar entry in that grid. An entry equals $1$ when its plane marks the corresponding square and $0$ otherwise. The state encoder $\phi_G$ stacks the 18 planes into one tensor:
+The state encoder uses file coordinates $0$ through $7$ for files `a` through `h` and rank coordinates $0$ through $7$ for ranks 1 through 8. It labels the pieces of the player to move as friendly and the other pieces as opposing. For a White-to-move state, canonical coordinates equal physical board coordinates. For a Black-to-move state, the encoder maps physical square $(r,f)$ to canonical square $(7-r,f)$.
+
+The resulting network input contains 17 binary planes, each of which is an $8\times8$ grid aligned with the canonical board. One entry equals $1$ when the feature represented by its plane is present at the corresponding square and equals $0$ otherwise:
 
 $$
-\phi_G:\mathcal X\rightarrow\lbrace0,1\rbrace^{18\times8\times8}.
+\phi_G:\mathcal X\rightarrow\lbrace0,1\rbrace^{17\times8\times8}.
 $$
 
-The first tensor dimension identifies a plane, the second identifies a rank and the third identifies a file. Planes 0 through 5 represent White pawn, knight, bishop, rook, queen and king occupancy. Each entry in a piece plane equals $1$ exactly when the corresponding square contains the piece represented by that plane. For example, the `f3` entry in the White-knight plane equals $1$ exactly when a White knight occupies `f3`. Planes 6 through 11 represent the six Black piece types in the same order.
+Planes 0 through 5 represent friendly pawn, knight, bishop, rook, queen and king occupancy. Planes 6 through 11 represent the opposing piece types in the same order. Each entry in these planes indicates whether the represented piece occupies the corresponding canonical square.
 
-The remaining six planes represent features that apply to the complete state or to one file. Plane 12 contains ones in all 64 entries when White is to move and zeros when Black is to move. Planes 13 through 16 represent White kingside, White queenside, Black kingside and Black queenside castling rights. Each castling plane contains ones in all 64 entries when its right is available and zeros otherwise. When an en passant square exists, plane 17 contains ones in the eight entries belonging to its file and zeros in all other entries. When no en passant square exists, plane 17 contains only zeros.
+Planes 12 through 15 represent friendly kingside, friendly queenside, opposing kingside and opposing queenside castling rights. Each castling plane contains ones at all 64 squares when its right is available and zeros at all 64 squares otherwise. Plane 16 contains ones at the eight squares of the canonical en passant file and zeros elsewhere. The complete plane is zero when no en passant square exists. The canonical transformation identifies the player to move through the friendly role, so the network input requires no separate side-to-move plane.
 
-For storage, Gadus packs the eight entries on one rank of one plane into one byte. Within each plane, the bytes appear in order from rank 1 through rank 8, and the planes appear in numerical order from 0 through 17. Within each byte, the bits represent files `a` through `h`, with file `a` in the most significant bit and file `h` in the least significant bit. One plane therefore requires eight bytes, and all 18 planes require $18\times8=144$ bytes. `PackedState` denotes this 144-byte representation, whose unpacked bits reproduce $\phi_G(x)$ exactly.
-
-The encoded tensor $\phi_G(x)$ records piece placement, side to move, castling rights and the en passant file. The complete state $x$ additionally records move counters and repetition history. Since $\phi_G$ omits move counters and repetition history, complete states that differ only in those fields produce the same network input.
+The canonical input records piece placement relative to the player to move, castling rights and the en passant file. The complete state $x$ additionally records move counters and repetition history. Complete states that differ only in these omitted fields therefore produce the same network input.
 
 ### 2.2 Action Encoding
 
-The legal-action set $\mathcal A(x)$ varies with the complete state $x$. To give actions a state-independent numerical representation, Gadus assigns each legal action $a\in\mathcal A(x)$ an index $i_G(a)$ in the fixed set $\mathcal I_G$.
+The legal-action set $\mathcal A(x)$ varies with the complete state $x$. Gadus first assigns each legal action a state-independent physical index in $\mathcal I_G$, then transforms that index to the same canonical coordinates as the encoded state.
 
 Every action index has two components. The source-square component $q$ identifies the square from which the move begins. The motion-pattern component $p$ describes the displacement from the source square to the destination square and, for an underpromotion, also identifies the promoted piece.
 
@@ -68,7 +69,7 @@ Gadus orders the eight possible directions as
 
 $$
 (-1,-1),\ (-1,0),\ (-1,1),\ (0,-1),\
-(0,1),\ (1,-1),\ (1,0),\ (1,1),
+(0,1),\ (1,-1),\ (1,0),\ (1,1).
 $$
 
 Let $(u_d,v_d)$ be the direction at position $d\in\lbrace0,\ldots,7\rbrace$ in this list. If the move travels $m\in\lbrace1,\ldots,7\rbrace$ squares in that direction, then
@@ -113,7 +114,7 @@ Castling also uses a rank displacement pattern. The rules library represents cas
 Once $q$ and $p$ have been determined, the action index is
 
 $$
-i_G(a)=73q+p.
+\widetilde i_G(a)=73q+p.
 $$
 
 Combining 64 source-square indices with 73 motion-pattern indices gives
@@ -122,85 +123,149 @@ $$
 |\mathcal I_G|=64\times73=4672.
 $$
 
+The map $\widetilde i_G$ assigns an index in physical-board coordinates. For $a\in\mathcal A(x)$, the canonical map $i_G(x,a)$ applies $\widetilde i_G$ directly when White is to move. When Black is to move, it reflects the source and destination ranks by $r\mapsto7-r$ before applying the same $64\times73$ codec. This transformation changes rank-sensitive sliding and knight patterns but preserves the file offset and promoted piece of an underpromotion. The state and its legal actions consequently use the same canonical coordinates, which are shared by supervised targets, legal-action inference and Policy logits.
+
 For complete state $x$, the available action indices are
 
 $$
 \mathcal I_G(x)=
-\lbrace i_G(a)\mid a\in\mathcal A(x)\rbrace.
+\lbrace i_G(x,a)\mid a\in\mathcal A(x)\rbrace.
 $$
 
-To decode an available index, Gadus generates the legal-action set $\mathcal A(x)$ and selects the action whose encoding equals that index. The selected legal action contains the castling, en passant or promotion information required by the rules engine.
+To decode an available physical index, Gadus generates the legal-action set $\mathcal A(x)$ and selects the action whose $\widetilde i_G$ encoding equals that index. The selected legal action contains the castling, en passant or promotion information required by the rules engine. Canonical indices are used only at the network boundary, where each legal action remains paired with its physical move representation.
 
 ## 3. Network
 
 ### 3.1 Residual Trunk
 
-The Gadus network derives its $\text{P}$ and $\text{V}$ from a shared residual trunk composed of a convolutional stem followed by a sequence of residual blocks. Within the trunk, the stem produces the initial feature tensor $h_0$, and each residual block $j$ combines its input $h_j$ with a learned transformation $F_j(h_j)$ to produce the next tensor $h_{j+1}$. The following formulas define these computations.
-
-Let $C$ be the number of feature channels in the trunk and let $B$ be its number of residual blocks. The stem maps the 18 binary input planes to $C$ real-valued $8\times8$ feature maps. The symbol $\mathrm{Conv}^{C_{\mathrm{in}}\rightarrow C_{\mathrm{out}}}_{3\times3}$ denotes a bias-free convolution with $C_{\mathrm{in}}$ input channels, $C_{\mathrm{out}}$ output channels and one-square zero padding. The symbol $\mathrm{BN}$ denotes batch normalization applied independently to each output channel, and $\mathrm{ReLU}(z)=\max(0,z)$ is applied elementwise. The stem computes
+The Gadus network derives its $\text{P}$ and $\text{V}$ from a shared chess-structured residual trunk. Let $C$ be the trunk width and let $B$ be its number of residual blocks. The stem maps the 17 canonical input planes to $C$ board-aligned feature channels, and a learned square embedding supplies an independent $C$-dimensional offset at each canonical square. With bias-free convolution, batch normalization and elementwise ReLU denoted by $\mathrm{Conv}$, $\mathrm{BN}$ and $\mathrm{ReLU}$, the initial feature tensor is
 
 $$
-h_0=\mathrm{ReLU}\left(
-\mathrm{BN}_{\mathrm{stem}}\left(
-\mathrm{Conv}^{18\rightarrow C}_{3\times3,\mathrm{stem}}(s)
-\right)\right)
-\in\mathbb R^{C\times8\times8}.
-$$
-
-The first residual block receives the stem output $h_0$ as its input. The learned transformation in residual block $j$ is
-
-$$
-F_j(h)=\mathrm{BN}_{j,2}\left(
-\mathrm{Conv}^{C\rightarrow C}_{3\times3,j,2}\left(
+h_0=
 \mathrm{ReLU}\left(
-\mathrm{BN}_{j,1}\left(
-\mathrm{Conv}^{C\rightarrow C}_{3\times3,j,1}(h)
-\right)\right)\right)\right).
+\mathrm{BN}_{\mathrm{stem}}\left(
+\mathrm{Conv}^{17\rightarrow C}_{3\times3,\mathrm{stem}}(s)
+\right)\right)+E_S,
+\qquad
+E_S\in\mathbb R^{C\times8\times8}.
 $$
 
-Residual block $j$ evaluates $F_j(h_j)$, adds the transformed tensor to its input $h_j$ and then applies ReLU:
+Every residual block preserves the shape $C\times8\times8$ and combines a local board transformation with a full-board relation transformation. The block first applies a $1\times1$ projection and obtains
 
 $$
-h_{j+1}=\mathrm{ReLU}\left(h_j+F_j(h_j)\right),
+b_j=
+\mathrm{ReLU}\left(
+\mathrm{BN}_{j,\downarrow}\left(
+\mathrm{Conv}^{C\rightarrow C}_{1\times1,j,\downarrow}(h_j)
+\right)\right).
+$$
+
+The local transformation contains parallel $3\times3$, $1\times1$ and identity branches. Each branch has its own batch normalization, and their outputs are added before the next nonlinearity:
+
+$$
+L_j(b_j)=
+\mathrm{BN}_{j,3}\left(
+\mathrm{Conv}^{C\rightarrow C}_{3\times3,j}(b_j)
+\right)
++\mathrm{BN}_{j,1}\left(
+\mathrm{Conv}^{C\rightarrow C}_{1\times1,j}(b_j)
+\right)
++\mathrm{BN}_{j,I}(b_j).
+$$
+
+The full-board transformation begins with eight fixed geometric relations over the 64 canonical squares. Let the output square be $q=(r_q,f_q)$ and the input square be $p=(r_p,f_p)$. Define $\mathbf 1[\cdot]$ to equal one when its condition holds and zero otherwise. The unnormalized relation matrices are
+
+$$
+\begin{aligned}
+B_0(q,p)&=\mathbf 1[p=q],\\
+B_1(q,p)&=\mathbf 1[\max(|r_q-r_p|,|f_q-f_p|)=1],\\
+B_2(q,p)&=\mathbf 1[(|r_q-r_p|,|f_q-f_p|)\in\lbrace(1,2),(2,1)\rbrace],\\
+B_3(q,p)&=\mathbf 1[r_q=r_p\text{ and }p\ne q],\\
+B_4(q,p)&=\mathbf 1[f_q=f_p\text{ and }p\ne q],\\
+B_5(q,p)&=\mathbf 1[r_q-f_q=r_p-f_p\text{ and }p\ne q],\\
+B_6(q,p)&=\mathbf 1[r_q+f_q=r_p+f_p\text{ and }p\ne q],\\
+B_7(q,p)&=1.
+\end{aligned}
+$$
+
+These matrices represent identity, king-step adjacency, knight displacement, common rank, common file, the two common diagonals and the complete board. Normalizing each output row gives
+
+$$
+\widehat B_r(q,p)=
+\frac{B_r(q,p)}
+{\displaystyle\max\left(1,\sum_{u=0}^{63}B_r(q,u)\right)},
+\qquad 0\leq r<8.
+$$
+
+Let
+
+$$
+K=\gcd(C,8),
+\qquad
+d=\frac{C}{K}.
+$$
+
+The channels of $b_j$ are divided into $K$ groups of width $d$. Relation group $g$ uses a learned linear combination of the fixed geometric matrices together with a learned unrestricted residual matrix:
+
+$$
+A_{j,g}=
+\sum_{r=0}^{7}\alpha_{j,g,r}\widehat B_r+
+\Delta A_{j,g},
+\qquad
+A_{j,g}\in\mathbb R^{64\times64}.
+$$
+
+After reshaping group $g$ to $b_{j,g}\in\mathbb R^{64\times d}$, the relation matrix acts on its square dimension:
+
+$$
+\widetilde R_{j,g}=A_{j,g}b_{j,g}.
+$$
+
+Concatenating the groups restores a $C\times8\times8$ tensor. A non-affine batch-normalization layer then produces the relation output $R_j(b_j)$.
+
+The learned vector $\lambda_j\in\mathbb R^C$ controls the relative contribution of the two transformations independently in every channel. Broadcasting it over the board gives
+
+$$
+c_j=
+\mathrm{ReLU}\left(
+\frac{L_j(b_j)+\lambda_j\odot R_j(b_j)}
+{\sqrt{1+\lambda_j^2}}
+\right),
+$$
+
+All operations involving $\lambda_j$ are applied independently to each channel and broadcast over its $8\times8$ feature map. A final $1\times1$ projection maps the combined representation back to the residual stream:
+
+$$
+h_{j+1}=
+\mathrm{ReLU}\left(
+h_j+
+\mathrm{BN}_{j,\uparrow}\left(
+\mathrm{Conv}^{C\rightarrow C}_{1\times1,j,\uparrow}(c_j)
+\right)
+\right),
 \qquad 0\leq j<B.
 $$
 
-The stem produces $C$ feature maps on the $8\times8$ board grid, and every residual block preserves both the channel count and the spatial dimensions. Consequently,
+The fixed relation basis is shared by all blocks, while $\alpha_{j,g,r}$, $\Delta A_{j,g}$ and $\lambda_j$ belong to block $j$. Initially, each group selects one basis relation, every $\Delta A_{j,g}$ is zero and every component of $\lambda_j$ equals one. The three local branch scales begin at $1/\sqrt3$, the scale of the final batch normalization begins at $1/\sqrt B$ and the square embedding begins at zero. The relation basis remains fixed. The relation coefficients, residual matrices, path-balance vector, normalization scales and square embedding remain trainable after initialization.
 
-$$
-h_j\in\mathbb R^{C\times8\times8},
-\qquad 0\leq j\leq B.
-$$
-
-After $B$ residual blocks, $h_B$ is the output of the residual trunk and serves as the shared input to the two output paths:
-
-$$
-s\longrightarrow\text{residual trunk}\longrightarrow h_B\longrightarrow
-\begin{cases}
-\text{Policy head}\longrightarrow\ell_\theta(s)
-\longrightarrow P_\theta(\cdot\mid s),\\
-\text{Value head}\longrightarrow V_\theta(s).
-\end{cases}
-$$
-
-Section 3.2 defines both heads and the legal-move normalization that converts $\ell_\theta(s)$ into $P_\theta(\cdot\mid s)$.
+After the $B$ blocks, $h_B\in\mathbb R^{C\times8\times8}$ is the shared representation supplied to the Policy and Value heads defined below.
 
 ### 3.2 Policy and Value Heads
 
-The Policy head assigns one unnormalized score, called a logit, to every action index in $\mathcal I_G$. It first maps $h_B$ through a bias-free $1\times1$ convolution from $C$ channels to 128 channels and applies batch normalization. A learned position tensor $E_P\in\mathbb R^{128\times8\times8}$ is added before ReLU, so the feature at each square can depend explicitly on its absolute board location. Writing the resulting tensor as $u_0$, this first stage is
+The Policy head assigns one unnormalized score, called a logit, to every canonical action index in $\mathcal I_G$. It begins with a bias-free $1\times1$ convolution from $C$ channels to 128 channels, followed by batch normalization and ReLU:
 
 $$
 u_0=\mathrm{ReLU}\left(
 \mathrm{BN}_P\left(
 \mathrm{Conv}^{C\rightarrow128}_{1\times1,P}(h_B)
-\right)+E_P
+\right)
 \right).
 $$
 
-Beginning with $u_0$, the next stage of the Policy head applies two Policy-specific residual blocks in sequence. Each block uses the two-convolution residual structure defined in Section 3.1 and maps a 128-channel tensor to another tensor of the same shape. If $G_j$ denotes the learned transformation in Policy block $j$, their successive outputs satisfy
+Two Policy-specific chess-structured residual blocks then transform $u_0$. They use the construction from Section 3.1 with 128 channels and independent Policy parameters. Let $F_{P,j}$ denote the complete input-output map of Policy block $j$ under that construction. The two blocks produce
 
 $$
-u_{j+1}=\mathrm{ReLU}\left(u_j+G_j(u_j)\right),
+u_{j+1}=F_{P,j}(u_j),
 \qquad 0\leq j<2.
 $$
 
@@ -218,13 +283,31 @@ $$
 \ell_\theta(s,73q+p)=L_\theta(s)_{p,r,f}.
 $$
 
-The Value head produces an estimate of the expected game result from the perspective of the player to move. Its first stage is a Value-specific residual block with $C$ input and output channels. If $H_V$ denotes the learned two-convolution transformation in this block, applying the block to $h_B$ gives
+The Value head produces an estimate of the expected game result from the perspective of the player to move. Let $F_V$ denote the complete input-output map of one Value-specific chess-structured residual block with independent parameters. This block first transforms $h_B$:
 
 $$
-v_0=\mathrm{ReLU}\left(h_B+H_V(h_B)\right).
+v_0=F_V(h_B).
 $$
 
-A bias-free $1\times1$ convolution maps $v_0$ from $C$ channels to 48 channels, followed by batch normalization, ReLU and flattening. A $3072\rightarrow512$ linear map and ReLU produce an intermediate vector. A final linear map produces one scalar, and the hyperbolic tangent restricts that scalar to $[-1,1]$.
+A bias-free $1\times1$ convolution maps $v_0$ from $C$ channels to 48 channels. Batch normalization and ReLU then produce
+
+$$
+r_V=\mathrm{ReLU}\left(
+\mathrm{BN}_V\left(
+\mathrm{Conv}^{C\rightarrow48}_{1\times1,V}(v_0)
+\right)\right).
+$$
+
+Flattening $r_V$ in channel-rank-file order gives $\mathrm{vec}(r_V)\in\mathbb R^{3072}$. Let $W_{V,1}\in\mathbb R^{512\times3072}$ and $b_{V,1}\in\mathbb R^{512}$ be the parameters of the hidden Value layer, and let $W_{V,2}\in\mathbb R^{1\times512}$ and $b_{V,2}\in\mathbb R$ be the parameters of its output layer. The Value estimate is
+
+$$
+V_\theta(s)=
+\tanh\left(
+W_{V,2}\mathrm{ReLU}\left(
+W_{V,1}\mathrm{vec}(r_V)+b_{V,1}
+\right)+b_{V,2}
+\right).
+$$
 
 Writing $f_\theta$ for the complete network gives
 
@@ -236,16 +319,27 @@ f_\theta(s)=\left(\ell_\theta(s),V_\theta(s)\right),
 V_\theta(s)\in[-1,1].
 $$
 
-The complete logit vector assigns a score to every index in $\mathcal I_G$. For $s=\phi_G(x)$, selecting the indices $i_G(a)$ for $a\in\mathcal A(x)$ and normalizing their logits with softmax produces the legal-move Policy:
+The complete logit vector assigns a score to every index in $\mathcal I_G$. For $s=\phi_G(x)$, selecting the indices $i_G(x,a)$ for $a\in\mathcal A(x)$ and normalizing their logits with softmax produces the legal-move Policy:
 
 $$
 P_\theta(a\mid s)=
-\frac{\exp\ell_\theta(s,i_G(a))}
-{\displaystyle\sum_{b\in\mathcal A(x)}\exp\ell_\theta(s,i_G(b))},
+\frac{\exp\ell_\theta(s,i_G(x,a))}
+{\displaystyle\sum_{b\in\mathcal A(x)}\exp\ell_\theta(s,i_G(x,b))},
 \qquad a\in\mathcal A(x).
 $$
 
 The denominator ranges over $\mathcal A(x)$, so $P_\theta(\cdot\mid s)$ is a probability distribution over the legal actions in complete state $x$.
+
+The complete data flow is therefore
+
+$$
+s\longrightarrow\text{shared trunk}\longrightarrow h_B\longrightarrow
+\begin{cases}
+\text{Policy head}\longrightarrow\ell_\theta(s)
+\longrightarrow P_\theta(\cdot\mid s),\\
+\text{Value head}\longrightarrow V_\theta(s).
+\end{cases}
+$$
 
 ### 3.3 Inference Evaluation
 
@@ -269,17 +363,9 @@ $$
 \ell_\theta(s,i)=w_p^{\mathsf T}u_2[:,r,f]+B_{P,p,r,f}.
 $$
 
-This expression equals $L_\theta(s)_{p,r,f}$ and computes the requested logit without materializing the other action-plane components. For a batch of complete states, the inference path pads every legal-index array to the largest legal-action count in that batch, evaluates the requested logits and masks the padded positions before applying softmax. The resulting distribution for each state contains exactly the probabilities of its legal actions.
+This expression equals $L_\theta(s)_{p,r,f}$ and computes the requested logit without materializing the other action-plane components. For a batch of complete states, the inference path first converts every legal action index to canonical coordinates. It pads the resulting arrays to the largest legal-action count in that batch, evaluates the requested logits and masks the padded positions before applying softmax. The resulting distribution for each state contains exactly the probabilities of its legal actions.
 
-During inference, each batch-normalization layer uses a fixed running mean, running variance, learned scale and learned bias. These fixed quantities allow a convolution and its following batch-normalization layer to be replaced by one convolution with transformed weights and an added bias. For output channel $o$, let $W_o$ be the original bias-free convolution weights, $\mu_o$ and $\sigma_o^2$ be the stored batch-normalization mean and variance, $\gamma_o$ and $\beta_o$ be its learned scale and bias and let $\epsilon$ be its numerical constant. The equivalent convolution parameters are
-
-$$
-W'_o=\frac{\gamma_o}{\sqrt{\sigma_o^2+\epsilon}}W_o,
-\qquad
-b'_o=\beta_o-\frac{\gamma_o\mu_o}{\sqrt{\sigma_o^2+\epsilon}}.
-$$
-
-Substituting $W'_o$ and $b'_o$ preserves the evaluation-mode output of every convolution-batch-normalization pair. Batch-normalization fusion therefore reduces the computation performed during inference while preserving $P_\theta(\cdot\mid s)$ and $V_\theta(s)$.
+In evaluation mode, every convolution followed directly by affine batch normalization is replaced by its equivalent biased convolution. Within each chess-structured block, the three local branches are further combined into one biased $3\times3$ convolution by placing the $1\times1$ and normalized identity kernels at the centre of the $3\times3$ kernel. Each learned relation matrix $A_{j,g}$ is also computed once from its coefficients, fixed bases and residual matrix. These exact transformations preserve the network outputs and remove repeated normalization, branch summation and relation-matrix construction from inference.
 
 ## 4. Supervised Training
 
@@ -303,12 +389,12 @@ where
 $$
 s_n=\phi_G(x_n),
 \qquad
-i_n=i_G(a_n),
+i_n=i_G(x_n,a_n),
 \qquad
 y_n\in[-1,1].
 $$
 
-The encoded state $s_n$ is the network input, and the action index $i_n$ is the Policy target. The scalar $y_n$ is the Value target, expressed as an estimate of the expected game result from the perspective of the side to move in $x_n$. On this scale, $-1$ denotes a loss, $0$ denotes a draw and $1$ denotes a win, while intermediate values express expectations between these outcomes.
+The encoded state $s_n$ is the canonical network input, and the action index $i_n$ is the corresponding canonical Policy target. The scalar $y_n$ is the Value target, expressed as an estimate of the expected game result from the perspective of the side to move in $x_n$. On this scale, $-1$ denotes a loss, $0$ denotes a draw and $1$ denotes a win, while intermediate values express expectations between these outcomes.
 
 ### 4.2 Supervised Objective
 
@@ -343,7 +429,7 @@ L_{V,\mathrm{sup}}^{(\mathcal B)}=
 \left(V_\theta(s)-y\right)^2.
 $$
 
-Let $w_{V,k}\geq0$ denote the Value-loss coefficient used at optimizer step $k$. The supplied initial coefficient determines $w_{V,0}$ as follows: zero remains zero, and a positive value is clipped to $[0.2,2]$. The complete objective for minibatch $\mathcal B_k$ is
+Let $w_{V,0}\in[0.2,2]$ be the initial Value-loss coefficient and let $w_{V,k}\in[0.2,2]$ be the coefficient used at optimizer step $k$ ($k\geq1$). The complete objective for minibatch $\mathcal B_k$ is
 
 $$
 L_{\mathrm{sup}}^{(\mathcal B_k)}=
@@ -351,7 +437,7 @@ L_{P,\mathrm{sup}}^{(\mathcal B_k)}+
 w_{V,k}L_{V,\mathrm{sup}}^{(\mathcal B_k)}.
 $$
 
-The coefficient is adjusted from the two loss gradients in the shared residual trunk. Define these gradient vectors by
+The controller adjusts a positive coefficient by comparing the Policy and Value gradients within the shared residual trunk. Define these gradient vectors by
 
 $$
 g_{P,k}=\nabla_{\theta_T}L_{P,\mathrm{sup}}^{(\mathcal B_k)},
@@ -393,7 +479,7 @@ I_k=
 \right].
 $$
 
-For $c_k\geq0$, define $I_k=[0.2,2]$. When $I_k$ is nonempty, the controller projects $\widetilde w_{V,k}$ into $I_k$ and smooths the projected value in logarithmic space with update rate $\gamma=0.08$:
+For $c_k\geq0$, define $I_k=[0.2,2]$. Let $\mathrm{proj}_{I_k}(w)$ denote the nearest point to $w$ in the closed interval $I_k$. When $I_k$ is nonempty, the controller projects $\widetilde w_{V,k}$ into $I_k$ and smooths the projected value in logarithmic space with update rate $\gamma=0.08$:
 
 $$
 \widehat w_{V,k}=\mathrm{proj}_{I_k}(\widetilde w_{V,k}),
@@ -405,7 +491,7 @@ w_{V,k}=\mathrm{clip}_{[0.2,2]}\left(
 \right).
 $$
 
-An empty $I_k$, a nonfinite gradient statistic or a squared gradient norm no greater than $10^{-12}$ leaves the preceding coefficient unchanged. The controller periodically performs this calculation during optimization. An initial coefficient of zero removes the Value term and disables subsequent adaptation.
+An empty $I_k$, a nonfinite gradient statistic or a squared gradient norm no greater than $10^{-12}$ leaves the preceding coefficient unchanged. The controller periodically performs this calculation during optimization.
 
 To express how the resulting objective updates the complete network, partition the network parameters as $\theta=(\theta_T,\theta_P,\theta_V)$, where $\theta_T$ contains the residual-trunk parameters and $\theta_P$ and $\theta_V$ contain the parameters of the two output heads. The gradients of $L_{\mathrm{sup}}^{(\mathcal B_k)}$ with respect to these parameter groups satisfy
 
@@ -428,44 +514,52 @@ The optimizer updates $\theta_P$ from the Policy-loss gradient and $\theta_V$ fr
 
 ### 4.3 Parameter Optimization
 
-Parameter optimization processes $\mathcal D_{\mathrm{sup}}$ in epochs, each of which uses every record exactly once. At the start of an epoch, the data loader first randomizes the order of the HDF5 chunks and then randomizes the records within each chunk before forming minibatches. This two-level shuffle prevents the fixed storage order from repeatedly placing related positions in consecutive minibatches, a pattern that may produce excessive correlation between successive gradient estimates. The resulting minibatches are indexed by optimizer step as $\mathcal B_1,\mathcal B_2,\ldots,\mathcal B_n$.
-
-Let $\theta^{(0)}$ denote the parameters of a newly initialized network with residual-trunk width $C$ and depth $B$. At optimizer step $k\geq1$, $\theta^{(k-1)}$ denotes the parameters available before the update. Automatic differentiation computes the gradient of the objective for $\mathcal B_k$ with respect to $\theta^{(k-1)}$:
+Before the first parameter update, Gadus estimates output priors from a stratified sample of the supervised targets. Let $c_i$ be the number of sampled Policy targets with canonical action index $i$, and let $\bar y$ be the mean sampled Value target. The smoothed action prior is
 
 $$
-g_k=\nabla_{\theta^{(k-1)}}
-L_{\mathrm{sup}}^{(\mathcal B_k)}.
+\pi_0(i)=
+\frac{c_i+1}
+{\displaystyle\sum_{j\in\mathcal I_G}c_j+|\mathcal I_G|},
+\qquad i\in\mathcal I_G.
 $$
 
-AdamW combines $g_k$ with information accumulated from earlier optimizer steps. Its first-moment estimate $u_k$ is an exponential moving average of the gradients, while its second-moment estimate $v_k$ is an exponential moving average of the squared gradients. Both estimates have the same dimensions as $\theta$ and begin with $u_0=v_0=0$. Because this initialization draws their early magnitudes toward zero, AdamW corrects the resulting bias. With $\beta_1=0.9$ and $\beta_2=0.999$, the moment estimates and their bias-corrected forms are
+The action-position bias corresponding to index $i$ is initialized to $\log\pi_0(i)$. The Policy output weights and Value output weights are each scaled by $\rho_0=0.1$ from their initial values, and the Value output bias is set to
 
 $$
-u_k=\beta_1u_{k-1}+(1-\beta_1)g_k,
-\qquad
-v_k=\beta_2v_{k-1}+(1-\beta_2)g_k^2,
+b_{V,2}=
+\mathrm{atanh}\left(
+\mathrm{clip}_{[-1+\epsilon_0,1-\epsilon_0]}(\bar y)
+\right),
+\qquad \epsilon_0=10^{-4}.
 $$
 
-$$
-\widehat u_k=\frac{u_k}{1-\beta_1^k},
-\qquad
-\widehat v_k=\frac{v_k}{1-\beta_2^k}.
-$$
-
-Let $\eta$ be the learning rate, let $\lambda$ be the weight-decay coefficient and let $\epsilon_A=10^{-8}$ prevent division by zero. AdamW updates the parameters according to
+The Policy bias places the sampled action frequencies in the initial logits, while the reduced output weights limit their random perturbation. The Value initialization similarly places the initial estimate near the sampled target mean. Parameter optimization then partitions each randomized traversal of $\mathcal D_{\mathrm{sup}}$ into minibatches. For minibatch $\mathcal B_k$, automatic differentiation computes the gradients of $L_{\mathrm{sup}}^{(\mathcal B_k)}$ given in Section 4.2. Before the AdamW update, Gadus limits the Euclidean norm of the Value-head gradient while leaving the Policy-head and shared-trunk gradients unchanged. Let
 
 $$
-\theta^{(k)}=
-(1-\eta\lambda)\theta^{(k-1)}-
-\eta\frac{\widehat u_k}{\sqrt{\widehat v_k}+\epsilon_A}.
+g_{V,k}^{\mathrm{head}}=
+\nabla_{\theta_V}L_{\mathrm{sup}}^{(\mathcal B_k)}.
 $$
 
-The square, square root and quotient in these equations are evaluated separately for each scalar parameter. In the update equation, the first term applies decoupled weight decay to $\theta^{(k-1)}$, and the second term applies the adaptive step determined by the corrected moment estimates. The resulting parameters $\theta^{(k)}$ become the starting point for the next minibatch. Optimization proceeds until the requested epochs are complete or the number of updates reaches a positive optimizer-step limit. In the absence of a positive limit, the epoch count alone determines completion.
+The gradient supplied to AdamW for the Value-head parameters is
+
+$$
+\widetilde g_{V,k}^{\mathrm{head}}=
+\begin{cases}
+g_{V,k}^{\mathrm{head}},
+&\lVert g_{V,k}^{\mathrm{head}}\rVert_2\leq1,\\[6pt]
+\dfrac{g_{V,k}^{\mathrm{head}}}
+{\lVert g_{V,k}^{\mathrm{head}}\rVert_2},
+&\lVert g_{V,k}^{\mathrm{head}}\rVert_2>1.
+\end{cases}
+$$
+
+AdamW applies the gradients for $\theta_T$ and $\theta_P$ from Section 4.2 together with $\widetilde g_{V,k}^{\mathrm{head}}$ to obtain the next parameter state $\theta^{(k+1)}$.
 
 ## 5. Search
 
 ### 5.1 Root Initialization
 
-For a nonterminal complete state $x_0$, the MCTS procedure initializes a tree whose root corresponds to $x_0$. Each node corresponds to a complete state, and each edge leaving a node corresponding to state $x$ records a legal action $a\in\mathcal A(x)$ and leads to a child node corresponding to $T(x,a)$. A simulation follows selected edges from the root to a leaf, determines an evaluation for the leaf state and propagates that evaluation back along the selected path.
+For a nonterminal complete state $x_0$, MCTS initializes a tree rooted at $x_0$. Each node represents one complete state $x$, and each outgoing edge represents a legal action $a\in\mathcal A(x)$ that connects the node to the child state $T(x,a)$. A simulation follows a sequence of edges to a leaf, evaluates that leaf and propagates the result back along the same path.
 
 Root initialization evaluates $s_0=\phi_G(x_0)$ to obtain $P_\theta(\cdot\mid s_0)$ and $V_\theta(s_0)$. Before any simulation completes, $V_\theta(s_0)$ supplies the reported root evaluation, and the root statistics satisfy $N(x_0)=W(x_0)=0$. The procedure then creates one outgoing edge and child node for every legal action $a\in\mathcal A(x_0)$, using its Policy probability as the edge prior:
 
@@ -473,7 +567,7 @@ $$
 P(x_0,a)=P_\theta(a\mid s_0).
 $$
 
-A nonterminal node is unexpanded while it has no outgoing edges. When a simulation reaches an unexpanded node corresponding to state $x$, the evaluator obtains $P_\theta(\cdot\mid\phi_G(x))$ and $V_\theta(\phi_G(x))$. Node expansion uses the Policy distribution to create one outgoing edge and child node for every action $a\in\mathcal A(x)$, assigning $P_\theta(a\mid\phi_G(x))$ to the edge prior $P(x,a)$. The backup procedure defined in Section 5.4 propagates $V_\theta(\phi_G(x))$ along the selected path.
+A nonterminal node is unexpanded while it has no outgoing edges. When a simulation reaches an unexpanded node representing state $x$, the evaluator obtains $P_\theta(\cdot\mid\phi_G(x))$ and $V_\theta(\phi_G(x))$. Node expansion uses the Policy distribution to create one outgoing edge and child node for every action $a\in\mathcal A(x)$, assigning $P_\theta(a\mid\phi_G(x))$ to the edge prior $P(x,a)$. The backup procedure defined in Section 5.4 propagates $V_\theta(\phi_G(x))$ along the selected path.
 
 ### 5.2 Tree Statistics
 
@@ -742,15 +836,15 @@ The first limit increases the evidence collected for every legal action at a ful
 
 ### 5.7 Evaluation Reuse
 
-Repeated neural evaluation of the same `PackedState` produces the same compact Policy and Value record, so Gadus stores each completed network evaluation in a cache indexed by its `PackedState`. For a requested complete state, the rules engine checks for a terminal outcome before consulting this cache. This order is required because `PackedState` omits move counters and repetition history. Exact rule outcomes therefore depend on the complete state, whereas cached network outputs depend only on the encoded state.
+For cache keys, Gadus packs 18 physical-board binary planes into a 144-byte representation called `PackedState`: 12 piece planes, one side-to-move plane, four castling-right planes and one en-passant plane. It omits move counters and repetition history. The rules engine therefore checks whether a requested complete state is terminal before consulting the evaluation cache. Equal `PackedState` keys determine equal network inputs and can therefore share one compact Policy and Value record.
 
 One MCTS invocation receives one or more root states and constructs a separate search tree for each root. All trees created by that invocation access the same evaluation cache, which allows simulations within one tree and simulations from different trees to reuse completed network records. Let $M_C\geq0$ be the configured memory capacity for records retained across invocations. When $M_C=0$, the cache exists only for the current invocation and is discarded with its search trees. When $M_C>0$, the same cache persists across invocations and uses TLRU (trajectory-aware least-recently-used) to order its records. A successful lookup moves the accessed record to the most-recent end of this order, and inserting a new record places it at the same end.
 
-TLRU records a directed link when a cached nonterminal child is reached from a cached parent. Let $\mathcal C$ be the set of retained entries and let $E_C\subseteq\mathcal C\times\mathcal C$ be the set of recorded parent-child links. For a tree node $v$ whose network record remains in $\mathcal C$, write $\kappa(v)$ for the corresponding cache entry. For a completed tree with root $x_0$ and $N(x_0)>0$, the trajectory heat of entry $c$ is
+TLRU records a directed link when a cached nonterminal child is reached from a cached parent. Let $\mathcal C$ be the set of retained entries and let $\mathcal T(x_0)$ be the node set of the completed tree rooted at $x_0$. For every visited node $v\in\mathcal T(x_0)$ whose network record remains in $\mathcal C$, write $\kappa(v)$ for the corresponding cache entry. When $N(x_0)>0$, the trajectory heat of entry $c$ is
 
 $$
 H_{x_0}(c)=
-\sum_{\substack{vis(v)=1\\\kappa(v)=c}}
+\sum_{\substack{v\in\mathcal T(x_0):\,N(v)>0\\\kappa(v)=c}}
 \frac{N(v)}{N(x_0)}.
 $$
 
@@ -764,7 +858,7 @@ When the approximate retained-cache memory exceeds the configured capacity, TLRU
 
 ### 5.8 Batched Evaluation
 
-One MCTS invocation may receive several root states. The evaluator first resolves every initial request whose `PackedState` has a cached record, then groups the remaining requests by `PackedState`. When uncached requests remain, their unique states form one neural batch. Each cached or computed record initializes every root tree with the corresponding `PackedState`.
+One MCTS invocation may receive several root states. The evaluator first assigns cached records to matching root nodes. It then groups the remaining roots by `PackedState`, evaluates the unique uncached states in one neural batch and assigns each resulting record to every matching root node.
 
 The batching scheduler retains a latency estimate $\tau$, measured in milliseconds, from one invocation to the next. The estimate begins at zero. Let $\Delta t$ be the measured duration of a neural call that evaluates exactly one uncached state. Such a call supplies the sample
 
@@ -818,7 +912,7 @@ The two terms limit the request by the available cycle capacity and the remainin
 
 To build the request set, the root scheduler first selects a legal root action with the largest positive fair-allocation deficit. After every legal root action completes the fair floor, it selects the action with the largest fixed-$\alpha$ root PUCT score defined in Section 5.5. During the fair phase, the selected root action is followed by full-width PUCT at every expanded non-root node. After the fair phase fixes $\gamma_{\mathrm{fair}}$, the scheduler instead updates the active prefix at each expanded non-root node according to Section 5.6. At each such node, an active action without a visit takes precedence. If every active action has been visited and the prefix has reached full width, the scheduler next considers positive verification deficits. When neither condition applies, it uses the PUCT ordering from Section 5.3. This descent ends at a terminal node or an unexpanded nonterminal node.
 
-A terminal node receives its exact rule outcome, and immediate backup completes one simulation without adding a neural-evaluation request. An unexpanded nonterminal node enters the request set when that tree has not reserved the node earlier in the same cycle, and its selected path retains one virtual visit until the request is resolved. Immediate terminal backups and accepted neural-leaf reservations both count toward the limit $m$. If another attempt from the same tree reaches an already reserved node, the selector releases the virtual visits introduced by that attempt and ends request selection for that tree in the current cycle. The submitted requests then change the completed tree statistics before the next cycle begins, preventing exact rollback from immediately reconstructing the same deterministic path. The tree performs at most $\max(5m,m+8)$ attempts while scheduling at most $m$ simulations, and a repeated reservation can end its current selection pass earlier.
+A terminal node receives its exact rule outcome, and immediate backup completes one simulation without adding a neural-evaluation request. An unexpanded nonterminal node enters the request set when that tree has not reserved the node earlier in the same cycle, and its selected path retains one virtual visit until the request is resolved. Immediate terminal backups and accepted neural-leaf reservations both count toward the limit $m$. If another attempt from the same tree reaches an already reserved node, the selector releases the virtual visits introduced by that attempt and ends request selection for that tree in the current cycle. The accepted requests are evaluated and backed up before the next cycle begins. The resulting updates prevent the selector from immediately reconstructing the same deterministic path after the temporary reservations are released. The tree performs at most $\max(5m,m+8)$ attempts while scheduling at most $m$ simulations, and a repeated reservation can end its current selection pass earlier.
 
 The requests collected from all trees form one list. Before each evaluation submission, the scheduler computes
 
@@ -838,11 +932,11 @@ For a representative leaf state $x$, let $L=|\mathcal A(x)|$, and write its orde
 
 $$
 (a_j)_{j=1}^{L},\qquad
-(i_G(a_j))_{j=1}^{L},\qquad
+(\widetilde i_G(a_j))_{j=1}^{L},\qquad
 (P_\theta(a_j\mid\phi_G(x)))_{j=1}^{L},
 $$
 
-together with the scalar $V_\theta(\phi_G(x))$. Entries with the same index $j$ describe the same legal action, which defines the alignment among the action, action-index and Policy sequences.
+together with the scalar $V_\theta(\phi_G(x))$. Entries with the same index $j$ describe the same legal action, which defines the alignment among the action, action-index and Policy sequences. Before neural evaluation, the evaluator converts each physical index $\widetilde i_G(a_j)$ to the canonical index $i_G(x,a_j)$ required by the network.
 
 After the neural batch returns, each newly computed record enters the active cache. The evaluator then assigns a cached or computed record to every request with the matching `PackedState`. For each requested leaf, tree expansion creates one outgoing edge for every $a_j$ and assigns $P_\theta(a_j\mid\phi_G(x))$ as that edge's prior. The scalar $V_\theta(\phi_G(x))$ is then backed up along the leaf's reserved path, so different trees can share a network record while retaining separate nodes, paths and search statistics.
 
@@ -850,7 +944,7 @@ After the submitted leaves complete their backups, another cycle begins only whe
 
 ### 5.9 Root Evaluation and Policy
 
-After the simulation phase, the root evaluation uses the network estimate when no simulation has completed and the empirical root mean otherwise:
+After the simulation phase, the root evaluation is determined by whether any simulation has completed:
 
 $$
 V_{\mathrm{root}}(x_0)=
@@ -878,14 +972,14 @@ $$
 
 The visit-based distribution $P_{\mathrm{root}}$ records the allocation produced by the fair visit floor and subsequent fixed-$\alpha$ root PUCT. It also supplies the base ordering used by the decision components in Section 5.10. Every legal root action retains positive weight because its original prior is included alongside its completed visits.
 
-When an output requires one probability for every index in $\mathcal I_G$, Gadus expands the compact root distribution into
+When an output requires one probability for every physical-board action index, Gadus expands the compact root distribution into
 
 $$
 P_{\mathrm{dense}}(i\mid s_0)=
 \begin{cases}
 P_{\mathrm{root}}(a\mid s_0),
-&i=i_G(a)\text{ for }a\in\mathcal A(x_0),\\
-0,&i\notin\lbrace i_G(a):a\in\mathcal A(x_0)\rbrace.
+&i=\widetilde i_G(a)\text{ for }a\in\mathcal A(x_0),\\
+0,&i\notin\lbrace \widetilde i_G(a):a\in\mathcal A(x_0)\rbrace.
 \end{cases}
 $$
 
