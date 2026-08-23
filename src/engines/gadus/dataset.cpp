@@ -30,6 +30,7 @@ constexpr double kMinValueWeight = 0.2;
 constexpr double kMaxValueWeight = 2.0;
 constexpr double kGradientEpsilon = 1e-12;
 constexpr double kConflictMargin = 1e-3;
+constexpr std::int64_t kOutputPriorSampleRows = 1 << 20;
 
 struct GradientBalanceStats {
 	double policy_squared_norm = 0.0;
@@ -688,8 +689,11 @@ SupervisedBatch SupervisedH5::read(const std::vector<std::int64_t> &requested,
 		H5Sclose(space);
 	}
 	auto *move_destination = move_tensor.data_ptr<std::int64_t>();
+	const auto *state_data = state_tensor.data_ptr<std::uint8_t>();
 	for (std::size_t index = 0; index < moves.size(); ++index) {
-		move_destination[index] = moves[index];
+		const bool white_to_move = state_data[index * kStatePlanes * 8 + 12 * 8] != 0;
+		move_destination[index] = canonical_action_index(
+			moves[index], white_to_move ? chess::Color::WHITE : chess::Color::BLACK);
 	}
 
 	return {
@@ -751,8 +755,12 @@ SupervisedBatch SupervisedH5::read_contiguous(std::int64_t begin, std::int64_t c
 		H5Sclose(space);
 	}
 	auto *move_destination = move_tensor.data_ptr<std::int64_t>();
-	for (std::size_t index = 0; index < moves.size(); ++index)
-		move_destination[index] = moves[index];
+	const auto *state_data = state_tensor.data_ptr<std::uint8_t>();
+	for (std::size_t index = 0; index < moves.size(); ++index) {
+		const bool white_to_move = state_data[index * kStatePlanes * 8 + 12 * 8] != 0;
+		move_destination[index] = canonical_action_index(
+			moves[index], white_to_move ? chess::Color::WHITE : chess::Color::BLACK);
+	}
 
 	return {
 		std::move(state_tensor),
@@ -916,6 +924,37 @@ double ValueWeightController::update(double policy_squared_norm,
 
 double ValueWeightController::value() const noexcept { return value_; }
 
+namespace {
+
+struct OutputTargetStatistics {
+	torch::Tensor action_counts;
+	double mean_value = 0.0;
+};
+
+OutputTargetStatistics collect_output_target_statistics(const SupervisedH5 &data) {
+	auto action_counts = torch::zeros({kActionSize}, torch::kInt64);
+	double value_sum = 0.0;
+	std::int64_t sampled_rows = 0;
+	const auto total_chunks =
+		(data.info().length + data.info().chunk_rows - 1) / data.info().chunk_rows;
+	const auto sampled_chunks = std::min(
+		total_chunks,
+		(kOutputPriorSampleRows + data.info().chunk_rows - 1) / data.info().chunk_rows);
+	for (std::int64_t sample = 0; sample < sampled_chunks; ++sample) {
+		const auto chunk_index =
+			((2 * sample + 1) * total_chunks) / (2 * sampled_chunks);
+		const auto begin = chunk_index * data.info().chunk_rows;
+		const auto count = std::min(data.info().chunk_rows, data.info().length - begin);
+		auto batch = data.read_contiguous(begin, count);
+		action_counts.add_(torch::bincount(batch.moves, {}, kActionSize));
+		value_sum += batch.values.sum().item<double>();
+		sampled_rows += count;
+	}
+	return {std::move(action_counts), value_sum / static_cast<double>(sampled_rows)};
+}
+
+} // namespace
+
 // Optimize a newly initialized model with the joint supervised objective.
 void train_supervised(const TrainOptions &options) {
 	torch::manual_seed(static_cast<std::int64_t>(options.seed));
@@ -924,6 +963,12 @@ void train_supervised(const TrainOptions &options) {
 	SupervisedH5 data(options.data);
 	ArchitectureInfo architecture{options.channels, options.blocks};
 	Model model(architecture.channels, architecture.blocks);
+	std::cout << "initializing output priors from stratified target sample" << std::endl;
+	const auto target_statistics = collect_output_target_statistics(data);
+	model->initialize_output_priors(target_statistics.action_counts,
+								 target_statistics.mean_value);
+	std::cout << "output priors ready: mean_value=" << target_statistics.mean_value
+			  << std::endl;
 	model->to(device);
 	for (auto &parameter : model->parameters()) {
 		if (parameter.dim() == 4) {

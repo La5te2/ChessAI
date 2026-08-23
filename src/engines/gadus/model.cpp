@@ -1,27 +1,58 @@
-// Implements Gadus's residual convolutional policy/value network.
+// Implements Gadus's canonical chess-structured policy/value network.
 
 #include "gadus/model.hpp"
 #include "gadus/precision.hpp"
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <numeric>
 #include <stdexcept>
 
 namespace gadus {
 
 namespace {
 
+using torch::indexing::Slice;
+
+constexpr int kGeometryBases = 8;
+constexpr int kMaximumRelationGroups = 8;
 constexpr int kPolicyChannels = 128;
 constexpr int kPolicyBlocks = 2;
 constexpr int kValueChannels = 48;
 constexpr int kValueHidden = 512;
+constexpr double kValueClipEpsilon = 1e-4;
 
-// Fold y = gamma * (conv(x) - mean) / sqrt(var + eps) + beta into one biased convolution.
+torch::Tensor build_relation_basis() {
+	auto basis = torch::zeros({kGeometryBases, 64, 64}, torch::kFloat32);
+	auto values = basis.accessor<float, 3>();
+	for (int q = 0; q < 64; ++q) {
+		const int qr = q / 8;
+		const int qf = q % 8;
+		for (int p = 0; p < 64; ++p) {
+			const int pr = p / 8;
+			const int pf = p % 8;
+			const int dr = std::abs(qr - pr);
+			const int df = std::abs(qf - pf);
+			values[0][q][p] = q == p ? 1.0F : 0.0F;
+			values[1][q][p] = std::max(dr, df) == 1 ? 1.0F : 0.0F;
+			values[2][q][p] = (dr == 1 && df == 2) || (dr == 2 && df == 1) ? 1.0F : 0.0F;
+			values[3][q][p] = qr == pr && q != p ? 1.0F : 0.0F;
+			values[4][q][p] = qf == pf && q != p ? 1.0F : 0.0F;
+			values[5][q][p] = qr - qf == pr - pf && q != p ? 1.0F : 0.0F;
+			values[6][q][p] = qr + qf == pr + pf && q != p ? 1.0F : 0.0F;
+			values[7][q][p] = 1.0F;
+		}
+	}
+	return basis / basis.sum(2, true).clamp_min(1.0F);
+}
+
 torch::nn::Conv2d fuse_conv_bn(const torch::nn::Conv2d &conv,
 							   const torch::nn::BatchNorm2d &norm) {
 	if (!conv || !norm || norm->is_training()) {
 		throw std::logic_error("Conv-BN fusion requires initialized evaluation modules");
 	}
 	auto options = torch::nn::Conv2dOptions(
-		conv->options.in_channels(), conv->options.out_channels(),
-		conv->options.kernel_size())
+		conv->options.in_channels(), conv->options.out_channels(), conv->options.kernel_size())
 			   .stride(conv->options.stride())
 			   .padding(conv->options.padding())
 			   .dilation(conv->options.dilation())
@@ -33,119 +64,209 @@ torch::nn::Conv2d fuse_conv_bn(const torch::nn::Conv2d &conv,
 
 	torch::NoGradGuard guard;
 	const auto scale = norm->weight / torch::sqrt(norm->running_var + norm->options.eps());
-	const auto source_bias = conv->bias.defined()
-							 ? conv->bias
-							 : torch::zeros_like(norm->running_mean);
+	const auto source_bias = conv->bias.defined() ? conv->bias : torch::zeros_like(norm->running_mean);
 	fused->weight.copy_(conv->weight * scale.reshape({-1, 1, 1, 1}));
 	fused->bias.copy_(norm->bias + (source_bias - norm->running_mean) * scale);
 	fused->eval();
 	return fused;
 }
 
+torch::nn::Conv2d fuse_local_branches(const torch::nn::Conv2d &conv3,
+									 const torch::nn::BatchNorm2d &norm3,
+									 const torch::nn::Conv2d &conv1,
+									 const torch::nn::BatchNorm2d &norm1,
+									 const torch::nn::BatchNorm2d &identity_norm) {
+	auto branch3 = fuse_conv_bn(conv3, norm3);
+	auto branch1 = fuse_conv_bn(conv1, norm1);
+	auto fused = torch::nn::Conv2d(torch::nn::Conv2dOptions(
+		conv3->options.in_channels(), conv3->options.out_channels(), 3).padding(1).bias(true));
+	fused->to(conv3->weight.device(), conv3->weight.scalar_type());
+
+	torch::NoGradGuard guard;
+	auto weight = branch3->weight.clone();
+	auto center = weight.index({Slice(), Slice(), 1, 1});
+	center.add_(branch1->weight.squeeze(3).squeeze(2));
+	const auto identity_scale = identity_norm->weight /
+		 torch::sqrt(identity_norm->running_var + identity_norm->options.eps());
+	center.add_(torch::diag(identity_scale));
+	const auto identity_bias = identity_norm->bias - identity_norm->running_mean * identity_scale;
+	fused->weight.copy_(weight);
+	fused->bias.copy_(branch3->bias + branch1->bias + identity_bias);
+	fused->eval();
+	return fused;
+}
+
 } // namespace
 
-// Construct F(x) as Conv-BN-ReLU-Conv-BN while leaving the skip path untouched.
-ResidualBlockImpl::ResidualBlockImpl(int channels) {
-	conv1 = torch::nn::Conv2d(
-		torch::nn::Conv2dOptions(channels, channels, 3).padding(1).bias(false));
-	norm1 = torch::nn::BatchNorm2d(channels);
-	conv2 = torch::nn::Conv2d(
-		torch::nn::Conv2dOptions(channels, channels, 3).padding(1).bias(false));
-	norm2 = torch::nn::BatchNorm2d(channels);
-	block = register_module(
-		"block", torch::nn::Sequential(conv1, norm1,
-										 torch::nn::ReLU(torch::nn::ReLUOptions(true)),
-										 conv2, norm2));
+SquareEmbeddingImpl::SquareEmbeddingImpl(int channels) {
+	values = register_parameter("values", torch::zeros({1, channels, 8, 8}));
 }
 
-// Residual addition gives y = ReLU(x + F(x)) and preserves the board tensor shape.
+torch::Tensor SquareEmbeddingImpl::forward(torch::Tensor x) { return x + values; }
+
+ResidualBlockImpl::ResidualBlockImpl(int channels, int sequence_depth)
+	: channels_(channels), groups_(std::gcd(channels, kMaximumRelationGroups)),
+	  group_width_(channels / groups_) {
+	if (channels <= 0 || sequence_depth <= 0) {
+		throw std::invalid_argument("Gadus residual dimensions must be positive");
+	}
+
+	down_conv = register_module("down_conv", torch::nn::Conv2d(
+		torch::nn::Conv2dOptions(channels_, channels_, 1).bias(false)));
+	down_norm = register_module("down_norm", torch::nn::BatchNorm2d(channels_));
+	local_conv3 = register_module("local_conv3", torch::nn::Conv2d(
+		torch::nn::Conv2dOptions(channels_, channels_, 3).padding(1).bias(false)));
+	local_norm3 = register_module("local_norm3", torch::nn::BatchNorm2d(channels_));
+	local_conv1 = register_module("local_conv1", torch::nn::Conv2d(
+		torch::nn::Conv2dOptions(channels_, channels_, 1).bias(false)));
+	local_norm1 = register_module("local_norm1", torch::nn::BatchNorm2d(channels_));
+	local_identity_norm = register_module("local_identity_norm", torch::nn::BatchNorm2d(channels_));
+	relation_norm = register_module(
+		"relation_norm", torch::nn::BatchNorm2d(
+			torch::nn::BatchNorm2dOptions(channels_).affine(false)));
+	up_conv = register_module("up_conv", torch::nn::Conv2d(
+		torch::nn::Conv2dOptions(channels_, channels_, 1).bias(false)));
+	up_norm = register_module("up_norm", torch::nn::BatchNorm2d(channels_));
+
+	relation_basis = register_buffer("relation_basis", build_relation_basis());
+	relation_coefficients = register_parameter(
+		"relation_coefficients", torch::zeros({groups_, kGeometryBases}));
+	relation_residual = register_parameter(
+		"relation_residual", torch::zeros({groups_, 64, 64}));
+	path_balance = register_parameter("path_balance", torch::ones({channels_}));
+
+	torch::NoGradGuard guard;
+	for (int group = 0; group < groups_; ++group) {
+		relation_coefficients.index_put_({group, group % kGeometryBases}, 1.0F);
+	}
+	const double local_scale = 1.0 / std::sqrt(3.0);
+	for (const auto &norm : {local_norm3, local_norm1, local_identity_norm}) {
+		norm->weight.fill_(local_scale);
+		norm->bias.zero_();
+	}
+	up_norm->weight.fill_(1.0 / std::sqrt(static_cast<double>(sequence_depth)));
+	up_norm->bias.zero_();
+}
+
+torch::Tensor ResidualBlockImpl::relation_matrices() const {
+	return torch::einsum("gh,hqp->gqp", {relation_coefficients, relation_basis}) +
+		   relation_residual;
+}
+
+int ResidualBlockImpl::relation_groups() const noexcept { return groups_; }
+
 torch::Tensor ResidualBlockImpl::forward(torch::Tensor x) {
-	return torch::relu(x + block->forward(x));
+	auto reduced = down_conv->forward(x);
+	if (!inference_fused_) {
+		reduced = down_norm->forward(reduced);
+	}
+	reduced = torch::relu(reduced);
+
+	torch::Tensor local;
+	if (inference_fused_) {
+		local = fused_local->forward(reduced);
+	} else {
+		local = local_norm3->forward(local_conv3->forward(reduced)) +
+				local_norm1->forward(local_conv1->forward(reduced)) +
+				local_identity_norm->forward(reduced);
+	}
+
+	const auto batch = reduced.size(0);
+	auto grouped = reduced.view({batch, groups_, group_width_, 64})
+				   .permute({0, 1, 3, 2});
+	const auto matrices = inference_fused_ ? fused_relation : relation_matrices();
+	auto related = torch::matmul(matrices.unsqueeze(0), grouped)
+				   .permute({0, 1, 3, 2})
+				   .contiguous()
+				   .view({batch, channels_, 8, 8});
+	related = relation_norm->forward(related);
+
+	auto balance = path_balance.view({1, channels_, 1, 1});
+	auto local_scale = torch::rsqrt(1.0 + balance.square());
+	auto combined = torch::relu(local_scale * local + balance * local_scale * related);
+	auto update = up_conv->forward(combined);
+	if (!inference_fused_) {
+		update = up_norm->forward(update);
+	}
+	return torch::relu(x + update);
 }
 
-// Remove four normalization tensors and two normalization kernels from inference.
 void ResidualBlockImpl::fuse_for_inference() {
 	if (inference_fused_) {
 		return;
 	}
-	conv1 = fuse_conv_bn(conv1, norm1);
-	conv2 = fuse_conv_bn(conv2, norm2);
-	block = replace_module(
-		"block", torch::nn::Sequential(conv1,
-										 torch::nn::ReLU(torch::nn::ReLUOptions(true)), conv2));
-	norm1 = nullptr;
-	norm2 = nullptr;
+	if (is_training()) {
+		throw std::logic_error("Gadus residual block must be in evaluation mode before fusion");
+	}
+	down_conv = replace_module("down_conv", fuse_conv_bn(down_conv, down_norm));
+	up_conv = replace_module("up_conv", fuse_conv_bn(up_conv, up_norm));
+	fused_relation = register_buffer("fused_relation", relation_matrices().detach().clone());
+	fused_local = register_module(
+		"fused_local", fuse_local_branches(local_conv3, local_norm3, local_conv1,
+										 local_norm1, local_identity_norm));
 	inference_fused_ = true;
 }
 
-// Build one shared residual trunk and separate policy/value readouts.
 ModelImpl::ModelImpl(int channels, int blocks) : channels_(channels), blocks_(blocks) {
+	if (channels_ <= 0 || blocks_ <= 0) {
+		throw std::invalid_argument("Gadus channels and blocks must be positive");
+	}
 	backbone = register_module("backbone", torch::nn::Sequential());
 	backbone_conv = torch::nn::Conv2d(
-		torch::nn::Conv2dOptions(kStatePlanes, channels_, 3).padding(1).bias(false));
+		torch::nn::Conv2dOptions(kInputPlanes, channels_, 3).padding(1).bias(false));
 	backbone_norm = torch::nn::BatchNorm2d(channels_);
+	square_embedding = SquareEmbedding(channels_);
 	backbone->push_back(backbone_conv);
 	backbone->push_back(backbone_norm);
 	backbone->push_back(torch::nn::ReLU(torch::nn::ReLUOptions(true)));
+	backbone->push_back(square_embedding);
 	for (int index = 0; index < blocks_; ++index) {
-		backbone->push_back(ResidualBlock(channels_));
+		backbone->push_back(ResidualBlock(channels_, blocks_));
 	}
 
-	policy_conv =
-		torch::nn::Conv2d(torch::nn::Conv2dOptions(channels_, kPolicyChannels, 1).bias(false));
-	policy_norm = torch::nn::BatchNorm2d(kPolicyChannels);
-	register_module("policy_conv", policy_conv);
-	register_module("policy_norm", policy_norm);
+	policy_conv = register_module(
+		"policy_conv", torch::nn::Conv2d(
+			torch::nn::Conv2dOptions(channels_, kPolicyChannels, 1).bias(false)));
+	policy_norm = register_module("policy_norm", torch::nn::BatchNorm2d(kPolicyChannels));
 	policy_blocks = register_module("policy_blocks", torch::nn::Sequential());
 	for (int index = 0; index < kPolicyBlocks; ++index) {
-		policy_blocks->push_back(ResidualBlock(kPolicyChannels));
+		policy_blocks->push_back(ResidualBlock(kPolicyChannels, kPolicyBlocks));
 	}
 	policy_output = register_module(
-		"policy_output",
-		torch::nn::Conv2d(torch::nn::Conv2dOptions(kPolicyChannels, kPolicyPlanes, 1)
-							  .bias(false)));
-	policy_position = register_parameter(
-		"policy_position", torch::empty({1, kPolicyChannels, 8, 8}));
+		"policy_output", torch::nn::Conv2d(
+			torch::nn::Conv2dOptions(kPolicyChannels, kPolicyPlanes, 1).bias(false)));
 	policy_action_bias = register_parameter(
 		"policy_action_bias", torch::zeros({1, kPolicyPlanes, 8, 8}));
-	torch::nn::init::normal_(policy_position, 0.0, 0.02);
 
-	value_block = ResidualBlock(channels_);
-	value_conv =
-		torch::nn::Conv2d(torch::nn::Conv2dOptions(channels_, kValueChannels, 1).bias(false));
+	value_block = ResidualBlock(channels_, 1);
+	value_conv = torch::nn::Conv2d(
+		torch::nn::Conv2dOptions(channels_, kValueChannels, 1).bias(false));
 	value_norm = torch::nn::BatchNorm2d(kValueChannels);
 	value_hidden = torch::nn::Linear(kValueChannels * 8 * 8, kValueHidden);
 	value_output = torch::nn::Linear(kValueHidden, 1);
-	{
-		torch::NoGradGuard guard;
-		value_output->weight.zero_();
-		value_output->bias.zero_();
-	}
 	value_head = register_module(
 		"value_head", torch::nn::Sequential(
-						  value_block, value_conv, value_norm,
-						  torch::nn::ReLU(torch::nn::ReLUOptions(true)),
-						  torch::nn::Flatten(), value_hidden,
-						  torch::nn::ReLU(torch::nn::ReLUOptions(true)), value_output,
-						  torch::nn::Tanh()));
+			value_block, value_conv, value_norm,
+			torch::nn::ReLU(torch::nn::ReLUOptions(true)), torch::nn::Flatten(),
+			value_hidden, torch::nn::ReLU(torch::nn::ReLUOptions(true)), value_output,
+			torch::nn::Tanh()));
 }
 
-// Evaluate the shared features once, then return action logits and bounded V(s).
 std::pair<torch::Tensor, torch::Tensor> ModelImpl::forward(torch::Tensor x) {
+	if (x.dim() != 4 || x.size(1) != kInputPlanes || x.size(2) != 8 || x.size(3) != 8) {
+		throw std::invalid_argument("Gadus input must have shape [N,17,8,8]");
+	}
 	auto features = backbone->forward(x);
 	return {policy_logits(features), value(features)};
 }
 
-// Convert source-major action indices q * 73 + p to plane-major NCHW offsets p * 64 + q.
 std::pair<torch::Tensor, torch::Tensor>
 ModelImpl::forward_legal(torch::Tensor x, torch::Tensor legal_indices) {
 	if (legal_indices.dim() != 2 || legal_indices.size(0) != x.size(0)) {
-		throw std::invalid_argument(
-			"legal_indices must have shape [batch, legal_width]");
+		throw std::invalid_argument("legal_indices must have shape [batch, legal_width]");
 	}
 	if (legal_indices.scalar_type() != torch::kInt64 || legal_indices.device() != x.device()) {
-		throw std::invalid_argument(
-			"legal_indices must be int64 and reside on the input device");
+		throw std::invalid_argument("legal_indices must be int64 and reside on the input device");
 	}
 
 	auto features = backbone->forward(x);
@@ -158,8 +279,7 @@ ModelImpl::forward_legal(torch::Tensor x, torch::Tensor legal_indices) {
 									  {-1, -1, kPolicyChannels}));
 	auto selected_weights = policy_output->weight.flatten(1)
 							.index_select(0, patterns.reshape({-1}))
-							.view({legal_indices.size(0), legal_indices.size(1),
-								   kPolicyChannels});
+							.view({legal_indices.size(0), legal_indices.size(1), kPolicyChannels});
 	auto legal_logits = (source_features * selected_weights).sum(2);
 	auto plane_offsets = patterns * 64 + source_squares;
 	legal_logits = legal_logits + policy_action_bias.flatten(1)
@@ -168,34 +288,51 @@ ModelImpl::forward_legal(torch::Tensor x, torch::Tensor legal_indices) {
 	return {legal_logits, value(features)};
 }
 
-// Keep the bounded Value readout in FP32 even when the shared trunk uses CUDA BF16.
+void ModelImpl::initialize_output_priors(const torch::Tensor &action_counts, double mean_value,
+									 double smoothing_count, double output_scale) {
+	if (action_counts.numel() != kActionSize || smoothing_count <= 0.0 ||
+		output_scale <= 0.0 || output_scale >= 1.0 || !std::isfinite(mean_value)) {
+		throw std::invalid_argument("invalid Gadus output-prior statistics");
+	}
+	torch::NoGradGuard guard;
+	auto counts = action_counts.to(torch::kCPU, torch::kFloat64).reshape({kActionSize});
+	auto prior = (counts + smoothing_count) /
+				 (counts.sum().item<double>() + smoothing_count * kActionSize);
+	auto plane_bias = prior.log()
+					  .view({8, 8, kPolicyPlanes})
+					  .permute({2, 0, 1})
+					  .unsqueeze(0)
+					  .to(policy_action_bias.options());
+	policy_action_bias.copy_(plane_bias);
+	policy_output->weight.mul_(output_scale);
+	const double clipped = std::clamp(mean_value, -1.0 + kValueClipEpsilon,
+									  1.0 - kValueClipEpsilon);
+	value_output->weight.mul_(output_scale);
+	value_output->bias.fill_(std::atanh(clipped));
+}
+
 torch::Tensor ModelImpl::value(torch::Tensor features) {
 	AutocastGuard fp32(ComputePrecision::Fp32, features.device());
 	return value_head->forward(features.to(torch::kFloat32));
 }
 
-// Produce position-aware Policy features before the final action-pattern projection.
 torch::Tensor ModelImpl::policy_features(torch::Tensor features) {
-	auto policy_features = policy_conv->forward(features);
+	auto result = policy_conv->forward(features);
 	if (!inference_fused_) {
-		policy_features = policy_norm->forward(policy_features);
+		result = policy_norm->forward(result);
 	}
-	policy_features = torch::relu(policy_features + policy_position);
-	return policy_blocks->forward(policy_features);
+	return policy_blocks->forward(torch::relu(result));
 }
 
-// Produce one action-pattern channel per source square in NCHW board order.
 torch::Tensor ModelImpl::policy_planes(torch::Tensor features) {
 	return policy_output->forward(policy_features(features)) + policy_action_bias;
 }
 
-// Reorder [pattern, rank, file] to the source-major action index 73 * square + pattern.
 torch::Tensor ModelImpl::policy_logits(torch::Tensor features) {
 	auto planes = policy_planes(features);
 	return planes.permute({0, 2, 3, 1}).contiguous().view({planes.size(0), kActionSize});
 }
 
-// Rebuild only the in-memory inference graph; checkpoint construction and training stay unfused.
 void ModelImpl::fuse_for_inference() {
 	if (inference_fused_) {
 		return;
@@ -206,17 +343,16 @@ void ModelImpl::fuse_for_inference() {
 
 	backbone_conv = fuse_conv_bn(backbone_conv, backbone_norm);
 	auto fused_backbone = torch::nn::Sequential(
-		backbone_conv, torch::nn::ReLU(torch::nn::ReLUOptions(true)));
+		backbone_conv, torch::nn::ReLU(torch::nn::ReLUOptions(true)), square_embedding);
 	for (int index = 0; index < blocks_; ++index) {
-		auto residual = backbone->ptr<ResidualBlockImpl>(static_cast<std::size_t>(index + 3));
+		auto residual = backbone->ptr<ResidualBlockImpl>(static_cast<std::size_t>(index + 4));
 		residual->fuse_for_inference();
 		fused_backbone->push_back(ResidualBlock(residual));
 	}
 	backbone = replace_module("backbone", fused_backbone);
 	backbone_norm = nullptr;
 
-	policy_conv = fuse_conv_bn(policy_conv, policy_norm);
-	replace_module("policy_conv", policy_conv);
+	policy_conv = replace_module("policy_conv", fuse_conv_bn(policy_conv, policy_norm));
 	policy_norm = nullptr;
 	for (int index = 0; index < kPolicyBlocks; ++index) {
 		policy_blocks->ptr<ResidualBlockImpl>(static_cast<std::size_t>(index))
@@ -227,21 +363,16 @@ void ModelImpl::fuse_for_inference() {
 	value_conv = fuse_conv_bn(value_conv, value_norm);
 	value_head = replace_module(
 		"value_head", torch::nn::Sequential(
-						  value_block, value_conv,
-						  torch::nn::ReLU(torch::nn::ReLUOptions(true)),
-						  torch::nn::Flatten(), value_hidden,
-						  torch::nn::ReLU(torch::nn::ReLUOptions(true)), value_output,
-						  torch::nn::Tanh()));
+			value_block, value_conv, torch::nn::ReLU(torch::nn::ReLUOptions(true)),
+			torch::nn::Flatten(), value_hidden,
+			torch::nn::ReLU(torch::nn::ReLUOptions(true)), value_output, torch::nn::Tanh()));
 	value_norm = nullptr;
 	inference_fused_ = true;
 }
 
-// Expose the checkpoint-defining channel width.
 int ModelImpl::channels() const noexcept { return channels_; }
-// Expose the checkpoint-defining residual depth.
 int ModelImpl::blocks() const noexcept { return blocks_; }
 
-// Sum tensor element counts rather than serialized bytes or optimizer state.
 std::int64_t parameter_count(const Model &model) {
 	std::int64_t count = 0;
 	for (const auto &parameter : model->parameters()) {

@@ -147,9 +147,9 @@ build/gadus/train \
 	--out models/gadus/gadus.pth \
 	--channels 128 \
 	--blocks 12 \
-	--epochs 10 \
+	--epochs 3 \
 	--batch-size 512 \
-	--max-steps 500000 \
+	--max-steps 0 \
 	--lr 0.001 \
 	--weight-decay 0.0001 \
 	--value-weight 0.5 \

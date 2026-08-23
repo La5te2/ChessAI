@@ -1,6 +1,6 @@
 #pragma once
 
-// Gadus chess rules, 18-plane state codec, AlphaZero move codec, and opening utilities.
+// Gadus chess rules, persistent state codec, canonical network input, and move codec.
 
 #include <array>
 #include <cstdint>
@@ -14,6 +14,7 @@ namespace gadus {
 
 inline constexpr int kBoardSquares = 64;
 inline constexpr int kStatePlanes = 18;
+inline constexpr int kInputPlanes = 17;
 inline constexpr int kPolicyPlanes = 73;
 inline constexpr int kActionSize = kBoardSquares * kPolicyPlanes;
 inline constexpr const char *kArchType = "gadus";
@@ -27,6 +28,8 @@ using PackedState = std::array<std::uint8_t, kStatePlanes * 8>;
 std::vector<chess::Move> legal_moves(const chess::Board &board);
 /// Maps a move to the Gadus AlphaZero 64x73 action space.
 int move_to_index(const chess::Move &move);
+/// Reflects a stored action index into the side-to-move canonical coordinates.
+int canonical_action_index(int index, chess::Color side_to_move);
 /// Resolves an action index against a position and rejects illegal or ambiguous actions.
 chess::Move index_to_move(int index, const chess::Board &board);
 /// Formats a move as standard UCI coordinate notation.
@@ -36,7 +39,7 @@ std::string move_san(const chess::Board &board, const chess::Move &move);
 
 /// Bit-packs the Gadus 18 binary board planes for compact HDF5 storage.
 PackedState encode_state(const chess::Board &board);
-/// Expands packed rows into a float tensor shaped [count, 18, 8, 8].
+/// Expands packed rows into canonical float tensors shaped [count, 17, 8, 8].
 torch::Tensor decode_states(const std::uint8_t *packed, std::int64_t count,
 							bool pinned_memory = false);
 /// Transfers packed rows first and expands their bits on the destination device.

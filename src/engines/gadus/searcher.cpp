@@ -498,9 +498,12 @@ struct Searcher::Impl {
 		auto index_rows = legal_indices.accessor<std::int64_t, 2>();
 		auto mask_rows = legal_mask.accessor<bool, 2>();
 		for (std::size_t row = 0; row < pending.size(); ++row) {
+			const auto side_to_move = pending_states[row][12 * 8] != 0
+				? chess::Color::WHITE
+				: chess::Color::BLACK;
 			for (std::size_t column = 0; column < pending[row].legal_indices.size(); ++column) {
 				index_rows[static_cast<std::int64_t>(row)][static_cast<std::int64_t>(column)] =
-					pending[row].legal_indices[column];
+					canonical_action_index(pending[row].legal_indices[column], side_to_move);
 				mask_rows[static_cast<std::int64_t>(row)][static_cast<std::int64_t>(column)] = true;
 			}
 		}

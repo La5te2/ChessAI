@@ -11,7 +11,7 @@ namespace gadus {
 
 struct ArchitectureInfo {
 	int channels = 128;
-	int blocks = 10;
+	int blocks = 12;
 };
 
 /// Saves model parameters plus the minimal architecture descriptor using atomic replacement.

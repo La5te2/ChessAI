@@ -23,6 +23,28 @@ int piece_plane(const chess::Piece &piece) {
 	return type;
 }
 
+// Convert expanded persistent planes to friendly/opposing canonical coordinates.
+torch::Tensor canonicalize_expanded(torch::Tensor expanded) {
+	auto white_to_move = expanded.slice(1, 12, 13).gt(0.5F);
+	auto reflected = expanded.flip({2});
+	auto friendly = torch::where(white_to_move, expanded.slice(1, 0, 6),
+							 reflected.slice(1, 6, 12));
+	auto opposing = torch::where(white_to_move, expanded.slice(1, 6, 12),
+							 reflected.slice(1, 0, 6));
+	auto friendly_king = torch::where(white_to_move, expanded.slice(1, 13, 14),
+								  reflected.slice(1, 15, 16));
+	auto friendly_queen = torch::where(white_to_move, expanded.slice(1, 14, 15),
+								   reflected.slice(1, 16, 17));
+	auto opposing_king = torch::where(white_to_move, expanded.slice(1, 15, 16),
+								 reflected.slice(1, 13, 14));
+	auto opposing_queen = torch::where(white_to_move, expanded.slice(1, 16, 17),
+								  reflected.slice(1, 14, 15));
+	auto en_passant = torch::where(white_to_move, expanded.slice(1, 17, 18),
+								 reflected.slice(1, 17, 18));
+	return torch::cat({friendly, opposing, friendly_king, friendly_queen,
+					   opposing_king, opposing_queen, en_passant}, 1);
+}
+
 } // namespace
 
 // Delegate legal move generation to chess-library and return an owning vector.
@@ -103,6 +125,30 @@ int move_to_index(const chess::Move &move) {
 	throw std::invalid_argument("cannot encode move: " + move_uci(move));
 }
 
+// Reflect the source rank and every rank-sensitive motion pattern for Black.
+int canonical_action_index(int index, chess::Color side_to_move) {
+	if (index < 0 || index >= kActionSize) {
+		throw std::out_of_range("Gadus action index");
+	}
+	if (side_to_move == chess::Color::WHITE) {
+		return index;
+	}
+
+	const int source = index / kPolicyPlanes;
+	const int pattern = index % kPolicyPlanes;
+	const int canonical_source = (7 - source / 8) * 8 + source % 8;
+	int canonical_pattern = pattern;
+	if (pattern < 56) {
+		constexpr std::array<int, 8> reflected_directions{{5, 6, 7, 3, 4, 0, 1, 2}};
+		const int direction = pattern / 7;
+		canonical_pattern = reflected_directions[direction] * 7 + pattern % 7;
+	} else if (pattern < 64) {
+		constexpr std::array<int, 8> reflected_knights{{6, 7, 4, 5, 2, 3, 0, 1}};
+		canonical_pattern = 56 + reflected_knights[pattern - 56];
+	}
+	return canonical_source * kPolicyPlanes + canonical_pattern;
+}
+
 // Decode by legal-move round-trip, which also validates position-dependent legality.
 chess::Move index_to_move(int index, const chess::Board &board) {
 	if (index < 0 || index >= kActionSize) {
@@ -166,7 +212,7 @@ PackedState encode_state(const chess::Board &board) {
 	return packed;
 }
 
-// Expand packed rank bits to the floating-point NCHW tensor consumed by convolutions.
+// Expand persistent planes and convert each row to side-to-move canonical coordinates.
 torch::Tensor decode_states(const std::uint8_t *packed, std::int64_t count,
 							bool pinned_memory) {
 	static const auto byte_planes = [] {
@@ -182,15 +228,30 @@ torch::Tensor decode_states(const std::uint8_t *packed, std::int64_t count,
 	if (pinned_memory) {
 		options = options.pinned_memory(true);
 	}
-	auto output = torch::empty({count, kStatePlanes, 8, 8}, options);
+	auto output = torch::empty({count, kInputPlanes, 8, 8}, options);
 	auto *destination = output.data_ptr<float>();
 	for (std::int64_t item = 0; item < count; ++item) {
 		const auto *state = packed + item * kStatePlanes * 8;
-		for (int plane = 0; plane < kStatePlanes; ++plane) {
+		const bool white_to_move = state[12 * 8] != 0;
+		for (int plane = 0; plane < kInputPlanes; ++plane) {
 			for (int rank = 0; rank < 8; ++rank) {
-				const auto byte = state[plane * 8 + rank];
+				int source_plane = 0;
+				if (plane < 6) {
+					source_plane = white_to_move ? plane : plane + 6;
+				} else if (plane < 12) {
+					source_plane = white_to_move ? plane : plane - 6;
+				} else if (plane < 16) {
+					constexpr std::array<int, 4> white_castling{{13, 14, 15, 16}};
+					constexpr std::array<int, 4> black_castling{{15, 16, 13, 14}};
+					source_plane = white_to_move ? white_castling[plane - 12]
+										 : black_castling[plane - 12];
+				} else {
+					source_plane = 17;
+				}
+				const int source_rank = white_to_move ? rank : 7 - rank;
+				const auto byte = state[source_plane * 8 + source_rank];
 				const auto offset =
-					(static_cast<std::size_t>(item) * kStatePlanes * 8 * 8) +
+					(static_cast<std::size_t>(item) * kInputPlanes * 8 * 8) +
 					(static_cast<std::size_t>(plane) * 8 * 8) +
 					(static_cast<std::size_t>(rank) * 8);
 				std::memcpy(destination + offset, byte_planes[byte].data(), 8 * sizeof(float));
@@ -216,9 +277,10 @@ torch::Tensor decode_states_device(const torch::Tensor &packed,
 	auto masks = torch::tensor(
 		{128, 64, 32, 16, 8, 4, 2, 1},
 		torch::TensorOptions().dtype(torch::kUInt8).device(device));
-	return torch::bitwise_and(device_packed.unsqueeze(-1), masks)
+	auto expanded = torch::bitwise_and(device_packed.unsqueeze(-1), masks)
 		.ne(0)
 		.to(torch::kFloat32);
+	return canonicalize_expanded(expanded);
 }
 
 // Keep the compact 144-byte representation across PCIe, then expand its bits in parallel.

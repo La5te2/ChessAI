@@ -103,7 +103,7 @@ int main() {
 					batch.states.size(1) == gadus::kStatePlanes && batch.states.size(2) == 8,
 					"Gadus HDF5 reader did not retain packed state rows");
 			const auto decoded = gadus::decode_states_device(batch.states, torch::kCPU);
-			require(decoded.sizes() == torch::IntArrayRef({6, gadus::kStatePlanes, 8, 8}),
+			require(decoded.sizes() == torch::IntArrayRef({6, gadus::kInputPlanes, 8, 8}),
 					"Gadus packed tensor decoder produced the wrong shape");
 			require(std::abs(batch.values.index({0}).item<float>()) < 1e-6F &&
 						std::abs(batch.values.index({1}).item<float>()) < 1e-6F &&
@@ -196,6 +196,18 @@ int main() {
 		for (int rank = 0; rank < 8; ++rank) {
 			require(packed[12 * 8 + rank] == 0xFF, "side-to-move state plane mismatch");
 		}
+		chess::Board canonical_white("4k2K/8/8/3p4/4P3/8/8/8 w - - 0 1");
+		chess::Board canonical_black("8/8/8/4p3/3P4/8/8/4K2k b - - 0 1");
+		require(torch::equal(gadus::encode_boards({canonical_white}),
+						 gadus::encode_boards({canonical_black})),
+				"side-to-move canonicalization changed an equivalent position");
+		const auto white_step = chess::uci::uciToMove(canonical_white, "e4e5");
+		const auto black_step = chess::uci::uciToMove(canonical_black, "e5e4");
+		require(gadus::canonical_action_index(gadus::move_to_index(white_step),
+										chess::Color::WHITE) ==
+					gadus::canonical_action_index(gadus::move_to_index(black_step),
+										chess::Color::BLACK),
+				"side-to-move canonicalization changed an equivalent action");
 
 		require_move_codec(board);
 		chess::Board promotion("8/P7/8/8/8/8/8/k6K w - - 0 1");
@@ -254,6 +266,13 @@ int main() {
 				"threefold-repetition termination mismatch");
 
 		// The action-plane layout must flatten as source square * 73 + motion pattern.
+		auto relation_block = gadus::ResidualBlock(8, 1);
+		const auto initial_relations = relation_block->relation_matrices();
+		require(initial_relations.sizes() == torch::IntArrayRef({8, 64, 64}),
+				"relation initialization produced the wrong shape");
+		require(torch::allclose(initial_relations.index({0}), torch::eye(64), 1e-6, 1e-7),
+				"identity geometry did not initialize the first relation group");
+
 		auto layout_model = gadus::Model(8, 1);
 		{
 			torch::NoGradGuard guard;
@@ -287,8 +306,6 @@ int main() {
 		require(torch::isfinite(value).all().item<bool>(), "value contains a non-finite value");
 		require(value.abs().max().item<float>() <= 1.000001F, "value range mismatch");
 		require(value.scalar_type() == torch::kFloat32, "Value output is not FP32");
-		require(torch::allclose(value, torch::zeros_like(value)),
-				"newly initialized Value output is not neutral");
 		(policy.mean() + value.mean()).backward();
 		require_finite_gradients(model);
 
@@ -311,6 +328,23 @@ int main() {
 				"legal-action forward changed a requested policy logit");
 		require(torch::allclose(legal_output.second, reference.second),
 				"legal-action forward changed Value");
+		chess::Board black_position;
+		black_position.makeMove(chess::uci::uciToMove(black_position, "e2e4"));
+		const auto black_moves = gadus::legal_moves(black_position);
+		auto black_indices = torch::empty(
+			{1, static_cast<std::int64_t>(black_moves.size())},
+			torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+		auto black_row = black_indices.accessor<std::int64_t, 2>();
+		for (std::size_t index = 0; index < black_moves.size(); ++index) {
+			black_row[0][static_cast<std::int64_t>(index)] = gadus::canonical_action_index(
+				gadus::move_to_index(black_moves[index]), chess::Color::BLACK);
+		}
+		auto black_reference = model->forward(gadus::encode_boards({black_position}));
+		auto black_legal = model->forward_legal(
+			gadus::encode_boards({black_position}), black_indices);
+		require(torch::allclose(black_legal.first,
+							 black_reference.first.gather(1, black_indices), 1e-5, 1e-6),
+				"black legal-action projection used noncanonical indices");
 		gadus::save_checkpoint_atomic(checkpoint, model, {8, 1});
 		gadus::ArchitectureInfo info;
 		auto loaded = gadus::load_checkpoint(checkpoint, torch::Device(torch::kCPU), &info);
