@@ -146,13 +146,13 @@ build/gadus/train \
 	--data data/lichess.gadus.h5 \
 	--out models/gadus/gadus.pth \
 	--channels 128 \
-	--blocks 10 \
+	--blocks 12 \
 	--epochs 3 \
 	--batch-size 512 \
 	--max-steps 0 \
 	--lr 0.001 \
 	--weight-decay 0.0001 \
-	--value-weight 1 \
+	--value-weight 0.5 \
 	--save-every 5000 \
 	--device cuda \
 	--precision bf16 \

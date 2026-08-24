@@ -246,7 +246,7 @@ h_j+
 \qquad 0\leq j<B.
 $$
 
-The fixed relation basis is shared by all blocks, while $\alpha_{j,g,r}$, $\Delta A_{j,g}$ and $\lambda_j$ belong to block $j$. Initially, $\alpha_{j,g,r}=1$ when $r=g$ and $0$ otherwise, so relation group $g$ begins with basis relation $\widehat B_g$. Every $\Delta A_{j,g}$ begins at zero, and every component of $\lambda_j$ begins at one. The three local branch scales begin at $1/\sqrt3$. For a residual sequence of length $D$, the scale of the final batch normalization in each block begins at $1/\sqrt D$; the shared trunk uses $D=B$, while the Policy and Value sequences defined below each use $D=1$. The square embedding begins at zero. The relation basis remains fixed, while the relation coefficients, residual matrices, path-balance vectors, normalization scales and square embedding are trainable.
+The fixed relation basis is shared by all blocks, while $\alpha_{j,g,r}$, $\Delta A_{j,g}$ and $\lambda_j$ belong to block $j$. Initially, $\alpha_{j,g,r}=1$ when $r=g$ and $0$ otherwise, so relation group $g$ begins with basis relation $\widehat B_g$. Every $\Delta A_{j,g}$ begins at zero, and every component of $\lambda_j$ begins at one. The three local branch scales begin at $1/\sqrt3$. For a residual sequence of length $D$, the scale of the final batch normalization in each block begins at $1/\sqrt D$. The shared trunk uses $D=B$, the Policy sequence uses $D=2$ and the Value sequence uses $D=1$. The square embedding begins at zero. The relation basis remains fixed, while the relation coefficients, residual matrices, path-balance vectors, normalization scales and square embedding are trainable.
 
 After the $B$ blocks, $h_B\in\mathbb R^{C\times8\times8}$ is the shared representation supplied to the Policy and Value heads defined below.
 
@@ -255,83 +255,50 @@ After the $B$ blocks, $h_B\in\mathbb R^{C\times8\times8}$ is the shared represen
 The Policy head assigns one unnormalized score, called a logit, to every canonical action index in $\mathcal I_G$. It begins with a bias-free $1\times1$ convolution from $C$ channels to 128 channels, followed by batch normalization and ReLU:
 
 $$
-p_0=\mathrm{ReLU}\left(
+u_0=\mathrm{ReLU}\left(
 \mathrm{BN}_P\left(
 \mathrm{Conv}^{C\rightarrow128}_{1\times1,P}(h_B)
 \right)
 \right).
 $$
 
-One Policy-specific chess-structured residual block applies the transformation from Section 3.1 with independent parameters and produces
+The Policy head passes $u_0$ through two chess-structured residual blocks in sequence, each following the construction in Section 3.1 with its own parameters. Let $F_{P,j}$ denote the input-output map of block $j$. The block sequence satisfies
 
 $$
-p_1=F_P(p_0),
-\qquad p_1\in\mathbb R^{128\times8\times8}.
+u_{j+1}=F_{P,j}(u_j),
+\qquad 0\leq j<2.
 $$
 
-The Policy readout represents each action in a 64-dimensional space. For canonical source square $q$, let $p_1(q)\in\mathbb R^{128}$ be the corresponding square feature. A source projection and a projection of the complete Policy tensor give
+A bias-free $1\times1$ convolution maps $u_2$ to 73 action-pattern planes. The learned tensor $B_P\in\mathbb R^{73\times8\times8}$ supplies a separate bias for every combination of motion pattern and source square, giving
 
 $$
-u_q=W_Sp_1(q),
-\qquad
-c_P=U_P\mathrm{vec}(p_1)+b_P,
+L_\theta(s)=
+\mathrm{Conv}^{128\rightarrow73}_{1\times1,\mathrm{out}}(u_2)+B_P
+\in\mathbb R^{73\times8\times8}.
 $$
 
-where $W_S\in\mathbb R^{64\times128}$, $U_P\in\mathbb R^{64\times8192}$ and $b_P\in\mathbb R^{64}$. Their normalized sum defines the context of source square $q$:
+Let $(r,f)$ be the canonical coordinates of a source square and let $q=8r+f$ be its square index. For motion pattern $p$, the component of $L_\theta(s)$ at channel $p$, rank $r$ and file $f$ is the logit assigned to action index $73q+p$:
 
 $$
-z_q=\mathrm{ReLU}\left(\frac{u_q+c_P}{\sqrt2}\right)
-\in\mathbb R^{64}.
+\ell_\theta(s,73q+p)=L_\theta(s)_{p,r,f}.
 $$
 
-For action index $i=73q+p$, let $m_p\in\mathbb R^{64}$ be the vector shared by actions with motion pattern $p$, let $\Delta a_i\in\mathbb R^{64}$ be the action-specific correction and let $b_i\in\mathbb R$ be its bias. The action vector and Policy logit are
+The Value head estimates the expected game result from the perspective of the player to move. It first passes $h_B$ through a Value-specific chess-structured residual block whose parameters are separate from those of the shared trunk and Policy head. Let $F_V$ denote the input-output map of this block. Its output is
 
 $$
-a_i=m_p+\Delta a_i,
-\qquad
-\ell_\theta(s,i)=a_i^{\mathsf T}z_q+b_i.
+v_0=F_V(h_B).
 $$
 
-The Value head estimates the expected game result from the perspective of the player to move. Unlike the static relations in the shared trunk and Policy block, its chess-structured block adjusts the geometric mixture for the current position. A bias-free $1\times1$ convolution first forms eight controller channels:
-
-$$
-d_V=\mathrm{ReLU}\left(
-\mathrm{Conv}^{C\rightarrow8}_{1\times1,D}(h_B)
-\right)
-\in\mathbb R^{8\times8\times8}.
-$$
-
-The controller produces one bounded correction for each of the $K$ relation groups and eight geometric bases:
-
-$$
-\delta\alpha_V(s)=
-\mathrm{reshape}_{K\times8}\left(
-\tanh\left(W_D\mathrm{vec}(d_V)+b_D\right)
-\right).
-$$
-
-Here $W_D\in\mathbb R^{8K\times512}$ and $b_D\in\mathbb R^{8K}$, since $\mathrm{vec}(d_V)$ contains $8\times8\times8=512$ components.
-
-For Value group $g$, this correction changes the relation matrix from Section 3.1 to
-
-$$
-A_{V,g}(s)=
-\sum_{r=0}^{7}
-\left(\alpha_{V,g,r}+\delta\alpha_{V,g,r}(s)\right)\widehat B_r
-+\Delta A_{V,g}.
-$$
-
-Let $F_V(h_B;\delta\alpha_V(s))$ denote one Value-specific chess-structured block using these position-conditioned matrices. Its output is projected to 48 channels:
+A bias-free $1\times1$ convolution maps $v_0$ from $C$ channels to 48 channels. Batch normalization and ReLU then produce
 
 $$
 r_V=\mathrm{ReLU}\left(
 \mathrm{BN}_V\left(
-\mathrm{Conv}^{C\rightarrow48}_{1\times1,V}
-\left(F_V(h_B;\delta\alpha_V(s))\right)
+\mathrm{Conv}^{C\rightarrow48}_{1\times1,V}(v_0)
 \right)\right).
 $$
 
-Flattening $r_V$ gives $\mathrm{vec}(r_V)\in\mathbb R^{3072}$. With $W_{V,1}\in\mathbb R^{512\times3072}$, $b_{V,1}\in\mathbb R^{512}$, $W_{V,2}\in\mathbb R^{1\times512}$ and $b_{V,2}\in\mathbb R$, the Value estimate is
+Flattening $r_V$ in channel-rank-file order gives $\mathrm{vec}(r_V)\in\mathbb R^{3072}$. Let $W_{V,1}\in\mathbb R^{512\times3072}$ and $b_{V,1}\in\mathbb R^{512}$ be the parameters of the hidden Value layer, and let $W_{V,2}\in\mathbb R^{1\times512}$ and $b_{V,2}\in\mathbb R$ be the parameters of its output layer. The Value estimate is
 
 $$
 V_\theta(s)=
@@ -376,23 +343,29 @@ $$
 
 ### 3.3 Inference Evaluation
 
-For requested action index $i$, define
+The action-plane tensor stores the logit for source square $q=8r+f$ and motion pattern $p$ at component $(p,r,f)$. To construct the complete logit vector $\ell_\theta(s)$, the network permutes $L_\theta(s)$ from action-pattern-major order to source-square-major order and then flattens the permuted tensor. This permutation makes component $73q+p$ of the flattened vector equal to $L_\theta(s)_{p,r,f}$, as required by the action encoding in Section 2.2.
+
+The final $1\times1$ Policy convolution associates action pattern $p$ with a weight vector $w_p\in\mathbb R^{128}$. For requested action index $i$, define
 
 $$
 q=\left\lfloor\frac{i}{73}\right\rfloor,
 \qquad
-p=i\bmod73.
+p=i\bmod73,
+\qquad
+r=\left\lfloor\frac{q}{8}\right\rfloor,
+\qquad
+f=q\bmod8.
 $$
 
-Legal-action inference gathers $z_q$, $m_p$, $\Delta a_i$ and $b_i$, then evaluates
+Legal-action inference gathers the Policy feature $u_2[:,r,f]$, the corresponding weight vector $w_p$ and the action-position bias $B_{P,p,r,f}$, then evaluates
 
 $$
-\ell_\theta(s,i)=\left(m_p+\Delta a_i\right)^{\mathsf T}z_q+b_i.
+\ell_\theta(s,i)=w_p^{\mathsf T}u_2[:,r,f]+B_{P,p,r,f}.
 $$
 
-The complete Policy evaluates this expression for all 4672 action indices, whereas legal-action inference evaluates it only for the canonical indices of available actions. For a batch of complete states, the legal-index arrays are padded to the largest legal-action count in the batch, and the padded positions are masked before softmax. Each resulting distribution therefore contains exactly the probabilities of the legal actions in its state.
+This expression equals $L_\theta(s)_{p,r,f}$ and computes the requested logit without materializing the other action-plane components. For a batch of complete states, the inference path first converts every legal action index to canonical coordinates. It pads the resulting arrays to the largest legal-action count in that batch, evaluates the requested logits and masks the padded positions before applying softmax. The resulting distribution for each state contains exactly the probabilities of its legal actions.
 
-In evaluation mode, every convolution followed directly by affine batch normalization is replaced by its equivalent biased convolution. Within each chess-structured block, the three local branches are combined into one biased $3\times3$ convolution by placing the $1\times1$ and normalized identity kernels at the center of its kernel. The relation matrices of the shared trunk and Policy block are computed once from their coefficients, fixed bases and residual matrices. The Value block similarly precomputes its static relation component and adds the controller correction for each evaluated position. These transformations preserve the network outputs while removing the affine normalization attached to fused convolutions, local-branch summation and static relation-matrix construction from inference. The non-affine normalization of each relation output remains part of the block.
+In evaluation mode, every convolution followed directly by affine batch normalization is replaced by its equivalent biased convolution. Within each chess-structured block, the three local branches are combined into one biased $3\times3$ convolution by placing the $1\times1$ and normalized identity kernels at the center of that kernel. Each learned relation matrix $A_{j,g}$ is also computed once from its coefficients, fixed bases and residual matrix. These transformations preserve the network outputs while removing affine normalization attached to fused convolutions, local-branch summation and repeated relation-matrix construction from inference. The non-affine normalization of each relation output remains part of the block.
 
 ## 4. Supervised Training
 
@@ -550,7 +523,7 @@ $$
 \qquad i\in\mathcal I_G.
 $$
 
-The action bias $b_i$ is initialized to $\log\pi_0(i)$. Each shared motion vector $m_p$ uses variance-preserving random initialization, every action correction $\Delta a_i$ begins at zero and the motion vectors are scaled by $\rho_0=0.1$. The final linear map of the Value controller has zero bias, and its weight matrix is multiplied by $\rho_D=0.01$ after initialization. This reduced initial scale keeps the position-dependent relation corrections small. The Value output weights are also scaled by $\rho_0$, and the Value output bias is set to
+The action-position bias corresponding to index $i$ is initialized to $\log\pi_0(i)$. The Policy output weights and Value output weights are each scaled by $\rho_0=0.1$ from their initial values, and the Value output bias is set to
 
 $$
 b_{V,2}=
@@ -560,7 +533,7 @@ b_{V,2}=
 \qquad \epsilon_0=10^{-4}.
 $$
 
-The Policy bias places the sampled action frequencies in the initial logits, while the scaled motion vectors limit their position-dependent perturbation. The Value initialization similarly places the initial estimate near the sampled target mean and begins with small position-dependent relation corrections.
+The Policy bias places the sampled action frequencies in the initial logits, while the reduced output weights limit their random perturbation. The Value initialization similarly places the initial estimate near the sampled target mean.
 
 After initialization, parameter optimization partitions each randomized traversal of $\mathcal D_{\mathrm{sup}}$ into minibatches. For minibatch $\mathcal B_k$, automatic differentiation computes the gradients of $L_{\mathrm{sup}}^{(\mathcal B_k)}$ given in Section 4.2. Before the AdamW update, Gadus limits the Euclidean norm of the Value-head gradient while leaving the Policy-head and shared-trunk gradients unchanged. Let
 

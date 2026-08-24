@@ -17,13 +17,10 @@ using torch::indexing::Slice;
 constexpr int kGeometryBases = 8;
 constexpr int kMaximumRelationGroups = 8;
 constexpr int kPolicyChannels = 128;
-constexpr int kPolicyBlocks = 1;
-constexpr int kPolicyRank = 64;
-constexpr int kValueControllerChannels = 8;
+constexpr int kPolicyBlocks = 2;
 constexpr int kValueChannels = 48;
 constexpr int kValueHidden = 512;
 constexpr double kValueClipEpsilon = 1e-4;
-constexpr double kDynamicValueInitialScale = 0.01;
 
 torch::Tensor build_relation_basis() {
 	auto basis = torch::zeros({kGeometryBases, 64, 64}, torch::kFloat32);
@@ -159,23 +156,6 @@ torch::Tensor ResidualBlockImpl::relation_matrices() const {
 int ResidualBlockImpl::relation_groups() const noexcept { return groups_; }
 
 torch::Tensor ResidualBlockImpl::forward(torch::Tensor x) {
-	return forward_impl(std::move(x), {});
-}
-
-torch::Tensor ResidualBlockImpl::forward_with_relation(
-	torch::Tensor x, torch::Tensor coefficient_corrections) {
-	if (coefficient_corrections.dim() != 3 ||
-		coefficient_corrections.size(0) != x.size(0) ||
-		coefficient_corrections.size(1) != groups_ ||
-		coefficient_corrections.size(2) != kGeometryBases) {
-		throw std::invalid_argument(
-			"Gadus relation corrections must have shape [batch, groups, 8]");
-	}
-	return forward_impl(std::move(x), coefficient_corrections);
-}
-
-torch::Tensor ResidualBlockImpl::forward_impl(
-	torch::Tensor x, const torch::Tensor &coefficient_corrections) {
 	auto reduced = down_conv->forward(x);
 	if (!inference_fused_) {
 		reduced = down_norm->forward(reduced);
@@ -194,14 +174,8 @@ torch::Tensor ResidualBlockImpl::forward_impl(
 	const auto batch = reduced.size(0);
 	auto grouped = reduced.view({batch, groups_, group_width_, 64})
 				   .permute({0, 1, 3, 2});
-	auto matrices = inference_fused_ ? fused_relation : relation_matrices();
-	if (coefficient_corrections.defined()) {
-		matrices = matrices.unsqueeze(0) + torch::einsum(
-			"ngh,hqp->ngqp", {coefficient_corrections, relation_basis});
-	} else {
-		matrices = matrices.unsqueeze(0);
-	}
-	auto related = torch::matmul(matrices, grouped)
+	const auto matrices = inference_fused_ ? fused_relation : relation_matrices();
+	auto related = torch::matmul(matrices.unsqueeze(0), grouped)
 				   .permute({0, 1, 3, 2})
 				   .contiguous()
 				   .view({batch, channels_, 8, 8});
@@ -233,68 +207,6 @@ void ResidualBlockImpl::fuse_for_inference() {
 	inference_fused_ = true;
 }
 
-ValueHeadImpl::ValueHeadImpl(int channels) {
-	if (channels <= 0) {
-		throw std::invalid_argument("Gadus Value channels must be positive");
-	}
-	dynamic_conv = register_module(
-		"dynamic_conv", torch::nn::Conv2d(torch::nn::Conv2dOptions(
-			channels, kValueControllerChannels, 1).bias(false)));
-	block = register_module("block", ResidualBlock(channels, 1));
-	relation_groups_ = block->relation_groups();
-	dynamic_coefficients = register_module(
-		"dynamic_coefficients", torch::nn::Linear(
-			kValueControllerChannels * 8 * 8, relation_groups_ * kGeometryBases));
-	output_conv = register_module(
-		"output_conv", torch::nn::Conv2d(
-			torch::nn::Conv2dOptions(channels, kValueChannels, 1).bias(false)));
-	output_norm = register_module("output_norm", torch::nn::BatchNorm2d(kValueChannels));
-	hidden = register_module(
-		"hidden", torch::nn::Linear(kValueChannels * 8 * 8, kValueHidden));
-	output = register_module("output", torch::nn::Linear(kValueHidden, 1));
-
-	torch::NoGradGuard guard;
-	dynamic_coefficients->weight.mul_(kDynamicValueInitialScale);
-	dynamic_coefficients->bias.zero_();
-}
-
-torch::Tensor ValueHeadImpl::forward(torch::Tensor features) {
-	auto dynamic = torch::relu(dynamic_conv->forward(features)).flatten(1);
-	dynamic = torch::tanh(dynamic_coefficients->forward(dynamic))
-			  .view({features.size(0), relation_groups_, kGeometryBases});
-	auto transformed = block->forward_with_relation(features, dynamic);
-	auto projected = output_conv->forward(transformed);
-	if (!inference_fused_) {
-		projected = output_norm->forward(projected);
-	}
-	projected = torch::relu(projected).flatten(1);
-	return torch::tanh(output->forward(torch::relu(hidden->forward(projected))));
-}
-
-void ValueHeadImpl::initialize_output_prior(double mean_value, double output_scale) {
-	if (output_scale <= 0.0 || output_scale >= 1.0 || !std::isfinite(mean_value)) {
-		throw std::invalid_argument("invalid Gadus Value output prior");
-	}
-	torch::NoGradGuard guard;
-	const double clipped = std::clamp(mean_value, -1.0 + kValueClipEpsilon,
-								  1.0 - kValueClipEpsilon);
-	output->weight.mul_(output_scale);
-	output->bias.fill_(std::atanh(clipped));
-}
-
-void ValueHeadImpl::fuse_for_inference() {
-	if (inference_fused_) {
-		return;
-	}
-	if (is_training()) {
-		throw std::logic_error("Gadus Value head must be in evaluation mode before fusion");
-	}
-	block->fuse_for_inference();
-	output_conv = replace_module("output_conv", fuse_conv_bn(output_conv, output_norm));
-	output_norm = nullptr;
-	inference_fused_ = true;
-}
-
 ModelImpl::ModelImpl(int channels, int blocks) : channels_(channels), blocks_(blocks) {
 	if (channels_ <= 0 || blocks_ <= 0) {
 		throw std::invalid_argument("Gadus channels and blocks must be positive");
@@ -320,22 +232,24 @@ ModelImpl::ModelImpl(int channels, int blocks) : channels_(channels), blocks_(bl
 	for (int index = 0; index < kPolicyBlocks; ++index) {
 		policy_blocks->push_back(ResidualBlock(kPolicyChannels, kPolicyBlocks));
 	}
-	policy_source = register_module(
-		"policy_source", torch::nn::Linear(
-			torch::nn::LinearOptions(kPolicyChannels, kPolicyRank).bias(false)));
-	policy_global = register_module(
-		"policy_global", torch::nn::Linear(kPolicyChannels * 8 * 8, kPolicyRank));
-	policy_motion_vectors = register_parameter(
-		"policy_motion_vectors", torch::empty({kPolicyPlanes, kPolicyRank}));
-	policy_action_corrections = register_parameter(
-		"policy_action_corrections", torch::zeros({kActionSize, kPolicyRank}));
+	policy_output = register_module(
+		"policy_output", torch::nn::Conv2d(
+			torch::nn::Conv2dOptions(kPolicyChannels, kPolicyPlanes, 1).bias(false)));
 	policy_action_bias = register_parameter(
-		"policy_action_bias", torch::zeros({kActionSize}));
-	value_head = register_module("value_head", ValueHead(channels_));
+		"policy_action_bias", torch::zeros({1, kPolicyPlanes, 8, 8}));
 
-	torch::NoGradGuard guard;
-	policy_motion_vectors.normal_(0.0, 1.0 / std::sqrt(static_cast<double>(kPolicyRank)));
-	policy_global->bias.zero_();
+	value_block = ResidualBlock(channels_, 1);
+	value_conv = torch::nn::Conv2d(
+		torch::nn::Conv2dOptions(channels_, kValueChannels, 1).bias(false));
+	value_norm = torch::nn::BatchNorm2d(kValueChannels);
+	value_hidden = torch::nn::Linear(kValueChannels * 8 * 8, kValueHidden);
+	value_output = torch::nn::Linear(kValueHidden, 1);
+	value_head = register_module(
+		"value_head", torch::nn::Sequential(
+			value_block, value_conv, value_norm,
+			torch::nn::ReLU(torch::nn::ReLUOptions(true)), torch::nn::Flatten(),
+			value_hidden, torch::nn::ReLU(torch::nn::ReLUOptions(true)), value_output,
+			torch::nn::Tanh()));
 }
 
 std::pair<torch::Tensor, torch::Tensor> ModelImpl::forward(torch::Tensor x) {
@@ -357,18 +271,20 @@ ModelImpl::forward_legal(torch::Tensor x, torch::Tensor legal_indices) {
 
 	auto features = backbone->forward(x);
 	auto source_squares = torch::floor_divide(legal_indices, kPolicyPlanes);
-	auto motion_patterns = torch::remainder(legal_indices, kPolicyPlanes);
-	auto contexts = policy_contexts(features);
-	auto source_contexts = contexts.gather(
-		1, source_squares.unsqueeze(2).expand({-1, -1, kPolicyRank}));
-	auto selected_vectors =
-		policy_motion_vectors.index_select(0, motion_patterns.reshape({-1})) +
-		policy_action_corrections.index_select(0, legal_indices.reshape({-1}));
-	selected_vectors = selected_vectors.view(
-		{legal_indices.size(0), legal_indices.size(1), kPolicyRank});
-	auto legal_logits = (source_contexts * selected_vectors).sum(2) +
-		policy_action_bias.index_select(0, legal_indices.reshape({-1}))
-			.view({legal_indices.size(0), legal_indices.size(1)});
+	auto patterns = torch::remainder(legal_indices, kPolicyPlanes);
+	auto compact_features = policy_features(features);
+	auto source_features = compact_features.flatten(2)
+						   .transpose(1, 2)
+						   .gather(1, source_squares.unsqueeze(2).expand(
+									  {-1, -1, kPolicyChannels}));
+	auto selected_weights = policy_output->weight.flatten(1)
+							.index_select(0, patterns.reshape({-1}))
+							.view({legal_indices.size(0), legal_indices.size(1), kPolicyChannels});
+	auto legal_logits = (source_features * selected_weights).sum(2);
+	auto plane_offsets = patterns * 64 + source_squares;
+	legal_logits = legal_logits + policy_action_bias.flatten(1)
+								 .expand({legal_indices.size(0), -1})
+								 .gather(1, plane_offsets);
 	return {legal_logits, value(features)};
 }
 
@@ -382,9 +298,17 @@ void ModelImpl::initialize_output_priors(const torch::Tensor &action_counts, dou
 	auto counts = action_counts.to(torch::kCPU, torch::kFloat64).reshape({kActionSize});
 	auto prior = (counts + smoothing_count) /
 				 (counts.sum().item<double>() + smoothing_count * kActionSize);
-	policy_action_bias.copy_(prior.log().to(policy_action_bias.options()));
-	policy_motion_vectors.mul_(output_scale);
-	value_head->initialize_output_prior(mean_value, output_scale);
+	auto plane_bias = prior.log()
+					  .view({8, 8, kPolicyPlanes})
+					  .permute({2, 0, 1})
+					  .unsqueeze(0)
+					  .to(policy_action_bias.options());
+	policy_action_bias.copy_(plane_bias);
+	policy_output->weight.mul_(output_scale);
+	const double clipped = std::clamp(mean_value, -1.0 + kValueClipEpsilon,
+									  1.0 - kValueClipEpsilon);
+	value_output->weight.mul_(output_scale);
+	value_output->bias.fill_(std::atanh(clipped));
 }
 
 torch::Tensor ModelImpl::value(torch::Tensor features) {
@@ -400,22 +324,13 @@ torch::Tensor ModelImpl::policy_features(torch::Tensor features) {
 	return policy_blocks->forward(torch::relu(result));
 }
 
-torch::Tensor ModelImpl::policy_contexts(torch::Tensor features) {
-	auto policy = policy_features(features);
-	auto sources = policy_source->forward(policy.flatten(2).transpose(1, 2));
-	auto global = policy_global->forward(policy.flatten(1)).unsqueeze(1);
-	return torch::relu((sources + global) / std::sqrt(2.0));
-}
-
-torch::Tensor ModelImpl::policy_action_vectors() {
-	return policy_motion_vectors.repeat({64, 1}) + policy_action_corrections;
+torch::Tensor ModelImpl::policy_planes(torch::Tensor features) {
+	return policy_output->forward(policy_features(features)) + policy_action_bias;
 }
 
 torch::Tensor ModelImpl::policy_logits(torch::Tensor features) {
-	auto contexts = policy_contexts(features);
-	auto vectors = policy_action_vectors().view({64, kPolicyPlanes, kPolicyRank});
-	return torch::einsum("nqr,qmr->nqm", {contexts, vectors}).flatten(1) +
-		policy_action_bias;
+	auto planes = policy_planes(features);
+	return planes.permute({0, 2, 3, 1}).contiguous().view({planes.size(0), kActionSize});
 }
 
 void ModelImpl::fuse_for_inference() {
@@ -444,7 +359,14 @@ void ModelImpl::fuse_for_inference() {
 			->fuse_for_inference();
 	}
 
-	value_head->fuse_for_inference();
+	value_block->fuse_for_inference();
+	value_conv = fuse_conv_bn(value_conv, value_norm);
+	value_head = replace_module(
+		"value_head", torch::nn::Sequential(
+			value_block, value_conv, torch::nn::ReLU(torch::nn::ReLUOptions(true)),
+			torch::nn::Flatten(), value_hidden,
+			torch::nn::ReLU(torch::nn::ReLUOptions(true)), value_output, torch::nn::Tanh()));
+	value_norm = nullptr;
 	inference_fused_ = true;
 }
 

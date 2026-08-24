@@ -280,33 +280,26 @@ int main() {
 		require(gadus::game_termination(repetition) == "threefold repetition",
 				"threefold-repetition termination mismatch");
 
-		// The Policy vector must follow source square * 73 + motion pattern.
+		// The action-plane layout must flatten as source square * 73 + motion pattern.
 		auto relation_block = gadus::ResidualBlock(8, 1);
 		const auto initial_relations = relation_block->relation_matrices();
 		require(initial_relations.sizes() == torch::IntArrayRef({8, 64, 64}),
 				"relation initialization produced the wrong shape");
 		require(torch::allclose(initial_relations.index({0}), torch::eye(64), 1e-6, 1e-7),
 				"identity geometry did not initialize the first relation group");
-		relation_block->eval();
-		auto relation_input = torch::randn({2, 8, 8, 8});
-		auto relation_reference = relation_block->forward(relation_input);
-		auto zero_corrections = torch::zeros({2, 8, 8});
-		auto relation_zero =
-			relation_block->forward_with_relation(relation_input, zero_corrections);
-		require(torch::allclose(relation_reference, relation_zero, 1e-6, 1e-7),
-				"zero dynamic relation correction changed a residual block");
-
 		auto layout_model = gadus::Model(8, 1);
 		{
 			torch::NoGradGuard guard;
 			for (const auto &parameter : layout_model->named_parameters()) {
-				if (parameter.key() == "policy_motion_vectors" ||
-					parameter.key() == "policy_action_corrections") {
+				if (parameter.key() == "policy_output.weight") {
 					parameter.value().zero_();
 				}
 				if (parameter.key() == "policy_action_bias") {
 					auto expected = torch::arange(
-						gadus::kActionSize, parameter.value().options());
+						gadus::kActionSize, parameter.value().options())
+						.view({8, 8, gadus::kPolicyPlanes})
+						.permute({2, 0, 1})
+						.unsqueeze(0);
 					parameter.value().copy_(expected);
 				}
 			}
