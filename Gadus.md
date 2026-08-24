@@ -72,7 +72,7 @@ $$
 (0,1),\ (1,-1),\ (1,0),\ (1,1).
 $$
 
-Let $(u_d,v_d)$ be the direction at position $d\in\lbrace0,\ldots,7\rbrace$ in this list. If the move travels $m\in\lbrace1,\ldots,7\rbrace$ squares in that direction, then
+Let $(u_d,v_d)$ be the direction at position $d\in\lbrace0,\ldots,7\rbrace$ in this list. For a move that travels $m\in\lbrace1,\ldots,7\rbrace$ squares in direction $(u_d,v_d)$, the motion-pattern index is
 
 $$
 (\Delta r,\Delta f)=m(u_d,v_d),
@@ -246,34 +246,46 @@ h_j+
 \qquad 0\leq j<B.
 $$
 
-The fixed relation basis is shared by all blocks, while $\alpha_{j,g,r}$, $\Delta A_{j,g}$ and $\lambda_j$ belong to block $j$. Initially, $\alpha_{j,g,r}=1$ when $r=g$ and $0$ otherwise, so relation group $g$ begins with basis relation $\widehat B_g$. Every $\Delta A_{j,g}$ begins at zero, and every component of $\lambda_j$ begins at one. The three local branch scales begin at $1/\sqrt3$. For a residual sequence of length $D$, the scale of the final batch normalization in each block begins at $1/\sqrt D$. The shared trunk uses $D=B$, the Policy sequence uses $D=2$ and the Value sequence uses $D=1$. The square embedding begins at zero. The relation basis remains fixed, while the relation coefficients, residual matrices, path-balance vectors, normalization scales and square embedding are trainable.
+The normalized relation matrices $\widehat B_0,\ldots,\widehat B_7$ are fixed and shared by every residual block. Each block has its own relation coefficients $\alpha_{j,g,r}$, residual matrices $\Delta A_{j,g}$ and path-balance vector $\lambda_j$. Their initial values are
+
+$$
+\alpha_{j,g,r}=\mathbf 1[r=g],
+\qquad
+\Delta A_{j,g}=0,
+\qquad
+\lambda_j=\mathbf 1.
+$$
+
+The first two assignments give $A_{j,g}=\widehat B_g$ at initialization. Substituting $\lambda_j=\mathbf 1$ into the definition of $c_j$ assigns the local and full-board transformations the same initial coefficient $1/\sqrt2$ in every channel.
+
+The affine scales of the three local-branch normalization layers are initialized to $1/\sqrt3$, and their biases are initialized to zero. For a residual sequence containing $D$ blocks, the affine scale of $\mathrm{BN}_{j,\uparrow}$ in every block is initialized to $1/\sqrt D$, with zero bias. The square embedding $E_S$ is also initialized to zero. The relation basis remains fixed during training, whereas the square embedding and all block-specific convolutional, normalization, relation and path-balance parameters are trainable.
 
 After the $B$ blocks, $h_B\in\mathbb R^{C\times8\times8}$ is the shared representation supplied to the Policy and Value heads defined below.
 
 ### 3.2 Policy and Value Heads
 
-The Policy head assigns one unnormalized score, called a logit, to every canonical action index in $\mathcal I_G$. It begins with a bias-free $1\times1$ convolution from $C$ channels to 128 channels, followed by batch normalization and ReLU:
+Let $C_P$, $C_V$ and $H_V$ be the positive integer widths of the Policy representation, the Value feature tensor and the hidden Value layer, respectively. Let $D_P$ and $D_V$ be the positive integer numbers of Policy-specific and Value-specific chess-structured residual blocks. The Policy head assigns one unnormalized score, called a logit, to every canonical action index in $\mathcal I_G$. It begins with a bias-free $1\times1$ convolution from $C$ channels to $C_P$ channels, followed by batch normalization and ReLU:
 
 $$
 u_0=\mathrm{ReLU}\left(
 \mathrm{BN}_P\left(
-\mathrm{Conv}^{C\rightarrow128}_{1\times1,P}(h_B)
+\mathrm{Conv}^{C\rightarrow C_P}_{1\times1,P}(h_B)
 \right)
 \right).
 $$
 
-The Policy head passes $u_0$ through two chess-structured residual blocks in sequence, each following the construction in Section 3.1 with its own parameters. Let $F_{P,j}$ denote the input-output map of block $j$. The block sequence satisfies
+The Policy head passes $u_0$ through its chess-structured residual blocks in sequence, each following the construction in Section 3.1 with its own parameters. Let $F_{P,j}$ denote the input-output map of block $j$. The block sequence satisfies
 
 $$
 u_{j+1}=F_{P,j}(u_j),
-\qquad 0\leq j<2.
+\qquad 0\leq j<D_P.
 $$
 
-A bias-free $1\times1$ convolution maps $u_2$ to 73 action-pattern planes. The learned tensor $B_P\in\mathbb R^{73\times8\times8}$ supplies a separate bias for every combination of motion pattern and source square, giving
+A bias-free $1\times1$ convolution maps $u_{D_P}$ to 73 action-pattern planes. The learned tensor $B_P\in\mathbb R^{73\times8\times8}$ supplies a separate bias for every combination of motion pattern and source square, giving
 
 $$
 L_\theta(s)=
-\mathrm{Conv}^{128\rightarrow73}_{1\times1,\mathrm{out}}(u_2)+B_P
+\mathrm{Conv}^{C_P\rightarrow73}_{1\times1,\mathrm{out}}(u_{D_P})+B_P
 \in\mathbb R^{73\times8\times8}.
 $$
 
@@ -283,22 +295,23 @@ $$
 \ell_\theta(s,73q+p)=L_\theta(s)_{p,r,f}.
 $$
 
-The Value head estimates the expected game result from the perspective of the player to move. It first passes $h_B$ through a Value-specific chess-structured residual block whose parameters are separate from those of the shared trunk and Policy head. Let $F_V$ denote the input-output map of this block. Its output is
+The Value head estimates the expected game result from the perspective of the player to move. It passes $h_B$ through its Value-specific chess-structured residual blocks, whose parameters are separate from those of the shared trunk and Policy head. Let $F_{V,j}$ denote the input-output map of Value block $j$. With $v_0=h_B$, the block sequence satisfies
 
 $$
-v_0=F_V(h_B).
+v_{j+1}=F_{V,j}(v_j),
+\qquad 0\leq j<D_V.
 $$
 
-A bias-free $1\times1$ convolution maps $v_0$ from $C$ channels to 48 channels. Batch normalization and ReLU then produce
+A bias-free $1\times1$ convolution maps $v_{D_V}$ from $C$ channels to $C_V$ channels. Batch normalization and ReLU then produce
 
 $$
 r_V=\mathrm{ReLU}\left(
 \mathrm{BN}_V\left(
-\mathrm{Conv}^{C\rightarrow48}_{1\times1,V}(v_0)
+\mathrm{Conv}^{C\rightarrow C_V}_{1\times1,V}(v_{D_V})
 \right)\right).
 $$
 
-Flattening $r_V$ in channel-rank-file order gives $\mathrm{vec}(r_V)\in\mathbb R^{3072}$. Let $W_{V,1}\in\mathbb R^{512\times3072}$ and $b_{V,1}\in\mathbb R^{512}$ be the parameters of the hidden Value layer, and let $W_{V,2}\in\mathbb R^{1\times512}$ and $b_{V,2}\in\mathbb R$ be the parameters of its output layer. The Value estimate is
+Flattening $r_V$ in channel-rank-file order gives $\mathrm{vec}(r_V)\in\mathbb R^{64C_V}$. Let $W_{V,1}\in\mathbb R^{H_V\times64C_V}$ and $b_{V,1}\in\mathbb R^{H_V}$ be the parameters of the hidden Value layer, and let $W_{V,2}\in\mathbb R^{1\times H_V}$ and $b_{V,2}\in\mathbb R$ be the parameters of its output layer. The Value estimate is
 
 $$
 V_\theta(s)=
@@ -345,7 +358,7 @@ $$
 
 The action-plane tensor stores the logit for source square $q=8r+f$ and motion pattern $p$ at component $(p,r,f)$. To construct the complete logit vector $\ell_\theta(s)$, the network permutes $L_\theta(s)$ from action-pattern-major order to source-square-major order and then flattens the permuted tensor. This permutation makes component $73q+p$ of the flattened vector equal to $L_\theta(s)_{p,r,f}$, as required by the action encoding in Section 2.2.
 
-The final $1\times1$ Policy convolution associates action pattern $p$ with a weight vector $w_p\in\mathbb R^{128}$. For requested action index $i$, define
+The final $1\times1$ Policy convolution associates action pattern $p$ with a weight vector $w_p\in\mathbb R^{C_P}$. For requested action index $i$, define
 
 $$
 q=\left\lfloor\frac{i}{73}\right\rfloor,
@@ -357,10 +370,17 @@ r=\left\lfloor\frac{q}{8}\right\rfloor,
 f=q\bmod8.
 $$
 
-Legal-action inference gathers the Policy feature $u_2[:,r,f]$, the corresponding weight vector $w_p$ and the action-position bias $B_{P,p,r,f}$, then evaluates
+The channel values of $u_{D_P}$ at source square $(r,f)$ form the Policy feature vector
 
 $$
-\ell_\theta(s,i)=w_p^{\mathsf T}u_2[:,r,f]+B_{P,p,r,f}.
+u_{D_P}(r,f)=\left(\left(u_{D_P}\right)_{c,r,f}\right)_{c=0}^{C_P-1}
+\in\mathbb R^{C_P}.
+$$
+
+The logit for action index $i$ is obtained from this feature vector, the weight vector for pattern $p$ and the corresponding action-position bias:
+
+$$
+\ell_\theta(s,i)=w_p^{\mathsf T}u_{D_P}(r,f)+B_{P,p,r,f}.
 $$
 
 This expression equals $L_\theta(s)_{p,r,f}$ and computes the requested logit without materializing the other action-plane components. For a batch of complete states, the inference path first converts every legal action index to canonical coordinates. It pads the resulting arrays to the largest legal-action count in that batch, evaluates the requested logits and masks the padded positions before applying softmax. The resulting distribution for each state contains exactly the probabilities of its legal actions.
@@ -429,7 +449,7 @@ L_{V,\mathrm{sup}}^{(\mathcal B)}=
 \left(V_\theta(s)-y\right)^2.
 $$
 
-Let $w_{V,0}\in[0.2,2]$ be the initial Value-loss coefficient and let $w_{V,k}\in[0.2,2]$ be the coefficient used at optimizer step $k$ ($k\geq1$). The complete objective for minibatch $\mathcal B_k$ is
+Let $w_{\min}=0.2$ and $w_{\max}=2$ be the lower and upper bounds of the Value-loss coefficient. The initial coefficient $w_{V,0}$ belongs to this range, and $w_{V,k}$ denotes the coefficient used at optimizer step $k$ ($k\geq1$). The complete objective for minibatch $\mathcal B_k$ is
 
 $$
 L_{\mathrm{sup}}^{(\mathcal B_k)}=
@@ -455,12 +475,12 @@ n_{V,k}=\lVert g_{V,k}\rVert_2,
 c_k=g_{P,k}^{\mathsf T}g_{V,k}.
 $$
 
-With $\epsilon_g=10^{-12}$, the norm-balanced proposal is
+Let $\eta_g=0.5$ control the target ratio between the two gradient norms, and let $\epsilon_g=10^{-12}$ provide numerical stability. The norm-balanced proposal is
 
 $$
 \widetilde w_{V,k}=
-\mathrm{clip}_{[0.2,2]}
-\left(0.5\frac{n_{P,k}}{n_{V,k}+\epsilon_g}\right).
+\mathrm{clip}_{[w_{\min},w_{\max}]}
+\left(\eta_g\frac{n_{P,k}}{n_{V,k}+\epsilon_g}\right).
 $$
 
 When $c_k<0$, a step along the negative combined gradient decreases both minibatch losses to first order precisely when
@@ -469,29 +489,29 @@ $$
 \frac{-c_k}{n_{V,k}^2}<w_{V,k}<\frac{n_{P,k}^2}{-c_k}.
 $$
 
-The controller applies an interior margin $\delta_g=10^{-3}$ and intersects this interval with the global coefficient range:
+The controller uses an interior margin $\delta_g=10^{-3}$ and intersects this interval with the admissible coefficient range:
 
 $$
 I_k=
 \left[
-\max\left(0.2,(1+\delta_g)\frac{-c_k}{n_{V,k}^2}\right),
-\min\left(2,(1-\delta_g)\frac{n_{P,k}^2}{-c_k}\right)
+\max\left(w_{\min},(1+\delta_g)\frac{-c_k}{n_{V,k}^2}\right),
+\min\left(w_{\max},(1-\delta_g)\frac{n_{P,k}^2}{-c_k}\right)
 \right].
 $$
 
-For $c_k\geq0$, define $I_k=[0.2,2]$. Let $\mathrm{proj}_{I_k}(w)$ denote the nearest point to $w$ in the closed interval $I_k$. When $I_k$ is nonempty, the controller projects $\widetilde w_{V,k}$ into $I_k$ and smooths the projected value in logarithmic space with update rate $\gamma=0.08$:
+For $c_k\geq0$, define $I_k=[w_{\min},w_{\max}]$. Let $\mathrm{proj}_{I_k}(w)$ denote the nearest point to $w$ in the closed interval $I_k$. When $I_k$ is nonempty, the controller projects $\widetilde w_{V,k}$ into $I_k$ and smooths the projected value in logarithmic space with update rate $\gamma=0.08$:
 
 $$
 \widehat w_{V,k}=\mathrm{proj}_{I_k}(\widetilde w_{V,k}),
 $$
 
 $$
-w_{V,k}=\mathrm{clip}_{[0.2,2]}\left(
+w_{V,k}=\mathrm{clip}_{[w_{\min},w_{\max}]}\left(
 \exp\left((1-\gamma)\log w_{V,k-1}+\gamma\log\widehat w_{V,k}\right)
 \right).
 $$
 
-An empty $I_k$, a nonfinite gradient statistic or a squared gradient norm no greater than $10^{-12}$ leaves the preceding coefficient unchanged. The controller periodically performs this calculation during optimization.
+An empty $I_k$, a nonfinite gradient statistic or a squared gradient norm no greater than $\epsilon_g$ leaves the preceding coefficient unchanged. The controller periodically performs this calculation during optimization.
 
 To express how the resulting objective updates the complete network, partition the network parameters as $\theta=(\theta_T,\theta_P,\theta_V)$, where $\theta_T$ contains the residual-trunk parameters and $\theta_P$ and $\theta_V$ contain the parameters of the two output heads. The gradients of $L_{\mathrm{sup}}^{(\mathcal B_k)}$ with respect to these parameter groups satisfy
 
@@ -514,16 +534,16 @@ The optimizer updates $\theta_P$ from the Policy-loss gradient and $\theta_V$ fr
 
 ### 4.3 Parameter Optimization
 
-Before the first parameter update, Gadus estimates output priors from a stratified sample of the supervised targets. Let $c_i$ be the number of sampled Policy targets with canonical action index $i$, and let $\bar y$ be the mean sampled Value target. The smoothed action prior is
+Before the first parameter update, Gadus estimates output priors from a stratified sample of the supervised targets. Let $c_i$ be the number of sampled Policy targets with canonical action index $i$, let $\bar y$ be the mean sampled Value target and let $a_0=1$ be the smoothing pseudocount. The smoothed action prior is
 
 $$
 \pi_0(i)=
-\frac{c_i+1}
-{\displaystyle\sum_{j\in\mathcal I_G}c_j+|\mathcal I_G|},
+\frac{c_i+a_0}
+{\displaystyle\sum_{j\in\mathcal I_G}c_j+a_0|\mathcal I_G|},
 \qquad i\in\mathcal I_G.
 $$
 
-The action-position bias corresponding to index $i$ is initialized to $\log\pi_0(i)$. The Policy output weights and Value output weights are each scaled by $\rho_0=0.1$ from their initial values, and the Value output bias is set to
+The action-position bias corresponding to index $i$ is initialized to $\log\pi_0(i)$. The Policy output weights and Value output weights are each scaled from their initial values by $\rho_0=0.1$, and the Value output bias is set to
 
 $$
 b_{V,2}=
@@ -535,7 +555,7 @@ $$
 
 The Policy bias places the sampled action frequencies in the initial logits, while the reduced output weights limit their random perturbation. The Value initialization similarly places the initial estimate near the sampled target mean.
 
-After initialization, parameter optimization partitions each randomized traversal of $\mathcal D_{\mathrm{sup}}$ into minibatches. For minibatch $\mathcal B_k$, automatic differentiation computes the gradients of $L_{\mathrm{sup}}^{(\mathcal B_k)}$ given in Section 4.2. Before the AdamW update, Gadus limits the Euclidean norm of the Value-head gradient while leaving the Policy-head and shared-trunk gradients unchanged. Let
+After initialization, parameter optimization partitions each randomized traversal of $\mathcal D_{\mathrm{sup}}$ into minibatches. For minibatch $\mathcal B_k$, automatic differentiation computes the gradients of $L_{\mathrm{sup}}^{(\mathcal B_k)}$ given in Section 4.2. Before the AdamW update, Gadus limits the Euclidean norm of the Value-head gradient to the threshold $G_V=1$ while leaving the Policy-head and shared-trunk gradients unchanged. Let
 
 $$
 g_{V,k}^{\mathrm{head}}=
@@ -548,10 +568,10 @@ $$
 \widetilde g_{V,k}^{\mathrm{head}}=
 \begin{cases}
 g_{V,k}^{\mathrm{head}},
-&\lVert g_{V,k}^{\mathrm{head}}\rVert_2\leq1,\\[6pt]
-\dfrac{g_{V,k}^{\mathrm{head}}}
+&\lVert g_{V,k}^{\mathrm{head}}\rVert_2\leq G_V,\\[6pt]
+G_V\dfrac{g_{V,k}^{\mathrm{head}}}
 {\lVert g_{V,k}^{\mathrm{head}}\rVert_2},
-&\lVert g_{V,k}^{\mathrm{head}}\rVert_2>1.
+&\lVert g_{V,k}^{\mathrm{head}}\rVert_2>G_V.
 \end{cases}
 $$
 
@@ -569,7 +589,7 @@ $$
 P(x_0,a)=P_\theta(a\mid s_0).
 $$
 
-A nonterminal node is unexpanded while it has no outgoing edges. When a simulation reaches an unexpanded node representing state $x$, the evaluator obtains $P_\theta(\cdot\mid\phi_G(x))$ and $V_\theta(\phi_G(x))$. Node expansion uses the Policy distribution to create one outgoing edge and child node for every action $a\in\mathcal A(x)$, assigning $P_\theta(a\mid\phi_G(x))$ to the edge prior $P(x,a)$. The backup procedure defined in Section 5.4 propagates $V_\theta(\phi_G(x))$ along the selected path.
+A nonterminal node with no outgoing edges is called an unexpanded node. When a simulation reaches an unexpanded node representing state $x$, the evaluator obtains $P_\theta(\cdot\mid\phi_G(x))$ and $V_\theta(\phi_G(x))$. Node expansion uses the Policy distribution to create one outgoing edge and child node for every action $a\in\mathcal A(x)$, assigning $P_\theta(a\mid\phi_G(x))$ to the edge prior $P(x,a)$. The backup procedure defined in Section 5.4 propagates $V_\theta(\phi_G(x))$ along the selected path.
 
 ### 5.2 Tree Statistics
 
@@ -672,21 +692,21 @@ These updates increase the completed count of each traversed child and thereby i
 
 ### 5.5 Root Allocation
 
-Let $N_{\mathrm{ref}}\geq0$ be the reference budget used to determine the fair visit floor, let $N_{\mathrm{cap}}\in\mathbb N_0\cup\lbrace\infty\rbrace$ be the maximum number of simulations and let $M=|\mathcal A(x_0)|$ be the number of legal root actions. Bounded search uses $N_{\mathrm{ref}}=N_{\mathrm{cap}}$. Unbounded search retains a positive reference budget while setting $N_{\mathrm{cap}}=\infty$. A zero reference budget performs no simulation. For $N_{\mathrm{ref}}>0$, the fair visit floor is
+Let $N_{\mathrm{ref}}\geq0$ be the reference budget used to determine the fair visit floor, let $N_{\mathrm{cap}}\in\mathbb N_0\cup\lbrace\infty\rbrace$ be the maximum number of simulations and let $M=|\mathcal A(x_0)|$ be the number of legal root actions. Bounded search uses $N_{\mathrm{ref}}=N_{\mathrm{cap}}$. Unbounded search retains a positive reference budget while setting $N_{\mathrm{cap}}=\infty$. A zero reference budget performs no simulation. For $N_{\mathrm{ref}}>0$, let $\kappa_{\mathrm{fair}}=10$ be the scale of the fair visit floor, which is
 
 $$
 m_{\mathrm{fair}}=
 \max\left(
 1,
 \left\lfloor
-10\log\left(
-1+\frac{N_{\mathrm{ref}}}{10M}
+\kappa_{\mathrm{fair}}\log\left(
+1+\frac{N_{\mathrm{ref}}}{\kappa_{\mathrm{fair}}M}
 \right)
 \right\rfloor
 \right).
 $$
 
-The scale 10 places the transition between two regimes. The floor is approximately linear in the reference budget per root action, $N_{\mathrm{ref}}/M$, when that quantity is small, while its growth becomes logarithmic as the reference budget increases. Every legal root action receives this floor, so a completed fair phase uses $Mm_{\mathrm{fair}}$ root visits.
+The scale $\kappa_{\mathrm{fair}}$ places the transition between two regimes. The floor is approximately linear in the reference budget per root action, $N_{\mathrm{ref}}/M$, when that quantity is small, while its growth becomes logarithmic as the reference budget increases. Every legal root action receives this floor, so a completed fair phase uses $Mm_{\mathrm{fair}}$ root visits.
 
 Each fair-stage simulation first enters the root action selected by the allocation deficit. At every expanded nonterminal state reached afterward, all legal actions participate in the PUCT ordering from Section 5.3. The original Policy prior therefore governs the complete legal-action set throughout the fair phase. During post-fair allocation, root selection uses the tempered prior defined below, and expanded non-root nodes use the action-opening and verification rules defined in Section 5.6.
 
@@ -780,11 +800,11 @@ A configured deadline or a caller-supplied stop signal can end bounded search be
 
 For an expanded non-root state $x$, let $M_x=|\mathcal A(x)|$ and order its legal actions $a_{(1)},\ldots,a_{(M_x)}$ by decreasing original Policy prior $P(x,a)$. Actions with equal priors retain their order in the legal-action array. The selectable actions form a prefix of this ordering.
 
-At the end of the fair phase, the calculation in Section 5.5 fixes $\gamma_{\mathrm{fair}}$ for the remaining simulations. Internal action opening uses the exponent
+At the end of the fair phase, the calculation in Section 5.5 fixes $\gamma_{\mathrm{fair}}$ for the remaining simulations. Let $\beta_{\min}=1/2$ be the minimum internal-opening exponent. The exponent used at every expanded non-root state is
 
 $$
 \beta_{\mathrm{open}}=
-\max\left(\frac12,1-\gamma_{\mathrm{fair}}\right).
+\max\left(\beta_{\min},1-\gamma_{\mathrm{fair}}\right).
 $$
 
 Let $K(x)$ denote the active-prefix width and initialize it to zero when $x$ is expanded. Before each selection at $x$, the scheduler updates this width by
