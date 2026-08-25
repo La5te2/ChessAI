@@ -282,11 +282,37 @@ int main() {
 
 		// The action-plane layout must flatten as source square * 73 + motion pattern.
 		auto relation_block = gadus::ResidualBlock(8, 1);
+		const auto empirical_basis = relation_block->named_buffers()["relation_basis"];
+		require(empirical_basis.sizes() == torch::IntArrayRef({12, 64, 64}),
+				"empirical relation dictionary has the wrong shape");
+		const auto basis_norms = empirical_basis.flatten(1).norm(2, 1);
+		require(torch::allclose(basis_norms, torch::ones_like(basis_norms), 1e-5, 1e-6),
+				"empirical relation dictionary is not unit normalized");
+		for (int basis = 0; basis < 12; ++basis) {
+			const auto flat = empirical_basis.index({basis}).flatten();
+			const auto pivot = flat.abs().argmax().item<std::int64_t>();
+			require(flat.index({pivot}).item<float>() > 0.0F,
+					"empirical relation basis has a noncanonical sign");
+		}
+		const auto initial_coefficients =
+			relation_block->named_parameters()["relation_coefficients"];
+		require(initial_coefficients.sizes() == torch::IntArrayRef({8, 12}),
+				"relation coefficient tensor has the wrong shape");
+		require(torch::equal(
+				initial_coefficients.index({torch::indexing::Slice(), torch::indexing::Slice(0, 8)}),
+				torch::eye(8, initial_coefficients.options())),
+				"leading empirical bases do not have one-hot group assignments");
+		require(torch::count_nonzero(
+				initial_coefficients.index({torch::indexing::Slice(), torch::indexing::Slice(8, 12)}))
+				.item<std::int64_t>() == 0,
+				"additional empirical basis coefficients do not begin at zero");
 		const auto initial_relations = relation_block->relation_matrices();
 		require(initial_relations.sizes() == torch::IntArrayRef({8, 64, 64}),
 				"relation initialization produced the wrong shape");
-		require(torch::allclose(initial_relations.index({0}), torch::eye(64), 1e-6, 1e-7),
-				"identity geometry did not initialize the first relation group");
+		require(torch::equal(
+				initial_relations,
+				empirical_basis.index({torch::indexing::Slice(0, 8)})),
+				"relation groups do not begin from the leading empirical bases");
 		auto layout_model = gadus::Model(8, 1);
 		{
 			torch::NoGradGuard guard;
@@ -312,6 +338,10 @@ int main() {
 			"action planes were flattened in the wrong index order");
 
 		auto model = gadus::Model(8, 1);
+		const auto second_value_scale =
+			model->named_parameters()["value_head.1.up_norm.weight"];
+		require(torch::count_nonzero(second_value_scale).item<std::int64_t>() == 0,
+				"second Value block does not begin as an identity map");
 		auto [policy, value] = model->forward(gadus::encode_boards({board, board}));
 		require(policy.sizes() == torch::IntArrayRef({2, gadus::kActionSize}),
 				"policy shape mismatch");

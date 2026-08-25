@@ -2,8 +2,8 @@
 
 #include "gadus/model.hpp"
 #include "gadus/precision.hpp"
+#include "gadus/basis.hpp"
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <numeric>
 #include <stdexcept>
@@ -14,7 +14,6 @@ namespace {
 
 using torch::indexing::Slice;
 
-constexpr int kGeometryBases = 8;
 constexpr int kMaximumRelationGroups = 8;
 constexpr int kPolicyChannels = 128;
 constexpr int kPolicyBlocks = 2;
@@ -23,27 +22,12 @@ constexpr int kValueHidden = 512;
 constexpr double kValueClipEpsilon = 1e-4;
 
 torch::Tensor build_relation_basis() {
-	auto basis = torch::zeros({kGeometryBases, 64, 64}, torch::kFloat32);
-	auto values = basis.accessor<float, 3>();
-	for (int q = 0; q < 64; ++q) {
-		const int qr = q / 8;
-		const int qf = q % 8;
-		for (int p = 0; p < 64; ++p) {
-			const int pr = p / 8;
-			const int pf = p % 8;
-			const int dr = std::abs(qr - pr);
-			const int df = std::abs(qf - pf);
-			values[0][q][p] = q == p ? 1.0F : 0.0F;
-			values[1][q][p] = std::max(dr, df) == 1 ? 1.0F : 0.0F;
-			values[2][q][p] = (dr == 1 && df == 2) || (dr == 2 && df == 1) ? 1.0F : 0.0F;
-			values[3][q][p] = qr == pr && q != p ? 1.0F : 0.0F;
-			values[4][q][p] = qf == pf && q != p ? 1.0F : 0.0F;
-			values[5][q][p] = qr - qf == pr - pf && q != p ? 1.0F : 0.0F;
-			values[6][q][p] = qr + qf == pr + pf && q != p ? 1.0F : 0.0F;
-			values[7][q][p] = 1.0F;
-		}
-	}
-	return basis / basis.sum(2, true).clamp_min(1.0F);
+	auto basis = torch::empty(
+		{static_cast<std::int64_t>(generated::kRelationBasisDimension), 64, 64},
+		torch::kFloat32);
+	std::copy(generated::kRelationBasis.begin(), generated::kRelationBasis.end(),
+			  basis.data_ptr<float>());
+	return basis;
 }
 
 torch::nn::Conv2d fuse_conv_bn(const torch::nn::Conv2d &conv,
@@ -104,7 +88,7 @@ SquareEmbeddingImpl::SquareEmbeddingImpl(int channels) {
 
 torch::Tensor SquareEmbeddingImpl::forward(torch::Tensor x) { return x + values; }
 
-ResidualBlockImpl::ResidualBlockImpl(int channels, int sequence_depth)
+ResidualBlockImpl::ResidualBlockImpl(int channels, int sequence_depth, bool zero_output_scale)
 	: channels_(channels), groups_(std::gcd(channels, kMaximumRelationGroups)),
 	  group_width_(channels / groups_) {
 	if (channels <= 0 || sequence_depth <= 0) {
@@ -130,21 +114,25 @@ ResidualBlockImpl::ResidualBlockImpl(int channels, int sequence_depth)
 
 	relation_basis = register_buffer("relation_basis", build_relation_basis());
 	relation_coefficients = register_parameter(
-		"relation_coefficients", torch::zeros({groups_, kGeometryBases}));
+		"relation_coefficients",
+		torch::zeros({groups_, static_cast<std::int64_t>(generated::kRelationBasisDimension)}));
 	relation_residual = register_parameter(
 		"relation_residual", torch::zeros({groups_, 64, 64}));
 	path_balance = register_parameter("path_balance", torch::ones({channels_}));
 
 	torch::NoGradGuard guard;
 	for (int group = 0; group < groups_; ++group) {
-		relation_coefficients.index_put_({group, group % kGeometryBases}, 1.0F);
+		relation_coefficients.index_put_(
+			{group, group % static_cast<int>(generated::kRelationBasisDimension)}, 1.0F);
 	}
 	const double local_scale = 1.0 / std::sqrt(3.0);
 	for (const auto &norm : {local_norm3, local_norm1, local_identity_norm}) {
 		norm->weight.fill_(local_scale);
 		norm->bias.zero_();
 	}
-	up_norm->weight.fill_(1.0 / std::sqrt(static_cast<double>(sequence_depth)));
+	up_norm->weight.fill_(zero_output_scale
+		? 0.0
+		: 1.0 / std::sqrt(static_cast<double>(sequence_depth)));
 	up_norm->bias.zero_();
 }
 
@@ -239,6 +227,7 @@ ModelImpl::ModelImpl(int channels, int blocks) : channels_(channels), blocks_(bl
 		"policy_action_bias", torch::zeros({1, kPolicyPlanes, 8, 8}));
 
 	value_block = ResidualBlock(channels_, 1);
+	value_block_2 = ResidualBlock(channels_, 1, true);
 	value_conv = torch::nn::Conv2d(
 		torch::nn::Conv2dOptions(channels_, kValueChannels, 1).bias(false));
 	value_norm = torch::nn::BatchNorm2d(kValueChannels);
@@ -246,7 +235,7 @@ ModelImpl::ModelImpl(int channels, int blocks) : channels_(channels), blocks_(bl
 	value_output = torch::nn::Linear(kValueHidden, 1);
 	value_head = register_module(
 		"value_head", torch::nn::Sequential(
-			value_block, value_conv, value_norm,
+			value_block, value_block_2, value_conv, value_norm,
 			torch::nn::ReLU(torch::nn::ReLUOptions(true)), torch::nn::Flatten(),
 			value_hidden, torch::nn::ReLU(torch::nn::ReLUOptions(true)), value_output,
 			torch::nn::Tanh()));
@@ -360,10 +349,12 @@ void ModelImpl::fuse_for_inference() {
 	}
 
 	value_block->fuse_for_inference();
+	value_block_2->fuse_for_inference();
 	value_conv = fuse_conv_bn(value_conv, value_norm);
 	value_head = replace_module(
 		"value_head", torch::nn::Sequential(
-			value_block, value_conv, torch::nn::ReLU(torch::nn::ReLUOptions(true)),
+			value_block, value_block_2, value_conv,
+			torch::nn::ReLU(torch::nn::ReLUOptions(true)),
 			torch::nn::Flatten(), value_hidden,
 			torch::nn::ReLU(torch::nn::ReLUOptions(true)), value_output, torch::nn::Tanh()));
 	value_norm = nullptr;

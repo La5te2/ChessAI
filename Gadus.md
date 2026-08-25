@@ -173,29 +173,64 @@ L_j(b_j)=
 +\mathrm{BN}_{j,I}(b_j).
 $$
 
-The full-board transformation begins with eight fixed geometric relations over the 64 canonical squares. Let the output square be $q=(r_q,f_q)$ and the input square be $p=(r_p,f_p)$. Define $\mathbf 1[\cdot]$ to equal one when its condition holds and zero otherwise. The unnormalized relation matrices are
+The full-board transformation uses a fixed relation dictionary over the 64 canonical squares. A dictionary is a collection of matrices, independent of how their entries are represented. A symbolic formula can be evaluated into a dense table, and a dense table can be represented exactly by indexed constants. The two representations are mathematically equivalent when they define the same entries. The construction is iterative, and both its human-designed initial dictionary and its statistically extracted successors are empirical choices in this sense.
+
+Generation zero begins with eight relations supplied by human geometric experience. Let the output square be $q=(r_q,f_q)$ and the input square be $p=(r_p,f_p)$. With $\mathbf 1[\cdot]$ denoting an indicator, the unnormalized matrices are
 
 $$
 \begin{aligned}
-B_0(q,p)&=\mathbf 1[p=q],\\
-B_1(q,p)&=\mathbf 1[\max(|r_q-r_p|,|f_q-f_p|)=1],\\
-B_2(q,p)&=\mathbf 1[(|r_q-r_p|,|f_q-f_p|)\in\lbrace(1,2),(2,1)\rbrace],\\
-B_3(q,p)&=\mathbf 1[r_q=r_p\text{ and }p\ne q],\\
-B_4(q,p)&=\mathbf 1[f_q=f_p\text{ and }p\ne q],\\
-B_5(q,p)&=\mathbf 1[r_q-f_q=r_p-f_p\text{ and }p\ne q],\\
-B_6(q,p)&=\mathbf 1[r_q+f_q=r_p+f_p\text{ and }p\ne q],\\
-B_7(q,p)&=1.
+B^{(0)}_0(q,p)&=\mathbf 1[q=p],\\
+B^{(0)}_1(q,p)&=\mathbf 1[\max(|r_q-r_p|,|f_q-f_p|)=1],\\
+B^{(0)}_2(q,p)&=\mathbf 1[(|r_q-r_p|,|f_q-f_p|)\in\{(1,2),(2,1)\}],\\
+B^{(0)}_3(q,p)&=\mathbf 1[r_q=r_p\land q\ne p],\\
+B^{(0)}_4(q,p)&=\mathbf 1[f_q=f_p\land q\ne p],\\
+B^{(0)}_5(q,p)&=\mathbf 1[r_q-f_q=r_p-f_p\land q\ne p],\\
+B^{(0)}_6(q,p)&=\mathbf 1[r_q+f_q=r_p+f_p\land q\ne p],\\
+B^{(0)}_7(q,p)&=1.
 \end{aligned}
 $$
 
-These matrices represent identity, king-step adjacency, knight displacement, common rank, common file, the two common diagonals and the complete board. Normalizing each output row gives
+Row normalization defines the generation-zero dictionary of dimension $H_0=8$:
 
 $$
-\widehat B_r(q,p)=
-\frac{B_r(q,p)}
-{\displaystyle\max\left(1,\sum_{u=0}^{63}B_r(q,u)\right)},
+\widehat B^{(0)}_r(q,p)=
+\frac{B^{(0)}_r(q,p)}
+{\max\left(1,\sum_{u=0}^{63}B^{(0)}_r(q,u)\right)},
 \qquad 0\leq r<8.
 $$
+
+Let $H_t$ denote the number of fixed matrices in the generation-$t$ dictionary. Training a model from that dictionary produces one or more source checkpoints. For checkpoint $m$, each chess-structured block $j$ and relation group $g$ contains the complete learned relation
+
+$$
+A^{(t,m)}_{j,g}=
+\sum_{r=0}^{H_t-1}\alpha^{(t,m)}_{j,g,r}\widehat B^{(t)}_r+
+\Delta A^{(t,m)}_{j,g}.
+$$
+
+Flattening all such matrices from checkpoint $m$ gives $R^{(t)}_m$, whose rows lie in $\mathbb R^{4096}$. Each checkpoint is normalized by its total Frobenius norm, and the normalized rows are concatenated:
+
+$$
+X^{(t)}=\operatorname{ConcatRows}\left(
+\frac{R^{(t)}_m}{\max(\lVert R^{(t)}_m\rVert_F,10^{-30})}:m\in\mathcal M_t
+\right).
+$$
+
+Let $X^{(t)}=U\Sigma V^\mathsf T$ be an uncentered singular-value decomposition and let $v_r$ be row $r$ of $V^\mathsf T$ in nonincreasing singular-value order. Dictionary iteration adopts the dimension-selection convention
+
+$$
+H_{t+1}\geq H_t.
+$$
+
+This inequality is a design choice rather than a property implied by the SVD. It prevents the number of shared relation directions from decreasing, although recomputing the SVD may rotate the subspace that they span. It also admits additional directions supported by the trained relations. Generation $t+1$ is
+
+$$
+\widehat B^{(t+1)}_r=\xi_r\operatorname{Matrix}_{64\times64}(v_r),
+\qquad 0\leq r<H_{t+1},
+$$
+
+where $\xi_r\in\{-1,1\}$ makes the first maximum-magnitude component positive. Consequently, every successor basis has unit Frobenius norm, and its leading prefixes minimize squared reconstruction error on the fused source relations at their respective dimensions. A successor may itself be written symbolically whenever an exact formula for its entries is available; storing it as a dense array changes neither the matrix nor the network. Repeating this construction after training the successor produces another dictionary without changing the network formula.
+
+For the network equations below, choose one dictionary generation and write its dimension and matrices as $H$ and $\widehat B_0,\ldots,\widehat B_{H-1}$, omitting the generation superscript.
 
 Let
 
@@ -205,11 +240,11 @@ K=\gcd(C,8),
 d=\frac{C}{K}.
 $$
 
-The channels of $b_j$ are divided into $K$ groups of width $d$. Relation group $g$ uses a learned linear combination of the fixed geometric matrices together with a learned unrestricted residual matrix:
+Here $K$ is the number of computational channel groups in one residual block; it is independent of the dictionary dimension $H$. The channels of $b_j$ are divided into $K$ groups of width $d$. Relation group $g$ uses a learned linear combination of the fixed matrices in the selected dictionary together with a learned unrestricted residual matrix:
 
 $$
 A_{j,g}=
-\sum_{r=0}^{7}\alpha_{j,g,r}\widehat B_r+
+\sum_{r=0}^{H-1}\alpha_{j,g,r}\widehat B_r+
 \Delta A_{j,g},
 \qquad
 A_{j,g}\in\mathbb R^{64\times64}.
@@ -246,7 +281,7 @@ h_j+
 \qquad 0\leq j<B.
 $$
 
-The normalized relation matrices $\widehat B_0,\ldots,\widehat B_7$ are fixed and shared by every residual block. Each block has its own relation coefficients $\alpha_{j,g,r}$, residual matrices $\Delta A_{j,g}$ and path-balance vector $\lambda_j$. Their initial values are
+The selected relation matrices $\widehat B_0,\ldots,\widehat B_{H-1}$ are fixed and shared by every residual block. Each block has its own relation coefficients $\alpha_{j,g,r}$, residual matrices $\Delta A_{j,g}$ and path-balance vector $\lambda_j$. For a selected dictionary satisfying $H\geq K$, as occurs under the nondecreasing construction from $H_0=8$, their initial values are
 
 $$
 \alpha_{j,g,r}=\mathbf 1[r=g],
@@ -258,7 +293,7 @@ $$
 
 The first two assignments give $A_{j,g}=\widehat B_g$ at initialization. Substituting $\lambda_j=\mathbf 1$ into the definition of $c_j$ assigns the local and full-board transformations the same initial coefficient $1/\sqrt2$ in every channel.
 
-The affine scales of the three local-branch normalization layers are initialized to $1/\sqrt3$, and their biases are initialized to zero. For a residual sequence containing $D$ blocks, the affine scale of $\mathrm{BN}_{j,\uparrow}$ in every block is initialized to $1/\sqrt D$, with zero bias. The square embedding $E_S$ is also initialized to zero. The relation basis remains fixed during training, whereas the square embedding and all block-specific convolutional, normalization, relation and path-balance parameters are trainable.
+The affine scales of the three local-branch normalization layers are initialized to $1/\sqrt3$, and their biases are initialized to zero. In the shared and Policy sequences, the affine scale of $\mathrm{BN}_{j,\uparrow}$ is initialized to $1/\sqrt D$ for a sequence of length $D$. The first Value block retains scale one, while the second Value block begins with zero scale and is therefore an identity map at initialization. All corresponding biases begin at zero. The square embedding $E_S$ is also initialized to zero. The relation basis remains fixed during training, whereas the square embedding and all block-specific convolutional, normalization, relation and path-balance parameters are trainable.
 
 After the $B$ blocks, $h_B\in\mathbb R^{C\times8\times8}$ is the shared representation supplied to the Policy and Value heads defined below.
 

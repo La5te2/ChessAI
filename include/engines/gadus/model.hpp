@@ -18,7 +18,7 @@ struct SquareEmbeddingImpl : torch::nn::Module {
 TORCH_MODULE(SquareEmbedding);
 
 struct ResidualBlockImpl : torch::nn::Module {
-	ResidualBlockImpl(int channels, int sequence_depth);
+	ResidualBlockImpl(int channels, int sequence_depth, bool zero_output_scale = false);
 	torch::Tensor forward(torch::Tensor x);
 	void fuse_for_inference();
 	torch::Tensor relation_matrices() const;
@@ -78,6 +78,7 @@ private:
 	torch::nn::Conv2d policy_output{nullptr};
 	torch::Tensor policy_action_bias;
 	ResidualBlock value_block{nullptr};
+	ResidualBlock value_block_2{nullptr};
 	torch::nn::Conv2d value_conv{nullptr};
 	torch::nn::BatchNorm2d value_norm{nullptr};
 	torch::nn::Linear value_hidden{nullptr};
