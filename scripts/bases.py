@@ -37,7 +37,7 @@ def parse_args() -> argparse.Namespace:
         "--dimension",
         required=True,
         type=int,
-        help="number K of abstract relation bases to produce",
+        help="relation-dictionary dimension H to produce",
     )
     return parser.parse_args()
 
@@ -173,14 +173,9 @@ def basis_overlap(left: torch.Tensor, right: torch.Tensor, count: int) -> float:
     return float(overlap.square().sum() / count)
 
 
-def effective_rank(singular: torch.Tensor, total_energy: float) -> float:
+def effective_rank(singular: torch.Tensor) -> float:
     eigenvalues = singular.square()
     captured = float(eigenvalues.sum())
-    residual = max(0.0, total_energy - captured)
-    if residual > 0.0:
-        # The unresolved tail is reported separately; treating it as one eigenvalue would
-        # overstate concentration, so effective rank is limited to the computed spectrum.
-        pass
     denominator = float(eigenvalues.square().sum())
     return captured * captured / denominator if denominator > 0.0 else 0.0
 
@@ -232,10 +227,6 @@ def align_basis(
         "relative_alignment_error": error,
         "row_norms": scales.tolist(),
     }
-
-
-def summarize_curve(curve: list[float], points: set[int]) -> dict[str, float]:
-    return {str(k): curve[k - 1] for k in sorted(points) if 0 < k <= len(curve)}
 
 
 def resource_estimates(
@@ -379,7 +370,6 @@ def main() -> None:
     validate_args(args)
     device = resolve_device()
 
-    states = []
     parameter_sources = []
     reference_state = None
     reference_prefixes = None
@@ -406,7 +396,6 @@ def main() -> None:
         reference_prefixes = prefixes if reference_prefixes is None else reference_prefixes
         parameters = parameter_rows(state, prefixes)
         parameter_sources.append(parameters)
-        states.append(state)
         print(f"loaded model={path} relation_rows={parameters.shape[0]}")
 
     normalized_sources = [normalize_checkpoint_rows(rows) for rows in parameter_sources]
@@ -506,9 +495,7 @@ def main() -> None:
             "dimension": dimension,
             "decomposition_method": decomposition_method,
             "singular_values": singular.tolist(),
-            "effective_rank_of_computed_spectrum": effective_rank(
-                singular, float(fit_rows.square().sum())
-            ),
+            "effective_rank_of_computed_spectrum": effective_rank(singular),
             "fit_explained_curve": fit_curve,
             "checkpoint_parameter_curves": checkpoint_curves,
             "current_basis_parameter_explained": current_explained,

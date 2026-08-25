@@ -162,6 +162,19 @@ build/gadus/train \
 
 For supervised training, a positive `--max-steps` value caps optimizer updates. Setting it to `0` leaves the update count under the control of `--epochs`. `--save-every` controls periodic atomic checkpoint writes.
 
+Generate an empirical Gadus relation dictionary from one or more compatible checkpoints with:
+
+```bash
+python scripts/bases.py \
+	--model models/gadus/100k.pth \
+	--model models/gadus/300k.pth \
+	--dimension 12
+```
+
+Repeat `--model` for every checkpoint that should contribute equally to the fitted relation subspace. The checkpoints must have the same relation-block layout and fixed source dictionary. `--dimension` selects the number of generated relation bases. The script uses CUDA when PyTorch reports it as available and otherwise uses the CPU.
+
+Each run writes `data/<run-id>-<time>.zip`. The archive contains the generated tensor in `basis.pt`, a C++ initializer in `basis.hpp`, compact results in `summary.json`, complete numerical diagnostics in `metrics.json`, and one four-column `bases.png` contact sheet showing every basis from source square `e4`. Generating an archive does not modify the Gadus model implementation.
+
 Analyze one position with Gadus search using:
 
 ```bash
