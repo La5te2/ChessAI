@@ -149,6 +149,10 @@ def optimal_basis(
         method = "randomized_svd"
     basis = basis.detach().to(dtype=torch.float64, device="cpu")
     basis = torch.linalg.qr(basis.T, mode="reduced").Q.T
+    for index in range(basis.shape[0]):
+        pivot = int(basis[index].abs().argmax())
+        if float(basis[index, pivot]) < 0.0:
+            basis[index].neg_()
     return (
         basis,
         singular.detach().double().cpu(),
@@ -187,46 +191,6 @@ def fixed_basis(state: dict[str, torch.Tensor], prefixes: list[str]) -> torch.Te
         .to(dtype=torch.float64, device="cpu")
         .reshape(-1, 4096)
     )
-
-
-def align_basis(
-    candidate: torch.Tensor, preceding: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor, dict[str, float | list[float]]]:
-    """Align an orthonormal candidate to preceding coordinates and restore their scales."""
-    dimension = candidate.shape[0]
-    old_count = preceding.shape[0]
-    old_norms = torch.linalg.vector_norm(preceding, dim=1).clamp_min(BASIS_EPSILON)
-    old_unit = preceding / old_norms.unsqueeze(1)
-    retained = min(dimension, old_count)
-
-    if dimension <= old_count:
-        target = old_unit[:dimension]
-        left, _, right = torch.linalg.svd(target @ candidate.T, full_matrices=False)
-        rotation = left @ right
-    else:
-        left, _, right = torch.linalg.svd(old_unit @ candidate.T, full_matrices=True)
-        head = left @ right[:old_count]
-        _, _, completion = torch.linalg.svd(head, full_matrices=True)
-        rotation = torch.cat((head, completion[old_count:]), dim=0)
-
-    aligned_unit = rotation @ candidate
-    if dimension <= old_count:
-        scales = old_norms[:dimension]
-    else:
-        appended_scale = old_norms.square().mean().sqrt()
-        scales = torch.cat(
-            (old_norms, appended_scale.repeat(dimension - old_count)), dim=0
-        )
-    aligned = scales.unsqueeze(1) * aligned_unit
-    target = old_unit[:retained]
-    error = float((aligned_unit[:retained] - target).square().sum()) / max(
-        float(target.square().sum()), BASIS_EPSILON
-    )
-    return aligned, aligned_unit, {
-        "retained_coordinates": retained,
-        "relative_alignment_error": error,
-        "row_norms": scales.tolist(),
-    }
 
 
 def resource_estimates(
@@ -371,58 +335,49 @@ def main() -> None:
     device = resolve_device()
 
     parameter_sources = []
+    current_spans = []
     reference_state = None
     reference_prefixes = None
-    preceding = None
     for path in args.model:
         state = load_state(path, device)
         prefixes = relation_prefixes(state)
         if reference_prefixes is not None and prefixes != reference_prefixes:
             raise RuntimeError(f"checkpoint {path} has a different relation-block layout")
-        checkpoint_basis = fixed_basis(state, prefixes)
-        if preceding is not None:
-            if checkpoint_basis.shape != preceding.shape:
-                raise RuntimeError(f"checkpoint {path} has a different fixed-basis shape")
-            relative_difference = float((checkpoint_basis - preceding).square().sum()) / max(
-                float(preceding.square().sum()), BASIS_EPSILON
-            )
-            if relative_difference > 1e-10:
-                raise RuntimeError(
-                    f"checkpoint {path} uses a different fixed relation dictionary"
-                )
-        else:
-            preceding = checkpoint_basis
         reference_state = state if reference_state is None else reference_state
         reference_prefixes = prefixes if reference_prefixes is None else reference_prefixes
         parameters = parameter_rows(state, prefixes)
         parameter_sources.append(parameters)
+        current_spans.append(orthonormal_span(fixed_basis(state, prefixes)))
         print(f"loaded model={path} relation_rows={parameters.shape[0]}")
 
     normalized_sources = [normalize_checkpoint_rows(rows) for rows in parameter_sources]
     fit_rows = torch.cat(normalized_sources, dim=0)
-    raw_basis, singular, decomposition_method = optimal_basis(fit_rows, args.dimension, device)
-    basis, orthonormal_basis, alignment = align_basis(raw_basis, preceding)
+    basis, singular, decomposition_method = optimal_basis(fit_rows, args.dimension, device)
     orthogonality_error = float(
         (
-            orthonormal_basis @ orthonormal_basis.T
-            - torch.eye(orthonormal_basis.shape[0], dtype=torch.float64)
+            basis @ basis.T
+            - torch.eye(basis.shape[0], dtype=torch.float64)
         )
         .abs()
         .max()
     )
-    fit_curve = energy_curve(fit_rows, orthonormal_basis)
-    checkpoint_curves = [energy_curve(rows, orthonormal_basis) for rows in parameter_sources]
-    current = orthonormal_span(preceding)
-    current_explained = [energy_curve(rows, current)[-1] for rows in parameter_sources]
+    fit_curve = energy_curve(fit_rows, basis)
+    checkpoint_curves = [energy_curve(rows, basis) for rows in parameter_sources]
+    current_explained = [
+        energy_curve(rows, current)[-1]
+        for rows, current in zip(parameter_sources, current_spans)
+    ]
 
     individual_bases = []
     for rows in normalized_sources:
         own_basis, _, _ = optimal_basis(rows, args.dimension, device)
         individual_bases.append(own_basis)
-    stability_curve = [
-        min(basis_overlap(orthonormal_basis, own, count) for own in individual_bases)
-        for count in range(1, orthonormal_basis.shape[0] + 1)
-    ]
+    stability_curve = None
+    if len(individual_bases) > 1:
+        stability_curve = [
+            min(basis_overlap(basis, own, count) for own in individual_bases)
+            for count in range(1, basis.shape[0] + 1)
+        ]
     dimension = args.dimension
     checkpoints = [
         {
@@ -448,13 +403,14 @@ def main() -> None:
         image_path = directory / "bases.png"
 
         selected_resources = resources[str(dimension)]
-        current_resources = resources[str(int(current.shape[0]))]
+        current_resources = resources[str(int(current_spans[0].shape[0]))]
         summary = {
             "dimension": dimension,
             "fit_explained": fit_curve[dimension - 1],
-            "stability": stability_curve[dimension - 1],
+            "stability": (
+                stability_curve[dimension - 1] if stability_curve is not None else None
+            ),
             "checkpoints": checkpoints,
-            "alignment": alignment,
             "numerics": {
                 "orthogonality_error": orthogonality_error,
             },
@@ -482,10 +438,14 @@ def main() -> None:
             },
         }
 
-        overlap_by_k = {
-            str(k): [basis_overlap(orthonormal_basis, own, k) for own in individual_bases]
-            for k in range(1, dimension + 1)
-        }
+        overlap_by_h = None
+        if len(individual_bases) > 1:
+            overlap_by_h = {
+                str(count): [
+                    basis_overlap(basis, own, count) for own in individual_bases
+                ]
+                for count in range(1, dimension + 1)
+            }
         metrics = {
             "run_id": run_id,
             "created_at": timestamp,
@@ -500,9 +460,7 @@ def main() -> None:
             "checkpoint_parameter_curves": checkpoint_curves,
             "current_basis_parameter_explained": current_explained,
             "stability_curve": stability_curve,
-            "checkpoint_subspace_overlap_by_k": overlap_by_k,
-            "automatic_to_current_overlap": (orthonormal_basis @ current.T).tolist(),
-            "alignment_rotation": (orthonormal_basis @ raw_basis.T).tolist(),
+            "checkpoint_subspace_overlap_by_h": overlap_by_h,
             "resource_estimates": resources,
             "image_source_square": "e4",
         }
@@ -511,9 +469,6 @@ def main() -> None:
         metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
         torch.save({
             "basis": basis.reshape(dimension, 64, 64).float(),
-            "orthonormal_basis": orthonormal_basis.reshape(dimension, 64, 64).float(),
-            "raw_svd_basis": raw_basis.reshape(dimension, 64, 64).float(),
-            "alignment_rotation": orthonormal_basis @ raw_basis.T,
             "singular_values": singular.float(),
             "dimension": dimension,
         }, basis_path)
@@ -531,12 +486,12 @@ def main() -> None:
     print(
         "fit explained: "
         + " ".join(
-            f"K={k}:{fit_curve[k - 1]:.4f}" for k in sorted(points) if k <= len(fit_curve)
+            f"H={k}:{fit_curve[k - 1]:.4f}" for k in sorted(points) if k <= len(fit_curve)
         )
     )
     for index, item in enumerate(checkpoints, start=1):
         print(
-            f"checkpoint={index} automatic@K="
+            f"checkpoint={index} automatic@H="
             f"{item['automatic_basis_parameter_explained']:.4f} "
             f"current={item['current_basis_parameter_explained']:.4f}"
         )
