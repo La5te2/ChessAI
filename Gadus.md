@@ -215,7 +215,7 @@ A^{\mathrm{static}}_{j,g}=
 +\Delta A^\perp_{j,g}.
 $$
 
-This decomposition is unique. Its relative component contains the common value of each displacement class, while the constrained residual contains only differences among square pairs in the same class. The implementation stores a $15\times15$ coefficient table and obtains its dense entries by displacement lookup rather than storing 225 dense basis matrices.
+This decomposition is unique. Its relative component contains the common value of each displacement class, while the constrained residual contains only differences among square pairs in the same class. For each relation group, the implementation stores 225 coefficients indexed by the $15\times15$ displacement set and obtains the corresponding dense entries by lookup rather than storing 225 dense basis matrices.
 
 Sliding-piece geometry also depends on occupied intermediate squares. Let $o_s(p)\in\{0,1\}$ indicate whether square $p$ is occupied in encoded state $s$, and let $I(q,p)$ be the squares strictly between two aligned endpoints. Define
 
@@ -238,9 +238,9 @@ A_{j,g}(s)=A^{\mathrm{static}}_{j,g}
 +\beta^B_{j,g}V^B_s,
 $$
 
-where $\beta^R_{j,g}$ and $\beta^B_{j,g}$ are learned scalars. The visibility matrices $V^R_s$ and $V^B_s$ are constructed once per encoded position and shared by every residual block.
+where $\beta^R_{j,g}$ and $\beta^B_{j,g}$ are learned scalars. The visibility matrices $V^R_s$ and $V^B_s$ are constructed once for each encoded position and used by every residual block that processes that position.
 
-During training, the implementation evaluates the static, rook and bishop products separately and adds their outputs. This form avoids retaining a batch-sized $N\times K\times64\times64$ relation tensor for every block during backpropagation. Fused inference has no backward state to retain, so it first combines the three matrices and evaluates one grouped relation multiplication.
+During training, the implementation evaluates the products of the feature tensor with the static, rook-visibility and bishop-visibility matrices separately, then adds the three results. This algebraically equivalent form avoids retaining a batch-sized $N\times K\times64\times64$ relation tensor for every block during backpropagation. Inference retains no backward state, so its fused form first combines the three matrices and then performs one grouped relation multiplication.
 
 Let
 
@@ -267,7 +267,7 @@ c_j=
 \mathrm{ReLU}\left(
 \frac{L_j(b_j)+\lambda_j\odot R_j(b_j)}
 {\sqrt{1+\lambda_j^2}}
-\right),
+\right).
 $$
 
 All operations involving $\lambda_j$ are applied independently to each channel and broadcast over its $8\times8$ feature map. A final $1\times1$ projection maps the combined representation back to the residual stream:
@@ -308,9 +308,9 @@ E_G&=\mathcal D.
 \end{aligned}
 $$
 
-Canonical rank displacement $+1$ points forward for the friendly side. The rook and bishop groups instead begin with their corresponding visibility coefficient equal to one. All other visibility coefficients, unassigned relative coefficients and absolute residuals begin at zero. Every block begins with $\lambda_j=\mathbf1$, assigning the local and full-board transformations the same coefficient $1/\sqrt2$ in every channel.
+The six static initialization modes use the canonical displacement coordinates defined above. In the friendly-pawn modes, canonical rank displacement $+1$ points forward for the friendly side. The remaining two modes initialize position-dependent visibility relations. If relation group $6$ exists, its rook-visibility coefficient $\beta^R_{j,6}$ is initialized to one. If relation group $7$ exists, its bishop-visibility coefficient $\beta^B_{j,7}$ is initialized to one. Every relation coefficient and absolute residual entry not assigned by these initialization modes is initialized to zero. Independently of the relation initialization, each block begins with $\lambda_j=\mathbf1$, which assigns the local and full-board transformations the same coefficient $1/\sqrt2$ in every channel.
 
-The affine scales of the three local-branch normalization layers are initialized to $1/\sqrt3$, and their biases are initialized to zero. In the shared and Policy sequences, the affine scale of $\mathrm{BN}_{j,\uparrow}$ is initialized to $1/\sqrt D$ for a sequence of length $D$. The first Value block retains scale one, while the second Value block begins with zero scale and is therefore an identity map at initialization. All corresponding biases begin at zero. The square embedding $E_S$ is also initialized to zero. The displacement atoms and ray geometry are fixed, whereas the square embedding and all block-specific convolutional, normalization, relation and path-balance parameters are trainable.
+The affine scales of the three local-branch normalization layers are initialized to $1/\sqrt3$, and their biases are initialized to zero. In the shared and Policy sequences, the affine scale of $\mathrm{BN}_{j,\uparrow}$ is initialized to $1/\sqrt D$ for a sequence of length $D$. The corresponding scale is initialized to one in the first Value block and to zero in the second. The second Value block is therefore an identity map at initialization. All corresponding biases are initialized to zero. The square embedding $E_S$ is also initialized to zero. The displacement atoms and ray geometry are fixed, whereas the square embedding and all block-specific convolutional, normalization, relation and path-balance parameters are trainable.
 
 After the $B$ blocks, $h_B\in\mathbb R^{C\times8\times8}$ is the shared representation supplied to the Policy and Value heads defined below.
 
@@ -447,9 +447,9 @@ $$
 \ell_\theta(s,i)=w_p^{\mathsf T}u_{D_P}(r,f)+B_{P,p,r,f}.
 $$
 
-This expression equals $L_\theta(s)_{p,r,f}$ and computes the requested logit without materializing the other action-plane components. For a batch of complete states, the inference path first converts every legal action index to canonical coordinates. It pads the resulting arrays to the largest legal-action count in that batch, evaluates the requested logits and masks the padded positions before applying softmax. The resulting distribution for each state contains exactly the probabilities of its legal actions.
+This expression equals $L_\theta(s)_{p,r,f}$ and computes the requested logit without materializing the other action-plane components. For a batch of complete states, inference first converts every legal action index to canonical coordinates. The legal-action arrays are padded to the largest legal-action count in the batch so that the requested logits can be evaluated together. The padded positions are masked before softmax, leaving each state with a distribution over exactly its legal actions.
 
-In evaluation mode, every convolution followed directly by affine batch normalization is replaced by its equivalent biased convolution. Within each chess-structured block, the three local branches are combined into one biased $3\times3$ convolution by placing the $1\times1$ and normalized identity kernels at the center of that kernel. Each $A^{\mathrm{static}}_{j,g}$ is computed once from its displacement coefficients and constrained residual. For each evaluated position, the network constructs $V^R_s$ and $V^B_s$ once and combines them with every block's two visibility coefficients. The fixed statistics of the non-affine relation normalization and the learned path-balance vector are also evaluated once during fusion. Their local coefficient and relation mean are absorbed into the fused local convolution, while their relation coefficient becomes one fixed channelwise scale applied after the grouped relation multiplication. These transformations preserve the network outputs while removing affine normalization attached to fused convolutions, local-branch summation, repeated construction of the static relation matrices, relation normalization and path-balance square roots from inference.
+In evaluation mode, every convolution followed directly by affine batch normalization is replaced by its equivalent biased convolution. Within each chess-structured block, the three local branches are combined into one biased $3\times3$ convolution by placing the $1\times1$ and normalized identity kernels at the center of the $3\times3$ kernel. Each $A^{\mathrm{static}}_{j,g}$ is computed once from its displacement coefficients and constrained residual. For each evaluated position, the network constructs $V^R_s$ and $V^B_s$ once and combines them with the rook and bishop visibility coefficients of every relation group in each block. Fusion also evaluates the fixed statistics of the non-affine relation normalization and the learned path-balance vector once. The resulting local coefficient and relation-centering term are absorbed into the fused local convolution, while the resulting relation coefficient becomes a fixed channelwise scale applied after grouped relation multiplication. These transformations preserve the network outputs while removing affine normalization attached to fused convolutions, local-branch summation, repeated construction of static relation matrices, relation normalization and path-balance square roots from inference.
 
 ## 4. Supervised Training
 
@@ -575,7 +575,7 @@ w_{V,k}=\mathrm{clip}_{[w_{\min},w_{\max}]}\left(
 \right).
 $$
 
-An empty $I_k$, a nonfinite gradient statistic or a squared gradient norm no greater than $\epsilon_g$ leaves the preceding coefficient unchanged. The controller periodically performs this calculation during optimization.
+At a periodic probe point, an empty $I_k$, a nonfinite gradient statistic or either squared gradient norm being no greater than $\epsilon_g$ causes the controller to set $w_{V,k}=w_{V,k-1}$. If none of these conditions holds, the controller applies the projection and logarithmic smoothing defined above. At optimizer steps without a probe, the coefficient also satisfies $w_{V,k}=w_{V,k-1}$.
 
 To express how the resulting objective updates the complete network, partition the network parameters as $\theta=(\theta_T,\theta_P,\theta_V)$, where $\theta_T$ contains the residual-trunk parameters and $\theta_P$ and $\theta_V$ contain the parameters of the two output heads. The gradients of $L_{\mathrm{sup}}^{(\mathcal B_k)}$ with respect to these parameter groups satisfy
 
@@ -934,7 +934,7 @@ The first limit increases the evidence collected for every legal action at a ful
 
 For cache keys, Gadus packs 18 physical-board binary planes into a 144-byte representation called `PackedState`: 12 piece planes, one side-to-move plane, four castling-right planes and one en-passant plane. It omits move counters and repetition history. The rules engine therefore checks whether a requested complete state is terminal before consulting the evaluation cache. Equal `PackedState` keys determine equal network inputs and can therefore share one compact Policy and Value record.
 
-One MCTS invocation receives one or more root states and constructs a separate search tree for each root. All trees created by that invocation access the same evaluation cache, which allows simulations within one tree and simulations from different trees to reuse completed network records. Let $M_C\geq0$ be the configured memory capacity for records retained across invocations. When $M_C=0$, the cache exists only for the current invocation and is discarded with its search trees. When $M_C>0$, the same cache persists across invocations and uses TLRU (trajectory-aware least-recently-used) to order its records. A successful lookup moves the accessed record to the most-recent end of this order, and inserting a new record places it at the same end.
+One MCTS invocation receives one or more root states and constructs a separate search tree for each root. These trees access one evaluation cache, allowing simulations within the same tree or across different trees to reuse completed network records. Let $M_C\geq0$ be the configured memory capacity for records retained across invocations. When $M_C=0$, the cache belongs only to the current invocation and is discarded with its search trees. When $M_C>0$, the cache persists across invocations and maintains a trajectory-aware least-recently-used (TLRU) order. A successful lookup moves the accessed record to the most-recent end of this order. An insertion places the new record at the same end.
 
 TLRU records a directed link when a cached nonterminal child is reached from a cached parent. Let $\mathcal C$ be the set of retained entries and let $\mathcal T(x_0)$ be the node set of the completed tree rooted at $x_0$. For every visited node $v\in\mathcal T(x_0)$ whose network record remains in $\mathcal C$, write $\kappa(v)$ for the corresponding cache entry. When $N(x_0)>0$, the trajectory heat of entry $c$ is
 
