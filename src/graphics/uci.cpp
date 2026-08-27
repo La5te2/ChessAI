@@ -1,12 +1,12 @@
 // Implements the cross-platform child-process transport and incremental UCI
 // parser used by both Simulator and Stadium.
 #include "graphics/uci.hpp"
-#include <nlohmann/json.hpp>
 #include <algorithm>
 #include <array>
 #include <cctype>
 #include <cerrno>
 #include <cstring>
+#include <nlohmann/json.hpp>
 #include <sstream>
 #include <stdexcept>
 #ifdef _WIN32
@@ -25,16 +25,14 @@ namespace {
 
 /// Returns an ASCII-lowercase copy for case-insensitive UCI option matching.
 std::string lowercase(std::string value) {
-	std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
-		return static_cast<char>(std::tolower(ch));
-	});
+	std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
 	return value;
 }
 
 /// Removes leading and trailing ASCII whitespace from protocol text.
 std::string trim(std::string value) {
 	const auto first = value.find_first_not_of(" \t\r\n");
-	if(first == std::string::npos) {
+	if (first == std::string::npos) {
 		return {};
 	}
 	const auto last = value.find_last_not_of(" \t\r\n");
@@ -45,18 +43,17 @@ std::string trim(std::string value) {
 std::vector<std::string> tokens_of(const std::string &line) {
 	std::istringstream stream(line);
 	std::vector<std::string> tokens;
-	for(std::string token; stream >> token;) {
+	for (std::string token; stream >> token;) {
 		tokens.push_back(std::move(token));
 	}
 	return tokens;
 }
 
 /// Joins one token range so option names, defaults, and combo choices retain spaces.
-std::string join_tokens(const std::vector<std::string> &tokens,
-						std::size_t begin, std::size_t end) {
+std::string join_tokens(const std::vector<std::string> &tokens, std::size_t begin, std::size_t end) {
 	std::ostringstream joined;
-	for(std::size_t index = begin; index < end; ++index) {
-		if(index > begin) {
+	for (std::size_t index = begin; index < end; ++index) {
+		if (index > begin) {
 			joined << ' ';
 		}
 		joined << tokens[index];
@@ -67,60 +64,53 @@ std::string join_tokens(const std::vector<std::string> &tokens,
 /// Parses the complete metadata carried by one standard UCI option declaration.
 std::optional<UciOption> parse_option_definition(const std::string &line) {
 	const auto tokens = tokens_of(line);
-	if(tokens.size() < 5 || tokens[0] != "option" || tokens[1] != "name") {
+	if (tokens.size() < 5 || tokens[0] != "option" || tokens[1] != "name") {
 		return std::nullopt;
 	}
-	const auto type_at =
-		std::find(tokens.begin() + 2, tokens.end(), std::string("type"));
-	if(type_at == tokens.end() || type_at + 1 == tokens.end()) {
+	const auto type_at = std::find(tokens.begin() + 2, tokens.end(), std::string("type"));
+	if (type_at == tokens.end() || type_at + 1 == tokens.end()) {
 		return std::nullopt;
 	}
-	const auto type_index =
-		static_cast<std::size_t>(std::distance(tokens.begin(), type_at));
+	const auto type_index = static_cast<std::size_t>(std::distance(tokens.begin(), type_at));
 	UciOption option;
 	option.name = join_tokens(tokens, 2, type_index);
 	option.type = lowercase(tokens[type_index + 1]);
-	const auto is_marker = [](const std::string &token) {
-		return token == "default" || token == "min" ||
-			   token == "max" || token == "var";
-	};
+	const auto is_marker = [](const std::string &token) { return token == "default" || token == "min" || token == "max" || token == "var"; };
 	std::size_t index = type_index + 2;
-	while(index < tokens.size()) {
+	while (index < tokens.size()) {
 		const std::string marker = tokens[index++];
 		const std::size_t value_begin = index;
-		while(index < tokens.size() && !is_marker(tokens[index])) {
+		while (index < tokens.size() && !is_marker(tokens[index])) {
 			++index;
 		}
 		const std::string value = join_tokens(tokens, value_begin, index);
-		if(marker == "default") {
+		if (marker == "default") {
 			option.default_value = value == "<empty>" ? "" : value;
-		} else if(marker == "min" && !value.empty()) {
+		} else if (marker == "min" && !value.empty()) {
 			try {
 				option.minimum = std::stoll(value);
-			} catch(...) {
+			} catch (...) {
 			}
-		} else if(marker == "max" && !value.empty()) {
+		} else if (marker == "max" && !value.empty()) {
 			try {
 				option.maximum = std::stoll(value);
-			} catch(...) {
+			} catch (...) {
 			}
-		} else if(marker == "var") {
+		} else if (marker == "var") {
 			option.choices.push_back(value);
 		}
 	}
-	return option.name.empty() || option.type.empty()
-			   ? std::nullopt
-			   : std::optional<UciOption>(std::move(option));
+	return option.name.empty() || option.type.empty() ? std::nullopt : std::optional<UciOption>(std::move(option));
 }
 
 /// Builds a platform shell command while preserving the user-entered argument tail.
 std::string command_text(const EngineConfig &config) {
-	if(config.path.empty()) {
+	if (config.path.empty()) {
 		throw std::invalid_argument("UCI engine path is empty");
 	}
 	std::string path = config.path.string();
 	std::string command = "\"" + path + "\"";
-	if(!trim(config.arguments).empty()) {
+	if (!trim(config.arguments).empty()) {
 		command += " " + config.arguments;
 	}
 	return command;
@@ -129,17 +119,15 @@ std::string command_text(const EngineConfig &config) {
 #ifdef _WIN32
 /// Converts UTF-8 command text into the UTF-16 representation required by Win32.
 std::wstring widen(const std::string &value) {
-	if(value.empty()) {
+	if (value.empty()) {
 		return {};
 	}
-	const int length = MultiByteToWideChar(
-		CP_UTF8, 0, value.data(), static_cast<int>(value.size()), nullptr, 0);
-	if(length <= 0) {
+	const int length = MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), nullptr, 0);
+	if (length <= 0) {
 		throw std::runtime_error("could not convert command to UTF-16");
 	}
 	std::wstring result(static_cast<std::size_t>(length), L'\0');
-	MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()),
-					   result.data(), length);
+	MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), result.data(), length);
 	return result;
 }
 #endif
@@ -155,8 +143,7 @@ public:
 		SECURITY_ATTRIBUTES security{};
 		security.nLength = sizeof(security);
 		security.bInheritHandle = TRUE;
-		if(!CreatePipe(&stdout_read_, &stdout_write_child_, &security, 0) ||
-		   !CreatePipe(&stdin_read_child_, &stdin_write_, &security, 0)) {
+		if (!CreatePipe(&stdout_read_, &stdout_write_child_, &security, 0) || !CreatePipe(&stdin_read_child_, &stdin_write_, &security, 0)) {
 			throw std::runtime_error("could not create UCI pipes");
 		}
 		SetHandleInformation(stdout_read_, HANDLE_FLAG_INHERIT, 0);
@@ -171,12 +158,10 @@ public:
 		startup.hStdError = stdout_write_child_;
 		std::wstring mutable_command = widen(command);
 		mutable_command.push_back(L'\0');
-		if(!CreateProcessW(nullptr, mutable_command.data(), nullptr, nullptr, TRUE,
-						   CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process_info_)) {
+		if (!CreateProcessW(nullptr, mutable_command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process_info_)) {
 			const auto code = GetLastError();
 			close_handles();
-			throw std::runtime_error("could not start UCI engine, Win32 error " +
-									 std::to_string(code));
+			throw std::runtime_error("could not start UCI engine, Win32 error " + std::to_string(code));
 		}
 		CloseHandle(stdin_read_child_);
 		stdin_read_child_ = nullptr;
@@ -185,15 +170,14 @@ public:
 #else
 		int input_pipe[2]{};
 		int output_pipe[2]{};
-		if(pipe(input_pipe) != 0 || pipe(output_pipe) != 0) {
-			throw std::runtime_error("could not create UCI pipes: " +
-									 std::string(std::strerror(errno)));
+		if (pipe(input_pipe) != 0 || pipe(output_pipe) != 0) {
+			throw std::runtime_error("could not create UCI pipes: " + std::string(std::strerror(errno)));
 		}
 		pid_ = fork();
-		if(pid_ < 0) {
+		if (pid_ < 0) {
 			throw std::runtime_error("could not fork UCI engine");
 		}
-		if(pid_ == 0) {
+		if (pid_ == 0) {
 			dup2(input_pipe[0], STDIN_FILENO);
 			dup2(output_pipe[1], STDOUT_FILENO);
 			dup2(output_pipe[1], STDERR_FILENO);
@@ -212,26 +196,21 @@ public:
 	}
 
 	/// Releases process handles after requesting a graceful, then forced, shutdown.
-	~Process() {
-		terminate();
-	}
+	~Process() { terminate(); }
 
 	/// Writes one newline-terminated UCI command atomically.
 	void write_line(const std::string &line) {
 		const std::string message = line + "\n";
 #ifdef _WIN32
 		DWORD written = 0;
-		if(stdin_write_ == nullptr ||
-		   !WriteFile(stdin_write_, message.data(), static_cast<DWORD>(message.size()),
-					  &written, nullptr)) {
+		if (stdin_write_ == nullptr || !WriteFile(stdin_write_, message.data(), static_cast<DWORD>(message.size()), &written, nullptr)) {
 			throw std::runtime_error("failed to write to UCI engine");
 		}
 #else
 		std::size_t offset = 0;
-		while(offset < message.size()) {
-			const auto count =
-				::write(stdin_write_, message.data() + offset, message.size() - offset);
-			if(count <= 0) {
+		while (offset < message.size()) {
+			const auto count = ::write(stdin_write_, message.data() + offset, message.size() - offset);
+			if (count <= 0) {
 				throw std::runtime_error("failed to write to UCI engine");
 			}
 			offset += static_cast<std::size_t>(count);
@@ -241,12 +220,12 @@ public:
 
 	/// Reads one complete line, returning false when the child closes stdout.
 	bool read_line(std::string &line) {
-		for(;;) {
+		for (;;) {
 			const auto newline = pending_.find('\n');
-			if(newline != std::string::npos) {
+			if (newline != std::string::npos) {
 				line = pending_.substr(0, newline);
 				pending_.erase(0, newline + 1);
-				if(!line.empty() && line.back() == '\r') {
+				if (!line.empty() && line.back() == '\r') {
 					line.pop_back();
 				}
 				return true;
@@ -254,15 +233,12 @@ public:
 			std::array<char, 4096> buffer{};
 #ifdef _WIN32
 			DWORD count = 0;
-			if(stdout_read_ == nullptr ||
-			   !ReadFile(stdout_read_, buffer.data(), static_cast<DWORD>(buffer.size()),
-						 &count, nullptr) ||
-			   count == 0) {
+			if (stdout_read_ == nullptr || !ReadFile(stdout_read_, buffer.data(), static_cast<DWORD>(buffer.size()), &count, nullptr) || count == 0) {
 				return false;
 			}
 #else
 			const auto count = ::read(stdout_read_, buffer.data(), buffer.size());
-			if(count <= 0) {
+			if (count <= 0) {
 				return false;
 			}
 #endif
@@ -272,46 +248,46 @@ public:
 
 	/// Closes pipes and guarantees that the child process no longer survives.
 	void terminate() {
-		if(terminated_.exchange(true)) {
+		if (terminated_.exchange(true)) {
 			return;
 		}
 		try {
 			write_line("quit");
-		} catch(...) {
+		} catch (...) {
 		}
 #ifdef _WIN32
-		if(stdin_write_ != nullptr) {
+		if (stdin_write_ != nullptr) {
 			CloseHandle(stdin_write_);
 			stdin_write_ = nullptr;
 		}
-		if(process_info_.hProcess != nullptr) {
-			if(WaitForSingleObject(process_info_.hProcess, 800) == WAIT_TIMEOUT) {
+		if (process_info_.hProcess != nullptr) {
+			if (WaitForSingleObject(process_info_.hProcess, 800) == WAIT_TIMEOUT) {
 				TerminateProcess(process_info_.hProcess, 0);
 				WaitForSingleObject(process_info_.hProcess, 800);
 			}
 		}
 		close_handles();
 #else
-		if(stdin_write_ >= 0) {
+		if (stdin_write_ >= 0) {
 			close(stdin_write_);
 			stdin_write_ = -1;
 		}
-		if(pid_ > 0) {
-			for(int attempt = 0; attempt < 8; ++attempt) {
+		if (pid_ > 0) {
+			for (int attempt = 0; attempt < 8; ++attempt) {
 				int status = 0;
-				if(waitpid(pid_, &status, WNOHANG) == pid_) {
+				if (waitpid(pid_, &status, WNOHANG) == pid_) {
 					pid_ = -1;
 					break;
 				}
 				std::this_thread::sleep_for(std::chrono::milliseconds(100));
 			}
-			if(pid_ > 0) {
+			if (pid_ > 0) {
 				kill(pid_, SIGTERM);
 				waitpid(pid_, nullptr, 0);
 				pid_ = -1;
 			}
 		}
-		if(stdout_read_ >= 0) {
+		if (stdout_read_ >= 0) {
 			close(stdout_read_);
 			stdout_read_ = -1;
 		}
@@ -322,10 +298,8 @@ private:
 #ifdef _WIN32
 	/// Closes every Win32 handle that may have been created during startup.
 	void close_handles() {
-		for(HANDLE *handle : {&stdout_read_, &stdout_write_child_, &stdin_read_child_,
-							  &stdin_write_, &process_info_.hThread,
-							  &process_info_.hProcess}) {
-			if(*handle != nullptr) {
+		for (HANDLE *handle : {&stdout_read_, &stdout_write_child_, &stdin_read_child_, &stdin_write_, &process_info_.hThread, &process_info_.hProcess}) {
+			if (*handle != nullptr) {
 				CloseHandle(*handle);
 				*handle = nullptr;
 			}
@@ -359,7 +333,7 @@ void UciEngine::start(const EngineConfig &config) {
 	try {
 		initialize(config);
 		starting_ = false;
-	} catch(...) {
+	} catch (...) {
 		starting_ = false;
 		throw;
 	}
@@ -372,9 +346,9 @@ void UciEngine::start_async(const EngineConfig &config) {
 	startup_ = std::thread([this, config] {
 		try {
 			initialize(config);
-		} catch(const std::exception &error) {
+		} catch (const std::exception &error) {
 			process_ready_ = false;
-			if(!closing_) {
+			if (!closing_) {
 				std::lock_guard lock(mutex_);
 				snapshot_.error = error.what();
 				snapshot_.searching = false;
@@ -419,8 +393,7 @@ void UciEngine::close() {
 	closing_ = true;
 	process_ready_ = false;
 	condition_.notify_all();
-	if(startup_.joinable() &&
-	   startup_.get_id() != std::this_thread::get_id()) {
+	if (startup_.joinable() && startup_.get_id() != std::this_thread::get_id()) {
 		startup_.join();
 	}
 	{
@@ -429,23 +402,23 @@ void UciEngine::close() {
 		discard_output_ = true;
 		snapshot_.searching = false;
 	}
-	if(process_) {
+	if (process_) {
 		try {
 			send("stop");
 			send("quit");
-		} catch(...) {
+		} catch (...) {
 		}
 #ifdef _WIN32
 		// A synchronous ReadFile on the engine pipe is not guaranteed to wake
 		// merely because another thread closes the handle. Cancel it explicitly
 		// so closing a Stadium match cannot strand the GUI thread in join().
-		if(reader_.joinable()) {
+		if (reader_.joinable()) {
 			CancelSynchronousIo(reader_.native_handle());
 		}
 #endif
 		process_->terminate();
 	}
-	if(reader_.joinable()) {
+	if (reader_.joinable()) {
 		reader_.join();
 	}
 	process_.reset();
@@ -460,7 +433,7 @@ void UciEngine::close() {
 }
 
 std::uint64_t UciEngine::analyse(const std::string &position, bool infinite) {
-	if(!ready()) {
+	if (!ready()) {
 		throw std::runtime_error("UCI engine is not ready");
 	}
 	AnalysisRequest request;
@@ -473,7 +446,7 @@ std::uint64_t UciEngine::analyse(const std::string &position, bool infinite) {
 		snapshot_.generation = request.generation;
 		snapshot_.searching = true;
 		snapshot_.engine_name = display_name();
-		if(command_searching_) {
+		if (command_searching_) {
 			pending_analysis_ = request;
 			discard_output_ = true;
 			stop_previous = true;
@@ -483,10 +456,10 @@ std::uint64_t UciEngine::analyse(const std::string &position, bool infinite) {
 			start_now = true;
 		}
 	}
-	if(stop_previous) {
+	if (stop_previous) {
 		send("stop");
 	}
-	if(start_now) {
+	if (start_now) {
 		send_analysis(request);
 	}
 	return request.generation;
@@ -494,19 +467,19 @@ std::uint64_t UciEngine::analyse(const std::string &position, bool infinite) {
 
 void UciEngine::send_analysis(const AnalysisRequest &request) {
 	std::lock_guard send_lock(send_mutex_);
-	if(!process_) {
+	if (!process_) {
 		throw std::runtime_error("UCI process is not running");
 	}
 	process_->write_line("position " + request.position);
-	if(request.infinite) {
+	if (request.infinite) {
 		process_->write_line("go infinite");
 	} else {
 		std::ostringstream go;
 		go << "go";
-		if(config_.node_limit > 0) {
+		if (config_.node_limit > 0) {
 			go << " nodes " << config_.node_limit;
 		}
-		if(config_.movetime_ms > 0 || config_.node_limit == 0) {
+		if (config_.movetime_ms > 0 || config_.node_limit == 0) {
 			go << " movetime " << std::max(0, config_.movetime_ms);
 		}
 		process_->write_line(go.str());
@@ -523,10 +496,10 @@ void UciEngine::stop_search() {
 		snapshot_.finished = false;
 		stop = command_searching_;
 	}
-	if(stop && process_) {
+	if (stop && process_) {
 		try {
 			send("stop");
-		} catch(...) {
+		} catch (...) {
 		}
 	}
 }
@@ -545,10 +518,10 @@ bool UciEngine::starting() const {
 }
 
 std::string UciEngine::display_name() const {
-	if(!trim(config_.name).empty()) {
+	if (!trim(config_.name).empty()) {
 		return trim(config_.name);
 	}
-	if(!reported_name_.empty()) {
+	if (!reported_name_.empty()) {
 		return reported_name_;
 	}
 	return config_.path.filename().string();
@@ -572,7 +545,7 @@ std::vector<UciOption> UciEngine::discover_options(const EngineConfig &config) {
 		auto definitions = probe.option_definitions();
 		probe.close();
 		return definitions;
-	} catch(...) {
+	} catch (...) {
 		probe.close();
 		throw;
 	}
@@ -580,55 +553,50 @@ std::vector<UciOption> UciEngine::discover_options(const EngineConfig &config) {
 
 void UciEngine::send(const std::string &line) {
 	std::lock_guard send_lock(send_mutex_);
-	if(!process_) {
+	if (!process_) {
 		throw std::runtime_error("UCI process is not running");
 	}
 	process_->write_line(line);
 }
 
-void UciEngine::wait_for_flag(const std::atomic_bool &flag,
-							  std::chrono::milliseconds timeout,
-							  const char *description) {
+void UciEngine::wait_for_flag(const std::atomic_bool &flag, std::chrono::milliseconds timeout, const char *description) {
 	std::unique_lock lock(mutex_);
-	const bool completed = condition_.wait_for(lock, timeout, [&] {
-		return flag.load() || !snapshot_.error.empty() || closing_.load();
-	});
-	if(!completed || !flag.load()) {
+	const bool completed = condition_.wait_for(lock, timeout, [&] { return flag.load() || !snapshot_.error.empty() || closing_.load(); });
+	if (!completed || !flag.load()) {
 		const std::string detail = snapshot_.error.empty() ? "" : ": " + snapshot_.error;
-		throw std::runtime_error(std::string("UCI handshake timed out waiting for ") +
-								 description + detail);
+		throw std::runtime_error(std::string("UCI handshake timed out waiting for ") + description + detail);
 	}
 }
 
 void UciEngine::reader_loop() {
 	try {
-		for(std::string line; !closing_ && process_ && process_->read_line(line);) {
+		for (std::string line; !closing_ && process_ && process_->read_line(line);) {
 			line = trim(std::move(line));
-			if(line.empty()) {
+			if (line.empty()) {
 				continue;
 			}
-			if(line == "uciok") {
+			if (line == "uciok") {
 				uciok_ = true;
 				condition_.notify_all();
-			} else if(line == "readyok") {
+			} else if (line == "readyok") {
 				readyok_ = true;
 				condition_.notify_all();
-			} else if(line.rfind("id ", 0) == 0 || line.rfind("option ", 0) == 0) {
+			} else if (line.rfind("id ", 0) == 0 || line.rfind("option ", 0) == 0) {
 				parse_handshake_line(line);
-			} else if(line.rfind("info ", 0) == 0) {
+			} else if (line.rfind("info ", 0) == 0) {
 				parse_info_line(line);
-			} else if(line.rfind("bestmove ", 0) == 0) {
+			} else if (line.rfind("bestmove ", 0) == 0) {
 				parse_bestmove_line(line);
 			}
 		}
-		if(!closing_) {
+		if (!closing_) {
 			process_ready_ = false;
 			std::lock_guard lock(mutex_);
 			snapshot_.searching = false;
 			snapshot_.error = "UCI engine closed its output stream";
 			condition_.notify_all();
 		}
-	} catch(const std::exception &error) {
+	} catch (const std::exception &error) {
 		process_ready_ = false;
 		std::lock_guard lock(mutex_);
 		snapshot_.searching = false;
@@ -638,13 +606,13 @@ void UciEngine::reader_loop() {
 }
 
 void UciEngine::parse_handshake_line(const std::string &line) {
-	if(line.rfind("id name ", 0) == 0) {
+	if (line.rfind("id name ", 0) == 0) {
 		std::lock_guard lock(mutex_);
 		reported_name_ = trim(line.substr(8));
 		return;
 	}
 	const auto definition = parse_option_definition(line);
-	if(!definition) {
+	if (!definition) {
 		return;
 	}
 	std::lock_guard lock(mutex_);
@@ -656,59 +624,54 @@ void UciEngine::parse_info_line(const std::string &line) {
 	const auto tokens = tokens_of(line);
 	AnalysisLine parsed;
 	bool has_pv = false;
-	for(std::size_t index = 1; index < tokens.size(); ++index) {
+	for (std::size_t index = 1; index < tokens.size(); ++index) {
 		const auto read_int = [&](int &target) {
-			if(index + 1 < tokens.size()) {
+			if (index + 1 < tokens.size()) {
 				target = std::stoi(tokens[++index]);
 			}
 		};
 		const auto read_uint = [&](std::uint64_t &target) {
-			if(index + 1 < tokens.size()) {
+			if (index + 1 < tokens.size()) {
 				target = std::stoull(tokens[++index]);
 			}
 		};
-		if(tokens[index] == "multipv") {
+		if (tokens[index] == "multipv") {
 			read_int(parsed.multipv);
-		} else if(tokens[index] == "depth") {
+		} else if (tokens[index] == "depth") {
 			read_int(parsed.depth);
-		} else if(tokens[index] == "seldepth") {
+		} else if (tokens[index] == "seldepth") {
 			read_int(parsed.seldepth);
-		} else if(tokens[index] == "nodes") {
+		} else if (tokens[index] == "nodes") {
 			read_uint(parsed.nodes);
-		} else if(tokens[index] == "nps") {
+		} else if (tokens[index] == "nps") {
 			read_uint(parsed.nps);
-		} else if(tokens[index] == "time") {
+		} else if (tokens[index] == "time") {
 			read_int(parsed.elapsed_ms);
-		} else if(tokens[index] == "score" && index + 2 < tokens.size()) {
+		} else if (tokens[index] == "score" && index + 2 < tokens.size()) {
 			parsed.mate = tokens[index + 1] == "mate";
 			parsed.score = std::stoi(tokens[index + 2]);
 			index += 2;
-		} else if(tokens[index] == "pv") {
-			parsed.pv.assign(tokens.begin() + static_cast<std::ptrdiff_t>(index + 1),
-							 tokens.end());
+		} else if (tokens[index] == "pv") {
+			parsed.pv.assign(tokens.begin() + static_cast<std::ptrdiff_t>(index + 1), tokens.end());
 			has_pv = !parsed.pv.empty();
 			break;
 		}
 	}
-	if(!has_pv) {
+	if (!has_pv) {
 		return;
 	}
 	std::lock_guard lock(mutex_);
-	if(discard_output_) {
+	if (discard_output_) {
 		return;
 	}
 	auto &rows = snapshot_.lines;
-	const auto existing = std::find_if(rows.begin(), rows.end(), [&](const auto &row) {
-		return row.multipv == parsed.multipv;
-	});
-	if(existing == rows.end()) {
+	const auto existing = std::find_if(rows.begin(), rows.end(), [&](const auto &row) { return row.multipv == parsed.multipv; });
+	if (existing == rows.end()) {
 		rows.push_back(std::move(parsed));
 	} else {
 		*existing = std::move(parsed);
 	}
-	std::sort(rows.begin(), rows.end(), [](const auto &left, const auto &right) {
-		return left.multipv < right.multipv;
-	});
+	std::sort(rows.begin(), rows.end(), [](const auto &left, const auto &right) { return left.multipv < right.multipv; });
 }
 
 void UciEngine::parse_bestmove_line(const std::string &line) {
@@ -717,21 +680,21 @@ void UciEngine::parse_bestmove_line(const std::string &line) {
 	{
 		std::lock_guard lock(mutex_);
 		command_searching_ = false;
-		if(pending_analysis_) {
+		if (pending_analysis_) {
 			next = std::move(pending_analysis_);
 			pending_analysis_.reset();
 			command_searching_ = true;
 			discard_output_ = false;
-		} else if(!discard_output_) {
+		} else if (!discard_output_) {
 			snapshot_.searching = false;
 			snapshot_.finished = true;
-			if(tokens.size() >= 2 && tokens[1] != "(none)") {
+			if (tokens.size() >= 2 && tokens[1] != "(none)") {
 				snapshot_.bestmove = tokens[1];
 			}
 		}
 		condition_.notify_all();
 	}
-	if(next) {
+	if (next) {
 		send_analysis(*next);
 	}
 }
@@ -739,43 +702,37 @@ void UciEngine::parse_bestmove_line(const std::string &line) {
 void UciEngine::configure() {
 	nlohmann::json requested;
 	try {
-		requested = nlohmann::json::parse(
-			trim(config_.options).empty() ? "{}" : config_.options);
-	} catch(const std::exception &error) {
-		throw std::invalid_argument("invalid UCI options JSON: " +
-									std::string(error.what()));
+		requested = nlohmann::json::parse(trim(config_.options).empty() ? "{}" : config_.options);
+	} catch (const std::exception &error) {
+		throw std::invalid_argument("invalid UCI options JSON: " + std::string(error.what()));
 	}
-	if(!requested.is_object()) {
+	if (!requested.is_object()) {
 		throw std::invalid_argument("UCI options must be a JSON object");
 	}
-	const auto apply_option = [&](const std::string &requested_name,
-								  const nlohmann::json &value) {
+	const auto apply_option = [&](const std::string &requested_name, const nlohmann::json &value) {
 		const auto found = option_names_.find(lowercase(requested_name));
-		if(found == option_names_.end()) {
-			throw std::invalid_argument("UCI engine does not expose option " +
-										requested_name);
+		if (found == option_names_.end()) {
+			throw std::invalid_argument("UCI engine does not expose option " + requested_name);
 		}
 		std::string text;
-		if(value.is_boolean()) {
+		if (value.is_boolean()) {
 			text = value.get<bool>() ? "true" : "false";
-		} else if(value.is_string()) {
+		} else if (value.is_string()) {
 			text = value.get<std::string>();
-		} else if(value.is_number()) {
+		} else if (value.is_number()) {
 			text = value.dump();
 		} else {
-			throw std::invalid_argument("unsupported UCI option value for " +
-										requested_name);
+			throw std::invalid_argument("unsupported UCI option value for " + requested_name);
 		}
 		send("setoption name " + found->second + " value " + text);
 	};
-	for(auto iterator = requested.begin(); iterator != requested.end(); ++iterator) {
+	for (auto iterator = requested.begin(); iterator != requested.end(); ++iterator) {
 		apply_option(iterator.key(), iterator.value());
 	}
-	for(const auto &requested_name : config_.button_commands) {
+	for (const auto &requested_name : config_.button_commands) {
 		const auto found = option_names_.find(lowercase(requested_name));
-		if(found == option_names_.end()) {
-			throw std::invalid_argument("UCI engine does not expose option " +
-										requested_name);
+		if (found == option_names_.end()) {
+			throw std::invalid_argument("UCI engine does not expose option " + requested_name);
 		}
 		send("setoption name " + found->second);
 	}

@@ -1,8 +1,8 @@
 // Melano one-shot supervised training command-line entry point.
 
-#include <iostream>
 #include "melano/args.hpp"
 #include "melano/dataset.hpp"
+#include <iostream>
 
 // Parse training hyperparameters and train a fresh policy/value checkpoint.
 int main(int argc, char **argv) {
@@ -10,11 +10,11 @@ int main(int argc, char **argv) {
 		melano::Args args(argc, argv);
 		if (args.has("help")) {
 			std::cout << "Usage: train --data <games.melano.h5> --out <melano.pth> [options]\n"
-					  << "  --channels <n> --blocks <n> --epochs <n> --batch-size <n>\n"
-					  << "  --max-steps <n> --lr <x> --weight-decay <x> --value-weight <x>\n"
-					  << "  --save-every <steps> --log-every <steps> --seed <n> --device "
-						 "<auto|cpu|cuda>\n"
-					  << "  --grad-clip <x> --precision <fp32|bf16>\n";
+			          << "  --channels <n> --blocks <n> --epochs <n> --batch-size <n>\n"
+			          << "  --max-steps <n> --lr <x> --weight-decay <x> --value-weight <x>\n"
+			          << "  --save-every <steps> --log-every <steps> --seed <n> --device "
+			             "<auto|cpu|cuda>\n"
+			          << "  --grad-clip <x> --precision <fp32|bf16>\n";
 			return 0;
 		}
 		melano::TrainOptions options;
@@ -33,8 +33,7 @@ int main(int argc, char **argv) {
 		options.log_every = args.get_int("log-every", options.log_every);
 		options.seed = static_cast<std::uint64_t>(args.get_int64("seed", options.seed));
 		options.device = args.get("device", options.device);
-		options.precision =
-			melano::parse_compute_precision(args.get("precision", "fp32"));
+		options.precision = melano::parse_compute_precision(args.get("precision", "fp32"));
 		melano::train_supervised(options);
 		return 0;
 	} catch (const std::exception &error) {

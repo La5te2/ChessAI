@@ -11,7 +11,7 @@
 namespace gadus {
 
 class Args {
-	public:
+public:
 	/// Parses GNU-style --name value options and standalone --flag switches.
 	Args(int argc, char **argv);
 
@@ -30,7 +30,7 @@ class Args {
 	/// Parses common textual Boolean spellings, using fallback when absent.
 	bool get_bool(const std::string &name, bool fallback) const;
 
-	private:
+private:
 	std::unordered_map<std::string, std::string> values_;
 	std::unordered_set<std::string> flags_;
 };

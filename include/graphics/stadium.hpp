@@ -90,8 +90,7 @@ private:
 	const EngineConfig &active_config() const;
 	bool engine_configured(chess::Color color) const;
 	bool engines_ready();
-	std::int64_t remaining_ms(chess::Color color,
-							  Clock::time_point now) const;
+	std::int64_t remaining_ms(chess::Color color, Clock::time_point now) const;
 	bool finish_turn_clock(Clock::time_point now, bool add_increment);
 	void finish_on_time(chess::Color loser);
 

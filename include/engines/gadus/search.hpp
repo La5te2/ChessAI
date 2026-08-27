@@ -2,14 +2,14 @@
 
 // Gadus direct-policy and batched PUCT MCTS API with sublinear root coverage.
 
+#include "gadus/game.hpp"
+#include "gadus/model.hpp"
+#include "gadus/precision.hpp"
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
 #include <vector>
-#include "gadus/game.hpp"
-#include "gadus/model.hpp"
-#include "gadus/precision.hpp"
 
 namespace gadus {
 
@@ -68,24 +68,21 @@ using SearchProgressCallback = std::function<void(const SearchResult &)>;
 using SearchCancelCallback = std::function<bool()>;
 
 class Searcher {
-	public:
+public:
 	/// Owns a Gadus model in inference mode with an immutable search configuration.
 	Searcher(Model model, torch::Device device, SearchOptions options);
 	/// Searches one position and optionally emits periodic snapshots for interactive clients.
-	SearchResult search(const chess::Board &board,
-						const SearchProgressCallback &progress = {}, int progress_interval_ms = 0,
-						const SearchCancelCallback &cancel = {});
+	SearchResult search(const chess::Board &board, const SearchProgressCallback &progress = {}, int progress_interval_ms = 0, const SearchCancelCallback &cancel = {});
 	/// Searches independent positions together so leaf evaluations share neural batches.
 	std::vector<SearchResult> search_many(const std::vector<chess::Board> &boards);
 	/// Evaluates Policy/Value directly without constructing search trees or dense action vectors.
-	std::vector<PolicyEvaluation>
-	evaluate_policy_many(const std::vector<chess::Board> &boards);
+	std::vector<PolicyEvaluation> evaluate_policy_many(const std::vector<chess::Board> &boards);
 	/// Applies a new search configuration while retaining compatible cached network evaluations.
 	void set_options(SearchOptions options);
 	/// Removes every network evaluation retained across previous search calls.
 	void clear_evaluation_cache();
 
-	private:
+private:
 	struct Impl;
 	std::shared_ptr<Impl> impl_;
 };

@@ -2,13 +2,13 @@
 
 // Melano PGN-to-HDF5 preprocessing and one-shot supervised policy/value training.
 
+#include "melano/game.hpp"
+#include "melano/precision.hpp"
 #include <cstdint>
 #include <filesystem>
 #include <string>
-#include <vector>
 #include <torch/types.h>
-#include "melano/game.hpp"
-#include "melano/precision.hpp"
+#include <vector>
 
 namespace melano {
 
@@ -29,7 +29,7 @@ struct DatasetInfo {
 };
 
 class SupervisedH5 {
-	public:
+public:
 	/// Opens and validates a Melano HDF5 dataset and its architecture schema.
 	explicit SupervisedH5(const std::filesystem::path &path);
 	/// Closes all HDF5 handles owned by this reader.
@@ -46,13 +46,11 @@ class SupervisedH5 {
 	/// Returns immutable schema and row-count metadata.
 	const DatasetInfo &info() const noexcept;
 	/// Reads arbitrary rows and decodes state, move, and value tensors.
-	SupervisedBatch read(const std::vector<std::int64_t> &indices,
-						 bool pinned_memory = false) const;
+	SupervisedBatch read(const std::vector<std::int64_t> &indices, bool pinned_memory = false) const;
 	/// Reads one contiguous range while preserving state, move, and value alignment.
-	SupervisedBatch read_contiguous(std::int64_t begin, std::int64_t count,
-									bool pinned_memory = false) const;
+	SupervisedBatch read_contiguous(std::int64_t begin, std::int64_t count, bool pinned_memory = false) const;
 
-	private:
+private:
 	struct Impl;
 	Impl *impl_;
 };

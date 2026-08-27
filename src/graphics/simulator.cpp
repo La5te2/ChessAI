@@ -26,7 +26,7 @@ EngineConfig &SimulatorWorkspace::config() {
 }
 
 void SimulatorWorkspace::set_config(const EngineConfig &config) {
-	if(config_ == config) {
+	if (config_ == config) {
 		return;
 	}
 	engine_.close();
@@ -39,17 +39,17 @@ const AnalysisSnapshot &SimulatorWorkspace::display() const {
 }
 
 void SimulatorWorkspace::update_analysis() {
-	if(!analysis_open_ || config_.path.empty()) {
+	if (!analysis_open_ || config_.path.empty()) {
 		return;
 	}
 	const std::string position = visible_game().uci_position();
 	try {
-		if(!engine_.ready()) {
+		if (!engine_.ready()) {
 			const auto startup = engine_.snapshot();
-			if(!startup.error.empty()) {
+			if (!startup.error.empty()) {
 				throw std::runtime_error(startup.error);
 			}
-			if(!engine_.starting()) {
+			if (!engine_.starting()) {
 				engine_.start_async(config_);
 				display_ = {};
 				display_.engine_name = "Loading engine";
@@ -58,21 +58,18 @@ void SimulatorWorkspace::update_analysis() {
 		}
 		config_.discovered_options = engine_.option_definitions();
 		config_.button_commands.clear();
-		if(analysis_position_ != position) {
+		if (analysis_position_ != position) {
 			engine_.analyse(position, true);
 			analysis_position_ = position;
 			last_display_ = Clock::time_point{};
 		}
 		const auto now = Clock::now();
 		const auto snapshot = engine_.snapshot();
-		if(last_display_ == Clock::time_point{} ||
-		   now - last_display_ >=
-			   std::chrono::milliseconds(100) ||
-		   snapshot.finished) {
+		if (last_display_ == Clock::time_point{} || now - last_display_ >= std::chrono::milliseconds(100) || snapshot.finished) {
 			display_ = snapshot;
 			last_display_ = now;
 		}
-	} catch(...) {
+	} catch (...) {
 		analysis_open_ = false;
 		engine_.close();
 		throw;
@@ -91,7 +88,7 @@ bool SimulatorWorkspace::analysis_open() const {
 }
 
 void SimulatorWorkspace::start_analysis() {
-	if(analysis_open_) {
+	if (analysis_open_) {
 		return;
 	}
 	analysis_open_ = true;
@@ -99,7 +96,7 @@ void SimulatorWorkspace::start_analysis() {
 }
 
 void SimulatorWorkspace::stop_analysis() {
-	if(!analysis_open_) {
+	if (!analysis_open_) {
 		return;
 	}
 	analysis_open_ = false;
@@ -131,7 +128,7 @@ void SimulatorWorkspace::make_move(const chess::Move &move) {
 }
 
 bool SimulatorWorkspace::undo() {
-	if(!game_.undo()) {
+	if (!game_.undo()) {
 		return false;
 	}
 	follow_live();
@@ -155,7 +152,7 @@ std::optional<std::size_t> SimulatorWorkspace::viewed_ply() const {
 }
 
 void SimulatorWorkspace::view_ply(std::size_t ply) {
-	if(ply >= game_.plies()) {
+	if (ply >= game_.plies()) {
 		follow_live();
 		return;
 	}

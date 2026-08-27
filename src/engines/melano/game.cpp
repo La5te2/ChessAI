@@ -53,16 +53,13 @@ int move_to_index(const chess::Move &move) {
 	const int to_file = to % 8;
 	const int dc = to_file - from_file;
 
-	if (move.typeOf() == chess::Move::PROMOTION &&
-		move.promotionType() != chess::PieceType::QUEEN) {
+	if (move.typeOf() == chess::Move::PROMOTION && move.promotionType() != chess::PieceType::QUEEN) {
 		const int direction = dc + 1;
-		const int piece = static_cast<int>(move.promotionType().internal()) -
-						  static_cast<int>(chess::PieceType::KNIGHT);
+		const int piece = static_cast<int>(move.promotionType().internal()) - static_cast<int>(chess::PieceType::KNIGHT);
 		if (direction < 0 || direction > 2 || piece < 0 || piece > 2) {
 			throw std::invalid_argument("cannot encode underpromotion: " + move_uci(move));
 		}
-		return kBoardSquares * kBoardSquares + from * kUnderpromotionPlanes +
-			   direction * 3 + piece;
+		return kBoardSquares * kBoardSquares + from * kUnderpromotionPlanes + direction * 3 + piece;
 	}
 	return from * kBoardSquares + to;
 }
@@ -81,7 +78,9 @@ chess::Move index_to_move(int index, const chess::Board &board) {
 }
 
 // Produce the protocol-level coordinate representation of a move.
-std::string move_uci(const chess::Move &move) { return chess::uci::moveToUci(move); }
+std::string move_uci(const chess::Move &move) {
+	return chess::uci::moveToUci(move);
+}
 
 // Produce SAN while turning library formatting failures into a stable UCI fallback.
 std::string move_san(const chess::Board &board, const chess::Move &move) {
@@ -122,30 +121,24 @@ PackedState encode_state(const chess::Board &board) {
 }
 
 // Expand compact byte tokens into optionally pinned int64 embedding indices.
-torch::Tensor decode_states(const std::uint8_t *packed, std::int64_t count,
-							bool pinned_memory) {
+torch::Tensor decode_states(const std::uint8_t *packed, std::int64_t count, bool pinned_memory) {
 	auto options = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
 	if (pinned_memory) {
 		options = options.pinned_memory(true);
 	}
 	auto output = torch::empty({count, kStateFeatures}, options);
 	auto *destination = output.data_ptr<std::int64_t>();
-	std::transform(packed, packed + count * kStateFeatures, destination,
-				   [](std::uint8_t value) { return static_cast<std::int64_t>(value); });
+	std::transform(packed, packed + count * kStateFeatures, destination, [](std::uint8_t value) { return static_cast<std::int64_t>(value); });
 	return output;
 }
 
 // Keep Melano's one-byte categorical tokens compact across PCIe and widen on the GPU.
-torch::Tensor decode_states_device(const std::uint8_t *packed, std::int64_t count,
-								   const torch::Device &device) {
+torch::Tensor decode_states_device(const std::uint8_t *packed, std::int64_t count, const torch::Device &device) {
 	if (!device.is_cuda()) {
 		return decode_states(packed, count, false).to(device);
 	}
-	auto host = torch::empty(
-		{count, kStateFeatures},
-		torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU).pinned_memory(true));
-	std::memcpy(host.data_ptr<std::uint8_t>(), packed,
-				static_cast<std::size_t>(count) * kStateFeatures);
+	auto host = torch::empty({count, kStateFeatures}, torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU).pinned_memory(true));
+	std::memcpy(host.data_ptr<std::uint8_t>(), packed, static_cast<std::size_t>(count) * kStateFeatures);
 	return host.to(device, true).to(torch::kInt64);
 }
 
@@ -156,13 +149,11 @@ torch::Tensor encode_boards(const std::vector<chess::Board> &boards, bool pinned
 		const auto state = encode_state(boards[index]);
 		std::copy(state.begin(), state.end(), packed.begin() + index * state.size());
 	}
-	return decode_states(packed.data(), static_cast<std::int64_t>(boards.size()),
-						 pinned_memory);
+	return decode_states(packed.data(), static_cast<std::int64_t>(boards.size()), pinned_memory);
 }
 
 // Pack live positions once, then transfer the batch directly to the inference device.
-torch::Tensor encode_boards_device(const std::vector<chess::Board> &boards,
-								   const torch::Device &device) {
+torch::Tensor encode_boards_device(const std::vector<chess::Board> &boards, const torch::Device &device) {
 	std::vector<std::uint8_t> packed(boards.size() * kStateFeatures);
 	for (std::size_t index = 0; index < boards.size(); ++index) {
 		const auto state = encode_state(boards[index]);
@@ -221,8 +212,7 @@ std::string game_termination(const chess::Board &board) {
 }
 
 // Restrict arbitrary network probabilities to legal actions and make their sum exactly one.
-std::vector<float> normalize_legal_policy(const std::vector<float> &policy,
-										  const chess::Board &board) {
+std::vector<float> normalize_legal_policy(const std::vector<float> &policy, const chess::Board &board) {
 	std::vector<float> normalized(kActionSize, 0.0F);
 	const auto moves = legal_moves(board);
 	if (moves.empty()) {
@@ -231,8 +221,7 @@ std::vector<float> normalize_legal_policy(const std::vector<float> &policy,
 	double total = 0.0;
 	for (const auto &move : moves) {
 		const int index = move_to_index(move);
-		const float value =
-			index < static_cast<int>(policy.size()) ? std::max(0.0F, policy[index]) : 0.0F;
+		const float value = index < static_cast<int>(policy.size()) ? std::max(0.0F, policy[index]) : 0.0F;
 		normalized[index] = value;
 		total += value;
 	}
@@ -256,8 +245,7 @@ torch::Device resolve_device(const std::string &requested) {
 	}
 	if (requested.starts_with("cuda")) {
 		if (!torch::cuda::is_available()) {
-			throw std::runtime_error(
-				"CUDA was requested but this LibTorch build has no available CUDA device");
+			throw std::runtime_error("CUDA was requested but this LibTorch build has no available CUDA device");
 		}
 		return torch::Device(requested);
 	}

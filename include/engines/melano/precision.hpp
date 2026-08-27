@@ -2,9 +2,9 @@
 
 // Melano compute-precision policy and scoped LibTorch CUDA autocast control.
 
+#include <ATen/autocast_mode.h>
 #include <stdexcept>
 #include <string>
-#include <ATen/autocast_mode.h>
 #include <torch/types.h>
 
 namespace melano {
@@ -35,10 +35,9 @@ inline void validate_compute_precision(ComputePrecision precision, const torch::
 }
 
 class AutocastGuard {
-	public:
+public:
 	/// Enables CUDA BF16 autocast for one forward scope and preserves nested caller state.
-	AutocastGuard(ComputePrecision precision, const torch::Device &device)
-		: active_(precision == ComputePrecision::Bf16) {
+	AutocastGuard(ComputePrecision precision, const torch::Device &device) : active_(precision == ComputePrecision::Bf16) {
 		if (!active_) {
 			return;
 		}
@@ -65,7 +64,7 @@ class AutocastGuard {
 	AutocastGuard(const AutocastGuard &) = delete;
 	AutocastGuard &operator=(const AutocastGuard &) = delete;
 
-	private:
+private:
 	bool active_ = false;
 	bool previous_enabled_ = false;
 	at::ScalarType previous_dtype_ = at::kFloat;

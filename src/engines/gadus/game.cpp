@@ -27,22 +27,14 @@ int piece_plane(const chess::Piece &piece) {
 torch::Tensor canonicalize_expanded(torch::Tensor expanded) {
 	auto white_to_move = expanded.slice(1, 12, 13).gt(0.5F);
 	auto reflected = expanded.flip({2});
-	auto friendly = torch::where(white_to_move, expanded.slice(1, 0, 6),
-							 reflected.slice(1, 6, 12));
-	auto opposing = torch::where(white_to_move, expanded.slice(1, 6, 12),
-							 reflected.slice(1, 0, 6));
-	auto friendly_king = torch::where(white_to_move, expanded.slice(1, 13, 14),
-								  reflected.slice(1, 15, 16));
-	auto friendly_queen = torch::where(white_to_move, expanded.slice(1, 14, 15),
-								   reflected.slice(1, 16, 17));
-	auto opposing_king = torch::where(white_to_move, expanded.slice(1, 15, 16),
-								 reflected.slice(1, 13, 14));
-	auto opposing_queen = torch::where(white_to_move, expanded.slice(1, 16, 17),
-								  reflected.slice(1, 14, 15));
-	auto en_passant = torch::where(white_to_move, expanded.slice(1, 17, 18),
-								 reflected.slice(1, 17, 18));
-	return torch::cat({friendly, opposing, friendly_king, friendly_queen,
-					   opposing_king, opposing_queen, en_passant}, 1);
+	auto friendly = torch::where(white_to_move, expanded.slice(1, 0, 6), reflected.slice(1, 6, 12));
+	auto opposing = torch::where(white_to_move, expanded.slice(1, 6, 12), reflected.slice(1, 0, 6));
+	auto friendly_king = torch::where(white_to_move, expanded.slice(1, 13, 14), reflected.slice(1, 15, 16));
+	auto friendly_queen = torch::where(white_to_move, expanded.slice(1, 14, 15), reflected.slice(1, 16, 17));
+	auto opposing_king = torch::where(white_to_move, expanded.slice(1, 15, 16), reflected.slice(1, 13, 14));
+	auto opposing_queen = torch::where(white_to_move, expanded.slice(1, 16, 17), reflected.slice(1, 14, 15));
+	auto en_passant = torch::where(white_to_move, expanded.slice(1, 17, 18), reflected.slice(1, 17, 18));
+	return torch::cat({friendly, opposing, friendly_king, friendly_queen, opposing_king, opposing_queen, en_passant}, 1);
 }
 
 } // namespace
@@ -77,11 +69,9 @@ int move_to_index(const chess::Move &move) {
 	const int dr = to_rank - from_rank;
 	const int dc = to_file - from_file;
 
-	if (move.typeOf() == chess::Move::PROMOTION &&
-		move.promotionType() != chess::PieceType::QUEEN) {
+	if (move.typeOf() == chess::Move::PROMOTION && move.promotionType() != chess::PieceType::QUEEN) {
 		const int direction = dc + 1;
-		const int piece = static_cast<int>(move.promotionType().internal()) -
-						  static_cast<int>(chess::PieceType::KNIGHT);
+		const int piece = static_cast<int>(move.promotionType().internal()) - static_cast<int>(chess::PieceType::KNIGHT);
 		if (direction < 0 || direction > 2 || piece < 0 || piece > 2) {
 			throw std::invalid_argument("cannot encode underpromotion: " + move_uci(move));
 		}
@@ -89,33 +79,32 @@ int move_to_index(const chess::Move &move) {
 	}
 
 	constexpr std::array<std::pair<int, int>, 8> directions{{
-		{-1, -1},
-		{-1, 0},
-		{-1, 1},
-		{0, -1},
-		{0, 1},
-		{1, -1},
-		{1, 0},
-		{1, 1},
+	    {-1, -1},
+	    {-1, 0},
+	    {-1, 1},
+	    {0, -1},
+	    {0, 1},
+	    {1, -1},
+	    {1, 0},
+	    {1, 1},
 	}};
 	for (int direction = 0; direction < static_cast<int>(directions.size()); ++direction) {
 		for (int distance = 1; distance <= 7; ++distance) {
-			if (dr == directions[direction].first * distance &&
-				dc == directions[direction].second * distance) {
+			if (dr == directions[direction].first * distance && dc == directions[direction].second * distance) {
 				return from * kPolicyPlanes + direction * 7 + distance - 1;
 			}
 		}
 	}
 
 	constexpr std::array<std::pair<int, int>, 8> knights{{
-		{-2, -1},
-		{-2, 1},
-		{-1, -2},
-		{-1, 2},
-		{1, -2},
-		{1, 2},
-		{2, -1},
-		{2, 1},
+	    {-2, -1},
+	    {-2, 1},
+	    {-1, -2},
+	    {-1, 2},
+	    {1, -2},
+	    {1, 2},
+	    {2, -1},
+	    {2, 1},
 	}};
 	for (int offset = 0; offset < static_cast<int>(knights.size()); ++offset) {
 		if (dr == knights[offset].first && dc == knights[offset].second) {
@@ -163,7 +152,9 @@ chess::Move index_to_move(int index, const chess::Board &board) {
 }
 
 // Produce the protocol-level coordinate representation of a move.
-std::string move_uci(const chess::Move &move) { return chess::uci::moveToUci(move); }
+std::string move_uci(const chess::Move &move) {
+	return chess::uci::moveToUci(move);
+}
 
 // Produce SAN while turning library formatting failures into a stable UCI fallback.
 std::string move_san(const chess::Board &board, const chess::Move &move) {
@@ -193,10 +184,10 @@ PackedState encode_state(const chess::Board &board) {
 	}
 	const auto rights = board.castlingRights();
 	const std::array<bool, 4> castling{{
-		rights.has(chess::Color::WHITE, chess::Board::CastlingRights::Side::KING_SIDE),
-		rights.has(chess::Color::WHITE, chess::Board::CastlingRights::Side::QUEEN_SIDE),
-		rights.has(chess::Color::BLACK, chess::Board::CastlingRights::Side::KING_SIDE),
-		rights.has(chess::Color::BLACK, chess::Board::CastlingRights::Side::QUEEN_SIDE),
+	    rights.has(chess::Color::WHITE, chess::Board::CastlingRights::Side::KING_SIDE),
+	    rights.has(chess::Color::WHITE, chess::Board::CastlingRights::Side::QUEEN_SIDE),
+	    rights.has(chess::Color::BLACK, chess::Board::CastlingRights::Side::KING_SIDE),
+	    rights.has(chess::Color::BLACK, chess::Board::CastlingRights::Side::QUEEN_SIDE),
 	}};
 	for (int index = 0; index < 4; ++index) {
 		if (castling[index]) {
@@ -213,8 +204,7 @@ PackedState encode_state(const chess::Board &board) {
 }
 
 // Expand persistent planes and convert each row to side-to-move canonical coordinates.
-torch::Tensor decode_states(const std::uint8_t *packed, std::int64_t count,
-							bool pinned_memory) {
+torch::Tensor decode_states(const std::uint8_t *packed, std::int64_t count, bool pinned_memory) {
 	static const auto byte_planes = [] {
 		std::array<std::array<float, 8>, 256> table{};
 		for (std::size_t byte = 0; byte < table.size(); ++byte) {
@@ -243,17 +233,13 @@ torch::Tensor decode_states(const std::uint8_t *packed, std::int64_t count,
 				} else if (plane < 16) {
 					constexpr std::array<int, 4> white_castling{{13, 14, 15, 16}};
 					constexpr std::array<int, 4> black_castling{{15, 16, 13, 14}};
-					source_plane = white_to_move ? white_castling[plane - 12]
-										 : black_castling[plane - 12];
+					source_plane = white_to_move ? white_castling[plane - 12] : black_castling[plane - 12];
 				} else {
 					source_plane = 17;
 				}
 				const int source_rank = white_to_move ? rank : 7 - rank;
 				const auto byte = state[source_plane * 8 + source_rank];
-				const auto offset =
-					(static_cast<std::size_t>(item) * kInputPlanes * 8 * 8) +
-					(static_cast<std::size_t>(plane) * 8 * 8) +
-					(static_cast<std::size_t>(rank) * 8);
+				const auto offset = (static_cast<std::size_t>(item) * kInputPlanes * 8 * 8) + (static_cast<std::size_t>(plane) * 8 * 8) + (static_cast<std::size_t>(rank) * 8);
 				std::memcpy(destination + offset, byte_planes[byte].data(), 8 * sizeof(float));
 			}
 		}
@@ -262,10 +248,8 @@ torch::Tensor decode_states(const std::uint8_t *packed, std::int64_t count,
 }
 
 // Expand compact binary planes after they reach the inference or training device.
-torch::Tensor decode_states_device(const torch::Tensor &packed,
-								   const torch::Device &device) {
-	if (packed.scalar_type() != torch::kUInt8 || packed.dim() != 3 ||
-		packed.size(1) != kStatePlanes || packed.size(2) != 8) {
+torch::Tensor decode_states_device(const torch::Tensor &packed, const torch::Device &device) {
+	if (packed.scalar_type() != torch::kUInt8 || packed.dim() != 3 || packed.size(1) != kStatePlanes || packed.size(2) != 8) {
 		throw std::invalid_argument("packed Gadus states must have shape [count, 18, 8]");
 	}
 	auto contiguous = packed.contiguous();
@@ -274,26 +258,18 @@ torch::Tensor decode_states_device(const torch::Tensor &packed,
 		return decode_states(host.data_ptr<std::uint8_t>(), host.size(0), false).to(device);
 	}
 	auto device_packed = contiguous.device() == device ? contiguous : contiguous.to(device, true);
-	auto masks = torch::tensor(
-		{128, 64, 32, 16, 8, 4, 2, 1},
-		torch::TensorOptions().dtype(torch::kUInt8).device(device));
-	auto expanded = torch::bitwise_and(device_packed.unsqueeze(-1), masks)
-		.ne(0)
-		.to(torch::kFloat32);
+	auto masks = torch::tensor({128, 64, 32, 16, 8, 4, 2, 1}, torch::TensorOptions().dtype(torch::kUInt8).device(device));
+	auto expanded = torch::bitwise_and(device_packed.unsqueeze(-1), masks).ne(0).to(torch::kFloat32);
 	return canonicalize_expanded(expanded);
 }
 
 // Keep the compact 144-byte representation across PCIe, then expand its bits in parallel.
-torch::Tensor decode_states_device(const std::uint8_t *packed, std::int64_t count,
-								   const torch::Device &device) {
+torch::Tensor decode_states_device(const std::uint8_t *packed, std::int64_t count, const torch::Device &device) {
 	if (!device.is_cuda()) {
 		return decode_states(packed, count, false).to(device);
 	}
-	auto host = torch::empty(
-		{count, kStatePlanes, 8},
-		torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU).pinned_memory(true));
-	std::memcpy(host.data_ptr<std::uint8_t>(), packed,
-				static_cast<std::size_t>(count) * kStatePlanes * 8);
+	auto host = torch::empty({count, kStatePlanes, 8}, torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU).pinned_memory(true));
+	std::memcpy(host.data_ptr<std::uint8_t>(), packed, static_cast<std::size_t>(count) * kStatePlanes * 8);
 	return decode_states_device(host, device);
 }
 
@@ -304,13 +280,11 @@ torch::Tensor encode_boards(const std::vector<chess::Board> &boards, bool pinned
 		const auto state = encode_state(boards[index]);
 		std::copy(state.begin(), state.end(), packed.begin() + index * state.size());
 	}
-	return decode_states(packed.data(), static_cast<std::int64_t>(boards.size()),
-						 pinned_memory);
+	return decode_states(packed.data(), static_cast<std::int64_t>(boards.size()), pinned_memory);
 }
 
 // Encode to packed host rows and use device-side expansion for CUDA inference.
-torch::Tensor encode_boards_device(const std::vector<chess::Board> &boards,
-								   const torch::Device &device) {
+torch::Tensor encode_boards_device(const std::vector<chess::Board> &boards, const torch::Device &device) {
 	std::vector<std::uint8_t> packed(boards.size() * kStatePlanes * 8);
 	for (std::size_t index = 0; index < boards.size(); ++index) {
 		const auto state = encode_state(boards[index]);
@@ -369,8 +343,7 @@ std::string game_termination(const chess::Board &board) {
 }
 
 // Restrict arbitrary network probabilities to legal actions and make their sum exactly one.
-std::vector<float> normalize_legal_policy(const std::vector<float> &policy,
-										  const chess::Board &board) {
+std::vector<float> normalize_legal_policy(const std::vector<float> &policy, const chess::Board &board) {
 	std::vector<float> normalized(kActionSize, 0.0F);
 	const auto moves = legal_moves(board);
 	if (moves.empty()) {
@@ -379,8 +352,7 @@ std::vector<float> normalize_legal_policy(const std::vector<float> &policy,
 	double total = 0.0;
 	for (const auto &move : moves) {
 		const int index = move_to_index(move);
-		const float value =
-			index < static_cast<int>(policy.size()) ? std::max(0.0F, policy[index]) : 0.0F;
+		const float value = index < static_cast<int>(policy.size()) ? std::max(0.0F, policy[index]) : 0.0F;
 		normalized[index] = value;
 		total += value;
 	}
@@ -404,8 +376,7 @@ torch::Device resolve_device(const std::string &requested) {
 	}
 	if (requested.starts_with("cuda")) {
 		if (!torch::cuda::is_available()) {
-			throw std::runtime_error(
-				"CUDA was requested but this LibTorch build has no available CUDA device");
+			throw std::runtime_error("CUDA was requested but this LibTorch build has no available CUDA device");
 		}
 		return torch::Device(requested);
 	}

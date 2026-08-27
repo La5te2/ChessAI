@@ -1,8 +1,8 @@
 // Gadus one-shot supervised training command-line entry point.
 
-#include <iostream>
 #include "gadus/args.hpp"
 #include "gadus/dataset.hpp"
+#include <iostream>
 
 // Parse training hyperparameters and optimize a new policy/value checkpoint.
 int main(int argc, char **argv) {
@@ -10,11 +10,11 @@ int main(int argc, char **argv) {
 		gadus::Args args(argc, argv);
 		if (args.has("help")) {
 			std::cout << "Usage: train --data <games.gadus.h5> --out <gadus.pth> [options]\n"
-					  << "  --channels <n> --blocks <n> --epochs <n> --batch-size <n>\n"
-					  << "  --max-steps <n> --lr <x> --weight-decay <x> --value-weight <x>\n"
-					  << "  --save-every <steps> --log-every <steps> --seed <n> --device "
-						 "<auto|cpu|cuda>\n"
-					  << "  --precision <fp32|bf16>\n";
+			          << "  --channels <n> --blocks <n> --epochs <n> --batch-size <n>\n"
+			          << "  --max-steps <n> --lr <x> --weight-decay <x> --value-weight <x>\n"
+			          << "  --save-every <steps> --log-every <steps> --seed <n> --device "
+			             "<auto|cpu|cuda>\n"
+			          << "  --precision <fp32|bf16>\n";
 			return 0;
 		}
 		gadus::TrainOptions options;
@@ -32,8 +32,7 @@ int main(int argc, char **argv) {
 		options.log_every = args.get_int("log-every", options.log_every);
 		options.seed = static_cast<std::uint64_t>(args.get_int64("seed", options.seed));
 		options.device = args.get("device", options.device);
-		options.precision =
-			gadus::parse_compute_precision(args.get("precision", "fp32"));
+		options.precision = gadus::parse_compute_precision(args.get("precision", "fp32"));
 		gadus::train_supervised(options);
 		return 0;
 	} catch (const std::exception &error) {

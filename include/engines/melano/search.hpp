@@ -64,12 +64,11 @@ using SearchProgressCallback = std::function<void(const SearchResult &)>;
 using SearchCancelCallback = std::function<bool()>;
 
 class Searcher {
-	public:
+public:
 	/// Owns a Melano model in inference mode and applies the configured search controls.
 	Searcher(Model model, torch::Device device, SearchOptions options);
 	/// Searches one position and optionally emits periodic snapshots for interactive clients.
-	SearchResult search(const chess::Board &board, const SearchProgressCallback &progress = {},
-						int progress_interval_ms = 0, const SearchCancelCallback &cancel = {});
+	SearchResult search(const chess::Board &board, const SearchProgressCallback &progress = {}, int progress_interval_ms = 0, const SearchCancelCallback &cancel = {});
 	/// Searches independent positions together so leaf evaluations share neural batches.
 	std::vector<SearchResult> search_many(const std::vector<chess::Board> &boards);
 	/// Applies search controls while retaining network evaluations compatible with the model.
@@ -77,7 +76,7 @@ class Searcher {
 	/// Clears cross-search network evaluations without changing the configured capacity.
 	void clear_evaluation_cache();
 
-	private:
+private:
 	struct Impl;
 	std::shared_ptr<Impl> impl_;
 };

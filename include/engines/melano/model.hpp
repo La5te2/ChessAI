@@ -84,8 +84,7 @@ struct ModelImpl : torch::nn::Module {
 	/// Returns policy logits and side-to-move V(s) for an exact board state.
 	std::tuple<torch::Tensor, torch::Tensor> forward(torch::Tensor state);
 	/// Returns legal-action logits [batch, legal_width] and the same side-to-move V(s).
-	std::tuple<torch::Tensor, torch::Tensor> forward_legal(torch::Tensor state,
-														   torch::Tensor legal_indices);
+	std::tuple<torch::Tensor, torch::Tensor> forward_legal(torch::Tensor state, torch::Tensor legal_indices);
 
 	StateEmbedding state_embedding{nullptr};
 	torch::nn::Sequential trunk{nullptr};

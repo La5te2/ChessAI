@@ -62,10 +62,8 @@ class TrajectoryLruCache {
 
 	using Entries = std::unordered_map<PackedState, Entry, PackedStateHash>;
 
-	public:
-	explicit TrajectoryLruCache(
-		std::size_t capacity_bytes = std::numeric_limits<std::size_t>::max())
-		: capacity_bytes_(capacity_bytes) {}
+public:
+	explicit TrajectoryLruCache(std::size_t capacity_bytes = std::numeric_limits<std::size_t>::max()) : capacity_bytes_(capacity_bytes) {}
 
 	// Return one exact network evaluation and refresh its ordinary LRU position.
 	bool get(const PackedState &state, CompactEvaluation &output) {
@@ -97,8 +95,7 @@ class TrajectoryLruCache {
 		auto stored = evaluation;
 		stored.cache_id = 0;
 		const auto id = next_id_++;
-		auto [entry, inserted] = entries_.emplace(
-			state, Entry{std::move(stored), recency, {}, id, 0, 0.0, bytes});
+		auto [entry, inserted] = entries_.emplace(state, Entry{std::move(stored), recency, {}, id, 0, 0.0, bytes});
 		if (!inserted) {
 			recency_.erase(recency);
 			throw std::logic_error("evaluation cache insertion failed");
@@ -121,17 +118,13 @@ class TrajectoryLruCache {
 		}
 		auto &parent = *parent_found->second;
 		parent.children.erase(
-			std::remove_if(parent.children.begin(), parent.children.end(),
-						   [&](std::uint64_t id) { return !entries_by_id_.contains(id); }),
-			parent.children.end());
-		if (std::find(parent.children.begin(), parent.children.end(), child_id) !=
-			parent.children.end()) {
+		    std::remove_if(parent.children.begin(), parent.children.end(), [&](std::uint64_t id) { return !entries_by_id_.contains(id); }), parent.children.end());
+		if (std::find(parent.children.begin(), parent.children.end(), child_id) != parent.children.end()) {
 			return;
 		}
 		const auto previous_capacity = parent.children.capacity();
 		parent.children.push_back(child_id);
-		const auto added_bytes =
-			(parent.children.capacity() - previous_capacity) * sizeof(std::uint64_t);
+		const auto added_bytes = (parent.children.capacity() - previous_capacity) * sizeof(std::uint64_t);
 		parent.bytes += added_bytes;
 		used_bytes_ += added_bytes;
 		evict_to_capacity();
@@ -144,10 +137,7 @@ class TrajectoryLruCache {
 		}
 		const auto generation = next_heat_generation_++;
 		trajectory.erase(
-			std::remove_if(trajectory.begin(), trajectory.end(), [&](const TrajectoryHeat &item) {
-				return item.id == 0 || !entries_by_id_.contains(item.id);
-			}),
-			trajectory.end());
+		    std::remove_if(trajectory.begin(), trajectory.end(), [&](const TrajectoryHeat &item) { return item.id == 0 || !entries_by_id_.contains(item.id); }), trajectory.end());
 		for (const auto &item : trajectory) {
 			auto &entry = *entries_by_id_.at(item.id);
 			entry.heat_generation = generation;
@@ -190,8 +180,7 @@ class TrajectoryLruCache {
 					continue;
 				}
 				const auto entry = entries_by_id_.find(item.id);
-				if (entry == entries_by_id_.end() ||
-					entry->second->heat_generation != generation) {
+				if (entry == entries_by_id_.end() || entry->second->heat_generation != generation) {
 					continue;
 				}
 				auto &aggregate = neighborhood[item.id];
@@ -244,12 +233,10 @@ class TrajectoryLruCache {
 		next_heat_generation_ = 1;
 	}
 
-	private:
+private:
 	static std::size_t entry_bytes(const CompactEvaluation &evaluation) {
-		return sizeof(PackedState) * 2 + sizeof(Entry) + 64 +
-			   evaluation.legal_moves.capacity() * sizeof(chess::Move) +
-			   evaluation.legal_indices.capacity() * sizeof(int) +
-			   evaluation.legal_policy.capacity() * sizeof(float);
+		return sizeof(PackedState) * 2 + sizeof(Entry) + 64 + evaluation.legal_moves.capacity() * sizeof(chess::Move) + evaluation.legal_indices.capacity() * sizeof(int) +
+		    evaluation.legal_policy.capacity() * sizeof(float);
 	}
 
 	void touch(Entry &entry) { recency_.splice(recency_.end(), recency_, entry.recency); }
@@ -283,8 +270,7 @@ class TrajectoryLruCache {
 
 struct Node {
 	// Create an edge/node pair with its Policy prior and incoming legal move.
-	explicit Node(float initial_prior = 0.0F, chess::Move incoming = chess::Move::NO_MOVE)
-		: prior(initial_prior), move(incoming) {}
+	explicit Node(float initial_prior = 0.0F, chess::Move incoming = chess::Move::NO_MOVE) : prior(initial_prior), move(incoming) {}
 
 	// Return the empirical value from this node's side-to-move perspective.
 	float q() const { return visits > 0 ? value_sum / static_cast<float>(visits) : 0.0F; }
@@ -320,7 +306,9 @@ struct TreeState {
 };
 
 // Keep bounded value arithmetic inside the model's [-1, 1] convention.
-float clamp_unit(float value) { return std::clamp(value, -1.0F, 1.0F); }
+float clamp_unit(float value) {
+	return std::clamp(value, -1.0F, 1.0F);
+}
 
 // Convert steady-clock elapsed time to seconds for deadlines and reporting.
 double seconds_since(Clock::time_point start) {
@@ -353,8 +341,7 @@ void backpropagate(const std::vector<Node *> &path, float value) {
 }
 
 // Aggregate each cached state's visit share within the completed root tree.
-void collect_trajectory_heat(const Node *node, double denominator, int depth,
-							 std::unordered_map<std::uint64_t, TrajectoryHeat> &output) {
+void collect_trajectory_heat(const Node *node, double denominator, int depth, std::unordered_map<std::uint64_t, TrajectoryHeat> &output) {
 	if (node == nullptr || node->visits <= 0 || denominator <= 0.0) {
 		return;
 	}
@@ -391,8 +378,7 @@ bool is_terminal(const chess::Board &board, float *value = nullptr) {
 struct Searcher::Impl {
 	// Move the model once to its inference device and sanitize non-negative virtual loss.
 	Impl(Model source_model, torch::Device source_device, SearchOptions source_options)
-		: model(std::move(source_model)), device(std::move(source_device)),
-		  options(source_options) {
+	    : model(std::move(source_model)), device(std::move(source_device)), options(source_options) {
 		if (!model) {
 			throw std::invalid_argument("Melano search requires a model");
 		}
@@ -405,20 +391,17 @@ struct Searcher::Impl {
 	void set_options(SearchOptions source_options) {
 		validate_compute_precision(source_options.precision, device);
 		source_options.virtual_loss = std::max(0.0, source_options.virtual_loss);
-		source_options.evaluation_cache_mb =
-			std::clamp(source_options.evaluation_cache_mb, 0, 65536);
+		source_options.evaluation_cache_mb = std::clamp(source_options.evaluation_cache_mb, 0, 65536);
 		if (device.is_cpu() && source_options.cpu_threads > 0) {
 			torch::set_num_threads(source_options.cpu_threads);
 		}
 		active_cpu_threads = device.is_cpu() ? torch::get_num_threads() : 0;
-		persistent_evaluation_cache.set_capacity(
-			static_cast<std::size_t>(source_options.evaluation_cache_mb) * 1024 * 1024);
+		persistent_evaluation_cache.set_capacity(static_cast<std::size_t>(source_options.evaluation_cache_mb) * 1024 * 1024);
 		options = source_options;
 	}
 
 	// Evaluate unique uncached states and map each compact result back to its request row.
-	std::vector<CompactEvaluation> evaluate_compact(const std::vector<chess::Board> &boards,
-													TrajectoryLruCache *cache = nullptr) {
+	std::vector<CompactEvaluation> evaluate_compact(const std::vector<chess::Board> &boards, TrajectoryLruCache *cache = nullptr) {
 		if (boards.empty()) {
 			return {};
 		}
@@ -472,18 +455,13 @@ struct Searcher::Impl {
 			index_options = index_options.pinned_memory(true);
 			mask_options = mask_options.pinned_memory(true);
 		}
-		auto legal_indices = torch::zeros(
-			{static_cast<std::int64_t>(pending.size()), static_cast<std::int64_t>(legal_width)},
-			index_options);
-		auto legal_mask = torch::zeros(
-			{static_cast<std::int64_t>(pending.size()), static_cast<std::int64_t>(legal_width)},
-			mask_options);
+		auto legal_indices = torch::zeros({static_cast<std::int64_t>(pending.size()), static_cast<std::int64_t>(legal_width)}, index_options);
+		auto legal_mask = torch::zeros({static_cast<std::int64_t>(pending.size()), static_cast<std::int64_t>(legal_width)}, mask_options);
 		auto index_rows = legal_indices.accessor<std::int64_t, 2>();
 		auto mask_rows = legal_mask.accessor<bool, 2>();
 		for (std::size_t row = 0; row < pending.size(); ++row) {
 			for (std::size_t column = 0; column < pending[row].legal_indices.size(); ++column) {
-				index_rows[static_cast<std::int64_t>(row)][static_cast<std::int64_t>(column)] =
-					pending[row].legal_indices[column];
+				index_rows[static_cast<std::int64_t>(row)][static_cast<std::int64_t>(column)] = pending[row].legal_indices[column];
 				mask_rows[static_cast<std::int64_t>(row)][static_cast<std::int64_t>(column)] = true;
 			}
 		}
@@ -499,8 +477,7 @@ struct Searcher::Impl {
 			std::tie(logits, raw_values) = model->forward_legal(states, device_indices);
 		}
 		auto compact_logits = logits.to(torch::kFloat32);
-		compact_logits =
-			compact_logits.masked_fill(~device_mask, -std::numeric_limits<float>::infinity());
+		compact_logits = compact_logits.masked_fill(~device_mask, -std::numeric_limits<float>::infinity());
 		auto probabilities = torch::softmax(compact_logits, 1).to(torch::kCPU).contiguous();
 		auto values = raw_values.reshape({-1}).to(torch::kFloat32).to(torch::kCPU).contiguous();
 
@@ -509,9 +486,7 @@ struct Searcher::Impl {
 		for (std::size_t row = 0; row < pending.size(); ++row) {
 			pending[row].legal_policy.resize(pending[row].legal_indices.size());
 			for (std::size_t column = 0; column < pending[row].legal_indices.size(); ++column) {
-				pending[row].legal_policy[column] =
-					probability_rows[static_cast<std::int64_t>(row)]
-									[static_cast<std::int64_t>(column)];
+				pending[row].legal_policy[column] = probability_rows[static_cast<std::int64_t>(row)][static_cast<std::int64_t>(column)];
 			}
 			pending[row].value = value_rows[static_cast<std::int64_t>(row)];
 			if (cache != nullptr) {
@@ -548,8 +523,7 @@ struct Searcher::Impl {
 		}
 		node->children.reserve(evaluation.legal_moves.size());
 		for (std::size_t index = 0; index < evaluation.legal_moves.size(); ++index) {
-			node->children.emplace_back(evaluation.legal_policy[index],
-										evaluation.legal_moves[index]);
+			node->children.emplace_back(evaluation.legal_policy[index], evaluation.legal_moves[index]);
 		}
 		node->evaluation_id = evaluation.cache_id;
 	}
@@ -560,22 +534,18 @@ struct Searcher::Impl {
 	// Estimate an unvisited edge as parent Q minus uncertainty proportional to explored prior mass.
 	float fpu(const Node *parent) const {
 		const float parent_q = parent->visits > 0 ? parent->q() : 0.0F;
-		return clamp_unit(parent_q - static_cast<float>(std::max(0.0, options.fpu_reduction)) *
-										 std::sqrt(visited_policy_mass(parent)));
+		return clamp_unit(parent_q - static_cast<float>(std::max(0.0, options.fpu_reduction)) * std::sqrt(visited_policy_mass(parent)));
 	}
 
 	// Return the edge value in the parent side-to-move perspective.
-	float edge_value(const Node *parent, const Node *child) const {
-		return child->visits > 0 ? -child->q() : fpu(parent);
-	}
+	float edge_value(const Node *parent, const Node *child) const { return child->visits > 0 ? -child->q() : fpu(parent); }
 
 	// Increase exploration logarithmically with parent visits: c_init +
 	// factor*log((N+base+1)/base).
 	double scheduled_c_puct(const Node *parent) const {
 		const double visits = std::max(0, parent->visits + parent->virtual_visits);
 		const double base = std::max(1.0, options.c_puct_base);
-		const double growth =
-			std::max(0.0, options.c_puct_factor) * std::log((visits + base + 1.0) / base);
+		const double growth = std::max(0.0, options.c_puct_factor) * std::log((visits + base + 1.0) / base);
 		return std::max(0.0, options.c_puct + growth);
 	}
 
@@ -583,9 +553,7 @@ struct Searcher::Impl {
 	double selection_score(const Node *parent, const Node *child) const {
 		const double exploitation = edge_value(parent, child);
 		const int child_visits = child->visits + child->virtual_visits;
-		const double exploration = scheduled_c_puct(parent) * child->prior *
-								   std::sqrt(parent->visits + parent->virtual_visits + 1.0) /
-								   (1.0 + child_visits);
+		const double exploration = scheduled_c_puct(parent) * child->prior * std::sqrt(parent->visits + parent->virtual_visits + 1.0) / (1.0 + child_visits);
 		return exploitation + exploration - options.virtual_loss * child->virtual_visits;
 	}
 
@@ -594,18 +562,17 @@ struct Searcher::Impl {
 		if (parent->children.empty()) {
 			return nullptr;
 		}
-		return &*std::max_element(parent->children.begin(), parent->children.end(),
-								  [&](const auto &left, const auto &right) {
-									  const double left_score = selection_score(parent, &left);
-									  const double right_score = selection_score(parent, &right);
-									  if (left_score != right_score) {
-										  return left_score < right_score;
-									  }
-									  if (left.prior != right.prior) {
-										  return left.prior < right.prior;
-									  }
-									  return edge_value(parent, &left) < edge_value(parent, &right);
-								  });
+		return &*std::max_element(parent->children.begin(), parent->children.end(), [&](const auto &left, const auto &right) {
+			const double left_score = selection_score(parent, &left);
+			const double right_score = selection_score(parent, &right);
+			if (left_score != right_score) {
+				return left_score < right_score;
+			}
+			if (left.prior != right.prior) {
+				return left.prior < right.prior;
+			}
+			return edge_value(parent, &left) < edge_value(parent, &right);
+		});
 	}
 
 	// Descend to an unexpanded or terminal node while reserving the path for batching.
@@ -657,17 +624,13 @@ struct Searcher::Impl {
 		for (const auto &child : root->children) {
 			ordered.push_back(&child);
 		}
-		std::sort(ordered.begin(), ordered.end(), [](const Node *left, const Node *right) {
-			return std::pair(left->visits, left->prior) > std::pair(right->visits, right->prior);
-		});
+		std::sort(
+		    ordered.begin(), ordered.end(), [](const Node *left, const Node *right) { return std::pair(left->visits, left->prior) > std::pair(right->visits, right->prior); });
 		const double first = ordered[0]->visits;
 		const double second = ordered[1]->visits;
-		const double visit_uncertainty =
-			1.0 - std::abs(first - second) / std::max(1.0, first + second);
-		const double q_uncertainty =
-			1.0 - std::min(1.0, std::abs(-ordered[0]->q() + ordered[1]->q()) / 0.5);
-		return std::clamp(0.5 * entropy + 0.35 * visit_uncertainty + 0.15 * q_uncertainty, 0.0,
-						  1.0);
+		const double visit_uncertainty = 1.0 - std::abs(first - second) / std::max(1.0, first + second);
+		const double q_uncertainty = 1.0 - std::min(1.0, std::abs(-ordered[0]->q() + ordered[1]->q()) / 0.5);
+		return std::clamp(0.5 * entropy + 0.35 * visit_uncertainty + 0.15 * q_uncertainty, 0.0, 1.0);
 	}
 
 	// Establish the mandatory simulation floor before uncertainty can extend the budget.
@@ -676,44 +639,34 @@ struct Searcher::Impl {
 		if (cap == 0) {
 			return 0;
 		}
-		const int configured = options.mcts_min_sims > 0
-								   ? options.mcts_min_sims
-								   : std::max(std::max(1, options.mcts_batch_size), cap / 4);
+		const int configured = options.mcts_min_sims > 0 ? options.mcts_min_sims : std::max(std::max(1, options.mcts_batch_size), cap / 4);
 		return std::max(1, std::min(cap, configured));
 	}
 
 	// Interpolate from minimum to the hard cap using the current root uncertainty.
 	int dynamic_target(const Node *root, int minimum) const {
 		const int cap = std::max(0, options.mcts_sims);
-		const int desired =
-			minimum + static_cast<int>(std::ceil(uncertainty(root) * std::max(0, cap - minimum)));
+		const int desired = minimum + static_cast<int>(std::ceil(uncertainty(root) * std::max(0, cap - minimum)));
 		return std::max(minimum, std::min(cap, desired));
 	}
 
 	// Track the cost of one uncached neural evaluation for deadline-aware batching.
-	void observe_evaluation(const std::vector<CompactEvaluation> &rows,
-							Clock::time_point started) {
-		const auto fresh = std::count_if(rows.begin(), rows.end(),
-			[](const CompactEvaluation &row) { return !row.reused; });
+	void observe_evaluation(const std::vector<CompactEvaluation> &rows, Clock::time_point started) {
+		const auto fresh = std::count_if(rows.begin(), rows.end(), [](const CompactEvaluation &row) { return !row.reused; });
 		if (fresh != 1) {
 			return;
 		}
-		const double sample = std::max(0.05,
-			std::chrono::duration<double, std::milli>(Clock::now() - started).count());
-		single_evaluation_ms = single_evaluation_ms <= 0.0
-			? sample
-			: std::max(sample, 0.8 * single_evaluation_ms + 0.2 * sample);
+		const double sample = std::max(0.05, std::chrono::duration<double, std::milli>(Clock::now() - started).count());
+		single_evaluation_ms = single_evaluation_ms <= 0.0 ? sample : std::max(sample, 0.8 * single_evaluation_ms + 0.2 * sample);
 	}
 
 	// Reserve enough time to finish an in-flight neural call and shrink the final batches.
-	int deadline_batch_size(const std::optional<Clock::time_point> &deadline,
-							int configured) const {
+	int deadline_batch_size(const std::optional<Clock::time_point> &deadline, int configured) const {
 		configured = std::max(1, configured);
 		if (!deadline.has_value()) {
 			return configured;
 		}
-		const double remaining =
-			std::chrono::duration<double, std::milli>(*deadline - Clock::now()).count();
+		const double remaining = std::chrono::duration<double, std::milli>(*deadline - Clock::now()).count();
 		const double row_budget = std::max(1.0, 1.25 * std::max(1.0, single_evaluation_ms));
 		const int rows = static_cast<int>(std::floor((remaining - 2.0) / row_budget));
 		return std::clamp(rows, 0, configured);
@@ -737,9 +690,8 @@ struct Searcher::Impl {
 	}
 
 	// Apply optional post-search ranking rules without modifying priors or the MCTS tree.
-	void apply_decision_components(const chess::Board &board, float root_value,
-								   std::vector<float> &scores, std::unordered_set<int> &repetitions,
-								   std::unordered_set<int> &mates) const {
+	void apply_decision_components(
+	    const chess::Board &board, float root_value, std::vector<float> &scores, std::unordered_set<int> &repetitions, std::unordered_set<int> &mates) const {
 		if (options.instant_mate_first) {
 			int selected = -1;
 			float selected_score = -std::numeric_limits<float>::infinity();
@@ -761,9 +713,7 @@ struct Searcher::Impl {
 			}
 		}
 
-		const float deduction =
-			static_cast<float>(std::clamp(options.repetition_policy_penalty, 0.0, 1.0) *
-							   std::clamp(static_cast<double>(root_value), 0.0, 1.0));
+		const float deduction = static_cast<float>(std::clamp(options.repetition_policy_penalty, 0.0, 1.0) * std::clamp(static_cast<double>(root_value), 0.0, 1.0));
 		if (deduction <= 0.0F) {
 			return;
 		}
@@ -807,29 +757,26 @@ struct Searcher::Impl {
 
 		std::unordered_set<int> repetitions;
 		std::unordered_set<int> mates;
-		apply_decision_components(state.board, result.value, result.decision_scores, repetitions,
-								  mates);
+		apply_decision_components(state.board, result.value, result.decision_scores, repetitions, mates);
 
 		auto moves = legal_moves(state.board);
-		std::sort(
-			moves.begin(), moves.end(), [&](const chess::Move &left, const chess::Move &right) {
-				const int left_index = move_to_index(left);
-				const int right_index = move_to_index(right);
-				if (result.decision_scores[left_index] != result.decision_scores[right_index]) {
-					return result.decision_scores[left_index] > result.decision_scores[right_index];
-				}
-				if (result.policy[left_index] != result.policy[right_index]) {
-					return result.policy[left_index] > result.policy[right_index];
-				}
-				return move_uci(left) > move_uci(right);
-			});
+		std::sort(moves.begin(), moves.end(), [&](const chess::Move &left, const chess::Move &right) {
+			const int left_index = move_to_index(left);
+			const int right_index = move_to_index(right);
+			if (result.decision_scores[left_index] != result.decision_scores[right_index]) {
+				return result.decision_scores[left_index] > result.decision_scores[right_index];
+			}
+			if (result.policy[left_index] != result.policy[right_index]) {
+				return result.policy[left_index] > result.policy[right_index];
+			}
+			return move_uci(left) > move_uci(right);
+		});
 		if (moves.empty()) {
 			throw std::runtime_error("game is already over");
 		}
 		result.move = moves.front();
 
-		const auto row_count =
-			std::min(moves.size(), static_cast<std::size_t>(std::max(1, options.root_topn)));
+		const auto row_count = std::min(moves.size(), static_cast<std::size_t>(std::max(1, options.root_topn)));
 		for (std::size_t row = 0; row < row_count; ++row) {
 			const auto move = moves[row];
 			const int action = move_to_index(move);
@@ -853,10 +800,8 @@ struct Searcher::Impl {
 	}
 
 	// Search many independent roots while sharing neural leaf batches across games.
-	std::vector<SearchResult> search_many(const std::vector<chess::Board> &boards,
-										  const SearchProgressCallback &progress = {},
-										  int progress_interval_ms = 0,
-										  const SearchCancelCallback &cancel = {}) {
+	std::vector<SearchResult> search_many(
+	    const std::vector<chess::Board> &boards, const SearchProgressCallback &progress = {}, int progress_interval_ms = 0, const SearchCancelCallback &cancel = {}) {
 		if (boards.empty()) {
 			return {};
 		}
@@ -868,8 +813,7 @@ struct Searcher::Impl {
 		const auto start = Clock::now();
 		std::optional<Clock::time_point> deadline;
 		if (options.movetime_ms > 0.0) {
-			deadline = start + std::chrono::duration_cast<Clock::duration>(
-								   std::chrono::duration<double, std::milli>(options.movetime_ms));
+			deadline = start + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double, std::milli>(options.movetime_ms));
 		}
 
 		std::vector<TreeState> states;
@@ -880,8 +824,7 @@ struct Searcher::Impl {
 			states.push_back(std::move(state));
 		}
 		TrajectoryLruCache local_evaluation_cache;
-		auto *evaluation_cache = options.evaluation_cache_mb > 0 ? &persistent_evaluation_cache
-															 : &local_evaluation_cache;
+		auto *evaluation_cache = options.evaluation_cache_mb > 0 ? &persistent_evaluation_cache : &local_evaluation_cache;
 		if (options.evaluation_cache_mb > 0) {
 			std::vector<PackedState> root_states;
 			root_states.reserve(boards.size());
@@ -907,13 +850,10 @@ struct Searcher::Impl {
 		auto next_progress = start;
 		if (progress && states.size() == 1) {
 			progress(make_result(states[0], start));
-			next_progress =
-				Clock::now() + std::chrono::milliseconds(std::max(1, progress_interval_ms));
+			next_progress = Clock::now() + std::chrono::milliseconds(std::max(1, progress_interval_ms));
 		}
 
-		const int simulation_limit = options.unbounded_simulations
-			? std::numeric_limits<int>::max()
-			: std::max(0, options.mcts_sims);
+		const int simulation_limit = options.unbounded_simulations ? std::numeric_limits<int>::max() : std::max(0, options.mcts_sims);
 		if (options.mcts_sims > 0) {
 			const int configured_batch_size = std::max(1, options.mcts_batch_size);
 			while (!deadline_reached(deadline) && !(cancel && cancel())) {
@@ -927,9 +867,7 @@ struct Searcher::Impl {
 				selected.reserve(states.size() * static_cast<std::size_t>(batch_size));
 				for (std::size_t state_index = 0; state_index < states.size(); ++state_index) {
 					auto &state = states[state_index];
-					if (state.sims_completed >= simulation_limit ||
-						(!options.unbounded_simulations &&
-						 state.sims_completed >= state.dynamic_target)) {
+					if (state.sims_completed >= simulation_limit || (!options.unbounded_simulations && state.sims_completed >= state.dynamic_target)) {
 						continue;
 					}
 					active = true;
@@ -939,9 +877,7 @@ struct Searcher::Impl {
 					}
 					std::unordered_set<Node *> selected_nodes;
 					selected_nodes.reserve(static_cast<std::size_t>(wanted) * 2);
-					for (int attempt = 0, scheduled = 0;
-						 scheduled < wanted && attempt < std::max(wanted * 5, wanted + 8);
-						 ++attempt) {
+					for (int attempt = 0, scheduled = 0; scheduled < wanted && attempt < std::max(wanted * 5, wanted + 8); ++attempt) {
 						if (deadline_reached(deadline) || (cancel && cancel())) {
 							break;
 						}
@@ -973,8 +909,7 @@ struct Searcher::Impl {
 						}
 						break;
 					}
-					const auto end = std::min(
-						selected.size(), begin + static_cast<std::size_t>(allowed));
+					const auto end = std::min(selected.size(), begin + static_cast<std::size_t>(allowed));
 					std::vector<chess::Board> leaf_boards;
 					leaf_boards.reserve(end - begin);
 					for (std::size_t index = begin; index < end; ++index) {
@@ -990,9 +925,7 @@ struct Searcher::Impl {
 						auto &state = states[leaf.state_index];
 						const std::size_t row = index - begin;
 						if (options.evaluation_cache_mb > 0 && leaf.path.size() > 1) {
-							persistent_evaluation_cache.link(
-								leaf.path[leaf.path.size() - 2]->evaluation_id,
-								evaluation[row].cache_id);
+							persistent_evaluation_cache.link(leaf.path[leaf.path.size() - 2]->evaluation_id, evaluation[row].cache_id);
 						}
 						if (leaf.leaf->children.empty()) {
 							expand(leaf.leaf, evaluation[row]);
@@ -1020,8 +953,7 @@ struct Searcher::Impl {
 						state.dynamic_target = dynamic_target(state.root.get(), minimum);
 					}
 				}
-				if (progress && states.size() == 1 && progress_interval_ms > 0 &&
-					Clock::now() >= next_progress) {
+				if (progress && states.size() == 1 && progress_interval_ms > 0 && Clock::now() >= next_progress) {
 					progress(make_result(states[0], start));
 					next_progress = Clock::now() + std::chrono::milliseconds(progress_interval_ms);
 				}
@@ -1037,8 +969,7 @@ struct Searcher::Impl {
 		for (auto &state : states) {
 			results.push_back(make_result(state, start));
 			if (options.evaluation_cache_mb > 0 && state.root->visits > 0) {
-				collect_trajectory_heat(state.root.get(), static_cast<double>(state.root->visits), 0,
-								trajectory_heat);
+				collect_trajectory_heat(state.root.get(), static_cast<double>(state.root->visits), 0, trajectory_heat);
 			}
 		}
 		if (options.evaluation_cache_mb > 0 && !trajectory_heat.empty()) {
@@ -1061,12 +992,11 @@ struct Searcher::Impl {
 };
 
 // Construct the public value-type wrapper around the shared implementation.
-Searcher::Searcher(Model model, torch::Device device, SearchOptions options)
-	: impl_(std::make_shared<Impl>(std::move(model), std::move(device), options)) {}
+Searcher::Searcher(Model model, torch::Device device, SearchOptions options) : impl_(std::make_shared<Impl>(std::move(model), std::move(device), options)) {
+}
 
 // Search one position and expose timed snapshots to interactive front ends.
-SearchResult Searcher::search(const chess::Board &board, const SearchProgressCallback &progress,
-							  int progress_interval_ms, const SearchCancelCallback &cancel) {
+SearchResult Searcher::search(const chess::Board &board, const SearchProgressCallback &progress, int progress_interval_ms, const SearchCancelCallback &cancel) {
 	return impl_->search_many({board}, progress, progress_interval_ms, cancel)[0];
 }
 
@@ -1076,9 +1006,13 @@ std::vector<SearchResult> Searcher::search_many(const std::vector<chess::Board> 
 }
 
 // Apply search controls while preserving compatible network evaluations.
-void Searcher::set_options(SearchOptions options) { impl_->set_options(options); }
+void Searcher::set_options(SearchOptions options) {
+	impl_->set_options(options);
+}
 
 // Clear retained cross-search evaluations without changing capacity.
-void Searcher::clear_evaluation_cache() { impl_->persistent_evaluation_cache.clear(); }
+void Searcher::clear_evaluation_cache() {
+	impl_->persistent_evaluation_cache.clear();
+}
 
 } // namespace melano

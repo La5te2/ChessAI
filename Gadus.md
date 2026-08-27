@@ -173,64 +173,74 @@ L_j(b_j)=
 +\mathrm{BN}_{j,I}(b_j).
 $$
 
-The full-board transformation uses a fixed relation dictionary over the 64 canonical squares. A dictionary is a collection of matrices, independent of how their entries are represented. A symbolic formula can be evaluated into a dense table, and a dense table can be represented exactly by indexed constants. The two representations are mathematically equivalent when they define the same entries. The construction is iterative, and both its human-designed initial dictionary and its statistically extracted successors are empirical choices in this sense.
+The full-board transformation acts on ordered pairs of the 64 canonical squares. Let $q=(r_q,f_q)$ be an output square and $p=(r_p,f_p)$ an input square. Their target-relative displacement is
 
-Generation zero begins with eight relations supplied by human geometric experience. Let the output square be $q=(r_q,f_q)$ and the input square be $p=(r_p,f_p)$. With $\mathbf 1[\cdot]$ denoting an indicator, the unnormalized matrices are
+$$
+\delta(q,p)=(r_q-r_p,f_q-f_p)\in\mathcal D,
+\qquad
+\mathcal D=\{-7,\ldots,7\}^2.
+$$
+
+For every $(a,b)\in\mathcal D$, define
+
+$$
+T_{a,b}(q,p)=\mathbf 1[\delta(q,p)=(a,b)],
+\qquad
+n_{a,b}=\lVert T_{a,b}\rVert_F^2=(8-|a|)(8-|b|),
+$$
+
+and
+
+$$
+\widehat B_{a,b}=\frac{T_{a,b}}{\sqrt{n_{a,b}}}.
+$$
+
+The 225 matrices $\widehat B_{a,b}$ have disjoint support and therefore form an orthonormal basis for every square relation whose coefficient depends only on relative displacement. Each relation group learns one coefficient $\alpha_{j,g,a,b}$ for every member of this basis.
+
+A static absolute-position residual $\Delta A^\perp_{j,g}$ supplies the complementary square-pair information. It obeys
+
+$$
+\sum_{\delta(q,p)=(a,b)}
+\Delta A^\perp_{j,g}(q,p)=0
+\qquad
+\text{for every }(a,b)\in\mathcal D.
+$$
+
+The static relation is consequently
+
+$$
+A^{\mathrm{static}}_{j,g}=
+\sum_{(a,b)\in\mathcal D}
+\alpha_{j,g,a,b}\widehat B_{a,b}
++\Delta A^\perp_{j,g}.
+$$
+
+This decomposition is unique. Its relative component contains the common value of each displacement class, while the constrained residual contains only differences among square pairs in the same class. The implementation stores a $15\times15$ coefficient table and obtains its dense entries by displacement lookup rather than storing 225 dense basis matrices.
+
+Sliding-piece geometry also depends on occupied intermediate squares. Let $o_s(p)\in\{0,1\}$ indicate whether square $p$ is occupied in encoded state $s$, and let $I(q,p)$ be the squares strictly between two aligned endpoints. Define
 
 $$
 \begin{aligned}
-B^{(0)}_0(q,p)&=\mathbf 1[q=p],\\
-B^{(0)}_1(q,p)&=\mathbf 1[\max(|r_q-r_p|,|f_q-f_p|)=1],\\
-B^{(0)}_2(q,p)&=\mathbf 1[(|r_q-r_p|,|f_q-f_p|)\in\{(1,2),(2,1)\}],\\
-B^{(0)}_3(q,p)&=\mathbf 1[r_q=r_p\land q\ne p],\\
-B^{(0)}_4(q,p)&=\mathbf 1[f_q=f_p\land q\ne p],\\
-B^{(0)}_5(q,p)&=\mathbf 1[r_q-f_q=r_p-f_p\land q\ne p],\\
-B^{(0)}_6(q,p)&=\mathbf 1[r_q+f_q=r_p+f_p\land q\ne p],\\
-B^{(0)}_7(q,p)&=1.
+V^R_s(q,p)&=
+\mathbf 1[q\ne p\land(r_q=r_p\lor f_q=f_p)]
+\prod_{u\in I(q,p)}(1-o_s(u)),\\
+V^B_s(q,p)&=
+\mathbf 1[q\ne p\land|r_q-r_p|=|f_q-f_p|]
+\prod_{u\in I(q,p)}(1-o_s(u)).
 \end{aligned}
 $$
 
-Row normalization defines the generation-zero dictionary of dimension $H_0=8$:
+The empty product equals one. Thus adjacent aligned squares are visible, an occupied intermediate square blocks every longer ray through it, and distance does not weaken an otherwise unobstructed relation. The complete position-dependent matrix is
 
 $$
-\widehat B^{(0)}_r(q,p)=
-\frac{B^{(0)}_r(q,p)}
-{\max\left(1,\sum_{u=0}^{63}B^{(0)}_r(q,u)\right)},
-\qquad 0\leq r<8.
+A_{j,g}(s)=A^{\mathrm{static}}_{j,g}
++\beta^R_{j,g}V^R_s
++\beta^B_{j,g}V^B_s,
 $$
 
-Let $H_t$ denote the number of fixed matrices in the generation-$t$ dictionary. Training a model from that dictionary produces one or more source checkpoints. For checkpoint $m$, each chess-structured block $j$ and relation group $g$ contains the complete learned relation
+where $\beta^R_{j,g}$ and $\beta^B_{j,g}$ are learned scalars. The visibility matrices $V^R_s$ and $V^B_s$ are constructed once per encoded position and shared by every residual block.
 
-$$
-A^{(t,m)}_{j,g}=
-\sum_{r=0}^{H_t-1}\alpha^{(t,m)}_{j,g,r}\widehat B^{(t)}_r+
-\Delta A^{(t,m)}_{j,g}.
-$$
-
-Flattening all such matrices from checkpoint $m$ gives $R^{(t)}_m$, whose rows lie in $\mathbb R^{4096}$. Each checkpoint is normalized by its total Frobenius norm, and the normalized rows are concatenated:
-
-$$
-X^{(t)}=\operatorname{ConcatRows}\left(
-\frac{R^{(t)}_m}{\max(\lVert R^{(t)}_m\rVert_F,10^{-30})}:m\in\mathcal M_t
-\right).
-$$
-
-Let $X^{(t)}=U\Sigma V^\mathsf T$ be an uncentered singular-value decomposition and let $v_r$ be row $r$ of $V^\mathsf T$ in nonincreasing singular-value order. Dictionary iteration adopts the dimension-selection convention
-
-$$
-H_{t+1}\geq H_t.
-$$
-
-This inequality is a design choice rather than a property implied by the SVD. It prevents the number of shared relation directions from decreasing, although recomputing the SVD may rotate the subspace that they span. It also admits additional directions supported by the trained relations. Generation $t+1$ is
-
-$$
-\widehat B^{(t+1)}_r=\xi_r\operatorname{Matrix}_{64\times64}(v_r),
-\qquad 0\leq r<H_{t+1},
-$$
-
-where $\xi_r\in\{-1,1\}$ makes the first maximum-magnitude component positive. Consequently, every successor basis has unit Frobenius norm, and its leading prefixes minimize squared reconstruction error on the fused source relations at their respective dimensions. A successor may itself be written symbolically whenever an exact formula for its entries is available; storing it as a dense array changes neither the matrix nor the network. Repeating this construction after training the successor produces another dictionary without changing the network formula.
-
-For the network equations below, choose one dictionary generation and write its dimension and matrices as $H$ and $\widehat B_0,\ldots,\widehat B_{H-1}$, omitting the generation superscript.
+During training, the implementation evaluates the static, rook and bishop products separately and adds their outputs. This form avoids retaining a batch-sized $N\times K\times64\times64$ relation tensor for every block during backpropagation. Fused inference has no backward state to retain, so it first combines the three matrices and evaluates one grouped relation multiplication.
 
 Let
 
@@ -240,20 +250,12 @@ K=\gcd(C,8),
 d=\frac{C}{K}.
 $$
 
-Here $K$ is the number of computational channel groups in one residual block; it is independent of the dictionary dimension $H$. The channels of $b_j$ are divided into $K$ groups of width $d$. Relation group $g$ uses a learned linear combination of the fixed matrices in the selected dictionary together with a learned unrestricted residual matrix:
-
-$$
-A_{j,g}=
-\sum_{r=0}^{H-1}\alpha_{j,g,r}\widehat B_r+
-\Delta A_{j,g},
-\qquad
-A_{j,g}\in\mathbb R^{64\times64}.
-$$
+Here $K$ is the number of computational channel groups in one residual block. The channels of $b_j$ are divided into $K$ groups of width $d$, and each group has its own $A_{j,g}(s)\in\mathbb R^{64\times64}$.
 
 After reshaping group $g$ to $b_{j,g}\in\mathbb R^{64\times d}$, the relation matrix acts on its square dimension:
 
 $$
-\widetilde R_{j,g}=A_{j,g}b_{j,g}.
+\widetilde R_{j,g}=A_{j,g}(s)b_{j,g}.
 $$
 
 Concatenating the groups restores a $C\times8\times8$ tensor. A non-affine batch-normalization layer then produces the relation output $R_j(b_j)$.
@@ -281,25 +283,52 @@ h_j+
 \qquad 0\leq j<B.
 $$
 
-The selected relation matrices $\widehat B_0,\ldots,\widehat B_{H-1}$ are fixed and shared by every residual block. Each block has its own relation coefficients $\alpha_{j,g,r}$, residual matrices $\Delta A_{j,g}$ and path-balance vector $\lambda_j$. For a selected dictionary satisfying $H\geq K$, as occurs under the nondecreasing construction from $H_0=8$, their initial values are
+The eight available initialization modes are identity, king displacement, knight displacement, canonical friendly-pawn advance, canonical friendly-pawn capture, complete-board communication, unobstructed rook geometry and unobstructed bishop geometry. If $K<8$, the first $K$ modes are used. For a static offset set $E\subseteq\mathcal D$, let $M_E=\sum_{(a,b)\in E}T_{a,b}$. Its group begins from the unit-Frobenius matrix
 
 $$
-\alpha_{j,g,r}=\mathbf 1[r=g],
+\overline M_E=\frac{M_E}{\lVert M_E\rVert_F},
 \qquad
-\Delta A_{j,g}=0,
-\qquad
-\lambda_j=\mathbf 1.
+\alpha_{j,g,a,b}=
+\begin{cases}
+\sqrt{n_{a,b}}/\lVert M_E\rVert_F,&(a,b)\in E,\\
+0,&(a,b)\notin E.
+\end{cases}
 $$
 
-The first two assignments give $A_{j,g}=\widehat B_g$ at initialization. Substituting $\lambda_j=\mathbf 1$ into the definition of $c_j$ assigns the local and full-board transformations the same initial coefficient $1/\sqrt2$ in every channel.
+The static offset sets are
 
-The affine scales of the three local-branch normalization layers are initialized to $1/\sqrt3$, and their biases are initialized to zero. In the shared and Policy sequences, the affine scale of $\mathrm{BN}_{j,\uparrow}$ is initialized to $1/\sqrt D$ for a sequence of length $D$. The first Value block retains scale one, while the second Value block begins with zero scale and is therefore an identity map at initialization. All corresponding biases begin at zero. The square embedding $E_S$ is also initialized to zero. The relation basis remains fixed during training, whereas the square embedding and all block-specific convolutional, normalization, relation and path-balance parameters are trainable.
+$$
+\begin{aligned}
+E_I&=\{(0,0)\},\\
+E_K&=\{(a,b):\max(|a|,|b|)=1\},\\
+E_N&=\{(a,b):(|a|,|b|)\in\{(1,2),(2,1)\}\},\\
+E_{P,m}&=\{(1,0)\},\\
+E_{P,c}&=\{(1,-1),(1,1)\},\\
+E_G&=\mathcal D.
+\end{aligned}
+$$
+
+Canonical rank displacement $+1$ points forward for the friendly side. The rook and bishop groups instead begin with their corresponding visibility coefficient equal to one. All other visibility coefficients, unassigned relative coefficients and absolute residuals begin at zero. Every block begins with $\lambda_j=\mathbf1$, assigning the local and full-board transformations the same coefficient $1/\sqrt2$ in every channel.
+
+The affine scales of the three local-branch normalization layers are initialized to $1/\sqrt3$, and their biases are initialized to zero. In the shared and Policy sequences, the affine scale of $\mathrm{BN}_{j,\uparrow}$ is initialized to $1/\sqrt D$ for a sequence of length $D$. The first Value block retains scale one, while the second Value block begins with zero scale and is therefore an identity map at initialization. All corresponding biases begin at zero. The square embedding $E_S$ is also initialized to zero. The displacement atoms and ray geometry are fixed, whereas the square embedding and all block-specific convolutional, normalization, relation and path-balance parameters are trainable.
 
 After the $B$ blocks, $h_B\in\mathbb R^{C\times8\times8}$ is the shared representation supplied to the Policy and Value heads defined below.
 
 ### 3.2 Policy and Value Heads
 
-Let $C_P$, $C_V$ and $H_V$ be the positive integer widths of the Policy representation, the Value feature tensor and the hidden Value layer, respectively. Let $D_P$ and $D_V$ be the positive integer numbers of Policy-specific and Value-specific chess-structured residual blocks. The Policy head assigns one unnormalized score, called a logit, to every canonical action index in $\mathcal I_G$. It begins with a bias-free $1\times1$ convolution from $C$ channels to $C_P$ channels, followed by batch normalization and ReLU:
+Let $C_P$, $C_V$ and $H_V$ be the positive integer widths of the Policy representation, the Value feature tensor and the hidden Value layer, respectively. Let $D_P$ and $D_V$ be the positive integer numbers of Policy-specific and Value-specific chess-structured residual blocks. The fixed head dimensions are
+
+$$
+D_P=D_V=2,
+\qquad
+C_P=128,
+\qquad
+C_V=48,
+\qquad
+H_V=512.
+$$
+
+The Policy head assigns one unnormalized score, called a logit, to every canonical action index in $\mathcal I_G$. It begins with a bias-free $1\times1$ convolution from $C$ channels to $C_P$ channels, followed by batch normalization and ReLU:
 
 $$
 u_0=\mathrm{ReLU}\left(
@@ -420,7 +449,7 @@ $$
 
 This expression equals $L_\theta(s)_{p,r,f}$ and computes the requested logit without materializing the other action-plane components. For a batch of complete states, the inference path first converts every legal action index to canonical coordinates. It pads the resulting arrays to the largest legal-action count in that batch, evaluates the requested logits and masks the padded positions before applying softmax. The resulting distribution for each state contains exactly the probabilities of its legal actions.
 
-In evaluation mode, every convolution followed directly by affine batch normalization is replaced by its equivalent biased convolution. Within each chess-structured block, the three local branches are combined into one biased $3\times3$ convolution by placing the $1\times1$ and normalized identity kernels at the center of that kernel. Each learned relation matrix $A_{j,g}$ is also computed once from its coefficients, fixed bases and residual matrix. These transformations preserve the network outputs while removing affine normalization attached to fused convolutions, local-branch summation and repeated relation-matrix construction from inference. The non-affine normalization of each relation output remains part of the block.
+In evaluation mode, every convolution followed directly by affine batch normalization is replaced by its equivalent biased convolution. Within each chess-structured block, the three local branches are combined into one biased $3\times3$ convolution by placing the $1\times1$ and normalized identity kernels at the center of that kernel. Each $A^{\mathrm{static}}_{j,g}$ is computed once from its displacement coefficients and constrained residual. For each evaluated position, the network constructs $V^R_s$ and $V^B_s$ once and combines them with every block's two visibility coefficients. The fixed statistics of the non-affine relation normalization and the learned path-balance vector are also evaluated once during fusion. Their local coefficient and relation mean are absorbed into the fused local convolution, while their relation coefficient becomes one fixed channelwise scale applied after the grouped relation multiplication. These transformations preserve the network outputs while removing affine normalization attached to fused convolutions, local-branch summation, repeated construction of the static relation matrices, relation normalization and path-balance square roots from inference.
 
 ## 4. Supervised Training
 
@@ -610,7 +639,17 @@ G_V\dfrac{g_{V,k}^{\mathrm{head}}}
 \end{cases}
 $$
 
-AdamW applies the gradients for $\theta_T$ and $\theta_P$ from Section 4.2 together with $\widetilde g_{V,k}^{\mathrm{head}}$ to obtain the next parameter state $\theta^{(k+1)}$.
+AdamW applies the gradients for $\theta_T$ and $\theta_P$ from Section 4.2 together with $\widetilde g_{V,k}^{\mathrm{head}}$ to obtain an intermediate parameter state. The residual matrix of every relation group is then projected onto the displacement-orthogonal subspace. For an intermediate residual $Z_{j,g}$, the stored residual for the next step is
+
+$$
+\Delta A^{\perp}_{j,g}(q,p)=Z_{j,g}(q,p)
+-\frac{1}{n_{a,b}}
+\sum_{\delta(u,v)=(a,b)}Z_{j,g}(u,v),
+\qquad
+(a,b)=\delta(q,p).
+$$
+
+This projected update preserves the zero-sum constraint in every displacement class and prevents the relative coefficients and absolute residual from optimizing duplicate directions. The resulting parameters form $\theta^{(k+1)}$.
 
 ## 5. Search
 

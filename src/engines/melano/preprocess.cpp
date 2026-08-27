@@ -1,18 +1,17 @@
 // Melano PGN-to-HDF5 preprocessing command-line entry point.
 
-#include <iostream>
 #include "melano/args.hpp"
 #include "melano/dataset.hpp"
+#include <iostream>
 
 // Parse preprocessing controls and build one architecture-locked policy/value HDF5 dataset.
 int main(int argc, char **argv) {
 	try {
 		melano::Args args(argc, argv);
 		if (args.has("help")) {
-			std::cout
-				<< "Usage: preprocess --input <games.pgn> --output <games.melano.h5> [options]\n"
-				<< "  --max-games <n> --chunk-size <n> --has-cmt <0|1>\n"
-				<< "  --compression-level <0..9> --log-every <games>\n";
+			std::cout << "Usage: preprocess --input <games.pgn> --output <games.melano.h5> [options]\n"
+			          << "  --max-games <n> --chunk-size <n> --has-cmt <0|1>\n"
+			          << "  --compression-level <0..9> --log-every <games>\n";
 			return 0;
 		}
 		melano::PreprocessOptions options;

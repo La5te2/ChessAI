@@ -2,13 +2,13 @@
 
 // Gadus chess rules, persistent state codec, canonical network input, and move codec.
 
+#include "chess.hpp"
 #include <array>
 #include <cstdint>
 #include <random>
 #include <string>
-#include <vector>
 #include <torch/types.h>
-#include "chess.hpp"
+#include <vector>
 
 namespace gadus {
 
@@ -40,20 +40,15 @@ std::string move_san(const chess::Board &board, const chess::Move &move);
 /// Bit-packs the Gadus 18 binary board planes for compact HDF5 storage.
 PackedState encode_state(const chess::Board &board);
 /// Expands packed rows into canonical float tensors shaped [count, 17, 8, 8].
-torch::Tensor decode_states(const std::uint8_t *packed, std::int64_t count,
-							bool pinned_memory = false);
+torch::Tensor decode_states(const std::uint8_t *packed, std::int64_t count, bool pinned_memory = false);
 /// Transfers packed rows first and expands their bits on the destination device.
-torch::Tensor decode_states_device(const std::uint8_t *packed, std::int64_t count,
-								   const torch::Device &device);
+torch::Tensor decode_states_device(const std::uint8_t *packed, std::int64_t count, const torch::Device &device);
 /// Expands a contiguous uint8 tensor shaped [count, 18, 8] on its destination device.
-torch::Tensor decode_states_device(const torch::Tensor &packed,
-								   const torch::Device &device);
+torch::Tensor decode_states_device(const torch::Tensor &packed, const torch::Device &device);
 /// Encodes live boards directly into a batched Gadus input tensor.
-torch::Tensor encode_boards(const std::vector<chess::Board> &boards,
-							bool pinned_memory = false);
+torch::Tensor encode_boards(const std::vector<chess::Board> &boards, bool pinned_memory = false);
 /// Encodes live boards and expands packed planes on the destination device.
-torch::Tensor encode_boards_device(const std::vector<chess::Board> &boards,
-								   const torch::Device &device);
+torch::Tensor encode_boards_device(const std::vector<chess::Board> &boards, const torch::Device &device);
 
 /// Applies all chess terminal rules represented by the chess library.
 bool game_is_over(const chess::Board &board);
@@ -65,8 +60,7 @@ std::string game_result(const chess::Board &board);
 std::string game_termination(const chess::Board &board);
 
 /// Masks illegal actions and renormalizes legal mass, falling back to uniform legal play.
-std::vector<float> normalize_legal_policy(const std::vector<float> &policy,
-										  const chess::Board &board);
+std::vector<float> normalize_legal_policy(const std::vector<float> &policy, const chess::Board &board);
 
 /// Resolves auto/cpu/cuda while rejecting unavailable CUDA requests.
 torch::Device resolve_device(const std::string &requested);

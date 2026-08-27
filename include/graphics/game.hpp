@@ -47,10 +47,8 @@ public:
 
 	/// Formats movetext or a complete PGN document.
 	std::string movetext(const std::string &result_override = "") const;
-	std::string pgn(const std::string &white = "White",
-					const std::string &black = "Black",
-					const std::string &result_override = "",
-					const std::string &termination_override = "") const;
+	std::string pgn(
+	    const std::string &white = "White", const std::string &black = "Black", const std::string &result_override = "", const std::string &termination_override = "") const;
 
 	/// Imports the main line of a PGN document.
 	void import_pgn(const std::string &document);

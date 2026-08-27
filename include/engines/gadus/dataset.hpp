@@ -2,13 +2,13 @@
 
 // Gadus PGN-to-HDF5 preprocessing and one-shot supervised policy/value training.
 
+#include "gadus/game.hpp"
+#include "gadus/precision.hpp"
 #include <cstdint>
 #include <filesystem>
 #include <string>
-#include <vector>
 #include <torch/types.h>
-#include "gadus/game.hpp"
-#include "gadus/precision.hpp"
+#include <vector>
 
 namespace gadus {
 
@@ -30,7 +30,7 @@ struct DatasetInfo {
 };
 
 class SupervisedH5 {
-	public:
+public:
 	/// Opens and validates a Gadus HDF5 dataset and its architecture schema.
 	explicit SupervisedH5(const std::filesystem::path &path);
 	/// Closes all HDF5 handles owned by this reader.
@@ -47,13 +47,11 @@ class SupervisedH5 {
 	/// Returns immutable schema and row-count metadata.
 	const DatasetInfo &info() const noexcept;
 	/// Reads arbitrary rows into packed state, move, and value tensors.
-	SupervisedBatch read(const std::vector<std::int64_t> &indices,
-						 bool pinned_memory = false) const;
+	SupervisedBatch read(const std::vector<std::int64_t> &indices, bool pinned_memory = false) const;
 	/// Reads one contiguous row range so HDF5 decompresses each storage chunk only once.
-	SupervisedBatch read_contiguous(std::int64_t begin, std::int64_t count,
-									bool pinned_memory = false) const;
+	SupervisedBatch read_contiguous(std::int64_t begin, std::int64_t count, bool pinned_memory = false) const;
 
-	private:
+private:
 	struct Impl;
 	Impl *impl_;
 };
@@ -98,12 +96,11 @@ struct ValueWeightController {
 	explicit ValueWeightController(double initial_weight);
 
 	/// Updates the effective Value coefficient from shared-trunk gradient statistics.
-	double update(double policy_squared_norm, double value_squared_norm,
-				  double inner_product);
+	double update(double policy_squared_norm, double value_squared_norm, double inner_product);
 	/// Returns the coefficient applied to the supervised Value loss.
 	double value() const noexcept;
 
-	private:
+private:
 	double value_;
 };
 

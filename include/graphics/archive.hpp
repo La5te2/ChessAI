@@ -1,8 +1,8 @@
 // Loads indexed chess-piece meshes from the compressed archive embedded in Gadidae.
 #pragma once
-#include <imgui.h>
 #include <array>
 #include <cstdint>
+#include <imgui.h>
 #include <string>
 #include <vector>
 

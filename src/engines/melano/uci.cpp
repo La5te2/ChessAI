@@ -89,8 +89,7 @@ int parse_int(const std::string &value, int fallback) {
 int parse_simulations(const std::string &value, int fallback) {
 	try {
 		const auto parsed = std::stoll(value);
-		return static_cast<int>(std::clamp<std::int64_t>(
-			parsed, 0, std::numeric_limits<int>::max()));
+		return static_cast<int>(std::clamp<std::int64_t>(parsed, 0, std::numeric_limits<int>::max()));
 	} catch (...) {
 		return fallback;
 	}
@@ -106,7 +105,7 @@ int simulations_for_depth(const std::string &value) {
 }
 
 class UciEngine {
-	public:
+public:
 	// Store initial options; model loading remains lazy until readiness or search.
 	explicit UciEngine(EngineOptions options) : options_(std::move(options)) {}
 	~UciEngine() { stop_and_join(); }
@@ -162,7 +161,7 @@ class UciEngine {
 		stop_and_join();
 	}
 
-	private:
+private:
 	// Emit and flush one complete protocol line.
 	static void print(const std::string &text) {
 		static std::mutex output_mutex;
@@ -184,16 +183,11 @@ class UciEngine {
 		print("id name Gadidae Melano");
 		print("id author La5te2");
 		print("option name ModelPath type string default " + options_.model_path.string());
-		print("option name Threads type spin default " +
-			  std::to_string(options_.search.cpu_threads) + " min 1 max 256");
-		print("option name Hash type spin default " +
-			  std::to_string(options_.search.evaluation_cache_mb) + " min 0 max 65536");
-		print("option name Sims type spin default " + std::to_string(options_.search.mcts_sims) +
-			  " min 0 max " + std::to_string(std::numeric_limits<int>::max()));
-		print("option name Move Overhead type spin default " +
-			  std::to_string(options_.move_overhead_ms) + " min 0 max 5000");
-		print("option name MultiPV type spin default " + std::to_string(options_.multipv) +
-			  " min 1 max 256");
+		print("option name Threads type spin default " + std::to_string(options_.search.cpu_threads) + " min 1 max 256");
+		print("option name Hash type spin default " + std::to_string(options_.search.evaluation_cache_mb) + " min 0 max 65536");
+		print("option name Sims type spin default " + std::to_string(options_.search.mcts_sims) + " min 0 max " + std::to_string(std::numeric_limits<int>::max()));
+		print("option name Move Overhead type spin default " + std::to_string(options_.move_overhead_ms) + " min 0 max 5000");
+		print("option name MultiPV type spin default " + std::to_string(options_.multipv) + " min 1 max 256");
 		print("uciok");
 	}
 
@@ -218,27 +212,21 @@ class UciEngine {
 			return;
 		}
 		const auto value_at = line.find(" value ", name_at + 6);
-		const auto name =
-			trim(line.substr(name_at + 6, value_at == std::string::npos ? std::string::npos
-																		: value_at - name_at - 6));
-		const auto value =
-			value_at == std::string::npos ? std::string() : trim(line.substr(value_at + 7));
+		const auto name = trim(line.substr(name_at + 6, value_at == std::string::npos ? std::string::npos : value_at - name_at - 6));
+		const auto value = value_at == std::string::npos ? std::string() : trim(line.substr(value_at + 7));
 		const auto key = normalized(name);
 		if (key == "modelpath") {
 			options_.model_path = value;
 			model_ = nullptr;
 			searcher_.reset();
 		} else if (key == "threads") {
-			options_.search.cpu_threads =
-				std::clamp(parse_int(value, options_.search.cpu_threads), 1, 256);
+			options_.search.cpu_threads = std::clamp(parse_int(value, options_.search.cpu_threads), 1, 256);
 		} else if (key == "sims") {
 			options_.search.mcts_sims = parse_simulations(value, options_.search.mcts_sims);
 		} else if (key == "moveoverhead") {
-			options_.move_overhead_ms =
-				std::clamp(parse_int(value, options_.move_overhead_ms), 0, 5000);
+			options_.move_overhead_ms = std::clamp(parse_int(value, options_.move_overhead_ms), 0, 5000);
 		} else if (key == "hash") {
-			options_.search.evaluation_cache_mb =
-				std::clamp(parse_int(value, options_.search.evaluation_cache_mb), 0, 65536);
+			options_.search.evaluation_cache_mb = std::clamp(parse_int(value, options_.search.evaluation_cache_mb), 0, 65536);
 		} else if (key == "multipv") {
 			options_.multipv = std::clamp(parse_int(value, options_.multipv), 1, 256);
 		} else {
@@ -310,39 +298,28 @@ class UciEngine {
 		const auto increment_key = white ? "winc" : "binc";
 		if (const auto found = go.find(time_key); found != go.end()) {
 			const int remaining = std::max(0, parse_int(found->second, 0));
-			const int increment =
-				go.contains(increment_key) ? std::max(0, parse_int(go.at(increment_key), 0)) : 0;
+			const int increment = go.contains(increment_key) ? std::max(0, parse_int(go.at(increment_key), 0)) : 0;
 			if (remaining == 0) {
 				return 1;
 			}
-			const int requested_moves = go.contains("movestogo")
-				? std::max(1, parse_int(go.at("movestogo"), 1))
-				: 0;
+			const int requested_moves = go.contains("movestogo") ? std::max(1, parse_int(go.at("movestogo"), 1)) : 0;
 			int moves_to_go = requested_moves > 0 ? std::min(requested_moves, 50) : 50;
 			if (remaining < 1000) {
 				moves_to_go = std::max(1, static_cast<int>(remaining * 0.05));
 			}
-			const double time_left = std::max(1.0,
-				static_cast<double>(remaining) + static_cast<double>(increment) * (moves_to_go - 1) -
-					static_cast<double>(options_.move_overhead_ms) * (2 + moves_to_go));
-			const int game_ply = 2 * (static_cast<int>(board_.fullMoveNumber()) - 1) +
-				(board_.sideToMove() == chess::Color::BLACK ? 1 : 0);
+			const double time_left = std::max(
+			    1.0, static_cast<double>(remaining) + static_cast<double>(increment) * (moves_to_go - 1) - static_cast<double>(options_.move_overhead_ms) * (2 + moves_to_go));
+			const int game_ply = 2 * (static_cast<int>(board_.fullMoveNumber()) - 1) + (board_.sideToMove() == chess::Color::BLACK ? 1 : 0);
 			double optimum_scale = 0.0;
 			if (requested_moves == 0) {
 				if (original_time_adjust_ < 0.0) {
 					original_time_adjust_ = 0.3272 * std::log10(time_left) - 0.4141;
 				}
-				const double log_seconds =
-					std::log10(std::max(1.0, static_cast<double>(remaining)) / 1000.0);
-				const double optimum_constant =
-					std::min(0.0029869 + 0.00033554 * log_seconds, 0.004905);
-				optimum_scale = std::min(
-					0.012112 + std::pow(game_ply + 3.22713, 0.46866) * optimum_constant,
-					0.19404 * remaining / time_left) * original_time_adjust_;
+				const double log_seconds = std::log10(std::max(1.0, static_cast<double>(remaining)) / 1000.0);
+				const double optimum_constant = std::min(0.0029869 + 0.00033554 * log_seconds, 0.004905);
+				optimum_scale = std::min(0.012112 + std::pow(game_ply + 3.22713, 0.46866) * optimum_constant, 0.19404 * remaining / time_left) * original_time_adjust_;
 			} else {
-				optimum_scale = std::min(
-					(0.88 + game_ply / 116.4) / moves_to_go,
-					0.88 * remaining / time_left);
+				optimum_scale = std::min((0.88 + game_ply / 116.4) / moves_to_go, 0.88 * remaining / time_left);
 			}
 			const int optimum = static_cast<int>(std::max(1.0, optimum_scale * time_left));
 			return std::min(optimum, std::max(1, remaining - options_.move_overhead_ms));
@@ -351,10 +328,7 @@ class UciEngine {
 	}
 
 	// Map bounded neural value to a monotonic centipawn-like UCI display score.
-	int score_cp(float value) const {
-		return static_cast<int>(
-			std::lround(std::clamp(value, -0.999F, 0.999F) * kScoreScale));
-	}
+	int score_cp(float value) const { return static_cast<int>(std::lround(std::clamp(value, -0.999F, 0.999F) * kScoreScale)); }
 
 	// Emit final or progressive MultiPV lines using root-side values and search statistics.
 	void emit_info(const melano::SearchResult &result) const {
@@ -366,11 +340,9 @@ class UciEngine {
 		for (int index = 0; index < count; ++index) {
 			const auto &row = result.root[index];
 			const float value = row.visits > 0 ? row.q : result.value;
-			print("info depth " + std::to_string(depth) + " seldepth " + std::to_string(depth) +
-				  " multipv " + std::to_string(index + 1) + " score cp " +
-				  std::to_string(score_cp(value)) + " nodes " + std::to_string(nodes) + " nps " +
-				  std::to_string(nps) + " time " + std::to_string(elapsed) +
-				  " hashfull 0 tbhits 0 pv " + melano::move_uci(row.move));
+			print("info depth " + std::to_string(depth) + " seldepth " + std::to_string(depth) + " multipv " + std::to_string(index + 1) + " score cp " +
+			    std::to_string(score_cp(value)) + " nodes " + std::to_string(nodes) + " nps " + std::to_string(nps) + " time " + std::to_string(elapsed) +
+			    " hashfull 0 tbhits 0 pv " + melano::move_uci(row.move));
 		}
 	}
 
@@ -405,16 +377,14 @@ class UciEngine {
 		stop_requested_ = false;
 		search_thread_ = std::thread([this, board, searcher, progress_interval_ms] {
 			try {
-				const auto result = searcher->search(
-					board, [this](const melano::SearchResult &partial) { emit_info(partial); },
-					progress_interval_ms, [this] { return stop_requested_.load(); });
+				const auto result =
+				    searcher->search(board, [this](const melano::SearchResult &partial) { emit_info(partial); }, progress_interval_ms, [this] { return stop_requested_.load(); });
 				emit_info(result);
 				print("bestmove " + melano::move_uci(result.move));
 			} catch (const std::exception &error) {
 				print("info string go error: " + std::string(error.what()));
 				const auto moves = melano::legal_moves(board);
-				print("bestmove " +
-					  (moves.empty() ? std::string("0000") : melano::move_uci(moves.front())));
+				print("bestmove " + (moves.empty() ? std::string("0000") : melano::move_uci(moves.front())));
 			}
 		});
 	}
@@ -444,9 +414,7 @@ EngineOptions options_from_args(int argc, char **argv) {
 	if (options.model_path.empty()) {
 		options.model_path = sidecar_model_path(argc > 0 ? argv[0] : nullptr);
 		if (!std::filesystem::is_regular_file(options.model_path)) {
-			throw std::invalid_argument(
-				"--model is required when the sidecar checkpoint does not exist: " +
-				options.model_path.string());
+			throw std::invalid_argument("--model is required when the sidecar checkpoint does not exist: " + options.model_path.string());
 		}
 	}
 	options.search.cpu_threads = 2;

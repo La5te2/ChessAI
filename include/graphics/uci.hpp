@@ -40,11 +40,8 @@ struct EngineConfig {
 	std::vector<std::string> button_commands;
 
 	bool operator==(const EngineConfig &other) const {
-		return path == other.path && name == other.name &&
-			   arguments == other.arguments && options == other.options &&
-			   movetime_ms == other.movetime_ms &&
-			   node_limit == other.node_limit &&
-			   button_commands == other.button_commands;
+		return path == other.path && name == other.name && arguments == other.arguments && options == other.options && movetime_ms == other.movetime_ms &&
+		    node_limit == other.node_limit && button_commands == other.button_commands;
 	}
 };
 
@@ -129,9 +126,7 @@ private:
 	void send_analysis(const AnalysisRequest &request);
 
 	/// Waits for a handshake marker while checking process and parser errors.
-	void wait_for_flag(const std::atomic_bool &flag,
-					   std::chrono::milliseconds timeout,
-					   const char *description);
+	void wait_for_flag(const std::atomic_bool &flag, std::chrono::milliseconds timeout, const char *description);
 
 	/// Continuously receives and parses stdout from the UCI process.
 	void reader_loop();

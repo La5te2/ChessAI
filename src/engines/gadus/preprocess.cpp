@@ -1,20 +1,19 @@
 // Gadus PGN or Lichess-evaluation to HDF5 preprocessing command-line entry point.
 
-#include <iostream>
 #include "gadus/args.hpp"
 #include "gadus/dataset.hpp"
+#include <iostream>
 
 // Parse preprocessing controls and build one architecture-locked HDF5 dataset.
 int main(int argc, char **argv) {
 	try {
 		gadus::Args args(argc, argv);
 		if (args.has("help")) {
-			std::cout
-				<< "Usage: preprocess --source <pgn|lichess-eval> --input <path|-> "
-					  "--output <games.gadus.h5> [options]\n"
-				<< "  --max-games <n> --chunk-size <n> --has-cmt <0|1>\n"
-				<< "  --max-positions <n> (lichess-eval)\n"
-				<< "  --compression-level <0..9> --log-every <accepted records>\n";
+			std::cout << "Usage: preprocess --source <pgn|lichess-eval> --input <path|-> "
+			             "--output <games.gadus.h5> [options]\n"
+			          << "  --max-games <n> --chunk-size <n> --has-cmt <0|1>\n"
+			          << "  --max-positions <n> (lichess-eval)\n"
+			          << "  --compression-level <0..9> --log-every <accepted records>\n";
 			return 0;
 		}
 		gadus::PreprocessOptions options;

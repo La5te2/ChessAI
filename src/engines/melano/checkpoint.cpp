@@ -29,8 +29,7 @@ std::int64_t read_scalar(torch::serialize::InputArchive &archive, const std::str
 // Replace a checkpoint atomically on each platform so readers never observe a partial file.
 void replace_file(const std::filesystem::path &temporary, const std::filesystem::path &target) {
 #ifdef _WIN32
-	if (!MoveFileExW(temporary.wstring().c_str(), target.wstring().c_str(),
-					 MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+	if (!MoveFileExW(temporary.wstring().c_str(), target.wstring().c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
 		throw std::runtime_error("atomic file replacement failed: " + target.string());
 	}
 #else
@@ -43,8 +42,7 @@ void replace_file(const std::filesystem::path &temporary, const std::filesystem:
 } // namespace
 
 // Serialize parameters and the exact Melano architecture descriptor to a sibling temp file.
-void save_checkpoint_atomic(const std::filesystem::path &path, const Model &model,
-							const ArchitectureInfo &arch) {
+void save_checkpoint_atomic(const std::filesystem::path &path, const Model &model, const ArchitectureInfo &arch) {
 	if (!path.parent_path().empty()) {
 		std::filesystem::create_directories(path.parent_path());
 	}
@@ -64,8 +62,7 @@ void save_checkpoint_atomic(const std::filesystem::path &path, const Model &mode
 }
 
 // Validate the Melano type/action dimensions before constructing and loading the model.
-Model load_checkpoint(const std::filesystem::path &path, const torch::Device &device,
-					  ArchitectureInfo *arch) {
+Model load_checkpoint(const std::filesystem::path &path, const torch::Device &device, ArchitectureInfo *arch) {
 	if (!std::filesystem::exists(path)) {
 		throw std::runtime_error("model not found: " + path.string());
 	}
@@ -73,8 +70,7 @@ Model load_checkpoint(const std::filesystem::path &path, const torch::Device &de
 	try {
 		archive.load_from(path.string(), device);
 	} catch (const c10::Error &error) {
-		throw std::runtime_error("cannot read Melano checkpoint " + path.string() + ": " +
-								 error.what_without_backtrace());
+		throw std::runtime_error("cannot read Melano checkpoint " + path.string() + ": " + error.what_without_backtrace());
 	}
 	torch::serialize::InputArchive model_archive;
 	torch::serialize::InputArchive arch_archive;
@@ -87,8 +83,7 @@ Model load_checkpoint(const std::filesystem::path &path, const torch::Device &de
 	loaded.channels = static_cast<int>(read_scalar(arch_archive, "channels"));
 	loaded.blocks = static_cast<int>(read_scalar(arch_archive, "blocks"));
 	if (loaded.channels <= 0 || loaded.blocks <= 0) {
-		throw std::runtime_error("checkpoint has invalid Melano architecture dimensions: " +
-								 path.string());
+		throw std::runtime_error("checkpoint has invalid Melano architecture dimensions: " + path.string());
 	}
 	if (read_scalar(arch_archive, "action_size") != kActionSize) {
 		throw std::runtime_error("checkpoint action size does not match Melano: " + path.string());

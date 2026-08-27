@@ -2,9 +2,9 @@
 
 // Gadus compute-precision policy and scoped LibTorch CUDA autocast control.
 
+#include <ATen/autocast_mode.h>
 #include <stdexcept>
 #include <string>
-#include <ATen/autocast_mode.h>
 #include <torch/types.h>
 
 namespace gadus {
@@ -35,10 +35,9 @@ inline void validate_compute_precision(ComputePrecision precision, const torch::
 }
 
 class AutocastGuard {
-	public:
+public:
 	/// Enables CUDA BF16 autocast for one forward scope and preserves nested caller state.
-	AutocastGuard(ComputePrecision precision, const torch::Device &device)
-		: active_(device.is_cuda()) {
+	AutocastGuard(ComputePrecision precision, const torch::Device &device) : active_(device.is_cuda()) {
 		if (!active_) {
 			return;
 		}
@@ -51,8 +50,7 @@ class AutocastGuard {
 		if (precision == ComputePrecision::Bf16) {
 			at::autocast::set_autocast_dtype(at::kCUDA, at::kBFloat16);
 		}
-		at::autocast::set_autocast_enabled(
-			at::kCUDA, precision == ComputePrecision::Bf16);
+		at::autocast::set_autocast_enabled(at::kCUDA, precision == ComputePrecision::Bf16);
 	}
 
 	/// Restores the prior thread-local autocast state and clears the outermost cast cache.
@@ -70,7 +68,7 @@ class AutocastGuard {
 	AutocastGuard(const AutocastGuard &) = delete;
 	AutocastGuard &operator=(const AutocastGuard &) = delete;
 
-	private:
+private:
 	bool active_ = false;
 	bool previous_enabled_ = false;
 	at::ScalarType previous_dtype_ = at::kFloat;

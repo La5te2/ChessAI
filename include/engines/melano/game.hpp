@@ -2,20 +2,19 @@
 
 // Melano chess rules, square-token state codec, and source-destination move codec.
 
+#include "chess.hpp"
 #include <array>
 #include <cstdint>
 #include <string>
-#include <vector>
 #include <torch/types.h>
-#include "chess.hpp"
+#include <vector>
 
 namespace melano {
 
 inline constexpr int kBoardSquares = 64;
 inline constexpr int kStateFeatures = 67;
 inline constexpr int kUnderpromotionPlanes = 9;
-inline constexpr int kActionSize = kBoardSquares * kBoardSquares +
-								   kBoardSquares * kUnderpromotionPlanes;
+inline constexpr int kActionSize = kBoardSquares * kBoardSquares + kBoardSquares * kUnderpromotionPlanes;
 inline constexpr const char *kArchType = "melano";
 inline constexpr const char *kStateEncoding = "melano_states";
 inline constexpr const char *kMoveEncoding = "sd_64x64_underpromo9";
@@ -37,17 +36,13 @@ std::string move_san(const chess::Board &board, const chess::Move &move);
 /// Packs 64 piece tokens plus side, castling, and en-passant metadata.
 PackedState encode_state(const chess::Board &board);
 /// Expands packed rows into an int64 tensor shaped [count, 67].
-torch::Tensor decode_states(const std::uint8_t *packed, std::int64_t count,
-							bool pinned_memory = false);
+torch::Tensor decode_states(const std::uint8_t *packed, std::int64_t count, bool pinned_memory = false);
 /// Transfers compact token bytes first and widens them to embedding indices on the device.
-torch::Tensor decode_states_device(const std::uint8_t *packed, std::int64_t count,
-								   const torch::Device &device);
+torch::Tensor decode_states_device(const std::uint8_t *packed, std::int64_t count, const torch::Device &device);
 /// Encodes live boards directly into a batched Melano token tensor.
-torch::Tensor encode_boards(const std::vector<chess::Board> &boards,
-							bool pinned_memory = false);
+torch::Tensor encode_boards(const std::vector<chess::Board> &boards, bool pinned_memory = false);
 /// Encodes live boards while keeping the host-to-device transfer compact.
-torch::Tensor encode_boards_device(const std::vector<chess::Board> &boards,
-								   const torch::Device &device);
+torch::Tensor encode_boards_device(const std::vector<chess::Board> &boards, const torch::Device &device);
 
 /// Applies all chess terminal rules represented by the chess library.
 bool game_is_over(const chess::Board &board);
@@ -59,8 +54,7 @@ std::string game_result(const chess::Board &board);
 std::string game_termination(const chess::Board &board);
 
 /// Masks illegal actions and renormalizes legal mass, falling back to uniform legal play.
-std::vector<float> normalize_legal_policy(const std::vector<float> &policy,
-										  const chess::Board &board);
+std::vector<float> normalize_legal_policy(const std::vector<float> &policy, const chess::Board &board);
 
 /// Resolves auto/cpu/cuda while rejecting unavailable CUDA requests.
 torch::Device resolve_device(const std::string &requested);

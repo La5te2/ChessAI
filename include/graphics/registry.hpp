@@ -20,8 +20,7 @@ public:
 
 private:
 	/// Produces a comparable absolute path without requiring the target to exist.
-	static std::filesystem::path normalized_path(
-		const std::filesystem::path &path);
+	static std::filesystem::path normalized_path(const std::filesystem::path &path);
 
 	std::vector<EngineConfig> engines_;
 };
