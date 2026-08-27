@@ -411,7 +411,7 @@ public:
 		try {
 			const auto move = chess::uci::parseSan(board_, san);
 			game_states_.push_back(encode_state(board_));
-			game_moves_.push_back(static_cast<std::uint16_t>(move_to_index(move)));
+			game_moves_.push_back(static_cast<std::uint16_t>(hdf5_action_index(move)));
 			game_values_.push_back(options_.has_comments ? comment_value(previous_comment_, board_.sideToMove()) : result_value(result_, board_.sideToMove()));
 			if (comment_score_white(std::string(comment)).has_value())
 				game_has_eval_ = true;
@@ -779,7 +779,7 @@ void preprocess_lichess_evaluations(const PreprocessOptions &options) {
 			chess::Board board(complete_lichess_fen(record.at("fen").get<std::string>()));
 			const auto target = lichess_target(record, board);
 			const auto state = encode_state(board);
-			const auto move = static_cast<std::uint16_t>(move_to_index(target.move));
+			const auto move = static_cast<std::uint16_t>(hdf5_action_index(target.move));
 			states.push_back(state);
 			moves.push_back(move);
 			values.push_back(target.value);

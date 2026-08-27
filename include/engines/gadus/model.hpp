@@ -74,7 +74,8 @@ struct ModelImpl : torch::nn::Module {
 private:
 	torch::Tensor trunk_features(torch::Tensor x, const torch::Tensor &rook_visibility, const torch::Tensor &bishop_visibility);
 	torch::Tensor policy_logits(torch::Tensor features, const torch::Tensor &rook_visibility, const torch::Tensor &bishop_visibility);
-	torch::Tensor policy_planes(torch::Tensor features, const torch::Tensor &rook_visibility, const torch::Tensor &bishop_visibility);
+	torch::Tensor policy_logits_for_indices(const torch::Tensor &features, const torch::Tensor &compact_indices);
+	torch::Tensor centered_policy_bias() const;
 	torch::Tensor policy_features(torch::Tensor features, const torch::Tensor &rook_visibility, const torch::Tensor &bishop_visibility);
 	torch::Tensor value(torch::Tensor features, const torch::Tensor &rook_visibility, const torch::Tensor &bishop_visibility);
 
@@ -84,7 +85,10 @@ private:
 	torch::nn::Conv2d policy_conv{nullptr};
 	torch::nn::BatchNorm2d policy_norm{nullptr};
 	torch::nn::Sequential policy_blocks{nullptr};
-	torch::nn::Conv2d policy_output{nullptr};
+	torch::nn::Linear policy_source{nullptr};
+	torch::nn::Linear policy_target{nullptr};
+	torch::nn::Linear policy_relation{nullptr};
+	torch::Tensor policy_interaction_gates;
 	torch::Tensor policy_action_bias;
 	ResidualBlock value_block{nullptr};
 	ResidualBlock value_block_2{nullptr};
@@ -95,6 +99,9 @@ private:
 	torch::Tensor rook_geometry;
 	torch::Tensor bishop_geometry;
 	torch::Tensor between_geometry;
+	torch::Tensor compact_action_sources;
+	torch::Tensor compact_action_destinations;
+	torch::Tensor compact_action_patterns;
 	bool inference_fused_ = false;
 	int channels_ = 0;
 	int blocks_ = 0;

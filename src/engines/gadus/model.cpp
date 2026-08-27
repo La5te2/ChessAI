@@ -379,8 +379,31 @@ ModelImpl::ModelImpl(int channels, int blocks) : channels_(channels), blocks_(bl
 	for (int index = 0; index < kPolicyBlocks; ++index) {
 		policy_blocks->push_back(ResidualBlock(kPolicyChannels, kPolicyBlocks));
 	}
-	policy_output = register_module("policy_output", torch::nn::Conv2d(torch::nn::Conv2dOptions(kPolicyChannels, kPolicyPlanes, 1).bias(false)));
-	policy_action_bias = register_parameter("policy_action_bias", torch::zeros({1, kPolicyPlanes, 8, 8}));
+	policy_source = register_module("policy_source", torch::nn::Linear(torch::nn::LinearOptions(kPolicyChannels, kPolicyPlanes).bias(false)));
+	policy_target = register_module("policy_target", torch::nn::Linear(torch::nn::LinearOptions(kPolicyChannels, kPolicyPlanes).bias(false)));
+	policy_relation = register_module("policy_relation", torch::nn::Linear(torch::nn::LinearOptions(kPolicyChannels, kPolicyChannels).bias(false)));
+	policy_interaction_gates = register_parameter("policy_interaction_gates", torch::zeros({kPolicyPlanes, kPolicyChannels}));
+	policy_action_bias = register_parameter("policy_action_bias", torch::zeros({kActionSize}));
+	auto action_sources = torch::empty({kActionSize}, torch::kInt64);
+	auto action_destinations = torch::empty({kActionSize}, torch::kInt64);
+	auto action_patterns = torch::empty({kActionSize}, torch::kInt64);
+	auto source_data = action_sources.accessor<std::int64_t, 1>();
+	auto destination_data = action_destinations.accessor<std::int64_t, 1>();
+	auto pattern_data = action_patterns.accessor<std::int64_t, 1>();
+	for (int action = 0; action < kActionSize; ++action) {
+		const int expanded = expanded_action_index(action);
+		source_data[action] = expanded / kPolicyPlanes;
+		destination_data[action] = action_destination(action);
+		pattern_data[action] = expanded % kPolicyPlanes;
+	}
+	compact_action_sources = register_buffer("compact_action_sources", action_sources);
+	compact_action_destinations = register_buffer("compact_action_destinations", action_destinations);
+	compact_action_patterns = register_buffer("compact_action_patterns", action_patterns);
+	{
+		torch::NoGradGuard guard;
+		policy_target->weight.zero_();
+		policy_relation->weight.copy_(torch::eye(kPolicyChannels, policy_relation->weight.options()));
+	}
 
 	value_block = ResidualBlock(channels_, 1);
 	value_block_2 = ResidualBlock(channels_, 1, true);
@@ -394,11 +417,13 @@ ModelImpl::ModelImpl(int channels, int blocks) : channels_(channels), blocks_(bl
 }
 
 void ModelImpl::save(torch::serialize::OutputArchive &archive) const {
-	save_without_buffers(*this, archive, {"rook_geometry", "bishop_geometry", "between_geometry"});
+	save_without_buffers(*this, archive,
+	    {"rook_geometry", "bishop_geometry", "between_geometry", "compact_action_sources", "compact_action_destinations", "compact_action_patterns"});
 }
 
 void ModelImpl::load(torch::serialize::InputArchive &archive) {
-	load_without_buffers(*this, archive, {"rook_geometry", "bishop_geometry", "between_geometry"});
+	load_without_buffers(*this, archive,
+	    {"rook_geometry", "bishop_geometry", "between_geometry", "compact_action_sources", "compact_action_destinations", "compact_action_patterns"});
 }
 
 std::pair<torch::Tensor, torch::Tensor> ModelImpl::forward(torch::Tensor x) {
@@ -420,15 +445,8 @@ std::pair<torch::Tensor, torch::Tensor> ModelImpl::forward_legal(torch::Tensor x
 
 	auto [rook_visibility, bishop_visibility] = visibility_matrices(x);
 	auto features = trunk_features(x, rook_visibility, bishop_visibility);
-	auto source_squares = torch::floor_divide(legal_indices, kPolicyPlanes);
-	auto patterns = torch::remainder(legal_indices, kPolicyPlanes);
 	auto compact_features = policy_features(features, rook_visibility, bishop_visibility);
-	auto source_features = compact_features.flatten(2).transpose(1, 2).gather(1, source_squares.unsqueeze(2).expand({-1, -1, kPolicyChannels}));
-	auto selected_weights = policy_output->weight.flatten(1).index_select(0, patterns.reshape({-1})).view({legal_indices.size(0), legal_indices.size(1), kPolicyChannels});
-	auto legal_logits = (source_features * selected_weights).sum(2);
-	auto plane_offsets = patterns * 64 + source_squares;
-	legal_logits = legal_logits + policy_action_bias.flatten(1).expand({legal_indices.size(0), -1}).gather(1, plane_offsets);
-	return {legal_logits, value(features, rook_visibility, bishop_visibility)};
+	return {policy_logits_for_indices(compact_features, legal_indices), value(features, rook_visibility, bishop_visibility)};
 }
 
 std::pair<torch::Tensor, torch::Tensor> ModelImpl::visibility_matrices(const torch::Tensor &x) const {
@@ -448,12 +466,15 @@ void ModelImpl::initialize_output_priors(const torch::Tensor &action_counts, dou
 	torch::NoGradGuard guard;
 	auto counts = action_counts.to(torch::kCPU, torch::kFloat64).reshape({kActionSize});
 	auto prior = (counts + smoothing_count) / (counts.sum().item<double>() + smoothing_count * kActionSize);
-	auto plane_bias = prior.log().view({8, 8, kPolicyPlanes}).permute({2, 0, 1}).unsqueeze(0).to(policy_action_bias.options());
-	policy_action_bias.copy_(plane_bias);
-	policy_output->weight.mul_(output_scale);
+	policy_action_bias.copy_(prior.log().to(policy_action_bias.options()));
+	policy_source->weight.mul_(output_scale);
 	const double clipped = std::clamp(mean_value, -1.0 + kValueClipEpsilon, 1.0 - kValueClipEpsilon);
 	value_output->weight.mul_(output_scale);
 	value_output->bias.fill_(std::atanh(clipped));
+}
+
+torch::Tensor ModelImpl::centered_policy_bias() const {
+	return policy_action_bias - policy_action_bias.mean();
 }
 
 torch::Tensor ModelImpl::trunk_features(torch::Tensor x, const torch::Tensor &rook_visibility, const torch::Tensor &bishop_visibility) {
@@ -494,13 +515,30 @@ torch::Tensor ModelImpl::policy_features(torch::Tensor features, const torch::Te
 	return result;
 }
 
-torch::Tensor ModelImpl::policy_planes(torch::Tensor features, const torch::Tensor &rook_visibility, const torch::Tensor &bishop_visibility) {
-	return policy_output->forward(policy_features(features, rook_visibility, bishop_visibility)) + policy_action_bias;
+torch::Tensor ModelImpl::policy_logits(torch::Tensor features, const torch::Tensor &rook_visibility, const torch::Tensor &bishop_visibility) {
+	auto compact_features = policy_features(features, rook_visibility, bishop_visibility);
+	auto indices = torch::arange(kActionSize, torch::TensorOptions().dtype(torch::kInt64).device(compact_features.device())).unsqueeze(0);
+	return policy_logits_for_indices(compact_features, indices.expand({compact_features.size(0), -1}));
 }
 
-torch::Tensor ModelImpl::policy_logits(torch::Tensor features, const torch::Tensor &rook_visibility, const torch::Tensor &bishop_visibility) {
-	auto planes = policy_planes(features, rook_visibility, bishop_visibility);
-	return planes.permute({0, 2, 3, 1}).contiguous().view({planes.size(0), kActionSize});
+torch::Tensor ModelImpl::policy_logits_for_indices(const torch::Tensor &features, const torch::Tensor &compact_indices) {
+	const auto batch = compact_indices.size(0);
+	const auto width = compact_indices.size(1);
+	auto squares = features.flatten(2).transpose(1, 2);
+	auto flat_indices = compact_indices.reshape({-1});
+	auto sources = compact_action_sources.index_select(0, flat_indices).view({batch, width});
+	auto destinations = compact_action_destinations.index_select(0, flat_indices).view({batch, width});
+	auto patterns = compact_action_patterns.index_select(0, flat_indices).view({batch, width});
+	auto source_features = squares.gather(1, sources.unsqueeze(2).expand({-1, -1, kPolicyChannels}));
+	auto target_features = squares.gather(1, destinations.unsqueeze(2).expand({-1, -1, kPolicyChannels}));
+	auto relation = policy_relation->weight / policy_relation->weight.norm(2, 1, true).clamp_min(1e-12);
+	auto related_targets = torch::matmul(target_features, relation.transpose(0, 1));
+	auto source_weights = policy_source->weight.index_select(0, patterns.reshape({-1})).view({batch, width, kPolicyChannels});
+	auto target_weights = policy_target->weight.index_select(0, patterns.reshape({-1})).view({batch, width, kPolicyChannels});
+	auto gates = policy_interaction_gates.index_select(0, patterns.reshape({-1})).view({batch, width, kPolicyChannels});
+	auto logits = (source_features * source_weights).sum(2) + (target_features * target_weights).sum(2);
+	logits = logits + (source_features * related_targets * gates).sum(2);
+	return logits + centered_policy_bias().index_select(0, flat_indices).view({batch, width});
 }
 
 void ModelImpl::project_relation_residuals() {

@@ -5,11 +5,89 @@
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
+#include <tuple>
 #include <torch/cuda.h>
 
 namespace gadus {
 
 namespace {
+
+constexpr std::array<std::pair<int, int>, 8> kRayDirections{{
+    {-1, -1},
+    {-1, 0},
+    {-1, 1},
+    {0, -1},
+    {0, 1},
+    {1, -1},
+    {1, 0},
+    {1, 1},
+}};
+
+constexpr std::array<std::pair<int, int>, 8> kKnightOffsets{{
+    {-2, -1},
+    {-2, 1},
+    {-1, -2},
+    {-1, 2},
+    {1, -2},
+    {1, 2},
+    {2, -1},
+    {2, 1},
+}};
+
+int encoded_destination(int source, int pattern) {
+	const int rank = source / 8;
+	const int file = source % 8;
+	int rank_delta = 0;
+	int file_delta = 0;
+	if (pattern < 56) {
+		const auto [rank_step, file_step] = kRayDirections[static_cast<std::size_t>(pattern / 7)];
+		const int distance = pattern % 7 + 1;
+		rank_delta = rank_step * distance;
+		file_delta = file_step * distance;
+	} else if (pattern < 64) {
+		std::tie(rank_delta, file_delta) = kKnightOffsets[static_cast<std::size_t>(pattern - 56)];
+	} else {
+		if (rank != 6) {
+			return -1;
+		}
+		rank_delta = 1;
+		file_delta = (pattern - 64) / 3 - 1;
+	}
+	const int target_rank = rank + rank_delta;
+	const int target_file = file + file_delta;
+	return target_rank >= 0 && target_rank < 8 && target_file >= 0 && target_file < 8 ? target_rank * 8 + target_file : -1;
+}
+
+struct CompactActionMap {
+	CompactActionMap() {
+		compact.fill(-1);
+		int next = 0;
+		for (int expanded_index = 0; expanded_index < kExpandedActionSize; ++expanded_index) {
+			const int source = expanded_index / kPolicyPlanes;
+			const int pattern = expanded_index % kPolicyPlanes;
+			if (encoded_destination(source, pattern) < 0) {
+				continue;
+			}
+			if (next >= kActionSize) {
+				throw std::logic_error("Gadus compact action map overflow");
+			}
+			compact[static_cast<std::size_t>(expanded_index)] = static_cast<std::int16_t>(next);
+			expanded[static_cast<std::size_t>(next)] = static_cast<std::int16_t>(expanded_index);
+			++next;
+		}
+		if (next != kActionSize) {
+			throw std::logic_error("Gadus compact action map has the wrong size");
+		}
+	}
+
+	std::array<std::int16_t, kExpandedActionSize> compact{};
+	std::array<std::int16_t, kActionSize> expanded{};
+};
+
+const CompactActionMap &compact_action_map() {
+	static const CompactActionMap mapping;
+	return mapping;
+}
 
 // Map a colored piece to one of twelve binary piece planes.
 int piece_plane(const chess::Piece &piece) {
@@ -47,7 +125,7 @@ std::vector<chess::Move> legal_moves(const chess::Board &board) {
 }
 
 // Normalize the library's king-to-rook castling representation to the king destination
-// used by the historical alphazero_64x73 training codec.
+// used by the persistent alphazero_64x73 training codec.
 int policy_destination(const chess::Move &move) {
 	if (move.typeOf() != chess::Move::CASTLING) {
 		return move.to().index();
@@ -58,8 +136,8 @@ int policy_destination(const chess::Move &move) {
 	return rank * 8 + (king_side ? 6 : 2);
 }
 
-// Encode underpromotions separately, then sliding rays and knight jumps in 73 planes.
-int move_to_index(const chess::Move &move) {
+// Encode underpromotions separately, then sliding rays and knight jumps in the HDF5 73-plane codec.
+int expanded_move_index(const chess::Move &move) {
 	const int from = move.from().index();
 	const int to = policy_destination(move);
 	const int from_rank = from / 8;
@@ -78,64 +156,79 @@ int move_to_index(const chess::Move &move) {
 		return from * kPolicyPlanes + 64 + direction * 3 + piece;
 	}
 
-	constexpr std::array<std::pair<int, int>, 8> directions{{
-	    {-1, -1},
-	    {-1, 0},
-	    {-1, 1},
-	    {0, -1},
-	    {0, 1},
-	    {1, -1},
-	    {1, 0},
-	    {1, 1},
-	}};
-	for (int direction = 0; direction < static_cast<int>(directions.size()); ++direction) {
+	for (int direction = 0; direction < static_cast<int>(kRayDirections.size()); ++direction) {
 		for (int distance = 1; distance <= 7; ++distance) {
-			if (dr == directions[direction].first * distance && dc == directions[direction].second * distance) {
+			if (dr == kRayDirections[direction].first * distance && dc == kRayDirections[direction].second * distance) {
 				return from * kPolicyPlanes + direction * 7 + distance - 1;
 			}
 		}
 	}
 
-	constexpr std::array<std::pair<int, int>, 8> knights{{
-	    {-2, -1},
-	    {-2, 1},
-	    {-1, -2},
-	    {-1, 2},
-	    {1, -2},
-	    {1, 2},
-	    {2, -1},
-	    {2, 1},
-	}};
-	for (int offset = 0; offset < static_cast<int>(knights.size()); ++offset) {
-		if (dr == knights[offset].first && dc == knights[offset].second) {
+	for (int offset = 0; offset < static_cast<int>(kKnightOffsets.size()); ++offset) {
+		if (dr == kKnightOffsets[offset].first && dc == kKnightOffsets[offset].second) {
 			return from * kPolicyPlanes + 56 + offset;
 		}
 	}
 	throw std::invalid_argument("cannot encode move: " + move_uci(move));
 }
 
+int move_to_index(const chess::Move &move, chess::Color side_to_move) {
+	return canonical_action_index(expanded_move_index(move), side_to_move);
+}
+
+int hdf5_action_index(const chess::Move &move) {
+	return expanded_move_index(move);
+}
+
 // Reflect the source rank and every rank-sensitive motion pattern for Black.
 int canonical_action_index(int index, chess::Color side_to_move) {
-	if (index < 0 || index >= kActionSize) {
-		throw std::out_of_range("Gadus action index");
-	}
-	if (side_to_move == chess::Color::WHITE) {
-		return index;
+	if (index < 0 || index >= kExpandedActionSize) {
+		throw std::out_of_range("Gadus HDF5 action index");
 	}
 
 	const int source = index / kPolicyPlanes;
 	const int pattern = index % kPolicyPlanes;
-	const int canonical_source = (7 - source / 8) * 8 + source % 8;
+	const int canonical_source = side_to_move == chess::Color::WHITE ? source : (7 - source / 8) * 8 + source % 8;
 	int canonical_pattern = pattern;
-	if (pattern < 56) {
+	if (side_to_move == chess::Color::BLACK && pattern < 56) {
 		constexpr std::array<int, 8> reflected_directions{{5, 6, 7, 3, 4, 0, 1, 2}};
 		const int direction = pattern / 7;
 		canonical_pattern = reflected_directions[direction] * 7 + pattern % 7;
-	} else if (pattern < 64) {
+	} else if (side_to_move == chess::Color::BLACK && pattern < 64) {
 		constexpr std::array<int, 8> reflected_knights{{6, 7, 4, 5, 2, 3, 0, 1}};
 		canonical_pattern = 56 + reflected_knights[pattern - 56];
 	}
-	return canonical_source * kPolicyPlanes + canonical_pattern;
+	const int canonical = compact_action_index(canonical_source * kPolicyPlanes + canonical_pattern);
+	if (canonical < 0) {
+		throw std::logic_error("canonical Gadus action is geometrically invalid");
+	}
+	return canonical;
+}
+
+int compact_action_index(int index) {
+	if (index < 0 || index >= kExpandedActionSize) {
+		throw std::out_of_range("Gadus expanded action index");
+	}
+	return compact_action_map().compact[static_cast<std::size_t>(index)];
+}
+
+int expanded_action_index(int index) {
+	if (index < 0 || index >= kActionSize) {
+		throw std::out_of_range("Gadus compact action index");
+	}
+	return compact_action_map().expanded[static_cast<std::size_t>(index)];
+}
+
+int action_destination(int index) {
+	if (index < 0 || index >= kActionSize) {
+		throw std::out_of_range("Gadus action index");
+	}
+	const int expanded = expanded_action_index(index);
+	const int destination = encoded_destination(expanded / kPolicyPlanes, expanded % kPolicyPlanes);
+	if (destination < 0) {
+		throw std::invalid_argument("Gadus action is geometrically invalid");
+	}
+	return destination;
 }
 
 // Decode by legal-move round-trip, which also validates position-dependent legality.
@@ -144,7 +237,7 @@ chess::Move index_to_move(int index, const chess::Board &board) {
 		return chess::Move(chess::Move::NO_MOVE);
 	}
 	for (const auto &move : legal_moves(board)) {
-		if (move_to_index(move) == index) {
+		if (move_to_index(move, board.sideToMove()) == index) {
 			return move;
 		}
 	}
@@ -351,7 +444,7 @@ std::vector<float> normalize_legal_policy(const std::vector<float> &policy, cons
 	}
 	double total = 0.0;
 	for (const auto &move : moves) {
-		const int index = move_to_index(move);
+		const int index = move_to_index(move, board.sideToMove());
 		const float value = index < static_cast<int>(policy.size()) ? std::max(0.0F, policy[index]) : 0.0F;
 		normalized[index] = value;
 		total += value;
@@ -359,7 +452,7 @@ std::vector<float> normalize_legal_policy(const std::vector<float> &policy, cons
 	if (total <= 0.0) {
 		const float uniform = 1.0F / static_cast<float>(moves.size());
 		for (const auto &move : moves) {
-			normalized[move_to_index(move)] = uniform;
+			normalized[move_to_index(move, board.sideToMove())] = uniform;
 		}
 	} else {
 		for (auto &value : normalized) {

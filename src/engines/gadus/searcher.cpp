@@ -453,7 +453,7 @@ struct Searcher::Impl {
 			pending.back().legal_moves = legal_moves(boards[row]);
 			pending.back().legal_indices.reserve(pending.back().legal_moves.size());
 			for (const auto &move : pending.back().legal_moves) {
-				pending.back().legal_indices.push_back(move_to_index(move));
+				pending.back().legal_indices.push_back(move_to_index(move, boards[row].sideToMove()));
 			}
 		}
 		if (pending.empty()) {
@@ -477,9 +477,8 @@ struct Searcher::Impl {
 		auto index_rows = legal_indices.accessor<std::int64_t, 2>();
 		auto mask_rows = legal_mask.accessor<bool, 2>();
 		for (std::size_t row = 0; row < pending.size(); ++row) {
-			const auto side_to_move = pending_states[row][12 * 8] != 0 ? chess::Color::WHITE : chess::Color::BLACK;
 			for (std::size_t column = 0; column < pending[row].legal_indices.size(); ++column) {
-				index_rows[static_cast<std::int64_t>(row)][static_cast<std::int64_t>(column)] = canonical_action_index(pending[row].legal_indices[column], side_to_move);
+				index_rows[static_cast<std::int64_t>(row)][static_cast<std::int64_t>(column)] = pending[row].legal_indices[column];
 				mask_rows[static_cast<std::int64_t>(row)][static_cast<std::int64_t>(column)] = true;
 			}
 		}
@@ -535,7 +534,7 @@ struct Searcher::Impl {
 		return output;
 	}
 
-	// Normalize an already masked legal policy without allocating the 4672-action vector.
+	// Normalize an already masked legal policy without allocating the full compact-action vector.
 	std::vector<float> normalize_compact_policy(const EvaluationRow &evaluation) const {
 		std::vector<float> normalized(evaluation.legal_policy.size(), 0.0F);
 		if (normalized.empty()) {
@@ -877,7 +876,7 @@ struct Searcher::Impl {
 	std::vector<float> root_policy(const TreeState &state) const {
 		std::vector<float> policy(kActionSize, 0.0F);
 		for (const auto &child : state.root->children) {
-			policy[move_to_index(child.move)] = child.visits + child.prior;
+			policy[move_to_index(child.move, state.board.sideToMove())] = child.visits + child.prior;
 		}
 		return normalize_legal_policy(policy, state.board);
 	}
@@ -894,7 +893,7 @@ struct Searcher::Impl {
 				if (probe.isGameOver().first != chess::GameResultReason::CHECKMATE) {
 					continue;
 				}
-				const int index = move_to_index(move);
+				const int index = move_to_index(move, board.sideToMove());
 				mates.insert(index);
 				if (scores[index] > selected_score) {
 					selected = index;
@@ -925,7 +924,7 @@ struct Searcher::Impl {
 				}
 			}
 			if (repetition) {
-				const int index = move_to_index(move);
+				const int index = move_to_index(move, board.sideToMove());
 				scores[index] = std::max(0.0F, scores[index] - deduction);
 				repetitions.insert(index);
 			}
@@ -952,8 +951,8 @@ struct Searcher::Impl {
 
 		auto moves = legal_moves(state.board);
 		std::sort(moves.begin(), moves.end(), [&](const chess::Move &left, const chess::Move &right) {
-			const int left_index = move_to_index(left);
-			const int right_index = move_to_index(right);
+			const int left_index = move_to_index(left, state.board.sideToMove());
+			const int right_index = move_to_index(right, state.board.sideToMove());
 			if (result.decision_scores[left_index] != result.decision_scores[right_index]) {
 				return result.decision_scores[left_index] > result.decision_scores[right_index];
 			}
@@ -970,7 +969,7 @@ struct Searcher::Impl {
 		const auto row_count = std::min(moves.size(), static_cast<std::size_t>(std::max(1, options.root_topn)));
 		for (std::size_t row = 0; row < row_count; ++row) {
 			const auto move = moves[row];
-			const int action = move_to_index(move);
+			const int action = move_to_index(move, state.board.sideToMove());
 			RootMove root_move;
 			root_move.move = move;
 			root_move.probability = result.policy[action];

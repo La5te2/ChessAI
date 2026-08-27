@@ -30,7 +30,7 @@ void require(bool condition, const char *message) {
 void require_move_codec(const chess::Board &board) {
 	std::unordered_set<int> actions;
 	for (const auto &move : gadus::legal_moves(board)) {
-		const int action = gadus::move_to_index(move);
+		const int action = gadus::move_to_index(move, board.sideToMove());
 		require(action >= 0 && action < gadus::kActionSize, "move codec produced an out-of-range action");
 		require(actions.insert(action).second, "legal moves share an action index");
 		require(gadus::index_to_move(action, board) == move, "move codec round trip failed");
@@ -160,13 +160,13 @@ int main() {
 			const auto batch = supervised.read_contiguous(0, 4);
 			const auto moves = batch.moves.to(torch::kCPU).contiguous();
 			const auto values = batch.values.to(torch::kCPU).contiguous();
-			require(moves.index({0}).item<std::int64_t>() == gadus::move_to_index(chess::uci::uciToMove(board, "d2d4")),
+			require(moves.index({0}).item<std::int64_t>() == gadus::move_to_index(chess::uci::uciToMove(board, "d2d4"), board.sideToMove()),
 			    "Lichess evaluation preprocessing did not select the deepest PV");
 			require(std::abs(values.index({0}).item<float>() - std::tanh(0.1F)) < 1e-6F, "Lichess centipawn conversion changed the Gadus Value scale");
 			require(values.index({1}).item<float>() < 0.0F, "Lichess centipawn conversion lost side-to-move perspective");
 			require(std::abs(values.index({2}).item<float>() - 1.0F) < 1e-6F, "Lichess mate conversion lost side-to-move perspective");
 			chess::Board castling_record("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1");
-			require(moves.index({3}).item<std::int64_t>() == gadus::move_to_index(chess::uci::uciToMove(castling_record, "e1g1")),
+			require(moves.index({3}).item<std::int64_t>() == gadus::move_to_index(chess::uci::uciToMove(castling_record, "e1g1"), castling_record.sideToMove()),
 			    "Lichess UCI_Chess960 castling notation was not decoded");
 		}
 		std::filesystem::remove(evaluation_jsonl);
@@ -186,19 +186,41 @@ int main() {
 		require(torch::equal(gadus::encode_boards({canonical_white}), gadus::encode_boards({canonical_black})), "side-to-move canonicalization changed an equivalent position");
 		const auto white_step = chess::uci::uciToMove(canonical_white, "e4e5");
 		const auto black_step = chess::uci::uciToMove(canonical_black, "e5e4");
-		require(gadus::canonical_action_index(gadus::move_to_index(white_step), chess::Color::WHITE) ==
-		        gadus::canonical_action_index(gadus::move_to_index(black_step), chess::Color::BLACK),
+		require(gadus::move_to_index(white_step, chess::Color::WHITE) == gadus::move_to_index(black_step, chess::Color::BLACK),
 		    "side-to-move canonicalization changed an equivalent action");
 
 		require_move_codec(board);
+		int geometrically_valid_actions = 0;
+		for (int expanded = 0; expanded < gadus::kExpandedActionSize; ++expanded) {
+			const int compact = gadus::compact_action_index(expanded);
+			if (compact < 0) {
+				continue;
+			}
+			++geometrically_valid_actions;
+			require(gadus::expanded_action_index(compact) == expanded, "compact action map is not invertible");
+			require(gadus::action_destination(compact) >= 0 && gadus::action_destination(compact) < gadus::kBoardSquares,
+			    "compact action has an invalid destination");
+		}
+		require(geometrically_valid_actions == gadus::kActionSize, "compact action map has the wrong cardinality");
 		chess::Board promotion("8/P7/8/8/8/8/8/k6K w - - 0 1");
 		require_move_codec(promotion);
+		chess::Board black_promotion("K6k/8/8/8/8/8/p7/8 b - - 0 1");
+		require_move_codec(black_promotion);
+		const auto white_underpromotion = chess::uci::uciToMove(promotion, "a7a8n");
+		const auto black_underpromotion = chess::uci::uciToMove(black_promotion, "a2a1n");
+		require(gadus::move_to_index(white_underpromotion, chess::Color::WHITE) == gadus::move_to_index(black_underpromotion, chess::Color::BLACK),
+		    "black underpromotion did not share the canonical action index");
+		require(gadus::canonical_action_index(gadus::hdf5_action_index(black_underpromotion), chess::Color::BLACK) ==
+		        gadus::move_to_index(black_underpromotion, chess::Color::BLACK),
+		    "black underpromotion HDF5 label did not map to the runtime action index");
 		chess::Board castling("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1");
 		require_move_codec(castling);
 		const auto king_side_castle = chess::uci::uciToMove(castling, "e1g1");
 		const auto queen_side_castle = chess::uci::uciToMove(castling, "e1c1");
-		require(gadus::move_to_index(king_side_castle) == 4 * 73 + 4 * 7 + 1, "king-side castling policy index mismatch");
-		require(gadus::move_to_index(queen_side_castle) == 4 * 73 + 3 * 7 + 1, "queen-side castling policy index mismatch");
+		require(gadus::expanded_action_index(gadus::move_to_index(king_side_castle, castling.sideToMove())) == 4 * 73 + 4 * 7 + 1,
+		    "king-side castling policy index mismatch");
+		require(gadus::expanded_action_index(gadus::move_to_index(queen_side_castle, castling.sideToMove())) == 4 * 73 + 3 * 7 + 1,
+		    "queen-side castling policy index mismatch");
 		chess::Board en_passant("8/8/8/3pP3/8/8/8/K6k w - d6 0 1");
 		require_move_codec(en_passant);
 
@@ -233,7 +255,7 @@ int main() {
 		require(!repetition.isRepetition(3), "threefold repetition was counted as fourfold");
 		require(gadus::game_termination(repetition) == "threefold repetition", "threefold-repetition termination mismatch");
 
-		// The action-plane layout must flatten as source square * 73 + motion pattern.
+		// The HDF5 action layout maps bijectively onto the geometrically valid runtime actions.
 		auto relation_block = gadus::ResidualBlock(8, 1);
 		const auto displacement_index = relation_block->named_buffers()["displacement_index"];
 		require(displacement_index.sizes() == torch::IntArrayRef({64, 64}), "displacement lookup has the wrong shape");
@@ -272,19 +294,29 @@ int main() {
 		{
 			torch::NoGradGuard guard;
 			for (const auto &parameter : layout_model->named_parameters()) {
-				if (parameter.key() == "policy_output.weight") {
+				if (parameter.key() == "policy_source.weight" || parameter.key() == "policy_target.weight" || parameter.key() == "policy_interaction_gates") {
 					parameter.value().zero_();
 				}
 				if (parameter.key() == "policy_action_bias") {
-					auto expected = torch::arange(gadus::kActionSize, parameter.value().options()).view({8, 8, gadus::kPolicyPlanes}).permute({2, 0, 1}).unsqueeze(0);
-					parameter.value().copy_(expected);
+					parameter.value().copy_(torch::arange(gadus::kActionSize, parameter.value().options()));
 				}
 			}
 		}
 		auto layout_logits = layout_model->forward(gadus::encode_boards({board})).first.squeeze(0);
-		require(torch::equal(layout_logits, torch::arange(gadus::kActionSize, layout_logits.options())), "action planes were flattened in the wrong index order");
+		auto expected_layout = torch::arange(gadus::kActionSize, layout_logits.options());
+		expected_layout = expected_layout - expected_layout.mean();
+		require(torch::equal(layout_logits, expected_layout), "compact action biases were read in the wrong index order");
+		{
+			torch::NoGradGuard guard;
+			layout_model->named_parameters()["policy_action_bias"].add_(7.0);
+		}
+		auto shifted_logits = layout_model->forward(gadus::encode_boards({board})).first.squeeze(0);
+		require(torch::equal(layout_logits, shifted_logits), "constant Policy Bias shift changed logits after centering");
 
 		auto model = gadus::Model(8, 1);
+		require(torch::equal(model->named_parameters()["policy_relation.weight"], torch::eye(128)), "Policy relation does not begin at the identity");
+		require(torch::count_nonzero(model->named_parameters()["policy_target.weight"]).item<std::int64_t>() == 0, "Policy target readout does not begin at zero");
+		require(torch::count_nonzero(model->named_parameters()["policy_interaction_gates"]).item<std::int64_t>() == 0, "Policy interaction gates do not begin at zero");
 		const auto second_value_scale = model->named_parameters()["value_head.1.up_norm.weight"];
 		require(torch::count_nonzero(second_value_scale).item<std::int64_t>() == 0, "second Value block does not begin as an identity map");
 		auto [policy, value] = model->forward(gadus::encode_boards({board, board}));
@@ -312,7 +344,7 @@ int main() {
 		auto legal_indices = torch::empty({1, static_cast<std::int64_t>(start_moves.size())}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
 		auto legal_row = legal_indices.accessor<std::int64_t, 2>();
 		for (std::size_t index = 0; index < start_moves.size(); ++index) {
-			legal_row[0][static_cast<std::int64_t>(index)] = gadus::move_to_index(start_moves[index]);
+			legal_row[0][static_cast<std::int64_t>(index)] = gadus::move_to_index(start_moves[index], board.sideToMove());
 		}
 		auto legal_output = model->forward_legal(gadus::encode_boards({board}), legal_indices);
 		require(torch::allclose(legal_output.first, reference.first.gather(1, legal_indices), 1e-5, 1e-6), "legal-action forward changed a requested policy logit");
@@ -323,7 +355,7 @@ int main() {
 		auto black_indices = torch::empty({1, static_cast<std::int64_t>(black_moves.size())}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
 		auto black_row = black_indices.accessor<std::int64_t, 2>();
 		for (std::size_t index = 0; index < black_moves.size(); ++index) {
-			black_row[0][static_cast<std::int64_t>(index)] = gadus::canonical_action_index(gadus::move_to_index(black_moves[index]), chess::Color::BLACK);
+			black_row[0][static_cast<std::int64_t>(index)] = gadus::move_to_index(black_moves[index], black_position.sideToMove());
 		}
 		auto black_reference = model->forward(gadus::encode_boards({black_position}));
 		auto black_legal = model->forward_legal(gadus::encode_boards({black_position}), black_indices);
@@ -336,6 +368,7 @@ int main() {
 			root_archive.read("model", model_archive);
 			torch::Tensor omitted;
 			require(!model_archive.try_read("between_geometry", omitted, true), "checkpoint retained reconstructible board geometry");
+			require(!model_archive.try_read("compact_action_sources", omitted, true), "checkpoint retained reconstructible compact action geometry");
 			torch::serialize::InputArchive backbone_archive;
 			model_archive.read("backbone", backbone_archive);
 			torch::serialize::InputArchive block_archive;
@@ -374,7 +407,8 @@ int main() {
 		require(std::abs(compact_result[0].value - direct_result.value) < 1e-6F, "compact Gadus evaluation changed Value");
 		require(direct_result.root.size() == 4, "direct search root size mismatch");
 		require(direct_result.sims_completed == 0, "direct search unexpectedly ran MCTS");
-		require(gadus::index_to_move(gadus::move_to_index(direct_result.move), board) == direct_result.move, "direct search selected an illegal move");
+		require(gadus::index_to_move(gadus::move_to_index(direct_result.move, board.sideToMove()), board) == direct_result.move,
+		    "direct search selected an illegal move");
 		auto full_probabilities = torch::softmax(reference.first, 1).squeeze(0).to(torch::kCPU).contiguous();
 		std::vector<float> full_policy(gadus::kActionSize);
 		std::copy_n(full_probabilities.data_ptr<float>(), gadus::kActionSize, full_policy.begin());
