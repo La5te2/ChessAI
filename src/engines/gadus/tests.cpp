@@ -210,7 +210,7 @@ int main() {
 		const auto black_underpromotion = chess::uci::uciToMove(black_promotion, "a2a1n");
 		require(gadus::move_to_index(white_underpromotion, chess::Color::WHITE) == gadus::move_to_index(black_underpromotion, chess::Color::BLACK),
 		    "black underpromotion did not share the canonical action index");
-		require(gadus::canonical_action_index(gadus::hdf5_action_index(black_underpromotion), chess::Color::BLACK) ==
+		require(gadus::canonical_action_index(gadus::full_action_index(black_underpromotion), chess::Color::BLACK) ==
 		        gadus::move_to_index(black_underpromotion, chess::Color::BLACK),
 		    "black underpromotion HDF5 label did not map to the runtime action index");
 		chess::Board castling("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1");

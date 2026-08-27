@@ -176,7 +176,7 @@ int move_to_index(const chess::Move &move, chess::Color side_to_move) {
 	return canonical_action_index(expanded_move_index(move), side_to_move);
 }
 
-int hdf5_action_index(const chess::Move &move) {
+int full_action_index(const chess::Move &move) {
 	return expanded_move_index(move);
 }
 

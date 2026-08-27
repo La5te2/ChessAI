@@ -29,9 +29,9 @@ using PackedState = std::array<std::uint8_t, kStatePlanes * 8>;
 std::vector<chess::Move> legal_moves(const chess::Board &board);
 /// Maps a move to the 1858-entry side-to-move canonical runtime action space.
 int move_to_index(const chess::Move &move, chess::Color side_to_move);
-/// Maps a move to the persistent physical-board HDF5 action space.
-int hdf5_action_index(const chess::Move &move);
-/// Maps a persistent HDF5 action index into the runtime canonical action space.
+/// Maps a move to the full physical-board 64x73 action space.
+int full_action_index(const chess::Move &move);
+/// Maps a full physical-board action index into the runtime canonical action space.
 int canonical_action_index(int index, chess::Color side_to_move);
 /// Maps a geometrically valid canonical 64x73 index to its runtime Policy index, or returns -1.
 int compact_action_index(int index);
