@@ -308,25 +308,15 @@ E_G&=\mathcal D.
 \end{aligned}
 $$
 
-The six static initialization modes use the canonical displacement coordinates defined above. In the friendly-pawn modes, canonical rank displacement $+1$ points forward for the friendly side. The remaining two modes initialize position-dependent visibility relations. If relation group $6$ exists, its rook-visibility coefficient $\beta^R_{j,6}$ is initialized to one. If relation group $7$ exists, its bishop-visibility coefficient $\beta^B_{j,7}$ is initialized to one. Every relation coefficient and absolute residual entry not assigned by these initialization modes is initialized to zero. Independently of the relation initialization, each block begins with $\lambda_j=\mathbf1$, which assigns the local and full-board transformations the same coefficient $1/\sqrt2$ in every channel.
+The first six initialization modes use the canonical displacement coordinates defined above. In the two pawn modes, rank displacement $+1$ points forward for the friendly side. When $K=8$, the final two modes initialize $\beta^R_{j,6}=1$ for relation group $6$ and $\beta^B_{j,7}=1$ for relation group $7$. Every relative coefficient, visibility coefficient and absolute residual entry not specified by the selected modes is initialized to zero. Independently, each block begins with $\lambda_j=\mathbf1$, which assigns the local and full-board transformations the same coefficient $1/\sqrt2$ in every channel.
 
-The affine scales of the three local-branch normalization layers are initialized to $1/\sqrt3$, and their biases are initialized to zero. In the shared and Policy sequences, the affine scale of $\mathrm{BN}_{j,\uparrow}$ is initialized to $1/\sqrt D$ for a sequence of length $D$. The corresponding scale is initialized to one in the first Value block and to zero in the second. The second Value block is therefore an identity map at initialization. All corresponding biases are initialized to zero. The square embedding $E_S$ is also initialized to zero. The displacement atoms and ray geometry are fixed, whereas the square embedding and all block-specific convolutional, normalization, relation and path-balance parameters are trainable.
+The three local-branch normalization layers use affine scales initialized to $1/\sqrt3$ and biases initialized to zero. In every shared or Policy sequence of length $D$, each $\mathrm{BN}_{j,\uparrow}$ uses affine scale $1/\sqrt D$ and zero bias. In the Value sequence, every nonfinal block uses unit affine scale in $\mathrm{BN}_{j,\uparrow}$, whereas the final block uses scale zero. Every Value block uses zero bias. The zero scale makes the final Value block an identity map at initialization. The square embedding $E_S$ is initialized to zero. The displacement atoms and ray geometry are fixed. The square embedding and all block-specific convolutional, normalization, relation and path-balance parameters are trainable.
 
 After the $B$ blocks, $h_B\in\mathbb R^{C\times8\times8}$ is the shared representation supplied to the Policy and Value heads defined below.
 
 ### 3.2 Policy and Value Heads
 
-Let $C_P$, $C_V$ and $H_V$ be the positive integer widths of the Policy representation, the Value feature tensor and the hidden Value layer, respectively. Let $D_P$ and $D_V$ be the positive integer numbers of Policy-specific and Value-specific chess-structured residual blocks. The fixed head dimensions are
-
-$$
-D_P=D_V=2,
-\qquad
-C_P=128,
-\qquad
-C_V=48,
-\qquad
-H_V=512.
-$$
+Let $C_P,C_V,H_V\in\mathbb N_{>0}$ denote the Policy width, Value feature width and Value hidden width. Let $D_P,D_V\in\mathbb N_{>0}$ denote the numbers of Policy-specific and Value-specific chess-structured residual blocks.
 
 The Policy head assigns one unnormalized score, called a logit, to every canonical action index in $\mathcal I_G$. It begins with a bias-free $1\times1$ convolution from $C$ channels to $C_P$ channels, followed by batch normalization and ReLU:
 
@@ -575,7 +565,7 @@ w_{V,k}=\mathrm{clip}_{[w_{\min},w_{\max}]}\left(
 \right).
 $$
 
-At a periodic probe point, an empty $I_k$, a nonfinite gradient statistic or either squared gradient norm being no greater than $\epsilon_g$ causes the controller to set $w_{V,k}=w_{V,k-1}$. If none of these conditions holds, the controller applies the projection and logarithmic smoothing defined above. At optimizer steps without a probe, the coefficient also satisfies $w_{V,k}=w_{V,k-1}$.
+The controller applies the projection and logarithmic smoothing defined above only when the optimizer reaches a periodic probe point with a nonempty $I_k$, finite gradient statistics and both squared gradient norms greater than $\epsilon_g$. At every other optimizer step, the controller sets $w_{V,k}=w_{V,k-1}$.
 
 To express how the resulting objective updates the complete network, partition the network parameters as $\theta=(\theta_T,\theta_P,\theta_V)$, where $\theta_T$ contains the residual-trunk parameters and $\theta_P$ and $\theta_V$ contain the parameters of the two output heads. The gradients of $L_{\mathrm{sup}}^{(\mathcal B_k)}$ with respect to these parameter groups satisfy
 
