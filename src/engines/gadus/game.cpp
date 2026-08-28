@@ -183,7 +183,7 @@ int full_action_index(const chess::Move &move) {
 // Reflect the source rank and every rank-sensitive motion pattern for Black.
 int canonical_action_index(int index, chess::Color side_to_move) {
 	if (index < 0 || index >= kExpandedActionSize) {
-		throw std::out_of_range("Gadus HDF5 action index");
+		throw std::out_of_range("Gadus full action index");
 	}
 
 	const int source = index / kPolicyPlanes;

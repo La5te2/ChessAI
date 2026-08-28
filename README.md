@@ -162,9 +162,9 @@ build/gadus/train \
 
 For supervised training, a positive `--max-steps` value caps optimizer updates. Setting it to `0` leaves the update count under the control of `--epochs`. `--save-every` controls periodic atomic checkpoint writes.
 
-Gadus checkpoints contain learned parameters and normalization state. Deterministic displacement tables and fixed ray geometry are reconstructed when a model is created, so they do not occupy checkpoint storage.
+Gadus checkpoints contain learned parameters and normalization state. Deterministic displacement tables and compact action lookup tables are reconstructed when a model is created, so they do not occupy checkpoint storage.
 
-Render the learned static Gadus relation matrices from one trained checkpoint with:
+Render the learned Gadus relation matrices from one trained checkpoint with:
 
 ```bash
 python scripts/visual.py \
@@ -172,7 +172,7 @@ python scripts/visual.py \
 	--source e4
 ```
 
-`--source` selects the source square shown in every heatmap and defaults to `e4`. Rows in the generated contact sheet follow the model's relation blocks, columns follow their computational groups, and each panel uses its own color scale so that learned spatial structure remains visible. Position-dependent rook and bishop visibility is not included because it requires a board occupancy rather than a checkpoint alone.
+`--source` selects the source square shown in every heatmap and defaults to `e4`. Rows in the generated contact sheet follow the model's relation blocks, columns follow their computational groups, and each panel uses its own color scale so that learned spatial structure remains visible.
 
 Each run writes `data/<run-id>-<time>.zip`. The archive contains only `relations.png`; the script does not generate or modify model parameters.
 

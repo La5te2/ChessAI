@@ -19,7 +19,7 @@ TORCH_MODULE(SquareEmbedding);
 
 struct ResidualBlockImpl : torch::nn::Module {
 	ResidualBlockImpl(int channels, int sequence_depth, bool zero_output_scale = false);
-	torch::Tensor forward(torch::Tensor x, const torch::Tensor &rook_visibility, const torch::Tensor &bishop_visibility);
+	torch::Tensor forward(torch::Tensor x);
 	void fuse_for_inference();
 	void project_relation_residual();
 	torch::Tensor relation_matrices() const;
@@ -43,7 +43,6 @@ private:
 	torch::Tensor displacement_support;
 	torch::Tensor relation_coefficients;
 	torch::Tensor relation_residual;
-	torch::Tensor visibility_coefficients;
 	torch::Tensor fused_relation;
 	torch::Tensor fused_relation_scale;
 	torch::Tensor path_balance;
@@ -59,7 +58,6 @@ struct ModelImpl : torch::nn::Module {
 
 	std::pair<torch::Tensor, torch::Tensor> forward(torch::Tensor x);
 	std::pair<torch::Tensor, torch::Tensor> forward_legal(torch::Tensor x, torch::Tensor legal_indices);
-	std::pair<torch::Tensor, torch::Tensor> visibility_matrices(const torch::Tensor &x) const;
 	void initialize_output_priors(const torch::Tensor &action_counts, double mean_value, double smoothing_count = 1.0, double output_scale = 0.1);
 	void project_relation_residuals();
 	void fuse_for_inference();
@@ -72,12 +70,12 @@ struct ModelImpl : torch::nn::Module {
 	torch::nn::Sequential value_head{nullptr};
 
 private:
-	torch::Tensor trunk_features(torch::Tensor x, const torch::Tensor &rook_visibility, const torch::Tensor &bishop_visibility);
-	torch::Tensor policy_logits(torch::Tensor features, const torch::Tensor &rook_visibility, const torch::Tensor &bishop_visibility);
+	torch::Tensor trunk_features(torch::Tensor x);
+	torch::Tensor policy_logits(torch::Tensor features);
 	torch::Tensor policy_logits_for_indices(const torch::Tensor &features, const torch::Tensor &compact_indices);
 	torch::Tensor centered_policy_bias() const;
-	torch::Tensor policy_features(torch::Tensor features, const torch::Tensor &rook_visibility, const torch::Tensor &bishop_visibility);
-	torch::Tensor value(torch::Tensor features, const torch::Tensor &rook_visibility, const torch::Tensor &bishop_visibility);
+	torch::Tensor policy_features(torch::Tensor features);
+	torch::Tensor value(torch::Tensor features);
 
 	torch::nn::Conv2d backbone_conv{nullptr};
 	torch::nn::BatchNorm2d backbone_norm{nullptr};
@@ -86,9 +84,6 @@ private:
 	torch::nn::BatchNorm2d policy_norm{nullptr};
 	torch::nn::Sequential policy_blocks{nullptr};
 	torch::nn::Linear policy_source{nullptr};
-	torch::nn::Linear policy_target{nullptr};
-	torch::nn::Linear policy_relation{nullptr};
-	torch::Tensor policy_interaction_gates;
 	torch::Tensor policy_action_bias;
 	ResidualBlock value_block{nullptr};
 	ResidualBlock value_block_2{nullptr};
@@ -96,11 +91,7 @@ private:
 	torch::nn::BatchNorm2d value_norm{nullptr};
 	torch::nn::Linear value_hidden{nullptr};
 	torch::nn::Linear value_output{nullptr};
-	torch::Tensor rook_geometry;
-	torch::Tensor bishop_geometry;
-	torch::Tensor between_geometry;
 	torch::Tensor compact_action_sources;
-	torch::Tensor compact_action_destinations;
 	torch::Tensor compact_action_patterns;
 	bool inference_fused_ = false;
 	int channels_ = 0;

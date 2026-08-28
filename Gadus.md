@@ -202,10 +202,10 @@ L_j(b_j)=
 +\mathrm{BN}_{j,I}(b_j).
 $$
 
-The full-board transformation acts on ordered pairs of the 64 canonical squares. Let $q=(r_q,f_q)$ be an output square and $p=(r_p,f_p)$ an input square. Their target-relative displacement is
+The full-board transformation acts on ordered pairs of the 64 canonical squares. Let $t=(r_t,f_t)$ be an output square and $o=(r_o,f_o)$ an input square. The displacement from the input square to the output square is
 
 $$
-\delta(q,p)=(r_q-r_p,f_q-f_p)\in\mathcal D,
+\delta(t,o)=(r_t-r_o,f_t-f_o)\in\mathcal D,
 \qquad
 \mathcal D=\{-7,\ldots,7\}^2.
 $$
@@ -213,7 +213,7 @@ $$
 For every $(a,b)\in\mathcal D$, define the displacement indicator $T_{a,b}$ and its support size $n_{a,b}$ by
 
 $$
-T_{a,b}(q,p)=\mathbf 1[\delta(q,p)=(a,b)],
+T_{a,b}(t,o)=\mathbf 1[\delta(t,o)=(a,b)],
 \qquad
 n_{a,b}=\lVert T_{a,b}\rVert_F^2=(8-|a|)(8-|b|).
 $$
@@ -226,50 +226,25 @@ $$
 
 The 225 matrices $\widehat B_{a,b}$ have disjoint support and therefore form an orthonormal basis for every square relation whose coefficient depends only on relative displacement. Each relation group learns one coefficient $\alpha_{j,g,a,b}$ for every member of this basis.
 
-A static absolute-position residual $\Delta A^\perp_{j,g}$ supplies the complementary square-pair information. It obeys
+An absolute-position residual $\Delta A^\perp_{j,g}$ represents square-pair information that is not determined by relative displacement alone. It satisfies
 
 $$
-\sum_{\delta(q,p)=(a,b)}
-\Delta A^\perp_{j,g}(q,p)=0
+\sum_{\delta(t,o)=(a,b)}
+\Delta A^\perp_{j,g}(t,o)=0
 \qquad
 \text{for every }(a,b)\in\mathcal D.
 $$
 
-The static relation is consequently
+The relation matrix for block $j$ and group $g$ is
 
 $$
-A^{\mathrm{static}}_{j,g}=
+A_{j,g}=
 \sum_{(a,b)\in\mathcal D}
 \alpha_{j,g,a,b}\widehat B_{a,b}
 +\Delta A^\perp_{j,g}.
 $$
 
-This decomposition is unique. The relative component assigns one shared coefficient to each displacement class, whereas the constrained residual represents only differences among square pairs within the same class. Consequently, the relative term is determined by 225 coefficients indexed by the $15\times15$ displacement set. Evaluating the coefficient associated with each square pair by its displacement avoids representing the 225 basis matrices explicitly.
-
-Sliding-piece geometry also depends on occupied intermediate squares. Let $o_s(p)\in\{0,1\}$ indicate whether square $p$ is occupied in encoded state $s$, and let $I(q,p)$ be the squares strictly between two aligned endpoints. Define
-
-$$
-\begin{aligned}
-V^R_s(q,p)&=
-\mathbf 1[q\ne p\land(r_q=r_p\lor f_q=f_p)]
-\prod_{u\in I(q,p)}(1-o_s(u)),\\
-V^B_s(q,p)&=
-\mathbf 1[q\ne p\land|r_q-r_p|=|f_q-f_p|]
-\prod_{u\in I(q,p)}(1-o_s(u)).
-\end{aligned}
-$$
-
-The empty product equals one. Thus adjacent aligned squares are visible, an occupied intermediate square blocks every longer ray through it, and distance does not weaken an otherwise unobstructed relation. The complete position-dependent matrix is
-
-$$
-A_{j,g}(s)=A^{\mathrm{static}}_{j,g}
-+\beta^R_{j,g}V^R_s
-+\beta^B_{j,g}V^B_s.
-$$
-
-The learned scalars $\beta^R_{j,g}$ and $\beta^B_{j,g}$ weight the two visibility relations. The matrices $V^R_s$ and $V^B_s$ are constructed once for each encoded position and shared by every residual block that processes that position.
-
-By distributivity, applying $A_{j,g}(s)$ to $b_{j,g}$ is equivalent to applying its static, rook-visibility and bishop-visibility terms separately and then adding the three products. For a minibatch of $N_b$ positions, parameter optimization uses the separated form and thereby avoids forming an $N_b\times K\times64\times64$ position-dependent relation tensor for every block. Network evaluation first combines the three matrices and then performs one grouped relation multiplication. Both orders produce the same relation output.
+This decomposition is unique. The displacement component assigns one shared coefficient to every square pair in the same displacement class, while the constrained residual represents only differences among pairs within that class. The displacement component therefore has 225 coefficients indexed by the $15\times15$ set $\mathcal D$. Looking up the coefficient associated with each square pair by its displacement avoids materializing the 225 basis matrices.
 
 Define the relation-group count $K$ and group width $d$ by
 
@@ -279,15 +254,13 @@ K=\gcd(C,8),
 d=\frac{C}{K}.
 $$
 
-Thus each residual block contains $K$ computational channel groups. The channels of $b_j$ are divided into groups of width $d$, and each group has its own $A_{j,g}(s)\in\mathbb R^{64\times64}$.
-
-After reshaping group $g$ to $b_{j,g}\in\mathbb R^{64\times d}$, the relation matrix acts on its square dimension:
+Each residual block consequently contains $K$ computational channel groups of width $d$. Group $g$ has its own relation matrix $A_{j,g}\in\mathbb R^{64\times64}$. After the group has been reshaped to $b_{j,g}\in\mathbb R^{64\times d}$, its relation matrix acts on the square dimension:
 
 $$
-\widetilde R_{j,g}=A_{j,g}(s)b_{j,g}.
+\widetilde R_{j,g}=A_{j,g}b_{j,g}.
 $$
 
-Concatenating the groups restores a $C\times8\times8$ tensor. A non-affine batch-normalization layer then produces the relation output $R_j(b_j)$.
+Concatenating the transformed groups restores a $C\times8\times8$ tensor. A non-affine batch-normalization layer then produces the relation output $R_j(b_j)$.
 
 The learned vector $\lambda_j\in\mathbb R^C$ controls the relative contribution of the two transformations independently in every channel. Broadcasting it over the board gives
 
@@ -315,12 +288,12 @@ $$
 Relation groups are initialized from the ordered sequence
 
 $$
-E_I,\ E_K,\ E_N,\ E_{P,m},\ E_{P,c},\ E_G,\ V^R,\ V^B.
+E_I,\ E_K,\ E_N,\ E_{P,m},\ E_{P,c},\ E_G,\ E_R,\ E_B.
 $$
 
-The eight members of this sequence represent identity, king displacement, knight displacement, canonical friendly-pawn advance, canonical friendly-pawn capture, complete-board communication, unobstructed rook geometry and unobstructed bishop geometry, respectively. The first $K$ members initialize the $K$ relation groups.
+Its members represent identity, king displacement, knight displacement, canonical friendly-pawn advance, canonical friendly-pawn capture, complete-board communication, rook-aligned displacement and bishop-aligned displacement, respectively. The first $K$ members initialize the $K$ relation groups.
 
-For a static offset set $E\subseteq\mathcal D$, define
+For an offset set $E\subseteq\mathcal D$, define
 
 $$
 M_E=\sum_{(a,b)\in E}T_{a,b},
@@ -328,7 +301,7 @@ M_E=\sum_{(a,b)\in E}T_{a,b},
 \overline M_E=\frac{M_E}{\lVert M_E\rVert_F}.
 $$
 
-A group initialized from $E$ represents $\overline M_E$ by setting
+A relation group initialized from $E$ represents $\overline M_E$ by setting
 
 $$
 \alpha_{j,g,a,b}=
@@ -338,24 +311,26 @@ $$
 \end{cases}
 $$
 
-The six static offset sets are
+The eight offset sets are
 
 $$
 \begin{aligned}
 E_I&=\{(0,0)\},\\
-E_K&=\{(a,b):\max(|a|,|b|)=1\},\\
-E_N&=\{(a,b):(|a|,|b|)\in\{(1,2),(2,1)\}\},\\
+E_K&=\{(a,b)\in\mathcal D:\max(|a|,|b|)=1\},\\
+E_N&=\{(a,b)\in\mathcal D:(|a|,|b|)\in\{(1,2),(2,1)\}\},\\
 E_{P,m}&=\{(1,0)\},\\
 E_{P,c}&=\{(1,-1),(1,1)\},\\
-E_G&=\mathcal D.
+E_G&=\mathcal D,\\
+E_R&=\{(a,b)\in\mathcal D\setminus\{(0,0)\}:a=0\lor b=0\},\\
+E_B&=\{(a,b)\in\mathcal D\setminus\{(0,0)\}:|a|=|b|\}.
 \end{aligned}
 $$
 
-The canonical displacement coordinates define all six sets. In the two pawn sets, rank displacement $+1$ points forward for the friendly side. Relation group $6$ begins with $\beta^R_{j,6}=1$ when $K>6$, and relation group $7$ begins with $\beta^B_{j,7}=1$ when $K>7$. Every coefficient and residual entry not assigned by these rules begins at zero.
+The canonical displacement coordinates define all eight sets. In the two pawn sets, rank displacement $+1$ points forward for the friendly side. Every entry of $\Delta A^\perp_{j,g}$ begins at zero, so each relation matrix initially equals the normalized matrix associated with its assigned offset set.
 
 Each block begins with $\lambda_j=\mathbf1$, so the local and full-board paths initially have the common channelwise coefficient $1/\sqrt2$. The affine scales of the three local-branch normalization layers begin at $1/\sqrt3$, and their biases begin at zero. The final normalization scale is initialized to $1/\sqrt B$ in every shared-trunk block and to $1/\sqrt{D_P}$ in every Policy block; the corresponding biases begin at zero. In the Value sequence, each nonfinal block begins with unit final scale, while the final block begins with zero final scale; all corresponding biases begin at zero. The final Value block is therefore an identity map at initialization.
 
-The square embedding $E_S$ begins at zero. The displacement atoms and ray geometry are fixed, while the square embedding and all block-specific convolutional, normalization, relation and path-balance parameters are trainable.
+The square embedding $E_S$ begins at zero. The displacement atoms are fixed. The square embedding and all block-specific convolutional, normalization, relation and path-balance parameters are trainable.
 
 After the $B$ blocks, $h_B\in\mathbb R^{C\times8\times8}$ is the shared representation supplied to the Policy and Value heads defined below.
 
@@ -386,38 +361,28 @@ $$
 \kappa^{-1}(i)=73q_i+p_i.
 $$
 
-This representation identifies the source square $q_i$ and motion pattern $p_i$. Together they determine an on-board destination square $d_i$ because $\kappa^{-1}(i)\in\mathcal J_G^\star$.
-
-Each motion pattern $p$ has source, destination and interaction vectors $w_p,v_p,g_p\in\mathbb R^{C_P}$. A shared matrix $M\in\mathbb R^{C_P\times C_P}$ transforms destination features. Its rows are normalized independently:
+The pair $(q_i,p_i)$ identifies the source square and motion pattern of action $i$. Each motion pattern $p$ has a readout vector $w_p\in\mathbb R^{C_P}$, while every geometrically valid source-pattern pair has a raw bias $B_{p,q}$. Removing the common component of the 1858 valid biases gives
 
 $$
-\widehat M_{c,:}=
-\frac{M_{c,:}}
-{\max\left(\lVert M_{c,:}\rVert_2,10^{-12}\right)}.
+\widetilde B_{p,q}
+=
+B_{p,q}
+-
+\frac{1}{1858}
+\sum_{t\in\mathcal I_G}B_{p_t,q_t}.
 $$
 
-Let $b\in\mathbb R^{1858}$ be the raw compact-action bias. Removing its common component gives
+The Policy logit for compact action $i$ is
 
 $$
-\widetilde b_i=b_i-\frac{1}{1858}\sum_{t\in\mathcal I_G}b_t.
-$$
-
-The resulting Policy logit is
-
-$$
-\ell_\theta(s,i)=
+\ell_\theta(s,i)
+=
 w_{p_i}^{\mathsf T}u(q_i)
-+v_{p_i}^{\mathsf T}u(d_i)
-+g_{p_i}^{\mathsf T}
-\left[
-u(q_i)\odot\left(\widehat M u(d_i)\right)
-\right]
-+\widetilde b_i.
++
+\widetilde B_{p_i,q_i}.
 $$
 
-Here $\odot$ denotes elementwise multiplication. The source and destination terms score the two endpoint features separately. The interaction term scores their channelwise products after the shared destination transformation. The centered bias represents relative preferences among compact actions without introducing an unidentifiable common logit offset.
-
-The destination and interaction vectors begin at zero, and $M$ begins as the identity matrix. Consequently, the initial readout consists of the source term and centered bias; training introduces the destination and interaction contributions.
+The first term evaluates motion pattern $p_i$ from the contextual feature at source square $q_i$. The centered bias represents relative preferences among geometrically valid source-pattern pairs without introducing an unidentifiable common offset into every logit.
 
 The Value head estimates the expected game result from the perspective of the player to move. It passes $h_B$ through its Value-specific chess-structured residual blocks, whose parameters are separate from those of the shared trunk and Policy head. Let $F_{V,j}$ denote the input-output map of Value block $j$. With $v_0=h_B$, the block sequence satisfies
 
@@ -480,15 +445,15 @@ $$
 
 ### 3.3 Inference Evaluation
 
-The Policy readout can be evaluated over either the complete compact set $\mathcal I_G$ or the legal subset $\mathcal I_G(x)$. Evaluation over $\mathcal I_G$ first decomposes every compact index $i$ into the source square $q_i$, motion pattern $p_i$ and destination square $d_i$ defined in Section 3.2. Applying the Policy formula to these triples produces all 1858 compact logits without constructing the geometrically invalid members of $\mathcal J_G$.
+The Policy readout can be evaluated over either the complete compact set $\mathcal I_G$ or the legal subset $\mathcal I_G(x)$. To evaluate the complete set, the inverse map $\kappa^{-1}$ supplies the source square $q_i$ and motion pattern $p_i$ of every compact index $i$. Applying the Policy formula to these pairs produces all 1858 compact logits without constructing the geometrically invalid members of $\mathcal J_G$.
 
 Evaluation over $\mathcal I_G(x)$ applies the same formula only to the indices $i_G(x,a)$ of legal actions $a\in\mathcal A(x)$. When states with different legal-action counts are evaluated together, absent positions are excluded from the softmax normalization. Both domains therefore assign the same logit to every legal action, while the restricted domain omits actions unavailable in the corresponding state.
 
 After the evaluation domain has been chosen, the remaining network operations admit exact algebraic simplifications. Once the batch-normalization statistics have been fixed, each convolution followed directly by affine batch normalization is replaced by the equivalent biased convolution. Within a chess-structured block, the $1\times1$ kernel and the normalized identity kernel are embedded at the center of a $3\times3$ kernel and added to the normalized $3\times3$ branch. This produces one biased local convolution with the same output as the three training branches.
 
-Each static relation matrix $A^{\mathrm{static}}_{j,g}$ is then evaluated once from its displacement coefficients and constrained residual. For each position, $V^R_s$ and $V^B_s$ are constructed once and shared by all blocks. The fixed statistics of the non-affine relation normalization and the learned path-balance vector determine a local scale, a relation-centering term and a relation scale. The local scale and centering term are absorbed into the fused local convolution, while the relation scale is applied channelwise after grouped relation multiplication.
+Each relation matrix $A_{j,g}$ is evaluated once from its displacement coefficients and constrained residual. The fixed statistics of the non-affine relation normalization and the learned path-balance vector determine a local scale, a relation-centering term and a relation scale. The local scale and centering term are absorbed into the fused local convolution, while the relation scale is applied channelwise after the grouped relation multiplication.
 
-These algebraic substitutions preserve the network function. They remove repeated affine normalization, local-branch summation, static-relation reconstruction, relation normalization and path-balance square roots from evaluation.
+These algebraic substitutions preserve the network function. They remove repeated affine normalization, local-branch summation, relation-matrix reconstruction, relation normalization and path-balance square roots from evaluation.
 
 ## 4. Supervised Training
 
@@ -670,13 +635,14 @@ $$
 \qquad i\in\mathcal I_G.
 $$
 
-The raw compact-action bias is initialized by
+The raw source-pattern bias is initialized by
 
 $$
-b_i=\log\pi_0(i).
+B_{p_i,q_i}=\log\pi_0(i),
+\qquad i\in\mathcal I_G.
 $$
 
-The Policy readout uses the centered bias $\widetilde b_i$ defined in Section 3.2. Because subtracting a common scalar from every logit leaves softmax unchanged, this centering preserves the distribution $\pi_0$. After the remaining parameters have received their ordinary random initial values, the Policy source vectors $w_p$ and the Value output weights $W_{V,2}$ are multiplied by $\rho_0=0.1$. The Value output bias is initialized by
+The Policy readout uses the centered bias $\widetilde B_{p_i,q_i}$ defined in Section 3.2. Because subtracting a common scalar from every logit leaves softmax unchanged, this centering preserves the distribution $\pi_0$. After the remaining parameters have received their ordinary random initial values, the Policy source vectors $w_p$ and the Value output weights $W_{V,2}$ are multiplied by $\rho_0=0.1$. The Value output bias is initialized by
 
 $$
 b_{V,2}=
@@ -713,11 +679,11 @@ $$
 AdamW applies the Policy-head and shared-trunk gradients from Section 4.2 together with $\widetilde g_{V,k}^{\mathrm{head}}$, producing an intermediate parameter state. The relation residuals in that state are then projected onto the displacement-orthogonal subspace. For intermediate residual $Z_{j,g}$, define
 
 $$
-\Delta A^{\perp}_{j,g}(q,p)=Z_{j,g}(q,p)
+\Delta A^{\perp}_{j,g}(t,o)=Z_{j,g}(t,o)
 -\frac{1}{n_{a,b}}
-\sum_{\delta(u,v)=(a,b)}Z_{j,g}(u,v),
+\sum_{\delta(t',o')=(a,b)}Z_{j,g}(t',o'),
 \qquad
-(a,b)=\delta(q,p).
+(a,b)=\delta(t,o).
 $$
 
 The projection restores the zero-sum constraint within every displacement class. It therefore prevents the displacement coefficients and the absolute residual from representing the same direction. The projected parameter state is $\theta^{(k+1)}$.

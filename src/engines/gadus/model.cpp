@@ -3,7 +3,6 @@
 #include "gadus/model.hpp"
 #include "gadus/precision.hpp"
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <initializer_list>
 #include <numeric>
@@ -66,28 +65,52 @@ int displacement_slot(int rank_delta, int file_delta) {
 	return (rank_delta + 7) * kDisplacementWidth + file_delta + 7;
 }
 
+std::vector<std::pair<int, int>> initial_relation_offsets(int group) {
+	switch (group) {
+	case 0:
+		return {{0, 0}};
+	case 1:
+		return {{-1, -1}, {-1, 0}, {-1, 1}, {0, -1}, {0, 1}, {1, -1}, {1, 0}, {1, 1}};
+	case 2:
+		return {{-2, -1}, {-2, 1}, {-1, -2}, {-1, 2}, {1, -2}, {1, 2}, {2, -1}, {2, 1}};
+	case 3:
+		return {{1, 0}};
+	case 4:
+		return {{1, -1}, {1, 1}};
+	default:
+		break;
+	}
+
+	std::vector<std::pair<int, int>> offsets;
+	for (int rank_delta = -7; rank_delta <= 7; ++rank_delta) {
+		for (int file_delta = -7; file_delta <= 7; ++file_delta) {
+			const bool global = group == 5;
+			const bool rook = group == 6 && (rank_delta == 0 || file_delta == 0) && (rank_delta != 0 || file_delta != 0);
+			const bool bishop = group == 7 && std::abs(rank_delta) == std::abs(file_delta) && rank_delta != 0;
+			if (global || rook || bishop) {
+				offsets.emplace_back(rank_delta, file_delta);
+			}
+		}
+	}
+	if (offsets.empty()) {
+		throw std::out_of_range("Gadus initial relation group");
+	}
+	return offsets;
+}
+
 struct RelationGeometry {
 	torch::Tensor displacement_index;
 	torch::Tensor displacement_scale;
 	torch::Tensor displacement_support;
-	torch::Tensor rook;
-	torch::Tensor bishop;
-	torch::Tensor between;
 };
 
 RelationGeometry build_relation_geometry() {
 	auto index = torch::empty({kBoardSquares, kBoardSquares}, torch::kInt64);
 	auto scale = torch::empty({kBoardSquares, kBoardSquares}, torch::kFloat32);
 	auto support = torch::empty({kDisplacementCount}, torch::kFloat32);
-	auto rook = torch::zeros({kBoardSquares, kBoardSquares}, torch::kFloat32);
-	auto bishop = torch::zeros({kBoardSquares, kBoardSquares}, torch::kFloat32);
-	auto between = torch::zeros({kBoardSquares * kBoardSquares, kBoardSquares}, torch::kFloat32);
 	auto index_data = index.accessor<std::int64_t, 2>();
 	auto scale_data = scale.accessor<float, 2>();
 	auto support_data = support.accessor<float, 1>();
-	auto rook_data = rook.accessor<float, 2>();
-	auto bishop_data = bishop.accessor<float, 2>();
-	auto between_data = between.accessor<float, 2>();
 
 	for (int rank_delta = -7; rank_delta <= 7; ++rank_delta) {
 		for (int file_delta = -7; file_delta <= 7; ++file_delta) {
@@ -106,29 +129,9 @@ RelationGeometry build_relation_geometry() {
 			const int slot = displacement_slot(rank_delta, file_delta);
 			index_data[target][source] = slot;
 			scale_data[target][source] = 1.0F / std::sqrt(support_data[slot]);
-
-			if (target == source) {
-				continue;
-			}
-			const bool rook_aligned = target_rank == source_rank || target_file == source_file;
-			const bool bishop_aligned = std::abs(rank_delta) == std::abs(file_delta);
-			if (!rook_aligned && !bishop_aligned) {
-				continue;
-			}
-			rook_data[target][source] = rook_aligned ? 1.0F : 0.0F;
-			bishop_data[target][source] = bishop_aligned ? 1.0F : 0.0F;
-			const int rank_step = (rank_delta > 0) - (rank_delta < 0);
-			const int file_step = (file_delta > 0) - (file_delta < 0);
-			int rank = source_rank + rank_step;
-			int file = source_file + file_step;
-			while (rank != target_rank || file != target_file) {
-				between_data[target * kBoardSquares + source][rank * 8 + file] = 1.0F;
-				rank += rank_step;
-				file += file_step;
-			}
 		}
 	}
-	return {index, scale, support, rook, bishop, between};
+	return {index, scale, support};
 }
 
 const RelationGeometry &relation_geometry() {
@@ -212,27 +215,11 @@ ResidualBlockImpl::ResidualBlockImpl(int channels, int sequence_depth, bool zero
 	displacement_support = register_buffer("displacement_support", geometry.displacement_support.clone());
 	relation_coefficients = register_parameter("relation_coefficients", torch::zeros({groups_, kDisplacementCount}));
 	relation_residual = register_parameter("relation_residual", torch::zeros({groups_, 64, 64}));
-	visibility_coefficients = register_parameter("visibility_coefficients", torch::zeros({groups_, 2}));
 	path_balance = register_parameter("path_balance", torch::ones({channels_}));
 
 	torch::NoGradGuard guard;
-	const std::array<std::vector<std::pair<int, int>>, 6> static_modes{{
-	    {{0, 0}},
-	    {{-1, -1}, {-1, 0}, {-1, 1}, {0, -1}, {0, 1}, {1, -1}, {1, 0}, {1, 1}},
-	    {{-2, -1}, {-2, 1}, {-1, -2}, {-1, 2}, {1, -2}, {1, 2}, {2, -1}, {2, 1}},
-	    {{1, 0}},
-	    {{1, -1}, {1, 1}},
-	    {},
-	}};
-	for (int group = 0; group < std::min(groups_, 6); ++group) {
-		std::vector<std::pair<int, int>> offsets = static_modes[static_cast<std::size_t>(group)];
-		if (group == 5) {
-			for (int rank_delta = -7; rank_delta <= 7; ++rank_delta) {
-				for (int file_delta = -7; file_delta <= 7; ++file_delta) {
-					offsets.emplace_back(rank_delta, file_delta);
-				}
-			}
-		}
+	for (int group = 0; group < std::min(groups_, 8); ++group) {
+		const auto offsets = initial_relation_offsets(group);
 		double squared_norm = 0.0;
 		for (const auto &[rank_delta, file_delta] : offsets) {
 			squared_norm += displacement_support.index({displacement_slot(rank_delta, file_delta)}).item<float>();
@@ -243,12 +230,6 @@ ResidualBlockImpl::ResidualBlockImpl(int channels, int sequence_depth, bool zero
 			const float coefficient = static_cast<float>(std::sqrt(displacement_support.index({slot}).item<float>()) / norm);
 			relation_coefficients.index_put_({group, slot}, coefficient);
 		}
-	}
-	if (groups_ > 6) {
-		visibility_coefficients.index_put_({6, 0}, 1.0F);
-	}
-	if (groups_ > 7) {
-		visibility_coefficients.index_put_({7, 1}, 1.0F);
 	}
 	const double local_scale = 1.0 / std::sqrt(3.0);
 	for (const auto &norm : {local_norm3, local_norm1, local_identity_norm}) {
@@ -283,7 +264,7 @@ void ResidualBlockImpl::project_relation_residual() {
 	flat.sub_(means.gather(1, index));
 }
 
-torch::Tensor ResidualBlockImpl::forward(torch::Tensor x, const torch::Tensor &rook_visibility, const torch::Tensor &bishop_visibility) {
+torch::Tensor ResidualBlockImpl::forward(torch::Tensor x) {
 	auto reduced = down_conv->forward(x);
 	if (!inference_fused_) {
 		reduced = down_norm->forward(reduced);
@@ -299,17 +280,8 @@ torch::Tensor ResidualBlockImpl::forward(torch::Tensor x, const torch::Tensor &r
 
 	const auto batch = reduced.size(0);
 	auto grouped = reduced.view({batch, groups_, group_width_, 64}).permute({0, 1, 3, 2});
-	const auto static_matrices = inference_fused_ ? fused_relation : relation_matrices();
-	torch::Tensor related;
-	if (inference_fused_) {
-		auto matrices = static_matrices.unsqueeze(0) + visibility_coefficients.index({Slice(), 0}).view({1, groups_, 1, 1}) * rook_visibility.unsqueeze(1) +
-		    visibility_coefficients.index({Slice(), 1}).view({1, groups_, 1, 1}) * bishop_visibility.unsqueeze(1);
-		related = torch::matmul(matrices, grouped);
-	} else {
-		related = torch::matmul(static_matrices.unsqueeze(0), grouped);
-		related = related + visibility_coefficients.index({Slice(), 0}).view({1, groups_, 1, 1}) * torch::matmul(rook_visibility.unsqueeze(1), grouped);
-		related = related + visibility_coefficients.index({Slice(), 1}).view({1, groups_, 1, 1}) * torch::matmul(bishop_visibility.unsqueeze(1), grouped);
-	}
+	const auto matrices = inference_fused_ ? fused_relation : relation_matrices();
+	auto related = torch::matmul(matrices.unsqueeze(0), grouped);
 	related = related.permute({0, 1, 3, 2}).contiguous().view({batch, channels_, 8, 8});
 	torch::Tensor combined;
 	if (inference_fused_) {
@@ -357,10 +329,6 @@ ModelImpl::ModelImpl(int channels, int blocks) : channels_(channels), blocks_(bl
 	if (channels_ <= 0 || blocks_ <= 0) {
 		throw std::invalid_argument("Gadus channels and blocks must be positive");
 	}
-	const auto &geometry = relation_geometry();
-	rook_geometry = register_buffer("rook_geometry", geometry.rook.clone());
-	bishop_geometry = register_buffer("bishop_geometry", geometry.bishop.clone());
-	between_geometry = register_buffer("between_geometry", geometry.between.clone());
 	backbone = register_module("backbone", torch::nn::Sequential());
 	backbone_conv = torch::nn::Conv2d(torch::nn::Conv2dOptions(kInputPlanes, channels_, 3).padding(1).bias(false));
 	backbone_norm = torch::nn::BatchNorm2d(channels_);
@@ -380,30 +348,18 @@ ModelImpl::ModelImpl(int channels, int blocks) : channels_(channels), blocks_(bl
 		policy_blocks->push_back(ResidualBlock(kPolicyChannels, kPolicyBlocks));
 	}
 	policy_source = register_module("policy_source", torch::nn::Linear(torch::nn::LinearOptions(kPolicyChannels, kPolicyPlanes).bias(false)));
-	policy_target = register_module("policy_target", torch::nn::Linear(torch::nn::LinearOptions(kPolicyChannels, kPolicyPlanes).bias(false)));
-	policy_relation = register_module("policy_relation", torch::nn::Linear(torch::nn::LinearOptions(kPolicyChannels, kPolicyChannels).bias(false)));
-	policy_interaction_gates = register_parameter("policy_interaction_gates", torch::zeros({kPolicyPlanes, kPolicyChannels}));
 	policy_action_bias = register_parameter("policy_action_bias", torch::zeros({kActionSize}));
 	auto action_sources = torch::empty({kActionSize}, torch::kInt64);
-	auto action_destinations = torch::empty({kActionSize}, torch::kInt64);
 	auto action_patterns = torch::empty({kActionSize}, torch::kInt64);
 	auto source_data = action_sources.accessor<std::int64_t, 1>();
-	auto destination_data = action_destinations.accessor<std::int64_t, 1>();
 	auto pattern_data = action_patterns.accessor<std::int64_t, 1>();
 	for (int action = 0; action < kActionSize; ++action) {
 		const int expanded = expanded_action_index(action);
 		source_data[action] = expanded / kPolicyPlanes;
-		destination_data[action] = action_destination(action);
 		pattern_data[action] = expanded % kPolicyPlanes;
 	}
 	compact_action_sources = register_buffer("compact_action_sources", action_sources);
-	compact_action_destinations = register_buffer("compact_action_destinations", action_destinations);
 	compact_action_patterns = register_buffer("compact_action_patterns", action_patterns);
-	{
-		torch::NoGradGuard guard;
-		policy_target->weight.zero_();
-		policy_relation->weight.copy_(torch::eye(kPolicyChannels, policy_relation->weight.options()));
-	}
 
 	value_block = ResidualBlock(channels_, 1);
 	value_block_2 = ResidualBlock(channels_, 1, true);
@@ -417,22 +373,19 @@ ModelImpl::ModelImpl(int channels, int blocks) : channels_(channels), blocks_(bl
 }
 
 void ModelImpl::save(torch::serialize::OutputArchive &archive) const {
-	save_without_buffers(*this, archive,
-	    {"rook_geometry", "bishop_geometry", "between_geometry", "compact_action_sources", "compact_action_destinations", "compact_action_patterns"});
+	save_without_buffers(*this, archive, {"compact_action_sources", "compact_action_patterns"});
 }
 
 void ModelImpl::load(torch::serialize::InputArchive &archive) {
-	load_without_buffers(*this, archive,
-	    {"rook_geometry", "bishop_geometry", "between_geometry", "compact_action_sources", "compact_action_destinations", "compact_action_patterns"});
+	load_without_buffers(*this, archive, {"compact_action_sources", "compact_action_patterns"});
 }
 
 std::pair<torch::Tensor, torch::Tensor> ModelImpl::forward(torch::Tensor x) {
 	if (x.dim() != 4 || x.size(1) != kInputPlanes || x.size(2) != 8 || x.size(3) != 8) {
 		throw std::invalid_argument("Gadus input must have shape [N,17,8,8]");
 	}
-	auto [rook_visibility, bishop_visibility] = visibility_matrices(x);
-	auto features = trunk_features(x, rook_visibility, bishop_visibility);
-	return {policy_logits(features, rook_visibility, bishop_visibility), value(features, rook_visibility, bishop_visibility)};
+	auto features = trunk_features(x);
+	return {policy_logits(features), value(features)};
 }
 
 std::pair<torch::Tensor, torch::Tensor> ModelImpl::forward_legal(torch::Tensor x, torch::Tensor legal_indices) {
@@ -443,20 +396,9 @@ std::pair<torch::Tensor, torch::Tensor> ModelImpl::forward_legal(torch::Tensor x
 		throw std::invalid_argument("legal_indices must be int64 and reside on the input device");
 	}
 
-	auto [rook_visibility, bishop_visibility] = visibility_matrices(x);
-	auto features = trunk_features(x, rook_visibility, bishop_visibility);
-	auto compact_features = policy_features(features, rook_visibility, bishop_visibility);
-	return {policy_logits_for_indices(compact_features, legal_indices), value(features, rook_visibility, bishop_visibility)};
-}
-
-std::pair<torch::Tensor, torch::Tensor> ModelImpl::visibility_matrices(const torch::Tensor &x) const {
-	if (x.dim() != 4 || x.size(1) != kInputPlanes || x.size(2) != 8 || x.size(3) != 8) {
-		throw std::invalid_argument("Gadus input must have shape [N,17,8,8]");
-	}
-	auto occupancy = x.index({Slice(), Slice(0, 12)}).sum(1).gt(0).to(x.scalar_type()).reshape({x.size(0), kBoardSquares});
-	auto blocked = torch::matmul(occupancy, between_geometry.transpose(0, 1));
-	auto clear = blocked.eq(0).to(x.scalar_type()).reshape({x.size(0), 64, 64});
-	return {clear * rook_geometry.unsqueeze(0), clear * bishop_geometry.unsqueeze(0)};
+	auto features = trunk_features(x);
+	auto compact_features = policy_features(features);
+	return {policy_logits_for_indices(compact_features, legal_indices), value(features)};
 }
 
 void ModelImpl::initialize_output_priors(const torch::Tensor &action_counts, double mean_value, double smoothing_count, double output_scale) {
@@ -477,7 +419,7 @@ torch::Tensor ModelImpl::centered_policy_bias() const {
 	return policy_action_bias - policy_action_bias.mean();
 }
 
-torch::Tensor ModelImpl::trunk_features(torch::Tensor x, const torch::Tensor &rook_visibility, const torch::Tensor &bishop_visibility) {
+torch::Tensor ModelImpl::trunk_features(torch::Tensor x) {
 	auto result = backbone_conv->forward(x);
 	if (!inference_fused_) {
 		result = backbone_norm->forward(result);
@@ -485,15 +427,15 @@ torch::Tensor ModelImpl::trunk_features(torch::Tensor x, const torch::Tensor &ro
 	result = square_embedding->forward(torch::relu(result));
 	const std::size_t offset = inference_fused_ ? 3 : 4;
 	for (int index = 0; index < blocks_; ++index) {
-		result = backbone->ptr<ResidualBlockImpl>(offset + static_cast<std::size_t>(index))->forward(result, rook_visibility, bishop_visibility);
+		result = backbone->ptr<ResidualBlockImpl>(offset + static_cast<std::size_t>(index))->forward(result);
 	}
 	return result;
 }
 
-torch::Tensor ModelImpl::value(torch::Tensor features, const torch::Tensor &rook_visibility, const torch::Tensor &bishop_visibility) {
+torch::Tensor ModelImpl::value(torch::Tensor features) {
 	AutocastGuard fp32(ComputePrecision::Fp32, features.device());
-	auto result = value_block->forward(features.to(torch::kFloat32), rook_visibility.to(torch::kFloat32), bishop_visibility.to(torch::kFloat32));
-	result = value_block_2->forward(result, rook_visibility.to(torch::kFloat32), bishop_visibility.to(torch::kFloat32));
+	auto result = value_block->forward(features.to(torch::kFloat32));
+	result = value_block_2->forward(result);
 	result = value_conv->forward(result);
 	if (!inference_fused_) {
 		result = value_norm->forward(result);
@@ -503,20 +445,20 @@ torch::Tensor ModelImpl::value(torch::Tensor features, const torch::Tensor &rook
 	return torch::tanh(value_output->forward(result));
 }
 
-torch::Tensor ModelImpl::policy_features(torch::Tensor features, const torch::Tensor &rook_visibility, const torch::Tensor &bishop_visibility) {
+torch::Tensor ModelImpl::policy_features(torch::Tensor features) {
 	auto result = policy_conv->forward(features);
 	if (!inference_fused_) {
 		result = policy_norm->forward(result);
 	}
 	result = torch::relu(result);
 	for (int index = 0; index < kPolicyBlocks; ++index) {
-		result = policy_blocks->ptr<ResidualBlockImpl>(static_cast<std::size_t>(index))->forward(result, rook_visibility, bishop_visibility);
+		result = policy_blocks->ptr<ResidualBlockImpl>(static_cast<std::size_t>(index))->forward(result);
 	}
 	return result;
 }
 
-torch::Tensor ModelImpl::policy_logits(torch::Tensor features, const torch::Tensor &rook_visibility, const torch::Tensor &bishop_visibility) {
-	auto compact_features = policy_features(features, rook_visibility, bishop_visibility);
+torch::Tensor ModelImpl::policy_logits(torch::Tensor features) {
+	auto compact_features = policy_features(features);
 	auto indices = torch::arange(kActionSize, torch::TensorOptions().dtype(torch::kInt64).device(compact_features.device())).unsqueeze(0);
 	return policy_logits_for_indices(compact_features, indices.expand({compact_features.size(0), -1}));
 }
@@ -527,17 +469,10 @@ torch::Tensor ModelImpl::policy_logits_for_indices(const torch::Tensor &features
 	auto squares = features.flatten(2).transpose(1, 2);
 	auto flat_indices = compact_indices.reshape({-1});
 	auto sources = compact_action_sources.index_select(0, flat_indices).view({batch, width});
-	auto destinations = compact_action_destinations.index_select(0, flat_indices).view({batch, width});
 	auto patterns = compact_action_patterns.index_select(0, flat_indices).view({batch, width});
 	auto source_features = squares.gather(1, sources.unsqueeze(2).expand({-1, -1, kPolicyChannels}));
-	auto target_features = squares.gather(1, destinations.unsqueeze(2).expand({-1, -1, kPolicyChannels}));
-	auto relation = policy_relation->weight / policy_relation->weight.norm(2, 1, true).clamp_min(1e-12);
-	auto related_targets = torch::matmul(target_features, relation.transpose(0, 1));
 	auto source_weights = policy_source->weight.index_select(0, patterns.reshape({-1})).view({batch, width, kPolicyChannels});
-	auto target_weights = policy_target->weight.index_select(0, patterns.reshape({-1})).view({batch, width, kPolicyChannels});
-	auto gates = policy_interaction_gates.index_select(0, patterns.reshape({-1})).view({batch, width, kPolicyChannels});
-	auto logits = (source_features * source_weights).sum(2) + (target_features * target_weights).sum(2);
-	logits = logits + (source_features * related_targets * gates).sum(2);
+	auto logits = (source_features * source_weights).sum(2);
 	return logits + centered_policy_bias().index_select(0, flat_indices).view({batch, width});
 }
 

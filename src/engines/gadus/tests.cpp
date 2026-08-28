@@ -189,6 +189,7 @@ int main() {
 		require(gadus::move_to_index(white_step, chess::Color::WHITE) == gadus::move_to_index(black_step, chess::Color::BLACK),
 		    "side-to-move canonicalization changed an equivalent action");
 
+		// The full action layout maps bijectively onto the geometrically valid runtime actions.
 		require_move_codec(board);
 		int geometrically_valid_actions = 0;
 		for (int expanded = 0; expanded < gadus::kExpandedActionSize; ++expanded) {
@@ -212,7 +213,7 @@ int main() {
 		    "black underpromotion did not share the canonical action index");
 		require(gadus::canonical_action_index(gadus::full_action_index(black_underpromotion), chess::Color::BLACK) ==
 		        gadus::move_to_index(black_underpromotion, chess::Color::BLACK),
-		    "black underpromotion HDF5 label did not map to the runtime action index");
+		    "black underpromotion full action index did not map to the runtime action index");
 		chess::Board castling("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1");
 		require_move_codec(castling);
 		const auto king_side_castle = chess::uci::uciToMove(castling, "e1g1");
@@ -255,23 +256,22 @@ int main() {
 		require(!repetition.isRepetition(3), "threefold repetition was counted as fourfold");
 		require(gadus::game_termination(repetition) == "threefold repetition", "threefold-repetition termination mismatch");
 
-		// The HDF5 action layout maps bijectively onto the geometrically valid runtime actions.
+		// Relation initialization is normalized, and its residual stays displacement-orthogonal.
 		auto relation_block = gadus::ResidualBlock(8, 1);
 		const auto displacement_index = relation_block->named_buffers()["displacement_index"];
 		require(displacement_index.sizes() == torch::IntArrayRef({64, 64}), "displacement lookup has the wrong shape");
 		const auto initial_coefficients = relation_block->named_parameters()["relation_coefficients"];
 		require(initial_coefficients.sizes() == torch::IntArrayRef({8, 225}), "relation coefficient tensor has the wrong shape");
-		const auto visibility_coefficients = relation_block->named_parameters()["visibility_coefficients"];
-		require(visibility_coefficients.sizes() == torch::IntArrayRef({8, 2}), "visibility coefficient tensor has the wrong shape");
-		require(visibility_coefficients.index({6, 0}).item<float>() == 1.0F && visibility_coefficients.index({7, 1}).item<float>() == 1.0F &&
-		        torch::count_nonzero(visibility_coefficients).item<std::int64_t>() == 2,
-		    "sliding visibility groups have the wrong initialization");
 		const auto initial_relations = relation_block->relation_matrices();
 		require(initial_relations.sizes() == torch::IntArrayRef({8, 64, 64}), "relation initialization produced the wrong shape");
-		const auto static_norms = initial_relations.index({torch::indexing::Slice(0, 6)}).flatten(1).norm(2, 1);
-		require(torch::allclose(static_norms, torch::ones_like(static_norms), 1e-5, 1e-6), "static chess-geometric modes are not unit normalized");
+		const auto relation_norms = initial_relations.flatten(1).norm(2, 1);
+		require(torch::allclose(relation_norms, torch::ones_like(relation_norms), 1e-5, 1e-6), "chess-geometric modes are not unit normalized");
 		require(initial_relations.index({3, 8, 0}).item<float>() > 0.0F && initial_relations.index({3, 0, 8}).item<float>() == 0.0F,
 		    "friendly-pawn advance uses the wrong rank direction");
+		require(initial_relations.index({6, 7, 0}).item<float>() > 0.0F && initial_relations.index({6, 9, 0}).item<float>() == 0.0F,
+		    "rook-aligned displacement mode has the wrong support");
+		require(initial_relations.index({7, 9, 0}).item<float>() > 0.0F && initial_relations.index({7, 8, 0}).item<float>() == 0.0F,
+		    "bishop-aligned displacement mode has the wrong support");
 		{
 			torch::NoGradGuard guard;
 			relation_block->named_parameters()["relation_residual"].normal_();
@@ -283,18 +283,11 @@ int main() {
 		displacement_sums.scatter_add_(1, expanded_index, projected);
 		require(displacement_sums.abs().max().item<float>() < 1e-4F, "relation residual left the displacement-orthogonal subspace");
 
-		auto visibility_model = gadus::Model(8, 1);
-		auto visibility_state = torch::zeros({1, gadus::kInputPlanes, 8, 8});
-		visibility_state.index_put_({0, 0, 3, 3}, 1.0F);
-		auto [rook_visibility, bishop_visibility] = visibility_model->visibility_matrices(visibility_state);
-		require(rook_visibility.index({0, 3 * 8 + 7, 3 * 8}).item<float>() == 0.0F, "rook visibility crossed an occupied intermediate square");
-		require(rook_visibility.index({0, 3 * 8 + 2, 3 * 8}).item<float>() == 1.0F, "rook visibility rejected an unobstructed ray");
-		require(bishop_visibility.index({0, 4 * 8 + 4, 3 * 8 + 3}).item<float>() == 1.0F, "bishop visibility rejected an adjacent diagonal square");
 		auto layout_model = gadus::Model(8, 1);
 		{
 			torch::NoGradGuard guard;
 			for (const auto &parameter : layout_model->named_parameters()) {
-				if (parameter.key() == "policy_source.weight" || parameter.key() == "policy_target.weight" || parameter.key() == "policy_interaction_gates") {
+				if (parameter.key() == "policy_source.weight") {
 					parameter.value().zero_();
 				}
 				if (parameter.key() == "policy_action_bias") {
@@ -314,9 +307,6 @@ int main() {
 		require(torch::equal(layout_logits, shifted_logits), "constant Policy Bias shift changed logits after centering");
 
 		auto model = gadus::Model(8, 1);
-		require(torch::equal(model->named_parameters()["policy_relation.weight"], torch::eye(128)), "Policy relation does not begin at the identity");
-		require(torch::count_nonzero(model->named_parameters()["policy_target.weight"]).item<std::int64_t>() == 0, "Policy target readout does not begin at zero");
-		require(torch::count_nonzero(model->named_parameters()["policy_interaction_gates"]).item<std::int64_t>() == 0, "Policy interaction gates do not begin at zero");
 		const auto second_value_scale = model->named_parameters()["value_head.1.up_norm.weight"];
 		require(torch::count_nonzero(second_value_scale).item<std::int64_t>() == 0, "second Value block does not begin as an identity map");
 		auto [policy, value] = model->forward(gadus::encode_boards({board, board}));
@@ -367,7 +357,6 @@ int main() {
 			torch::serialize::InputArchive model_archive;
 			root_archive.read("model", model_archive);
 			torch::Tensor omitted;
-			require(!model_archive.try_read("between_geometry", omitted, true), "checkpoint retained reconstructible board geometry");
 			require(!model_archive.try_read("compact_action_sources", omitted, true), "checkpoint retained reconstructible compact action geometry");
 			torch::serialize::InputArchive backbone_archive;
 			model_archive.read("backbone", backbone_archive);
