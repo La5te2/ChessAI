@@ -239,9 +239,9 @@ build/melano/train \
 	--out models/melano/melano.pth \
 	--channels 128 \
 	--blocks 20 \
-	--epochs 3 \
-	--batch-size 256 \
-	--max-steps 500000 \
+	--epochs 2 \
+	--batch-size 512 \
+	--max-steps 0 \
 	--lr 0.001 \
 	--weight-decay 0.0001 \
 	--value-weight 1.0 \
