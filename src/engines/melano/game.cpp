@@ -11,17 +11,74 @@ namespace melano {
 
 namespace {
 
-// Map an empty or colored piece to the categorical token vocabulary [0, 12].
-int piece_token(const chess::Piece &piece) {
+struct CompactActionMap {
+	CompactActionMap();
+
+	std::array<std::int16_t, kExpandedActionSize> compact{};
+	std::array<std::int16_t, kActionSize> expanded{};
+};
+
+// Map a piece to the friendly/opposing categorical token vocabulary [1, 12].
+int piece_token(const chess::Piece &piece, chess::Color friendly) {
 	int type = static_cast<int>(piece.type().internal());
 	if (type < 0 || type > 5) {
 		throw std::runtime_error("invalid chess piece type");
 	}
 	type += 1;
-	if (piece.color() == chess::Color::BLACK) {
+	if (piece.color() != friendly) {
 		type += 6;
 	}
 	return type;
+}
+
+// Decode the destination of one canonical expanded action, or reject invalid geometry.
+int expanded_destination(int index) {
+	if (index < kBoardSquares * kBoardSquares) {
+		const int source = index / kBoardSquares;
+		const int destination = index % kBoardSquares;
+		const int dr = destination / 8 - source / 8;
+		const int df = destination % 8 - source % 8;
+		const int adr = std::abs(dr);
+		const int adf = std::abs(df);
+		return source != destination && (dr == 0 || df == 0 || adr == adf || (adr == 1 && adf == 2) || (adr == 2 && adf == 1)) ? destination : -1;
+	}
+
+	const int suffix = index - kBoardSquares * kBoardSquares;
+	const int source = suffix / kUnderpromotionPlanes;
+	const int pattern = suffix % kUnderpromotionPlanes;
+	if (source / 8 != 6) {
+		return -1;
+	}
+	const int target_file = source % 8 + pattern / 3 - 1;
+	return target_file >= 0 && target_file < 8 ? 7 * 8 + target_file : -1;
+}
+
+CompactActionMap::CompactActionMap() {
+	compact.fill(-1);
+	int next = 0;
+	for (int expanded_index = 0; expanded_index < kExpandedActionSize; ++expanded_index) {
+		if (expanded_destination(expanded_index) < 0) {
+			continue;
+		}
+		if (next >= kActionSize) {
+			throw std::logic_error("Melano compact action map overflow");
+		}
+		compact[static_cast<std::size_t>(expanded_index)] = static_cast<std::int16_t>(next);
+		expanded[static_cast<std::size_t>(next)] = static_cast<std::int16_t>(expanded_index);
+		++next;
+	}
+	if (next != kActionSize) {
+		throw std::logic_error("Melano compact action map has the wrong size");
+	}
+}
+
+const CompactActionMap &compact_action_map() {
+	static const CompactActionMap mapping;
+	return mapping;
+}
+
+int reflected_rank_square(int square) {
+	return (7 - square / 8) * 8 + square % 8;
 }
 
 } // namespace
@@ -46,7 +103,7 @@ int policy_destination(const chess::Move &move) {
 }
 
 // Encode ordinary/queen moves as from*64+to and reserve a suffix for underpromotions.
-int move_to_index(const chess::Move &move) {
+int expanded_move_index(const chess::Move &move) {
 	const int from = move.from().index();
 	const int to = policy_destination(move);
 	const int from_file = from % 8;
@@ -64,13 +121,46 @@ int move_to_index(const chess::Move &move) {
 	return from * kBoardSquares + to;
 }
 
+int move_to_index(const chess::Move &move, chess::Color side_to_move) {
+	const int index = expanded_move_index(move);
+
+	int canonical = index;
+	if (side_to_move == chess::Color::BLACK) {
+		if (index < kBoardSquares * kBoardSquares) {
+			canonical = reflected_rank_square(index / kBoardSquares) * kBoardSquares + reflected_rank_square(index % kBoardSquares);
+		} else {
+			const int suffix = index - kBoardSquares * kBoardSquares;
+			canonical = kBoardSquares * kBoardSquares + reflected_rank_square(suffix / kUnderpromotionPlanes) * kUnderpromotionPlanes + suffix % kUnderpromotionPlanes;
+		}
+	}
+	const int compact = compact_action_index(canonical);
+	if (compact < 0) {
+		throw std::logic_error("canonical Melano action is geometrically invalid");
+	}
+	return compact;
+}
+
+int compact_action_index(int index) {
+	if (index < 0 || index >= kExpandedActionSize) {
+		throw std::out_of_range("Melano expanded action index");
+	}
+	return compact_action_map().compact[static_cast<std::size_t>(index)];
+}
+
+int expanded_action_index(int index) {
+	if (index < 0 || index >= kActionSize) {
+		throw std::out_of_range("Melano compact action index");
+	}
+	return compact_action_map().expanded[static_cast<std::size_t>(index)];
+}
+
 // Decode by legal-move round-trip, which also validates position-dependent legality.
 chess::Move index_to_move(int index, const chess::Board &board) {
 	if (index < 0 || index >= kActionSize) {
 		return chess::Move(chess::Move::NO_MOVE);
 	}
 	for (const auto &move : legal_moves(board)) {
-		if (move_to_index(move) == index) {
+		if (move_to_index(move, board.sideToMove()) == index) {
 			return move;
 		}
 	}
@@ -91,75 +181,50 @@ std::string move_san(const chess::Board &board, const chess::Move &move) {
 	}
 }
 
-// Store one categorical token per square followed by side, castling, and EP metadata.
+// Store friendly/opposing piece tokens in side-to-move canonical coordinates.
 PackedState encode_state(const chess::Board &board) {
 	PackedState packed{};
+	const auto friendly = board.sideToMove();
 	for (int square = 0; square < 64; ++square) {
 		const auto piece = board.at(chess::Square(square));
 		if (piece == chess::Piece::NONE) {
 			continue;
 		}
-		packed[square] = static_cast<std::uint8_t>(piece_token(piece));
+		const int canonical_square = friendly == chess::Color::WHITE ? square : reflected_rank_square(square);
+		packed[canonical_square] = static_cast<std::uint8_t>(piece_token(piece, friendly));
 	}
 
-	packed[64] = board.sideToMove() == chess::Color::WHITE ? 1 : 0;
 	const auto rights = board.castlingRights();
+	const auto opposing = friendly == chess::Color::WHITE ? chess::Color::BLACK : chess::Color::WHITE;
 	std::uint8_t castling = 0;
-	if (rights.has(chess::Color::WHITE, chess::Board::CastlingRights::Side::KING_SIDE))
+	if (rights.has(friendly, chess::Board::CastlingRights::Side::KING_SIDE))
 		castling |= 1;
-	if (rights.has(chess::Color::WHITE, chess::Board::CastlingRights::Side::QUEEN_SIDE))
+	if (rights.has(friendly, chess::Board::CastlingRights::Side::QUEEN_SIDE))
 		castling |= 2;
-	if (rights.has(chess::Color::BLACK, chess::Board::CastlingRights::Side::KING_SIDE))
+	if (rights.has(opposing, chess::Board::CastlingRights::Side::KING_SIDE))
 		castling |= 4;
-	if (rights.has(chess::Color::BLACK, chess::Board::CastlingRights::Side::QUEEN_SIDE))
+	if (rights.has(opposing, chess::Board::CastlingRights::Side::QUEEN_SIDE))
 		castling |= 8;
-	packed[65] = castling;
+	packed[64] = castling;
 	if (board.enpassantSq().is_valid()) {
-		packed[66] = static_cast<std::uint8_t>(board.enpassantSq().file() + 1);
+		packed[65] = static_cast<std::uint8_t>(board.enpassantSq().file() + 1);
 	}
 	return packed;
 }
 
-// Expand compact byte tokens into optionally pinned int64 embedding indices.
-torch::Tensor decode_states(const std::uint8_t *packed, std::int64_t count, bool pinned_memory) {
-	auto options = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
+// Encode live positions through exactly the same representation used by HDF5 rows.
+torch::Tensor encode_boards(const std::vector<chess::Board> &boards, bool pinned_memory) {
+	auto options = torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU);
 	if (pinned_memory) {
 		options = options.pinned_memory(true);
 	}
-	auto output = torch::empty({count, kStateFeatures}, options);
-	auto *destination = output.data_ptr<std::int64_t>();
-	std::transform(packed, packed + count * kStateFeatures, destination, [](std::uint8_t value) { return static_cast<std::int64_t>(value); });
+	auto output = torch::empty({static_cast<std::int64_t>(boards.size()), kStateFeatures}, options);
+	auto *destination = output.data_ptr<std::uint8_t>();
+	for (std::size_t index = 0; index < boards.size(); ++index) {
+		const auto state = encode_state(boards[index]);
+		std::memcpy(destination + index * kStateFeatures, state.data(), state.size());
+	}
 	return output;
-}
-
-// Keep Melano's one-byte categorical tokens compact across PCIe and widen on the GPU.
-torch::Tensor decode_states_device(const std::uint8_t *packed, std::int64_t count, const torch::Device &device) {
-	if (!device.is_cuda()) {
-		return decode_states(packed, count, false).to(device);
-	}
-	auto host = torch::empty({count, kStateFeatures}, torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU).pinned_memory(true));
-	std::memcpy(host.data_ptr<std::uint8_t>(), packed, static_cast<std::size_t>(count) * kStateFeatures);
-	return host.to(device, true).to(torch::kInt64);
-}
-
-// Encode live positions through exactly the same representation used by HDF5 rows.
-torch::Tensor encode_boards(const std::vector<chess::Board> &boards, bool pinned_memory) {
-	std::vector<std::uint8_t> packed(boards.size() * kStateFeatures);
-	for (std::size_t index = 0; index < boards.size(); ++index) {
-		const auto state = encode_state(boards[index]);
-		std::copy(state.begin(), state.end(), packed.begin() + index * state.size());
-	}
-	return decode_states(packed.data(), static_cast<std::int64_t>(boards.size()), pinned_memory);
-}
-
-// Pack live positions once, then transfer the batch directly to the inference device.
-torch::Tensor encode_boards_device(const std::vector<chess::Board> &boards, const torch::Device &device) {
-	std::vector<std::uint8_t> packed(boards.size() * kStateFeatures);
-	for (std::size_t index = 0; index < boards.size(); ++index) {
-		const auto state = encode_state(boards[index]);
-		std::copy(state.begin(), state.end(), packed.begin() + index * state.size());
-	}
-	return decode_states_device(packed.data(), static_cast<std::int64_t>(boards.size()), device);
 }
 
 // Report any library-recognized terminal reason, including mate and rule draws.
@@ -220,7 +285,7 @@ std::vector<float> normalize_legal_policy(const std::vector<float> &policy, cons
 	}
 	double total = 0.0;
 	for (const auto &move : moves) {
-		const int index = move_to_index(move);
+		const int index = move_to_index(move, board.sideToMove());
 		const float value = index < static_cast<int>(policy.size()) ? std::max(0.0F, policy[index]) : 0.0F;
 		normalized[index] = value;
 		total += value;
@@ -228,7 +293,7 @@ std::vector<float> normalize_legal_policy(const std::vector<float> &policy, cons
 	if (total <= 0.0) {
 		const float uniform = 1.0F / static_cast<float>(moves.size());
 		for (const auto &move : moves) {
-			normalized[move_to_index(move)] = uniform;
+			normalized[move_to_index(move, board.sideToMove())] = uniform;
 		}
 	} else {
 		for (auto &value : normalized) {

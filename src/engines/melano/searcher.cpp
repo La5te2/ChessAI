@@ -1,6 +1,7 @@
 // Implements Melano exact-state batched PUCT; search.cpp is its CLI front end.
 
 #include "melano/search.hpp"
+#include "melano/cuda.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -18,6 +19,14 @@
 namespace melano {
 
 namespace {
+
+std::size_t power_of_two_bucket(std::size_t value) {
+	std::size_t bucket = 1;
+	while (bucket < value) {
+		bucket *= 2;
+	}
+	return bucket;
+}
 
 using Clock = std::chrono::steady_clock;
 
@@ -385,6 +394,7 @@ struct Searcher::Impl {
 		set_options(source_options);
 		model->to(device);
 		model->eval();
+		model->fuse_for_inference();
 	}
 
 	// Apply mutable search controls without rebuilding the model or its compatible cache rows.
@@ -436,7 +446,7 @@ struct Searcher::Impl {
 			pending.back().legal_moves = legal_moves(boards[row]);
 			pending.back().legal_indices.reserve(pending.back().legal_moves.size());
 			for (const auto &move : pending.back().legal_moves) {
-				pending.back().legal_indices.push_back(move_to_index(move));
+				pending.back().legal_indices.push_back(move_to_index(move, boards[row].sideToMove()));
 			}
 		}
 		if (pending.empty()) {
@@ -449,36 +459,27 @@ struct Searcher::Impl {
 		}
 
 		const bool pin_memory = device.is_cuda();
-		auto index_options = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
-		auto mask_options = torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU);
+		const auto evaluation_width = pin_memory ? power_of_two_bucket(legal_width) : legal_width;
+		auto index_options = torch::TensorOptions().dtype(torch::kInt16).device(torch::kCPU);
 		if (pin_memory) {
 			index_options = index_options.pinned_memory(true);
-			mask_options = mask_options.pinned_memory(true);
 		}
-		auto legal_indices = torch::zeros({static_cast<std::int64_t>(pending.size()), static_cast<std::int64_t>(legal_width)}, index_options);
-		auto legal_mask = torch::zeros({static_cast<std::int64_t>(pending.size()), static_cast<std::int64_t>(legal_width)}, mask_options);
-		auto index_rows = legal_indices.accessor<std::int64_t, 2>();
-		auto mask_rows = legal_mask.accessor<bool, 2>();
+		auto legal_indices = torch::full(
+		    {static_cast<std::int64_t>(pending.size()), static_cast<std::int64_t>(evaluation_width)}, -1, index_options);
+		auto index_rows = legal_indices.accessor<std::int16_t, 2>();
 		for (std::size_t row = 0; row < pending.size(); ++row) {
 			for (std::size_t column = 0; column < pending[row].legal_indices.size(); ++column) {
-				index_rows[static_cast<std::int64_t>(row)][static_cast<std::int64_t>(column)] = pending[row].legal_indices[column];
-				mask_rows[static_cast<std::int64_t>(row)][static_cast<std::int64_t>(column)] = true;
+				index_rows[static_cast<std::int64_t>(row)][static_cast<std::int64_t>(column)] =
+				    static_cast<std::int16_t>(pending[row].legal_indices[column]);
 			}
 		}
 
 		torch::InferenceMode guard;
-		auto states = encode_boards_device(pending_boards, device);
-		auto device_indices = legal_indices.to(device, true);
-		auto device_mask = legal_mask.to(device, true);
-		torch::Tensor logits;
+		auto states = encode_boards(pending_boards, pin_memory);
+		torch::Tensor probabilities;
 		torch::Tensor raw_values;
-		{
-			AutocastGuard autocast(options.precision, device);
-			std::tie(logits, raw_values) = model->forward_legal(states, device_indices);
-		}
-		auto compact_logits = logits.to(torch::kFloat32);
-		compact_logits = compact_logits.masked_fill(~device_mask, -std::numeric_limits<float>::infinity());
-		auto probabilities = torch::softmax(compact_logits, 1).to(torch::kCPU).contiguous();
+		std::tie(probabilities, raw_values) = inference_graphs.run(model, states, legal_indices, device, options.precision);
+		probabilities = probabilities.to(torch::kCPU).contiguous();
 		auto values = raw_values.reshape({-1}).to(torch::kFloat32).to(torch::kCPU).contiguous();
 
 		auto probability_rows = probabilities.accessor<float, 2>();
@@ -678,12 +679,12 @@ struct Searcher::Impl {
 		float total = 0.0F;
 		for (const auto &child : state.root->children) {
 			const float weight = child.visits + child.prior;
-			policy[move_to_index(child.move)] = weight;
+			policy[move_to_index(child.move, state.board.sideToMove())] = weight;
 			total += weight;
 		}
 		if (total > 0.0F) {
 			for (const auto &child : state.root->children) {
-				policy[move_to_index(child.move)] /= total;
+				policy[move_to_index(child.move, state.board.sideToMove())] /= total;
 			}
 		}
 		return policy;
@@ -701,7 +702,7 @@ struct Searcher::Impl {
 				if (probe.isGameOver().first != chess::GameResultReason::CHECKMATE) {
 					continue;
 				}
-				const int index = move_to_index(move);
+				const int index = move_to_index(move, board.sideToMove());
 				mates.insert(index);
 				if (scores[index] > selected_score) {
 					selected = index;
@@ -732,7 +733,7 @@ struct Searcher::Impl {
 				}
 			}
 			if (repetition) {
-				const int index = move_to_index(move);
+				const int index = move_to_index(move, board.sideToMove());
 				scores[index] = std::max(0.0F, scores[index] - deduction);
 				repetitions.insert(index);
 			}
@@ -761,8 +762,8 @@ struct Searcher::Impl {
 
 		auto moves = legal_moves(state.board);
 		std::sort(moves.begin(), moves.end(), [&](const chess::Move &left, const chess::Move &right) {
-			const int left_index = move_to_index(left);
-			const int right_index = move_to_index(right);
+			const int left_index = move_to_index(left, state.board.sideToMove());
+			const int right_index = move_to_index(right, state.board.sideToMove());
 			if (result.decision_scores[left_index] != result.decision_scores[right_index]) {
 				return result.decision_scores[left_index] > result.decision_scores[right_index];
 			}
@@ -779,7 +780,7 @@ struct Searcher::Impl {
 		const auto row_count = std::min(moves.size(), static_cast<std::size_t>(std::max(1, options.root_topn)));
 		for (std::size_t row = 0; row < row_count; ++row) {
 			const auto move = moves[row];
-			const int action = move_to_index(move);
+			const int action = move_to_index(move, state.board.sideToMove());
 			RootMove root_move;
 			root_move.move = move;
 			root_move.probability = result.policy[action];
@@ -986,6 +987,7 @@ struct Searcher::Impl {
 	Model model;
 	torch::Device device;
 	SearchOptions options;
+	InferenceGraphs inference_graphs;
 	TrajectoryLruCache persistent_evaluation_cache{0};
 	int active_cpu_threads = 0;
 	double single_evaluation_ms = 0.0;

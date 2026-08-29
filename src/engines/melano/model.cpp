@@ -1,15 +1,54 @@
 // Implements Melano's geometry-aware token network and Policy/Value heads.
 
 #include "melano/model.hpp"
+#include "melano/attention.hpp"
 #include <algorithm>
 #include <cmath>
+#include <initializer_list>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace melano {
 
 namespace {
+
+bool contains_name(std::initializer_list<std::string_view> names, const std::string &name) {
+	return std::find(names.begin(), names.end(), name) != names.end();
+}
+
+void save_without_buffers(const torch::nn::Module &module, torch::serialize::OutputArchive &archive, std::initializer_list<std::string_view> omitted) {
+	for (const auto &parameter : module.named_parameters(false)) {
+		archive.write(parameter.key(), *parameter, false);
+	}
+	for (const auto &buffer : module.named_buffers(false)) {
+		if (!contains_name(omitted, buffer.key())) {
+			archive.write(buffer.key(), *buffer, true);
+		}
+	}
+	for (const auto &child : module.named_children()) {
+		torch::serialize::OutputArchive child_archive;
+		child.value()->save(child_archive);
+		archive.write(child.key(), child_archive);
+	}
+}
+
+void load_without_buffers(torch::nn::Module &module, torch::serialize::InputArchive &archive, std::initializer_list<std::string_view> omitted) {
+	for (auto &parameter : module.named_parameters(false)) {
+		archive.read(parameter.key(), *parameter, false);
+	}
+	for (auto &buffer : module.named_buffers(false)) {
+		if (!contains_name(omitted, buffer.key())) {
+			archive.read(buffer.key(), *buffer, true);
+		}
+	}
+	for (const auto &child : module.named_children()) {
+		torch::serialize::InputArchive child_archive;
+		archive.read(child.key(), child_archive);
+		child.value()->load(child_archive);
+	}
+}
 
 // Select a practical multi-head factor without requiring channels to use one fixed width.
 int attention_heads_for_channels(int channels) {
@@ -29,93 +68,67 @@ int require_positive(int value, const char *name) {
 	return value;
 }
 
-// Classify an ordered square pair by chessboard geometry for attention bias lookup.
-int square_geometry_relation(int source, int target) {
-	const int source_rank = source / 8;
-	const int source_file = source % 8;
-	const int target_rank = target / 8;
-	const int target_file = target % 8;
-	const int dr = target_rank - source_rank;
-	const int dc = target_file - source_file;
-	const int adr = std::abs(dr);
-	const int adc = std::abs(dc);
-	int value = 0;
-	if (source == target) {
-		value = 0;
-	} else if (dr == 0) {
-		value = adc;
-	} else if (dc == 0) {
-		value = 7 + adr;
-	} else if (adr == adc) {
-		value = 14 + adr;
-	} else if ((adr == 1 && adc == 2) || (adr == 2 && adc == 1)) {
-		value = 22;
-	} else {
-		// Five residual classes group the remaining ordered pairs by Manhattan distance.
-		value = 23 + std::min(4, adr + adc - 4);
-	}
-	return value + 1;
-}
-
 } // namespace
 
-// Materialize relation ids once; registered buffers move with the model but are not trained.
-torch::Tensor build_geometry_relation_ids() {
-	auto relation = torch::zeros({kTokenCount, kTokenCount}, torch::kInt64);
-	auto accessor = relation.accessor<std::int64_t, 2>();
-	for (int source = 0; source < kBoardSquares; ++source) {
-		for (int target = 0; target < kBoardSquares; ++target) {
-			accessor[source + 1][target + 1] = square_geometry_relation(source, target);
-		}
-	}
-	return relation;
-}
-
-// Embed board contents and global rule state into one global plus 64 square tokens.
+// Embed board contents and rule state into 64 square tokens.
 StateEmbeddingImpl::StateEmbeddingImpl(int channels) {
 	piece = register_module("piece", torch::nn::Embedding(13, channels));
 	square = register_module("square", torch::nn::Embedding(kBoardSquares, channels));
-	side = register_module("side", torch::nn::Embedding(2, channels));
 	castling = register_module("castling", torch::nn::Embedding(16, channels));
 	ep_file = register_module("ep_file", torch::nn::Embedding(9, channels));
-	global_token = register_parameter("global_token", torch::zeros({1, 1, channels}));
-	square_indices = register_buffer("square_indices", torch::arange(kBoardSquares, torch::kInt64));
 }
 
-// Add piece, absolute-square, and rule-context embeddings before token concatenation.
+// Add piece, absolute-square, and rule-context embeddings for every square.
 torch::Tensor StateEmbeddingImpl::forward(torch::Tensor state) {
 	if (state.dim() != 2 || state.size(1) != kStateFeatures) {
-		throw std::runtime_error("expected Melano state [batch, 67]");
+		throw std::runtime_error("expected Melano state [batch, 66]");
 	}
 	state = state.to(torch::kInt64);
 	auto pieces = state.index({torch::indexing::Slice(), torch::indexing::Slice(0, kBoardSquares)}).clamp(0, 12);
-	auto side_token = state.index({torch::indexing::Slice(), 64}).clamp(0, 1);
-	auto castling_token = state.index({torch::indexing::Slice(), 65}).clamp(0, 15);
-	auto ep_token = state.index({torch::indexing::Slice(), 66}).clamp(0, 8);
-	auto context = side->forward(side_token) + castling->forward(castling_token) + ep_file->forward(ep_token);
-	auto squares = piece->forward(pieces) + square->forward(square_indices).unsqueeze(0) + context.unsqueeze(1);
-	auto global = global_token.expand({state.size(0), -1, -1}) + context.unsqueeze(1);
-	return torch::cat({global, squares}, 1);
+	auto castling_token = state.index({torch::indexing::Slice(), 64}).clamp(0, 15);
+	auto ep_token = state.index({torch::indexing::Slice(), 65}).clamp(0, 8);
+	auto context = castling->forward(castling_token) + ep_file->forward(ep_token);
+	return piece->forward(pieces) + square->weight.unsqueeze(0) + context.unsqueeze(1);
 }
 
-// Construct pre-norm attention with learned static geometry and state-conditioned bias.
+// Construct pre-norm attention with a position-conditioned geometric bias generator.
 GeometryAttentionBlockImpl::GeometryAttentionBlockImpl(int channel_count)
     : channels(channel_count), heads(attention_heads_for_channels(channel_count)), head_dim(channel_count / heads) {
 	position = register_parameter("position", torch::zeros({1, kTokenCount, channels}));
-	relation_ids = register_buffer("relation_ids", build_geometry_relation_ids());
 	norm1 = register_module("norm1", torch::nn::LayerNorm(torch::nn::LayerNormOptions({channels})));
 	qkv = register_module("qkv", torch::nn::Linear(channels, channels * 3));
 	out = register_module("out", torch::nn::Linear(channels, channels));
-	relation_bias = register_module("relation_bias", torch::nn::Embedding(kGeometryRelations, heads));
-	dynamic_relation = register_module("dynamic_relation",
-	    torch::nn::Sequential(torch::nn::LayerNorm(torch::nn::LayerNormOptions({channels})), torch::nn::Linear(channels, channels), torch::nn::GELU(),
-	        torch::nn::Linear(channels, heads * kGeometryRelations)));
+	gab_square = register_module("gab_square", torch::nn::Linear(channels, kGabSquareChannels));
+	gab_state = register_module("gab_state", torch::nn::Linear(kTokenCount * kGabSquareChannels, kGabStateChannels));
+	gab_state_norm = register_module("gab_state_norm", torch::nn::LayerNorm(torch::nn::LayerNormOptions({kGabStateChannels})));
+	gab_coefficients = register_module("gab_coefficients", torch::nn::Linear(kGabStateChannels, heads * kGabTemplateCount));
+	gab_coefficient_norm = register_module("gab_coefficient_norm", torch::nn::LayerNorm(torch::nn::LayerNormOptions({heads * kGabTemplateCount})));
 	norm2 = register_module("norm2", torch::nn::LayerNorm(torch::nn::LayerNormOptions({channels})));
-	ffn = register_module("ffn", torch::nn::Sequential(torch::nn::Linear(channels, channels * 4), torch::nn::GELU(), torch::nn::Linear(channels * 4, channels)));
+	ffn = register_module("ffn", torch::nn::Sequential(torch::nn::Linear(channels, channels * 2), torch::nn::GELU(), torch::nn::Linear(channels * 2, channels)));
 }
 
-// Compute softmax((QK^T)/sqrt(d) + static_bias + dynamic_bias)V with residual updates.
-torch::Tensor GeometryAttentionBlockImpl::forward(torch::Tensor tokens) {
+// Compress the complete square sequence and mix the model-wide geometric templates.
+torch::Tensor GeometryAttentionBlockImpl::geometry_bias(torch::Tensor tokens, torch::Tensor templates) {
+	if (tokens.dim() != 3 || tokens.size(1) != kTokenCount || tokens.size(2) != channels) {
+		throw std::runtime_error("invalid Melano geometry-attention token shape");
+	}
+	if (templates.sizes() != torch::IntArrayRef({kGabTemplateCount, kTokenCount, kTokenCount})) {
+		throw std::runtime_error("invalid Melano geometric template shape");
+	}
+	return torch::matmul(geometry_coefficients(tokens), templates.view({kGabTemplateCount, kTokenCount * kTokenCount}))
+	    .view({tokens.size(0), heads, kTokenCount, kTokenCount});
+}
+
+// Produce the dynamic template coefficients without constructing their square-pair expansion.
+torch::Tensor GeometryAttentionBlockImpl::geometry_coefficients(torch::Tensor tokens) {
+	const auto batch = tokens.size(0);
+	auto compressed = gab_square->forward(tokens).reshape({batch, kTokenCount * kGabSquareChannels});
+	compressed = gab_state_norm->forward(torch::gelu(gab_state->forward(compressed)));
+	return gab_coefficient_norm->forward(torch::gelu(gab_coefficients->forward(compressed))).view({batch, heads, kGabTemplateCount});
+}
+
+// Compute softmax((QK^T)/sqrt(d) + GAB)V with residual updates.
+torch::Tensor GeometryAttentionBlockImpl::forward(torch::Tensor tokens, torch::Tensor templates) {
 	if (tokens.dim() != 3 || tokens.size(1) != kTokenCount || tokens.size(2) != channels) {
 		throw std::runtime_error("invalid Melano geometry-attention token shape");
 	}
@@ -126,12 +139,8 @@ torch::Tensor GeometryAttentionBlockImpl::forward(torch::Tensor tokens) {
 	auto query = parts[0].transpose(1, 2);
 	auto key = parts[1].transpose(1, 2);
 	auto value = parts[2].transpose(1, 2);
-	auto scores = torch::matmul(query, key.transpose(-2, -1)) / std::sqrt(static_cast<double>(head_dim));
-	auto static_bias = relation_bias->forward(relation_ids).permute({2, 0, 1}).unsqueeze(0);
-	auto dynamic = dynamic_relation->forward(tokens.index({torch::indexing::Slice(), 0})).view({batch, heads, kGeometryRelations});
-	auto dynamic_bias = dynamic.index_select(2, relation_ids.reshape({-1})).view({batch, heads, kTokenCount, kTokenCount});
-	auto attention = torch::softmax(scores + static_bias + dynamic_bias, -1);
-	auto attention_output = torch::matmul(attention, value).transpose(1, 2).contiguous().view({batch, kTokenCount, channels});
+	auto attention_output = geometry_attention(query, key, value, geometry_coefficients(tokens), templates);
+	attention_output = attention_output.transpose(1, 2).contiguous().view({batch, kTokenCount, channels});
 	tokens = tokens + out->forward(attention_output);
 	return tokens + ffn->forward(norm2->forward(tokens));
 }
@@ -142,6 +151,34 @@ ActionHeadImpl::ActionHeadImpl(int channels) {
 	from_proj = register_module("from_proj", torch::nn::Linear(channels, channels));
 	to_proj = register_module("to_proj", torch::nn::Linear(channels, channels));
 	underpromotion = register_module("underpromotion", torch::nn::Linear(channels, kUnderpromotionPlanes));
+	auto metadata = torch::empty({kActionSize, 4}, torch::kInt64);
+	auto ordinary = torch::empty({kOrdinaryActionSize}, torch::kInt64);
+	auto promotions = torch::empty({kUnderpromotionActionSize}, torch::kInt64);
+	auto metadata_values = metadata.accessor<std::int64_t, 2>();
+	auto ordinary_values = ordinary.accessor<std::int64_t, 1>();
+	auto promotion_values = promotions.accessor<std::int64_t, 1>();
+	for (int action = 0; action < kActionSize; ++action) {
+		const int expanded_action = expanded_action_index(action);
+		if (expanded_action < kBoardSquares * kBoardSquares) {
+			metadata_values[action][0] = expanded_action / kBoardSquares;
+			metadata_values[action][1] = expanded_action % kBoardSquares;
+			metadata_values[action][2] = 0;
+			metadata_values[action][3] = 1;
+			ordinary_values[action] = expanded_action;
+		} else {
+			const int suffix = expanded_action - kBoardSquares * kBoardSquares;
+			const int source = suffix / kUnderpromotionPlanes;
+			const int pattern = suffix % kUnderpromotionPlanes;
+			metadata_values[action][0] = source;
+			metadata_values[action][1] = 7 * 8 + source % 8 + pattern / 3 - 1;
+			metadata_values[action][2] = pattern;
+			metadata_values[action][3] = 0;
+			promotion_values[action - kOrdinaryActionSize] = suffix - 48 * kUnderpromotionPlanes;
+		}
+	}
+	action_metadata = register_buffer("action_metadata", metadata);
+	ordinary_actions = register_buffer("ordinary_actions", ordinary);
+	promotion_actions = register_buffer("promotion_actions", promotions);
 }
 
 // Score ordinary moves by scaled source-destination dot products, then append promotions.
@@ -150,17 +187,26 @@ torch::Tensor ActionHeadImpl::forward(torch::Tensor square_tokens) {
 		throw std::runtime_error("expected Melano square tokens [batch, 64, channels]");
 	}
 	auto normalized = norm->forward(square_tokens);
-	auto from = from_proj->forward(normalized);
-	auto to = to_proj->forward(normalized);
-	auto from_to = torch::matmul(from, to.transpose(1, 2)) / std::sqrt(static_cast<double>(from.size(2)));
-	auto promotions = underpromotion->forward(normalized);
-	return torch::cat(
-	    {from_to.contiguous().view({normalized.size(0), kBoardSquares * kBoardSquares}), promotions.contiguous().view({normalized.size(0), kBoardSquares * kUnderpromotionPlanes})},
-	    1);
+	torch::Tensor from_to;
+	if (inference_fused) {
+		from_to = torch::matmul(torch::matmul(normalized, fused_policy_matrix), normalized.transpose(1, 2));
+		from_to.add_(torch::matmul(normalized, fused_source_linear).unsqueeze(2));
+		from_to.add_(torch::matmul(normalized, fused_destination_linear).unsqueeze(1));
+		from_to.add_(fused_constant);
+	} else {
+		auto from = from_proj->forward(normalized);
+		auto to = to_proj->forward(normalized);
+		from_to = torch::matmul(from, to.transpose(1, 2)) / std::sqrt(static_cast<double>(from.size(2)));
+	}
+	auto ordinary_logits = from_to.contiguous().view({normalized.size(0), kBoardSquares * kBoardSquares}).index_select(1, ordinary_actions);
+	auto promotion_logits = underpromotion->forward(normalized.slice(1, 48, 56))
+	                            .contiguous()
+	                            .view({normalized.size(0), 8 * kUnderpromotionPlanes})
+	                            .index_select(1, promotion_actions);
+	return torch::cat({ordinary_logits, promotion_logits}, 1);
 }
 
-// Score only requested source-destination pairs and underpromotions without materializing 4672
-// logits.
+// Score only requested source-destination pairs and underpromotions.
 torch::Tensor ActionHeadImpl::forward_legal(torch::Tensor square_tokens, torch::Tensor legal_indices) {
 	if (square_tokens.dim() != 3 || square_tokens.size(1) != kBoardSquares) {
 		throw std::runtime_error("expected Melano square tokens [batch, 64, channels]");
@@ -168,37 +214,103 @@ torch::Tensor ActionHeadImpl::forward_legal(torch::Tensor square_tokens, torch::
 	if (legal_indices.dim() != 2 || legal_indices.size(0) != square_tokens.size(0)) {
 		throw std::runtime_error("legal_indices must have shape [batch, legal_width]");
 	}
-	if (legal_indices.scalar_type() != torch::kInt64 || legal_indices.device() != square_tokens.device()) {
-		throw std::runtime_error("legal_indices must be int64 and reside on the token device");
+	const bool compact_or_native = legal_indices.scalar_type() == torch::kInt16 || legal_indices.scalar_type() == torch::kInt64;
+	if (!compact_or_native || legal_indices.device() != square_tokens.device()) {
+		throw std::runtime_error("legal_indices must be int16 or int64 and reside on the token device");
 	}
 
+	legal_indices = legal_indices.to(torch::kInt64);
 	auto normalized = norm->forward(square_tokens);
-	auto from = from_proj->forward(normalized);
-	auto to = to_proj->forward(normalized);
-	const auto ordinary = legal_indices < kBoardSquares * kBoardSquares;
-	const auto promotion_indices = (legal_indices - kBoardSquares * kBoardSquares).clamp_min(0);
-	const auto source = torch::where(ordinary, torch::floor_divide(legal_indices, kBoardSquares), torch::floor_divide(promotion_indices, kUnderpromotionPlanes));
-	const auto destination = (legal_indices % kBoardSquares).clamp_min(0);
+	auto metadata = action_metadata.index_select(0, legal_indices.reshape({-1})).view({legal_indices.size(0), legal_indices.size(1), 4});
+	const auto source = metadata.select(2, 0);
+	const auto destination = metadata.select(2, 1);
+	const auto promotion_indices = metadata.select(2, 2);
+	const auto ordinary = metadata.select(2, 3).to(torch::kBool);
 	const auto channels = normalized.size(2);
 	const auto gather_shape = source.unsqueeze(-1).expand({-1, -1, channels});
-	auto selected_from = from.gather(1, gather_shape);
-	auto selected_to = to.gather(1, destination.unsqueeze(-1).expand({-1, -1, channels}));
-	auto ordinary_logits = (selected_from * selected_to).sum(-1) / std::sqrt(static_cast<double>(channels));
+	auto selected_source = normalized.gather(1, gather_shape);
+	auto selected_destination = normalized.gather(1, destination.unsqueeze(-1).expand({-1, -1, channels}));
+	torch::Tensor ordinary_logits;
+	if (inference_fused) {
+		torch::Tensor transformed_source;
+		if (legal_indices.size(1) < kBoardSquares) {
+			transformed_source = torch::matmul(selected_source, fused_policy_matrix);
+		} else {
+			transformed_source = torch::matmul(normalized, fused_policy_matrix).gather(1, gather_shape);
+		}
+		ordinary_logits = (transformed_source * selected_destination).sum(-1);
+		ordinary_logits.add_(torch::matmul(selected_source, fused_source_linear));
+		ordinary_logits.add_(torch::matmul(selected_destination, fused_destination_linear));
+		ordinary_logits.add_(fused_constant);
+	} else {
+		torch::Tensor selected_from;
+		torch::Tensor selected_to;
+		if (legal_indices.size(1) < kBoardSquares) {
+			selected_from = from_proj->forward(selected_source);
+			selected_to = to_proj->forward(selected_destination);
+		} else {
+			selected_from = from_proj->forward(normalized).gather(1, gather_shape);
+			selected_to = to_proj->forward(normalized).gather(1, destination.unsqueeze(-1).expand({-1, -1, channels}));
+		}
+		ordinary_logits = (selected_from * selected_to).sum(-1) / std::sqrt(static_cast<double>(channels));
+	}
 
-	auto source_tokens = normalized.gather(1, gather_shape);
-	auto promotion_logits = underpromotion->forward(source_tokens).gather(2, (promotion_indices % kUnderpromotionPlanes).unsqueeze(-1)).squeeze(-1);
+	auto promotion_logits = underpromotion->forward(selected_source).gather(2, promotion_indices.unsqueeze(-1)).squeeze(-1);
 	return torch::where(ordinary, ordinary_logits, promotion_logits);
 }
 
-// Map the global token to a bounded side-to-move value.
+void ActionHeadImpl::fuse_for_inference() {
+	if (inference_fused) {
+		return;
+	}
+	if (is_training()) {
+		throw std::logic_error("Melano Policy head must be in evaluation mode before fusion");
+	}
+	torch::NoGradGuard guard;
+	const auto scale = std::sqrt(static_cast<double>(from_proj->weight.size(0)));
+	const auto from_bias = from_proj->bias.defined() ? from_proj->bias : torch::zeros({from_proj->weight.size(0)}, from_proj->weight.options());
+	const auto to_bias = to_proj->bias.defined() ? to_proj->bias : torch::zeros({to_proj->weight.size(0)}, to_proj->weight.options());
+	fused_policy_matrix = register_buffer("fused_policy_matrix", torch::matmul(from_proj->weight.transpose(0, 1), to_proj->weight).div(scale).detach().clone());
+	fused_source_linear = register_buffer("fused_source_linear", torch::matmul(from_proj->weight.transpose(0, 1), to_bias).div(scale).detach().clone());
+	fused_destination_linear = register_buffer("fused_destination_linear", torch::matmul(to_proj->weight.transpose(0, 1), from_bias).div(scale).detach().clone());
+	fused_constant = register_buffer("fused_constant", torch::dot(from_bias, to_bias).div(scale).detach().clone());
+	inference_fused = true;
+}
+
+void ActionHeadImpl::save(torch::serialize::OutputArchive &archive) const {
+	save_without_buffers(*this, archive,
+	    {"action_metadata", "ordinary_actions", "promotion_actions", "fused_policy_matrix", "fused_source_linear", "fused_destination_linear", "fused_constant"});
+}
+
+void ActionHeadImpl::load(torch::serialize::InputArchive &archive) {
+	load_without_buffers(*this, archive,
+	    {"action_metadata", "ordinary_actions", "promotion_actions", "fused_policy_matrix", "fused_source_linear", "fused_destination_linear", "fused_constant"});
+}
+
+// Pool the square representation with a learned read-only query before Value prediction.
 ValueHeadImpl::ValueHeadImpl(int channels) {
 	norm = register_module("norm", torch::nn::LayerNorm(torch::nn::LayerNormOptions({channels})));
+	query = register_parameter("query", torch::zeros({channels}));
 	value = register_module("value", torch::nn::Sequential(torch::nn::Linear(channels, 256), torch::nn::ReLU(), torch::nn::Linear(256, 1), torch::nn::Tanh()));
 }
 
-// Read only the global token because attention has already pooled square information into it.
-torch::Tensor ValueHeadImpl::forward(torch::Tensor tokens) {
-	return value->forward(norm->forward(tokens.index({torch::indexing::Slice(), 0})));
+// Pool the contextual square tokens and return the unbounded Value coordinate.
+torch::Tensor ValueHeadImpl::logit(torch::Tensor square_tokens) {
+	if (square_tokens.dim() != 3 || square_tokens.size(1) != kBoardSquares || square_tokens.size(2) != query.size(0)) {
+		throw std::runtime_error("expected Melano square tokens [batch, 64, channels]");
+	}
+	auto normalized = norm->forward(square_tokens);
+	auto scores = torch::matmul(normalized, query) / std::sqrt(static_cast<double>(query.size(0)));
+	auto weights = torch::softmax(scores, 1);
+	auto pooled = torch::bmm(weights.unsqueeze(1), normalized).squeeze(1);
+	auto hidden = value->ptr<torch::nn::LinearImpl>(0)->forward(pooled);
+	hidden = value->ptr<torch::nn::ReLUImpl>(1)->forward(hidden);
+	return value->ptr<torch::nn::LinearImpl>(2)->forward(hidden);
+}
+
+// Bound the training coordinate to the side-to-move Value interval.
+torch::Tensor ValueHeadImpl::forward(torch::Tensor square_tokens) {
+	return value->ptr<torch::nn::TanhImpl>(3)->forward(logit(std::move(square_tokens)));
 }
 
 // Stack geometry-attention blocks and attach the policy and value heads.
@@ -206,7 +318,10 @@ ModelImpl::ModelImpl(int channels, int blocks) {
 	channels = require_positive(channels, "channels");
 	blocks = require_positive(blocks, "blocks");
 	state_embedding = register_module("state_embedding", StateEmbedding(channels));
-	trunk = register_module("trunk", torch::nn::Sequential());
+	geometry_templates = register_parameter("geometry_templates", torch::empty({kGabTemplateCount, kTokenCount, kTokenCount}));
+	torch::nn::init::xavier_normal_(geometry_templates.view({kGabTemplateCount, kTokenCount * kTokenCount}));
+	center_geometry_templates();
+	trunk = register_module("trunk", torch::nn::ModuleList());
 	for (int index = 0; index < blocks; ++index) {
 		trunk->push_back(GeometryAttentionBlock(channels));
 	}
@@ -216,16 +331,40 @@ ModelImpl::ModelImpl(int channels, int blocks) {
 
 // Produce policy logits and V(s) from the shared exact-state representation.
 std::tuple<torch::Tensor, torch::Tensor> ModelImpl::forward(torch::Tensor state) {
-	auto tokens = trunk->forward(state_embedding->forward(state));
-	auto squares = tokens.index({torch::indexing::Slice(), torch::indexing::Slice(1, torch::indexing::None)});
-	return {policy_head->forward(squares), value_head->forward(tokens)};
+	auto squares = state_embedding->forward(state);
+	for (std::size_t index = 0; index < trunk->size(); ++index) {
+		squares = trunk->ptr<GeometryAttentionBlockImpl>(index)->forward(squares, geometry_templates);
+	}
+	return {policy_head->forward(squares), value_head->forward(squares)};
+}
+
+// Share the complete encoder with inference while exposing the pre-tanh Value coordinate.
+std::tuple<torch::Tensor, torch::Tensor> ModelImpl::forward_training(torch::Tensor state) {
+	auto squares = state_embedding->forward(state);
+	for (std::size_t index = 0; index < trunk->size(); ++index) {
+		squares = trunk->ptr<GeometryAttentionBlockImpl>(index)->forward(squares, geometry_templates);
+	}
+	return {policy_head->forward(squares), value_head->logit(squares)};
 }
 
 // Reuse the shared encoder while evaluating only the legal Policy actions requested by search.
 std::tuple<torch::Tensor, torch::Tensor> ModelImpl::forward_legal(torch::Tensor state, torch::Tensor legal_indices) {
-	auto tokens = trunk->forward(state_embedding->forward(state));
-	auto squares = tokens.index({torch::indexing::Slice(), torch::indexing::Slice(1, torch::indexing::None)});
-	return {policy_head->forward_legal(squares, legal_indices), value_head->forward(tokens)};
+	auto squares = state_embedding->forward(state);
+	for (std::size_t index = 0; index < trunk->size(); ++index) {
+		squares = trunk->ptr<GeometryAttentionBlockImpl>(index)->forward(squares, geometry_templates);
+	}
+	return {policy_head->forward_legal(squares, legal_indices), value_head->forward(squares)};
+}
+
+void ModelImpl::fuse_for_inference() {
+	if (is_training()) {
+		throw std::logic_error("Melano model must be in evaluation mode before fusion");
+	}
+	policy_head->fuse_for_inference();
+}
+
+void ModelImpl::center_geometry_templates() {
+	center_gab_rows(geometry_templates);
 }
 
 // Sum tensor element counts rather than serialized bytes or optimizer state.

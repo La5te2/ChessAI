@@ -1,16 +1,20 @@
-// Implements Melano PGN parsing, schema-checked HDF5 I/O, and Policy/Value training.
+// Implements Melano JSONL preprocessing, schema-checked HDF5 I/O, and Policy/Value training.
 
 #include "melano/dataset.hpp"
 #include "melano/checkpoint.hpp"
+#include "melano/cuda.hpp"
+#include <ATen/ops/_foreach_mul.h>
+#include <ATen/ops/_foreach_norm.h>
+#include <ATen/ops/index_select.h>
 #include <algorithm>
 #include <cmath>
 #include <fstream>
 #include <future>
 #include <hdf5.h>
 #include <iostream>
+#include <nlohmann/json.hpp>
 #include <numeric>
 #include <random>
-#include <regex>
 #include <stdexcept>
 #include <torch/optim.h>
 #include <utility>
@@ -34,6 +38,37 @@ void set_learning_rate(torch::optim::AdamW &optimizer, double learning_rate) {
 	for (auto &group : optimizer.param_groups()) {
 		static_cast<torch::optim::AdamWOptions &>(group.options()).lr(learning_rate);
 	}
+}
+
+// Preserve pinned allocation while applying one shared row permutation to a loaded tensor.
+torch::Tensor shuffled_rows(const torch::Tensor &input, const torch::Tensor &permutation, bool pinned_memory) {
+	auto options = torch::TensorOptions().dtype(input.scalar_type()).device(torch::kCPU);
+	if (pinned_memory) {
+		options = options.pinned_memory(true);
+	}
+	auto output = torch::empty(input.sizes(), options);
+	at::index_select_out(output, input, 0, permutation);
+	return output;
+}
+
+// Clip gradients entirely on their device without materializing the norm on the host.
+void clip_gradient_norm_async(const std::vector<torch::Tensor> &parameters, double maximum_norm) {
+	std::vector<torch::Tensor> gradients;
+	gradients.reserve(parameters.size());
+	for (const auto &parameter : parameters) {
+		if (parameter.grad().defined()) {
+			gradients.push_back(parameter.grad().detach());
+		}
+	}
+	if (gradients.empty()) {
+		return;
+	}
+	const auto norms = at::_foreach_norm(gradients, 2.0);
+	const auto total_norm = torch::stack(norms).norm(2.0);
+	at::_assert_async(torch::isfinite(total_norm), "The total norm of order 2.0 for gradients is non-finite");
+	const auto coefficient = (maximum_norm / (total_norm + 1.0e-6)).clamp_max(1.0);
+	torch::NoGradGuard guard;
+	at::_foreach_mul_(gradients, coefficient);
 }
 
 // Turn a negative HDF5 status into an operation-specific C++ exception.
@@ -87,18 +122,6 @@ std::string read_string_attribute(hid_t object, const char *name) {
 	return std::string(buffer.data());
 }
 
-// Read a required integer attribute used for row counts and comment mode.
-std::int64_t read_int_attribute(hid_t object, const char *name) {
-	if (H5Aexists(object, name) <= 0) {
-		throw std::runtime_error(std::string("HDF5 missing required attribute: ") + name);
-	}
-	std::int64_t value = 0;
-	const hid_t attribute = require_id(H5Aopen(object, name, H5P_DEFAULT), name);
-	require_h5(H5Aread(attribute, H5T_NATIVE_INT64, &value), name);
-	H5Aclose(attribute);
-	return value;
-}
-
 class H5Writer {
 public:
 	// Create a fresh Melano file with aligned state, policy, and value rows.
@@ -112,11 +135,7 @@ public:
 		write_string_attribute(file_, "move_encoding", kMoveEncoding);
 		write_string_attribute(file_, "target_schema", kTargetSchema);
 		write_string_attribute(file_, "value_perspective", "side_to_move");
-		write_int_attribute(file_, "has_cmt", options.has_comments);
-		if (options.has_comments) {
-			write_string_attribute(file_, "comment_eval_perspective", "white");
-			write_string_attribute(file_, "comment_value_transform", "tanh(side_to_move_pawn_score/3)");
-		}
+		write_string_attribute(file_, "value_transform", "tanh(side_to_move_pawn_score/3)");
 		states_ =
 		    create_dataset("states", {0, kStateFeatures}, {H5S_UNLIMITED, kStateFeatures}, {static_cast<hsize_t>(std::max(1, options.chunk_size)), kStateFeatures}, H5T_STD_U8LE);
 		moves_ = create_dataset("moves", {0}, {H5S_UNLIMITED}, {static_cast<hsize_t>(std::max(1, options.chunk_size))}, H5T_STD_U16LE);
@@ -155,11 +174,11 @@ public:
 		size_ = next;
 	}
 
-	// Record final counters and flush all HDF5 buffers to disk.
-	void finish(std::int64_t games, std::int64_t skipped_games) {
-		write_int_attribute(file_, "games", games);
+	// Record input-line counters and flush all HDF5 buffers to disk.
+	void finish(std::int64_t records, std::int64_t skipped_records) {
 		write_int_attribute(file_, "positions", static_cast<std::int64_t>(size_));
-		write_int_attribute(file_, "skipped_games", skipped_games);
+		write_int_attribute(file_, "records", records);
+		write_int_attribute(file_, "skipped_records", skipped_records);
 		require_h5(H5Fflush(file_, H5F_SCOPE_GLOBAL), "flush output file");
 	}
 
@@ -203,179 +222,90 @@ private:
 	hsize_t size_ = 0;
 };
 
-// Parse a CCRL-style white-perspective signed pawn evaluation from a PGN comment.
-std::optional<double> comment_score_white(const std::string &comment) {
-	static const std::regex score_pattern(R"((^|[^A-Za-z0-9_.])([+-](?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+))(?:/[0-9]+)?)");
-	std::smatch match;
-	if (!std::regex_search(comment, match, score_pattern))
-		return std::nullopt;
-	return std::stod(match[2].str());
-}
-
-// Convert white-perspective pawn score to bounded side-to-move V=tanh(score/3).
-float comment_value(const std::string &comment, chess::Color turn) {
-	const double white = comment_score_white(comment).value_or(0.0);
+// Convert a White-perspective centipawn score to bounded side-to-move value.
+float cp_value(int centipawns, chess::Color turn) {
+	const double white = static_cast<double>(centipawns) / 100.0;
 	const double side = turn == chess::Color::WHITE ? white : -white;
 	return static_cast<float>(std::tanh(side / 3.0));
 }
 
-// Convert a PGN game result to an exact side-to-move terminal target.
-float result_value(const std::string &result, chess::Color turn) {
-	float white = 0.0F;
-	if (result == "1-0")
-		white = 1.0F;
-	if (result == "0-1")
-		white = -1.0F;
+// Convert a White-perspective mate sign to an exact side-to-move endpoint.
+float mate_value(int mate, chess::Color turn) {
+	const float white = mate > 0 ? 1.0F : -1.0F;
 	return turn == chess::Color::WHITE ? white : -white;
 }
 
-struct StopPgnParsing {};
-
-// Recognize numeric movetext metadata after the PGN parser has removed leading digits.
-bool is_detached_numeric_metadata(std::string_view token) {
-	if (token.empty())
-		return false;
-	bool has_separator = false;
-	for (const char character : token) {
-		if (character == ':' || character == ',') {
-			has_separator = true;
-			continue;
-		}
-		if (character < '0' || character > '9')
-			return false;
+std::string complete_fen(const std::string &fen) {
+	const auto fields = static_cast<int>(std::count(fen.begin(), fen.end(), ' ')) + 1;
+	if (fields == 4) {
+		return fen + " 0 1";
 	}
-	return has_separator;
+	if (fields == 6) {
+		return fen;
+	}
+	throw std::invalid_argument("FEN must contain four or six fields");
 }
 
-class PreprocessVisitor : public chess::pgn::Visitor {
-public:
-	// Bind parser callbacks to one Melano writer and option set.
-	PreprocessVisitor(const PreprocessOptions &options, H5Writer &writer) : options_(options), writer_(writer) {}
-
-	// Reset per-game state and stop cleanly after max_games.
-	void startPgn() override {
-		if (options_.max_games >= 0 && games_ >= options_.max_games) {
-			throw StopPgnParsing{};
-		}
-		board_ = chess::Board();
-		result_ = "*";
-		previous_comment_.clear();
-		game_has_eval_ = false;
-		game_invalid_ = false;
-		game_states_.clear();
-		game_moves_.clear();
-		game_values_.clear();
-		detached_comment_.clear();
-		collecting_detached_comment_ = false;
-	}
-
-	// Capture Result and optional non-starting FEN headers before move parsing.
-	void header(std::string_view key, std::string_view value) override {
-		if (key == "Result")
-			result_ = std::string(value);
-		if (key == "FEN" && !value.empty())
-			board_ = chess::Board(value);
-	}
-
-	// Satisfy the visitor interface; no setup is needed after headers.
-	void startMoves() override {}
-
-	// Encode the pre-move state and attach its policy action and side-to-move value target.
-	void move(std::string_view san, std::string_view comment) override {
-		if (san.empty()) {
-			if (options_.has_comments)
-				attach_detached_comment(comment);
-			return;
-		}
-		if (consume_detached_comment(san))
-			return;
-		if (is_detached_numeric_metadata(san)) {
-			if (options_.has_comments && !comment.empty())
-				attach_detached_comment(comment);
-			return;
-		}
-		if (game_invalid_)
-			return;
-		try {
-			const auto move = chess::uci::parseSan(board_, san);
-			const auto move_index = static_cast<std::uint16_t>(move_to_index(move));
-			game_states_.push_back(encode_state(board_));
-			game_moves_.push_back(move_index);
-			const float value = options_.has_comments ? comment_value(previous_comment_, board_.sideToMove()) : result_value(result_, board_.sideToMove());
-			game_values_.push_back(value);
-			if (comment_score_white(std::string(comment)).has_value())
-				game_has_eval_ = true;
-			board_.makeMove(move);
-			previous_comment_ = std::string(comment);
-		} catch (const std::exception &error) {
-			game_invalid_ = true;
-			if (parse_warning_count_ < 8) {
-				std::cerr << "Melano preprocess rejected game after SAN '" << san << "': " << error.what() << std::endl;
-				++parse_warning_count_;
-			}
+chess::Move parse_pv_move(const chess::Board &board, std::string_view token) {
+	for (const auto &move : legal_moves(board)) {
+		if (chess::uci::moveToUci(move) == token || chess::uci::moveToUci(move, true) == token) {
+			return move;
 		}
 	}
+	throw std::invalid_argument("PV starts with an illegal move: " + std::string(token));
+}
 
-	// Commit complete games whose SAN sequence and requested target source are valid.
-	void endPgn() override {
-		if (game_invalid_ || (options_.has_comments && !game_has_eval_)) {
-			++skipped_games_;
-			return;
-		}
-		writer_.append(game_states_, game_moves_, game_values_);
-		++games_;
-		if (options_.log_every > 0 && games_ % options_.log_every == 0) {
-			std::cout << "preprocess progress: games=" << games_ << " positions=" << writer_.size() << " skipped=" << skipped_games_ << std::endl;
-		}
-	}
-
-	// Return the number of games committed to HDF5.
-	std::int64_t games() const { return games_; }
-	// Return the number of games rejected for invalid SAN or a missing requested target.
-	std::int64_t skipped_games() const { return skipped_games_; }
-
-private:
-	// Attach a parser-separated comment to the state reached by the preceding move.
-	void attach_detached_comment(std::string_view comment) {
-		previous_comment_ = std::string(comment);
-		if (comment_score_white(previous_comment_).has_value())
-			game_has_eval_ = true;
-	}
-
-	// Consume a brace comment that the PGN parser exposed through its SAN callback.
-	bool consume_detached_comment(std::string_view token) {
-		if (!collecting_detached_comment_ && (token.empty() || token.front() != '{'))
-			return false;
-		if (!detached_comment_.empty())
-			detached_comment_.push_back(' ');
-		detached_comment_.append(token);
-		collecting_detached_comment_ = detached_comment_.find('}') == std::string::npos;
-		if (collecting_detached_comment_)
-			return true;
-
-		const auto open = detached_comment_.find('{');
-		const auto close = detached_comment_.rfind('}');
-		attach_detached_comment(std::string_view(detached_comment_).substr(open + 1, close - open - 1));
-		detached_comment_.clear();
-		return true;
-	}
-
-	PreprocessOptions options_;
-	H5Writer &writer_;
-	chess::Board board_;
-	std::string result_;
-	std::string previous_comment_;
-	bool game_has_eval_ = false;
-	bool game_invalid_ = false;
-	std::vector<PackedState> game_states_;
-	std::vector<std::uint16_t> game_moves_;
-	std::vector<float> game_values_;
-	std::string detached_comment_;
-	bool collecting_detached_comment_ = false;
-	std::int64_t games_ = 0;
-	std::int64_t skipped_games_ = 0;
-	int parse_warning_count_ = 0;
+struct EvaluationTarget {
+	chess::Move move;
+	float value = 0.0F;
 };
+
+// Select the deepest evaluation, break equal depths by nodes, and use its first PV.
+EvaluationTarget evaluation_target(const nlohmann::json &record, const chess::Board &board) {
+	if (!record.contains("evals") || !record.at("evals").is_array()) {
+		throw std::invalid_argument("record has no evaluation array");
+	}
+	const nlohmann::json *selected = nullptr;
+	int selected_depth = -1;
+	std::int64_t selected_knodes = -1;
+	for (const auto &evaluation : record.at("evals")) {
+		if (!evaluation.is_object() || !evaluation.contains("pvs") || !evaluation.at("pvs").is_array() || evaluation.at("pvs").empty()) {
+			continue;
+		}
+		const int depth = evaluation.value("depth", -1);
+		const std::int64_t knodes = evaluation.value("knodes", std::int64_t{-1});
+		if (selected == nullptr || depth > selected_depth || (depth == selected_depth && knodes > selected_knodes)) {
+			selected = &evaluation;
+			selected_depth = depth;
+			selected_knodes = knodes;
+		}
+	}
+	if (selected == nullptr) {
+		throw std::invalid_argument("record has no principal variation");
+	}
+
+	const auto &pv = selected->at("pvs").front();
+	if (!pv.is_object() || !pv.contains("line") || !pv.at("line").is_string()) {
+		throw std::invalid_argument("selected principal variation has no line");
+	}
+	const std::string line = pv.at("line").get<std::string>();
+	const auto separator = line.find(' ');
+	const auto first_move_length = separator == std::string::npos ? line.size() : separator;
+	const std::string_view first_move(line.data(), first_move_length);
+	if (first_move.empty()) {
+		throw std::invalid_argument("selected principal variation is empty");
+	}
+
+	float value = 0.0F;
+	if (pv.contains("cp") && pv.at("cp").is_number_integer()) {
+		value = cp_value(pv.at("cp").get<int>(), board.sideToMove());
+	} else if (pv.contains("mate") && pv.at("mate").is_number_integer() && pv.at("mate").get<int>() != 0) {
+		value = mate_value(pv.at("mate").get<int>(), board.sideToMove());
+	} else {
+		throw std::invalid_argument("selected principal variation has no cp or mate score");
+	}
+	return {parse_pv_move(board, first_move), value};
+}
 
 // Build an ordered union of one-row hyperslabs for arbitrary batch indices.
 void select_rows(hid_t space, const std::vector<std::int64_t> &indices, int rank) {
@@ -418,7 +348,6 @@ struct SupervisedH5::Impl {
 		info.state_encoding = read_string_attribute(file, "state_encoding");
 		info.move_encoding = read_string_attribute(file, "move_encoding");
 		info.target_schema = read_string_attribute(file, "target_schema");
-		info.has_comments = static_cast<int>(read_int_attribute(file, "has_cmt"));
 		if (info.arch_type != kArchType || info.state_encoding != kStateEncoding || info.move_encoding != kMoveEncoding || info.target_schema != kTargetSchema) {
 			throw std::runtime_error("HDF5 schema does not match the Melano architecture");
 		}
@@ -434,7 +363,7 @@ struct SupervisedH5::Impl {
 		H5Sget_simple_extent_dims(space, dimensions, nullptr);
 		H5Sclose(space);
 		if (dimensions[1] != kStateFeatures)
-			throw std::runtime_error("states must have shape [N,67]");
+			throw std::runtime_error("states must have shape [N,66]");
 		info.length = static_cast<std::int64_t>(dimensions[0]);
 		if (info.length <= 0)
 			throw std::runtime_error("supervised HDF5 is empty");
@@ -508,27 +437,28 @@ SupervisedBatch SupervisedH5::read(const std::vector<std::int64_t> &requested, b
 			throw std::out_of_range("HDF5 row index");
 	}
 	const hsize_t batch = indices.size();
-	std::vector<std::uint8_t> packed(batch * kStateFeatures);
-	std::vector<std::uint16_t> moves(batch);
-	auto index_options = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
+	auto state_options = torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU);
+	auto move_options = torch::TensorOptions().dtype(torch::kInt16).device(torch::kCPU);
 	auto float_options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
 	if (pinned_memory) {
-		index_options = index_options.pinned_memory(true);
+		state_options = state_options.pinned_memory(true);
+		move_options = move_options.pinned_memory(true);
 		float_options = float_options.pinned_memory(true);
 	}
-	auto move_tensor = torch::empty({static_cast<std::int64_t>(batch)}, index_options);
+	auto state_tensor = torch::empty({static_cast<std::int64_t>(batch), kStateFeatures}, state_options);
+	auto move_tensor = torch::empty({static_cast<std::int64_t>(batch)}, move_options);
 	auto value_tensor = torch::empty({static_cast<std::int64_t>(batch)}, float_options);
 
 	const hid_t state_space = require_id(H5Dget_space(impl_->states), "get states selection");
 	select_rows(state_space, indices, 2);
 	const hsize_t state_dims[] = {batch, kStateFeatures};
 	const hid_t state_memory = require_id(H5Screate_simple(2, state_dims, nullptr), "state memory");
-	require_h5(H5Dread(impl_->states, H5T_NATIVE_UINT8, state_memory, state_space, H5P_DEFAULT, packed.data()), "read state rows");
+	require_h5(H5Dread(impl_->states, H5T_NATIVE_UINT8, state_memory, state_space, H5P_DEFAULT, state_tensor.data_ptr<std::uint8_t>()), "read state rows");
 	H5Sclose(state_memory);
 	H5Sclose(state_space);
 
 	for (const auto &[dataset, type, destination] : {
-	         std::tuple<hid_t, hid_t, void *>{impl_->moves, H5T_NATIVE_UINT16, moves.data()},
+	         std::tuple<hid_t, hid_t, void *>{impl_->moves, H5T_NATIVE_INT16, move_tensor.data_ptr<std::int16_t>()},
 	         std::tuple<hid_t, hid_t, void *>{impl_->values, H5T_NATIVE_FLOAT, value_tensor.data_ptr<float>()},
 	     }) {
 		const hid_t space = require_id(H5Dget_space(dataset), "get scalar selection");
@@ -539,13 +469,8 @@ SupervisedBatch SupervisedH5::read(const std::vector<std::int64_t> &requested, b
 		H5Sclose(memory);
 		H5Sclose(space);
 	}
-	auto *move_destination = move_tensor.data_ptr<std::int64_t>();
-	for (std::size_t index = 0; index < moves.size(); ++index) {
-		move_destination[index] = moves[index];
-	}
-
 	return {
-	    decode_states(packed.data(), static_cast<std::int64_t>(batch), pinned_memory),
+	    std::move(state_tensor),
 	    std::move(move_tensor),
 	    std::move(value_tensor),
 	};
@@ -556,15 +481,16 @@ SupervisedBatch SupervisedH5::read_contiguous(std::int64_t begin, std::int64_t c
 	if (begin < 0 || count <= 0 || begin > impl_->info.length - count)
 		throw std::out_of_range("contiguous HDF5 row range");
 	const hsize_t batch = static_cast<hsize_t>(count);
-	std::vector<std::uint8_t> packed(batch * kStateFeatures);
-	std::vector<std::uint16_t> moves(batch);
-	auto index_options = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
+	auto state_options = torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU);
+	auto move_options = torch::TensorOptions().dtype(torch::kInt16).device(torch::kCPU);
 	auto float_options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
 	if (pinned_memory) {
-		index_options = index_options.pinned_memory(true);
+		state_options = state_options.pinned_memory(true);
+		move_options = move_options.pinned_memory(true);
 		float_options = float_options.pinned_memory(true);
 	}
-	auto move_tensor = torch::empty({count}, index_options);
+	auto state_tensor = torch::empty({count, kStateFeatures}, state_options);
+	auto move_tensor = torch::empty({count}, move_options);
 	auto value_tensor = torch::empty({count}, float_options);
 
 	const hid_t state_space = require_id(H5Dget_space(impl_->states), "get state range");
@@ -572,12 +498,12 @@ SupervisedBatch SupervisedH5::read_contiguous(std::int64_t begin, std::int64_t c
 	const hsize_t state_count[] = {batch, kStateFeatures};
 	require_h5(H5Sselect_hyperslab(state_space, H5S_SELECT_SET, state_start, nullptr, state_count, nullptr), "select state range");
 	const hid_t state_memory = require_id(H5Screate_simple(2, state_count, nullptr), "create state range memory");
-	require_h5(H5Dread(impl_->states, H5T_NATIVE_UINT8, state_memory, state_space, H5P_DEFAULT, packed.data()), "read state range");
+	require_h5(H5Dread(impl_->states, H5T_NATIVE_UINT8, state_memory, state_space, H5P_DEFAULT, state_tensor.data_ptr<std::uint8_t>()), "read state range");
 	H5Sclose(state_memory);
 	H5Sclose(state_space);
 
 	for (const auto &[dataset, type, destination] : {
-	         std::tuple<hid_t, hid_t, void *>{impl_->moves, H5T_NATIVE_UINT16, moves.data()},
+	         std::tuple<hid_t, hid_t, void *>{impl_->moves, H5T_NATIVE_INT16, move_tensor.data_ptr<std::int16_t>()},
 	         std::tuple<hid_t, hid_t, void *>{impl_->values, H5T_NATIVE_FLOAT, value_tensor.data_ptr<float>()},
 	     }) {
 		const hid_t space = require_id(H5Dget_space(dataset), "get scalar range");
@@ -589,40 +515,83 @@ SupervisedBatch SupervisedH5::read_contiguous(std::int64_t begin, std::int64_t c
 		H5Sclose(memory);
 		H5Sclose(space);
 	}
-	auto *move_destination = move_tensor.data_ptr<std::int64_t>();
-	for (std::size_t index = 0; index < moves.size(); ++index) {
-		move_destination[index] = moves[index];
-	}
-
 	return {
-	    decode_states(packed.data(), count, pinned_memory),
+	    std::move(state_tensor),
 	    std::move(move_tensor),
 	    std::move(value_tensor),
 	};
 }
 
-// Stream PGN input through the visitor and finalize a fresh Melano dataset.
-void preprocess_pgn(const PreprocessOptions &options) {
-	if (options.has_comments != 0 && options.has_comments != 1) {
-		throw std::invalid_argument("has_comments must be 0 or 1");
+// Stream position-evaluation JSONL records into the Melano schema.
+void preprocess_jsonl(const PreprocessOptions &options) {
+	if (options.input != std::filesystem::path{"-"} && options.input.extension() == ".zst") {
+		throw std::invalid_argument("compressed JSONL input must be streamed with zstdcat and --input -");
 	}
-	std::ifstream input(options.input);
-	if (!input)
-		throw std::runtime_error("PGN not found: " + options.input.string());
-	std::cout << "preprocess start: input=" << options.input.string() << " output=" << options.output.string() << " arch_type=" << kArchType << " has_cmt=" << options.has_comments
-	          << std::endl;
-	H5Writer writer(options);
-	PreprocessVisitor visitor(options, writer);
-	try {
-		chess::pgn::StreamParser parser(input);
-		const auto error = parser.readGames(visitor);
-		if (error.hasError() && error.code() != chess::pgn::StreamParserError::NotEnoughData) {
-			throw std::runtime_error("PGN parse failed: " + error.message());
+
+	std::ifstream file;
+	std::istream *input = &std::cin;
+	if (options.input != std::filesystem::path{"-"}) {
+		file.open(options.input);
+		if (!file) {
+			throw std::runtime_error("evaluation JSONL not found: " + options.input.string());
 		}
-	} catch (const StopPgnParsing &) {
+		input = &file;
 	}
-	writer.finish(visitor.games(), visitor.skipped_games());
-	std::cout << "preprocess summary: games=" << visitor.games() << " positions=" << writer.size() << " skipped=" << visitor.skipped_games()
+
+	H5Writer writer(options);
+	std::vector<PackedState> states;
+	std::vector<std::uint16_t> moves;
+	std::vector<float> values;
+	const auto buffer_capacity = static_cast<std::size_t>(std::max(1, options.chunk_size));
+	states.reserve(buffer_capacity);
+	moves.reserve(buffer_capacity);
+	values.reserve(buffer_capacity);
+	auto flush = [&] {
+		writer.append(states, moves, values);
+		states.clear();
+		moves.clear();
+		values.clear();
+	};
+
+	std::cout << "preprocess start: input=" << options.input.string() << " output=" << options.output.string() << " arch_type=" << kArchType << std::endl;
+	std::int64_t records = 0;
+	std::int64_t accepted_records = 0;
+	std::int64_t skipped_records = 0;
+	std::string line;
+	while ((options.max_positions < 0 || accepted_records < options.max_positions) && std::getline(*input, line)) {
+		++records;
+		try {
+			if (line.empty()) {
+				throw std::invalid_argument("empty record");
+			}
+			const auto record = nlohmann::json::parse(line);
+			if (!record.is_object() || !record.contains("fen") || !record.at("fen").is_string()) {
+				throw std::invalid_argument("record has no FEN");
+			}
+			chess::Board board(complete_fen(record.at("fen").get<std::string>()));
+			const auto target = evaluation_target(record, board);
+			const auto state = encode_state(board);
+			const auto move = static_cast<std::uint16_t>(move_to_index(target.move, board.sideToMove()));
+			states.push_back(state);
+			moves.push_back(move);
+			values.push_back(target.value);
+			++accepted_records;
+			if (states.size() >= buffer_capacity) {
+				flush();
+			}
+			if (options.log_every > 0 && accepted_records % options.log_every == 0) {
+				std::cout << "preprocess progress: positions=" << accepted_records << " skipped=" << skipped_records << std::endl;
+			}
+		} catch (const std::exception &error) {
+			++skipped_records;
+			if (skipped_records <= 8) {
+				std::cerr << "preprocess skipped record " << records << ": " << error.what() << std::endl;
+			}
+		}
+	}
+	flush();
+	writer.finish(records, skipped_records);
+	std::cout << "preprocess summary: records=" << records << " positions=" << accepted_records << " skipped=" << skipped_records
 	          << " output=" << options.output.string() << std::endl;
 }
 
@@ -641,7 +610,9 @@ void train_supervised(const TrainOptions &options) {
 	auto model = Model(options.channels, options.blocks);
 	model->to(device);
 	model->train();
-	torch::optim::AdamW optimizer(model->parameters(), torch::optim::AdamWOptions(options.learning_rate).weight_decay(options.weight_decay));
+	const auto parameters = model->parameters();
+	torch::optim::AdamW optimizer(parameters, torch::optim::AdamWOptions(options.learning_rate).weight_decay(options.weight_decay));
+	TrainingGraph training_graph;
 	const auto steps_per_epoch = std::max<std::int64_t>(1, (data.info().length + options.batch_size - 1) / options.batch_size);
 	const auto epoch_step_limit = std::max<std::int64_t>(1, static_cast<std::int64_t>(options.epochs) * steps_per_epoch);
 	const auto planned_steps = options.max_steps > 0 ? std::min(options.max_steps, epoch_step_limit) : epoch_step_limit;
@@ -663,8 +634,6 @@ void train_supervised(const TrainOptions &options) {
 			chunk_starts.push_back(begin);
 		}
 		std::shuffle(chunk_starts.begin(), chunk_starts.end(), rng);
-		auto metric_totals = torch::zeros({2}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
-		std::int64_t batches = 0;
 		auto launch_read = [&](std::size_t chunk_index) {
 			const auto begin = chunk_starts[chunk_index];
 			const auto count = std::min(data.info().chunk_rows, data.info().length - begin);
@@ -681,43 +650,30 @@ void train_supervised(const TrainOptions &options) {
 			std::iota(local_order.begin(), local_order.end(), 0);
 			std::shuffle(local_order.begin(), local_order.end(), rng);
 			auto permutation = torch::from_blob(local_order.data(), {chunk_rows}, torch::TensorOptions().dtype(torch::kInt64)).clone();
-			chunk.states = chunk.states.index_select(0, permutation);
-			chunk.moves = chunk.moves.index_select(0, permutation);
-			chunk.values = chunk.values.index_select(0, permutation);
+			chunk.states = shuffled_rows(chunk.states, permutation, device.is_cuda());
+			chunk.moves = shuffled_rows(chunk.moves, permutation, device.is_cuda());
+			chunk.values = shuffled_rows(chunk.values, permutation, device.is_cuda());
 
 			for (std::int64_t begin = 0; begin < chunk_rows; begin += options.batch_size) {
 				const auto count = std::min<std::int64_t>(options.batch_size, chunk_rows - begin);
-				auto states = chunk.states.narrow(0, begin, count).to(device, true);
-				auto moves = chunk.moves.narrow(0, begin, count).to(device, true);
-				auto values = chunk.values.narrow(0, begin, count).to(device, true);
+				auto states = chunk.states.narrow(0, begin, count);
+				auto moves = chunk.moves.narrow(0, begin, count);
+				auto values = chunk.values.narrow(0, begin, count);
 				const double learning_rate = scheduled_learning_rate(options.learning_rate, global_step + 1, warmup_steps);
 				set_learning_rate(optimizer, learning_rate);
-				optimizer.zero_grad();
-
-				torch::Tensor policy;
-				torch::Tensor predicted_value;
-				{
-					AutocastGuard autocast(options.precision, device);
-					std::tie(policy, predicted_value) = model->forward(states);
-				}
-				auto policy_loss = torch::nn::functional::cross_entropy(policy.to(torch::kFloat32), moves);
-				auto value_loss = torch::mse_loss(predicted_value.squeeze(1).to(torch::kFloat32), values);
-				auto loss = policy_loss + options.value_weight * value_loss;
-				loss.backward();
-				double gradient_norm = 0.0;
+				auto step = training_graph.run(model, optimizer, states, moves, values, device, options.precision, options.value_weight, count == options.batch_size);
 				if (options.grad_clip > 0.0) {
-					gradient_norm = torch::nn::utils::clip_grad_norm_(model->parameters(), options.grad_clip, 2.0, true);
+					clip_gradient_norm_async(parameters, options.grad_clip);
 				}
 				optimizer.step();
+				model->center_geometry_templates();
 
 				++global_step;
-				++batches;
-				metric_totals.add_(torch::stack({policy_loss.detach(), value_loss.detach()}));
 				if (options.log_every > 0 && (global_step == 1 || global_step % options.log_every == 0)) {
-					auto metrics = torch::stack({policy_loss.detach(), value_loss.detach(), loss.detach()}).to(torch::kCPU).contiguous();
+					auto metrics = torch::stack({step.policy_loss.detach(), step.value_bce.detach(), step.loss.detach()}).to(torch::kCPU).contiguous();
 					auto metric_values = metrics.accessor<float, 1>();
 					std::cout << "train step: epoch=" << epoch << " global_step=" << global_step << " policy=" << metric_values[0] << " value=" << metric_values[1]
-					          << " loss=" << metric_values[2] << " grad_norm_before_clip=" << gradient_norm << " lr=" << learning_rate << std::endl;
+					          << " loss=" << metric_values[2] << " lr=" << learning_rate << std::endl;
 				}
 				if (options.save_every > 0 && global_step % options.save_every == 0) {
 					save_checkpoint_atomic(options.output, model, {options.channels, options.blocks});
@@ -730,10 +686,6 @@ void train_supervised(const TrainOptions &options) {
 			}
 		}
 		save_checkpoint_atomic(options.output, model, {options.channels, options.blocks});
-		auto epoch_metrics = metric_totals.to(torch::kCPU).contiguous();
-		auto epoch_values = epoch_metrics.accessor<float, 1>();
-		std::cout << "epoch=" << epoch << ", steps=" << global_step << ", policy=" << epoch_values[0] / std::max<std::int64_t>(1, batches)
-		          << ", value=" << epoch_values[1] / std::max<std::int64_t>(1, batches) << std::endl;
 	}
 	std::cout << "training finished: " << options.output.string() << std::endl;
 }

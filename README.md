@@ -214,38 +214,41 @@ The [UCI](#uci) section describes runtime options, output fields and time manage
 
 ### Melano
 
-Preprocess an annotated PGN into the Melano HDF5 schema with:
+Stream the Lichess evaluation dataset into the Melano HDF5 schema with:
 
 ```bash
-build/melano/preprocess \
-	--input data/ccrl.pgn \
-	--output data/games.melano.h5 \
-	--has-cmt 1 \
-	--chunk-size 4096 \
+zstdcat data/lichess_db_eval.jsonl.zst | build/melano/preprocess \
+	--source lichess-eval \
+	--input - \
+	--output data/lichess.melano.h5 \
+	--chunk-size 16384 \
 	--compression-level 1 \
-	--log-every 10000 \
-	--max-games 1000000
+	--max-positions 50000000 \
+	--log-every 1000000
 ```
 
-`--has-cmt 1` derives Value targets from numerical PGN comments, while `--has-cmt 0` derives them from final game results. `--max-games` limits the number of PGN games read. `--chunk-size` controls HDF5 dataset extension units. `--compression-level` selects the deflate level. `--log-every` controls progress reporting by game count.
+For each JSONL record, the preprocessor selects the evaluation with the greatest depth, breaks equal-depth ties by `knodes` and uses the first principal variation from that evaluation. Its first move supplies the Policy target, while its `cp` or `mate` field supplies the side-to-move Value target. `--max-positions` limits accepted records.
+
+Annotated PGN input remains available with `--source pgn`. In this mode, `--has-cmt 1` derives Value targets from numerical comments, while `--has-cmt 0` derives them from final game results; `--max-games` limits the number of games read. In both modes, `--chunk-size` controls HDF5 dataset extension units, `--compression-level` selects the deflate level and `--log-every` controls progress reporting by accepted row count.
 
 Train a new Melano model with:
 
 ```bash
 build/melano/train \
-	--data data/games.melano.h5 \
+	--data data/lichess.melano.h5 \
 	--out models/melano/melano.pth \
 	--channels 128 \
 	--blocks 20 \
 	--epochs 3 \
 	--batch-size 256 \
 	--max-steps 500000 \
-	--lr 0.0002 \
+	--lr 0.001 \
 	--weight-decay 0.0001 \
 	--value-weight 1.0 \
 	--grad-clip 1.0 \
 	--device cuda \
 	--precision bf16 \
+	--save-every 5000 \
 	--log-every 50
 ```
 

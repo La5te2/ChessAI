@@ -9,44 +9,46 @@
 
 namespace melano {
 
-inline constexpr int kTokenCount = kBoardSquares + 1;
-inline constexpr int kGeometryRelations = 29;
-
-/// Builds static relation ids for every global/square token pair.
-torch::Tensor build_geometry_relation_ids();
+inline constexpr int kTokenCount = kBoardSquares;
+inline constexpr int kGabTemplateCount = 64;
+inline constexpr int kGabSquareChannels = 8;
+inline constexpr int kGabStateChannels = 32;
 
 struct StateEmbeddingImpl : torch::nn::Module {
-	/// Builds embeddings for pieces, squares, side, castling, en-passant, and a global token.
+	/// Builds embeddings for pieces, squares, castling, and en-passant state.
 	explicit StateEmbeddingImpl(int channels);
-	/// Converts [N, 67] encoded states into [N, 65, C] transformer tokens.
+	/// Converts [N, 66] encoded states into [N, 64, C] square tokens.
 	torch::Tensor forward(torch::Tensor state);
 
 	torch::nn::Embedding piece{nullptr};
 	torch::nn::Embedding square{nullptr};
-	torch::nn::Embedding side{nullptr};
 	torch::nn::Embedding castling{nullptr};
 	torch::nn::Embedding ep_file{nullptr};
-	torch::Tensor global_token;
-	torch::Tensor square_indices;
 };
 TORCH_MODULE(StateEmbedding);
 
 struct GeometryAttentionBlockImpl : torch::nn::Module {
-	/// Builds pre-normalized multi-head attention with static and position-dependent geometry bias.
+	/// Builds pre-normalized multi-head attention with dynamic geometric attention bias.
 	explicit GeometryAttentionBlockImpl(int channels);
+	/// Generates one state-dependent square-pair bias matrix per attention head.
+	torch::Tensor geometry_bias(torch::Tensor tokens, torch::Tensor templates);
+	/// Generates the state-dependent coefficients used by the geometric templates.
+	torch::Tensor geometry_coefficients(torch::Tensor tokens);
 	/// Applies geometry-biased self-attention and a residual feed-forward transform.
-	torch::Tensor forward(torch::Tensor tokens);
+	torch::Tensor forward(torch::Tensor tokens, torch::Tensor templates);
 
 	int channels;
 	int heads;
 	int head_dim;
 	torch::Tensor position;
-	torch::Tensor relation_ids;
 	torch::nn::LayerNorm norm1{nullptr};
 	torch::nn::Linear qkv{nullptr};
 	torch::nn::Linear out{nullptr};
-	torch::nn::Embedding relation_bias{nullptr};
-	torch::nn::Sequential dynamic_relation{nullptr};
+	torch::nn::Linear gab_square{nullptr};
+	torch::nn::Linear gab_state{nullptr};
+	torch::nn::LayerNorm gab_state_norm{nullptr};
+	torch::nn::Linear gab_coefficients{nullptr};
+	torch::nn::LayerNorm gab_coefficient_norm{nullptr};
 	torch::nn::LayerNorm norm2{nullptr};
 	torch::nn::Sequential ffn{nullptr};
 };
@@ -55,25 +57,40 @@ TORCH_MODULE(GeometryAttentionBlock);
 struct ActionHeadImpl : torch::nn::Module {
 	/// Builds source/destination projections plus explicit underpromotion logits.
 	explicit ActionHeadImpl(int channels);
-	/// Maps 64 square tokens to Melano's 4672 action logits.
+	/// Maps 64 square tokens to Melano's 1858 geometrically valid action logits.
 	torch::Tensor forward(torch::Tensor square_tokens);
 	/// Computes logits only for the requested Melano action indices [batch, legal_width].
 	torch::Tensor forward_legal(torch::Tensor square_tokens, torch::Tensor legal_indices);
+	/// Fuses the two ordinary-move projections into one bilinear inference form.
+	void fuse_for_inference();
+	void save(torch::serialize::OutputArchive &archive) const override;
+	void load(torch::serialize::InputArchive &archive) override;
 
 	torch::nn::LayerNorm norm{nullptr};
 	torch::nn::Linear from_proj{nullptr};
 	torch::nn::Linear to_proj{nullptr};
 	torch::nn::Linear underpromotion{nullptr};
+	torch::Tensor action_metadata;
+	torch::Tensor ordinary_actions;
+	torch::Tensor promotion_actions;
+	torch::Tensor fused_policy_matrix;
+	torch::Tensor fused_source_linear;
+	torch::Tensor fused_destination_linear;
+	torch::Tensor fused_constant;
+	bool inference_fused = false;
 };
 TORCH_MODULE(ActionHead);
 
 struct ValueHeadImpl : torch::nn::Module {
-	/// Builds a bounded side-to-move value predictor over the global token.
+	/// Builds attention pooling and a bounded side-to-move value predictor.
 	explicit ValueHeadImpl(int channels);
-	/// Produces V(s) in [-1, 1] from the transformed global token.
-	torch::Tensor forward(torch::Tensor tokens);
+	/// Produces the unbounded scalar whose hyperbolic tangent is V(s).
+	torch::Tensor logit(torch::Tensor square_tokens);
+	/// Produces V(s) in [-1, 1] from the transformed square tokens.
+	torch::Tensor forward(torch::Tensor square_tokens);
 
 	torch::nn::LayerNorm norm{nullptr};
+	torch::Tensor query;
 	torch::nn::Sequential value{nullptr};
 };
 TORCH_MODULE(ValueHead);
@@ -83,11 +100,18 @@ struct ModelImpl : torch::nn::Module {
 	ModelImpl(int channels = 128, int blocks = 10);
 	/// Returns policy logits and side-to-move V(s) for an exact board state.
 	std::tuple<torch::Tensor, torch::Tensor> forward(torch::Tensor state);
+	/// Returns Policy logits and the unbounded Value logit used by supervised training.
+	std::tuple<torch::Tensor, torch::Tensor> forward_training(torch::Tensor state);
 	/// Returns legal-action logits [batch, legal_width] and the same side-to-move V(s).
 	std::tuple<torch::Tensor, torch::Tensor> forward_legal(torch::Tensor state, torch::Tensor legal_indices);
+	/// Precomputes evaluation-only constants without changing the represented function.
+	void fuse_for_inference();
+	/// Projects every GAB template row onto its zero-mean representative.
+	void center_geometry_templates();
 
 	StateEmbedding state_embedding{nullptr};
-	torch::nn::Sequential trunk{nullptr};
+	torch::Tensor geometry_templates;
+	torch::nn::ModuleList trunk{nullptr};
 	ActionHead policy_head{nullptr};
 	ValueHead value_head{nullptr};
 };

@@ -31,8 +31,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# LibTorch enables CUDA only to validate its imported runtime. No project target compiles .cu
-# sources, so keep that probe on the broadly supported CUDA C++17 dialect.
+# CUDA extensions use the broadly supported CUDA C++17 dialect while the host code uses C++20.
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
@@ -203,14 +202,17 @@ endif()
 
 if(GADIDAE_BUILD_MELANO)
 
-add_library(melano
+set(GADIDAE_MELANO_SOURCES
+	src/engines/melano/attention.cpp
 	src/engines/melano/checkpoint.cpp
+	src/engines/melano/cuda.cpp
 	src/engines/melano/args.cpp
 	src/engines/melano/dataset.cpp
 	src/engines/melano/game.cpp
 	src/engines/melano/model.cpp
 	src/engines/melano/searcher.cpp
 )
+add_library(melano ${GADIDAE_MELANO_SOURCES})
 set_target_properties(melano PROPERTIES
 	ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/melano"
 	LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/melano"
@@ -219,20 +221,24 @@ set_target_properties(melano PROPERTIES
 target_include_directories(melano PUBLIC "${CMAKE_SOURCE_DIR}/include/engines")
 target_include_directories(melano SYSTEM PUBLIC
 	"${GADIDAE_API_DIR}/chess"
+	"${GADIDAE_API_DIR}/nlohmann/include"
 	${HDF5_INCLUDE_DIRS}
 )
-target_precompile_headers(melano PRIVATE <chess.hpp>)
+target_precompile_headers(melano PRIVATE <chess.hpp> <nlohmann/json.hpp>)
 if(MSVC)
 	target_link_libraries(
 		melano
 		PUBLIC ${TORCH_LIBRARIES} ${HDF5_LIBRARIES} "${GADIDAE_ZLIB_STATIC}" Threads::Threads Shlwapi
 	)
-	target_compile_options(melano PRIVATE /MP /W4 /permissive- /utf-8)
+	target_compile_options(melano PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:/MP;/W4;/permissive-;/utf-8>")
 else()
 	target_link_libraries(melano PUBLIC ${TORCH_LIBRARIES} ${HDF5_LIBRARIES} ZLIB::ZLIB Threads::Threads)
-	target_compile_options(melano PRIVATE -Wall -Wextra -Wpedantic)
+	target_compile_options(melano PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Wpedantic>")
 endif()
 target_compile_definitions(melano PRIVATE H5_USE_110_API)
+if(CMAKE_CUDA_COMPILER AND CAFFE2_USE_CUDA)
+	target_compile_definitions(melano PRIVATE GADIDAE_MELANO_CUDA=1)
+endif()
 
 function(melanoexecutable name source)
 	set(target "melano${name}")

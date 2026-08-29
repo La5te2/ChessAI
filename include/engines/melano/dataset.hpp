@@ -1,6 +1,6 @@
 #pragma once
 
-// Melano PGN-to-HDF5 preprocessing and one-shot supervised policy/value training.
+// Melano JSONL-to-HDF5 preprocessing and one-shot supervised policy/value training.
 
 #include "melano/game.hpp"
 #include "melano/precision.hpp"
@@ -21,7 +21,6 @@ struct SupervisedBatch {
 struct DatasetInfo {
 	std::int64_t length = 0;
 	std::int64_t chunk_rows = 1;
-	int has_comments = 1;
 	std::string arch_type;
 	std::string state_encoding;
 	std::string move_encoding;
@@ -45,7 +44,7 @@ public:
 
 	/// Returns immutable schema and row-count metadata.
 	const DatasetInfo &info() const noexcept;
-	/// Reads arbitrary rows and decodes state, move, and value tensors.
+	/// Reads arbitrary rows into compact state and move tensors plus floating-point values.
 	SupervisedBatch read(const std::vector<std::int64_t> &indices, bool pinned_memory = false) const;
 	/// Reads one contiguous range while preserving state, move, and value alignment.
 	SupervisedBatch read_contiguous(std::int64_t begin, std::int64_t count, bool pinned_memory = false) const;
@@ -56,17 +55,16 @@ private:
 };
 
 struct PreprocessOptions {
-	std::filesystem::path input = "data/games.pgn";
+	std::filesystem::path input = "data/evaluations.jsonl";
 	std::filesystem::path output = "data/games.melano.h5";
-	std::int64_t max_games = -1;
+	std::int64_t max_positions = -1;
 	int chunk_size = 16384;
-	int has_comments = 1;
 	int compression_level = 1;
 	int log_every = 10000;
 };
 
-/// Parses PGN games and writes Melano-specific state, policy, and value targets.
-void preprocess_pgn(const PreprocessOptions &options);
+/// Converts evaluation JSONL records into Melano supervision rows.
+void preprocess_jsonl(const PreprocessOptions &options);
 
 struct TrainOptions {
 	std::filesystem::path data = "data/games.melano.h5";
