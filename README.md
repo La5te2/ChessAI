@@ -219,13 +219,13 @@ build/melano/train \
 	--data data/positions.melano.h5 \
 	--out models/melano/melano.pth \
 	--channels 128 \
-	--blocks 20 \
+	--blocks 16 \
 	--epochs 2 \
 	--batch-size 512 \
 	--max-steps 0 \
 	--lr 0.001 \
 	--weight-decay 0.0001 \
-	--value-weight 1.0 \
+	--value-weight 0.8 \
 	--grad-clip 1.0 \
 	--device cuda \
 	--precision bf16 \
