@@ -109,41 +109,25 @@ The Gadus and Melano UCI executables publish their configurable engine options i
 
 ### Gadus
 
-Preprocess an annotated PGN into the Gadus HDF5 schema with:
+Preprocess a JSONL stream into the Gadus HDF5 schema with:
 
 ```bash
-build/gadus/preprocess \
-	--input data/ccrl.pgn \
-	--output data/games.gadus.h5 \
-	--has-cmt 1 \
-	--chunk-size 512 \
-	--compression-level 1 \
-	--log-every 10000 \
-	--max-games 1200000
-```
-
-`--has-cmt 1` derives Value targets from numerical PGN comments, while `--has-cmt 0` derives them from final game results. `--max-games` limits the number of PGN games read. `--chunk-size` controls HDF5 dataset extension units. `--compression-level` selects the deflate level. `--log-every` controls progress reporting by game count.
-
-The Gadus preprocessor can also consume the position-oriented [Lichess evaluation database](https://database.lichess.org/#evals). Stream the compressed JSONL file into the preprocessor so decompression and HDF5 writing proceed concurrently:
-
-```bash
-zstdcat data/lichess_db_eval.jsonl.zst | build/gadus/preprocess \
-	--source lichess-eval \
+zstdcat data/positions.jsonl.zst | build/gadus/preprocess \
 	--input - \
-	--output data/lichess.gadus.h5 \
+	--output data/positions.gadus.h5 \
 	--chunk-size 16384 \
 	--compression-level 1 \
 	--max-positions 300000000 \
-	--log-every 10000
+	--log-every 1000000
 ```
 
-For each position, the preprocessor selects the evaluation with the greatest search depth and uses its first principal variation. The first move supplies the Policy target, while its White-perspective `cp` or `mate` score is converted to the side-to-move Value scale used by Gadus. `--max-positions` places an optional limit on the number of accepted positions. An uncompressed JSONL file may be passed directly through `--input`.
+Each JSONL record contains a `fen` string and an `evals` array. The preprocessor selects the entry with the greatest `depth`, breaks equal-depth ties by `knodes` and uses its first principal variation. The first move in `line` supplies the Policy target, while the White-perspective `cp` or `mate` score supplies the side-to-move Value target. `--max-positions` limits accepted records. An uncompressed JSONL file may be passed directly through `--input`.
 
 Train a new Gadus model with:
 
 ```bash
 build/gadus/train \
-	--data data/lichess.gadus.h5 \
+	--data data/positions.gadus.h5 \
 	--out models/gadus/gadus.pth \
 	--channels 128 \
 	--blocks 12 \
@@ -214,28 +198,25 @@ The [UCI](#uci) section describes runtime options, output fields and time manage
 
 ### Melano
 
-Stream the Lichess evaluation dataset into the Melano HDF5 schema with:
+Preprocess a JSONL stream into the Melano HDF5 schema with:
 
 ```bash
-zstdcat data/lichess_db_eval.jsonl.zst | build/melano/preprocess \
-	--source lichess-eval \
+zstdcat data/positions.jsonl.zst | build/melano/preprocess \
 	--input - \
-	--output data/lichess.melano.h5 \
+	--output data/positions.melano.h5 \
 	--chunk-size 16384 \
 	--compression-level 1 \
-	--max-positions 50000000 \
+	--max-positions 100000000 \
 	--log-every 1000000
 ```
 
-For each JSONL record, the preprocessor selects the evaluation with the greatest depth, breaks equal-depth ties by `knodes` and uses the first principal variation from that evaluation. Its first move supplies the Policy target, while its `cp` or `mate` field supplies the side-to-move Value target. `--max-positions` limits accepted records.
-
-Annotated PGN input remains available with `--source pgn`. In this mode, `--has-cmt 1` derives Value targets from numerical comments, while `--has-cmt 0` derives them from final game results; `--max-games` limits the number of games read. In both modes, `--chunk-size` controls HDF5 dataset extension units, `--compression-level` selects the deflate level and `--log-every` controls progress reporting by accepted row count.
+Melano accepts the same JSONL record structure as Gadus. Its preprocessor applies the same evaluation and principal-variation selection rule, then encodes the resulting state and targets in the Melano HDF5 schema.
 
 Train a new Melano model with:
 
 ```bash
 build/melano/train \
-	--data data/lichess.melano.h5 \
+	--data data/positions.melano.h5 \
 	--out models/melano/melano.pth \
 	--channels 128 \
 	--blocks 20 \
@@ -433,8 +414,8 @@ The `scripts/` directory contains the Windows and Linux build launchers, checkpo
 `scripts/check.py` performs a read-only inspection of a Gadus or Melano checkpoint. The report includes its architecture, heads, architecture dimensions, parameter counts, tensor data types, tensor memory, devices, finite-value status, file size and SHA-256 digest.
 
 ```bash
-python scripts/check.py --model models/gadus/gadus.pth
-python scripts/check.py --model models/melano/melano.pth
+python scripts/check.py models/gadus/gadus.pth
+python scripts/check.py models/melano/melano.pth
 ```
 
 ## Graphics

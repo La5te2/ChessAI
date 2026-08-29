@@ -2,7 +2,6 @@
 
 #include "melano/dataset.hpp"
 #include "melano/checkpoint.hpp"
-#include "melano/cuda.hpp"
 #include <ATen/ops/_foreach_mul.h>
 #include <ATen/ops/_foreach_norm.h>
 #include <ATen/ops/index_select.h>
@@ -38,6 +37,38 @@ void set_learning_rate(torch::optim::AdamW &optimizer, double learning_rate) {
 	for (auto &group : optimizer.param_groups()) {
 		static_cast<torch::optim::AdamWOptions &>(group.options()).lr(learning_rate);
 	}
+}
+
+struct TrainingStep {
+	torch::Tensor policy_loss;
+	torch::Tensor value_bce;
+	torch::Tensor loss;
+};
+
+// Evaluate binary cross-entropy directly from the unbounded Value coordinate.
+torch::Tensor bce_logits(const torch::Tensor &logits, const torch::Tensor &targets) {
+	const auto score_logits = logits.squeeze(1).to(torch::kFloat32) * 2.0;
+	const auto probabilities = ((targets.to(torch::kFloat32) + 1.0) * 0.5).clamp(0.0, 1.0);
+	return torch::nn::functional::binary_cross_entropy_with_logits(score_logits, probabilities);
+}
+
+TrainingStep train_batch(Model &model, torch::optim::AdamW &optimizer, const torch::Tensor &states, const torch::Tensor &moves,
+                         const torch::Tensor &values, const torch::Device &device, ComputePrecision precision, double value_weight) {
+	optimizer.zero_grad();
+	const auto device_states = states.to(device, true);
+	const auto device_moves = moves.to(device, true).to(torch::kInt64);
+	const auto device_values = values.to(device, true);
+	torch::Tensor policy;
+	torch::Tensor predicted_value;
+	{
+		AutocastGuard autocast(precision, device);
+		std::tie(policy, predicted_value) = model->forward_training(device_states);
+	}
+	auto policy_loss = torch::nn::functional::cross_entropy(policy.to(torch::kFloat32), device_moves);
+	auto value_bce = bce_logits(predicted_value, device_values);
+	auto loss = policy_loss + value_weight * value_bce;
+	loss.backward();
+	return {policy_loss, value_bce, loss};
 }
 
 // Preserve pinned allocation while applying one shared row permutation to a loaded tensor.
@@ -255,13 +286,13 @@ chess::Move parse_pv_move(const chess::Board &board, std::string_view token) {
 	throw std::invalid_argument("PV starts with an illegal move: " + std::string(token));
 }
 
-struct EvaluationTarget {
+struct Target {
 	chess::Move move;
 	float value = 0.0F;
 };
 
 // Select the deepest evaluation, break equal depths by nodes, and use its first PV.
-EvaluationTarget evaluation_target(const nlohmann::json &record, const chess::Board &board) {
+Target target(const nlohmann::json &record, const chess::Board &board) {
 	if (!record.contains("evals") || !record.at("evals").is_array()) {
 		throw std::invalid_argument("record has no evaluation array");
 	}
@@ -522,8 +553,8 @@ SupervisedBatch SupervisedH5::read_contiguous(std::int64_t begin, std::int64_t c
 	};
 }
 
-// Stream position-evaluation JSONL records into the Melano schema.
-void preprocess_jsonl(const PreprocessOptions &options) {
+// Stream JSONL records into the Melano supervised schema.
+void preprocess(const PreprocessOptions &options) {
 	if (options.input != std::filesystem::path{"-"} && options.input.extension() == ".zst") {
 		throw std::invalid_argument("compressed JSONL input must be streamed with zstdcat and --input -");
 	}
@@ -533,7 +564,7 @@ void preprocess_jsonl(const PreprocessOptions &options) {
 	if (options.input != std::filesystem::path{"-"}) {
 		file.open(options.input);
 		if (!file) {
-			throw std::runtime_error("evaluation JSONL not found: " + options.input.string());
+			throw std::runtime_error("JSONL input not found: " + options.input.string());
 		}
 		input = &file;
 	}
@@ -569,12 +600,12 @@ void preprocess_jsonl(const PreprocessOptions &options) {
 				throw std::invalid_argument("record has no FEN");
 			}
 			chess::Board board(complete_fen(record.at("fen").get<std::string>()));
-			const auto target = evaluation_target(record, board);
+			const auto selected_target = target(record, board);
 			const auto state = encode_state(board);
-			const auto move = static_cast<std::uint16_t>(move_to_index(target.move, board.sideToMove()));
+			const auto move = static_cast<std::uint16_t>(move_to_index(selected_target.move, board.sideToMove()));
 			states.push_back(state);
 			moves.push_back(move);
-			values.push_back(target.value);
+			values.push_back(selected_target.value);
 			++accepted_records;
 			if (states.size() >= buffer_capacity) {
 				flush();
@@ -612,7 +643,6 @@ void train_supervised(const TrainOptions &options) {
 	model->train();
 	const auto parameters = model->parameters();
 	torch::optim::AdamW optimizer(parameters, torch::optim::AdamWOptions(options.learning_rate).weight_decay(options.weight_decay));
-	TrainingGraph training_graph;
 	const auto steps_per_epoch = std::max<std::int64_t>(1, (data.info().length + options.batch_size - 1) / options.batch_size);
 	const auto epoch_step_limit = std::max<std::int64_t>(1, static_cast<std::int64_t>(options.epochs) * steps_per_epoch);
 	const auto planned_steps = options.max_steps > 0 ? std::min(options.max_steps, epoch_step_limit) : epoch_step_limit;
@@ -661,7 +691,7 @@ void train_supervised(const TrainOptions &options) {
 				auto values = chunk.values.narrow(0, begin, count);
 				const double learning_rate = scheduled_learning_rate(options.learning_rate, global_step + 1, warmup_steps);
 				set_learning_rate(optimizer, learning_rate);
-				auto step = training_graph.run(model, optimizer, states, moves, values, device, options.precision, options.value_weight, count == options.batch_size);
+				auto step = train_batch(model, optimizer, states, moves, values, device, options.precision, options.value_weight);
 				if (options.grad_clip > 0.0) {
 					clip_gradient_norm_async(parameters, options.grad_clip);
 				}

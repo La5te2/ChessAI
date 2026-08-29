@@ -2,14 +2,9 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import sys
 from collections import Counter
 from pathlib import Path
-
-try:
-    import torch
-except ImportError as error:
-    raise SystemExit("check requires Python PyTorch for reading LibTorch checkpoints") from error
-
 
 ARCHITECTURES = {
     1: {
@@ -23,6 +18,16 @@ ARCHITECTURES = {
         "fields": ("type_id", "channels", "blocks", "action_size"),
     },
 }
+
+
+def load_torch():
+    try:
+        import torch
+    except Exception as error:
+        raise SystemExit(
+            f"check requires PyTorch, but {sys.executable} cannot import torch: {error}"
+        ) from error
+    return torch
 
 
 def sha256(path: Path) -> str:
@@ -70,7 +75,7 @@ def tensor_bytes(tensors) -> int:
     return sum(tensor.numel() * tensor.element_size() for tensor in tensors)
 
 
-def all_finite(tensors) -> bool:
+def all_finite(tensors, torch) -> bool:
     for tensor in tensors:
         value = tensor.detach()
         if (value.is_floating_point() or value.is_complex()) and not torch.isfinite(value).all().item():
@@ -83,6 +88,7 @@ def format_mib(byte_count: int) -> str:
 
 
 def inspect_model(path: Path) -> dict[str, object]:
+    torch = load_torch()
     try:
         archive = torch.jit.load(str(path), map_location="cpu")
     except Exception as error:
@@ -124,15 +130,15 @@ def inspect_model(path: Path) -> dict[str, object]:
             f"{name} ({count})" for name, count in sorted(dtype_counts.items())
         ),
         "devices": ", ".join(devices) or "none",
-        "finite": all_finite(tensors),
+        "finite": all_finite(tensors, torch),
     }
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Display basic information about a Gadidae LibTorch checkpoint."
+        description="Inspect a Gadus or Melano LibTorch checkpoint and detect its architecture."
     )
-    parser.add_argument("--model", required=True, type=Path)
+    parser.add_argument("model", type=Path, metavar="checkpoint")
     return parser.parse_args()
 
 

@@ -1,4 +1,4 @@
-// Implements Gadus PGN parsing, schema-checked HDF5 I/O, and supervised training.
+// Implements Gadus JSONL preprocessing, schema-checked HDF5 I/O, and supervised training.
 
 #include "gadus/dataset.hpp"
 #include "gadus/checkpoint.hpp"
@@ -11,7 +11,6 @@
 #include <nlohmann/json.hpp>
 #include <numeric>
 #include <random>
-#include <regex>
 #include <stdexcept>
 #include <torch/csrc/autograd/autograd.h>
 #include <torch/optim.h>
@@ -104,18 +103,6 @@ std::string read_string_attribute(hid_t object, const char *name) {
 	return std::string(buffer.data());
 }
 
-// Read a required integer attribute used for row counts and comment mode.
-std::int64_t read_int_attribute(hid_t object, const char *name) {
-	if (H5Aexists(object, name) <= 0) {
-		throw std::runtime_error(std::string("HDF5 missing required attribute: ") + name);
-	}
-	std::int64_t value = 0;
-	const hid_t attribute = require_id(H5Aopen(object, name, H5P_DEFAULT), name);
-	require_h5(H5Aread(attribute, H5T_NATIVE_INT64, &value), name);
-	H5Aclose(attribute);
-	return value;
-}
-
 class H5Writer {
 public:
 	// Create a fresh Gadus file with extensible, chunked architecture-specific datasets.
@@ -129,16 +116,8 @@ public:
 		write_string_attribute(file_, "move_encoding", kMoveEncoding);
 		write_string_attribute(file_, "target_schema", kTargetSchema);
 		write_string_attribute(file_, "value_perspective", "side_to_move");
-		const bool lichess_eval = options.source == "lichess-eval";
-		write_int_attribute(file_, "has_cmt", lichess_eval ? 1 : options.has_comments);
-		if (!lichess_eval && options.has_comments) {
-			write_string_attribute(file_, "comment_eval_perspective", "white");
-			write_string_attribute(file_, "comment_value_transform", "tanh(side_to_move_pawn_score/3)");
-		} else if (lichess_eval) {
-			write_string_attribute(file_, "evaluation_source", "lichess_cloud_eval");
-			write_string_attribute(file_, "evaluation_perspective", "white");
-			write_string_attribute(file_, "evaluation_value_transform", "tanh(side_to_move_centipawn_score/300)");
-		}
+		write_string_attribute(file_, "score_perspective", "white");
+		write_string_attribute(file_, "value_transform", "tanh(side_to_move_centipawn_score/300)");
 		states_ = create_dataset(
 		    "states", {0, kStatePlanes, 8}, {H5S_UNLIMITED, kStatePlanes, 8}, {static_cast<hsize_t>(std::max(1, options.chunk_size)), kStatePlanes, 8}, H5T_STD_U8LE);
 		moves_ = create_dataset("moves", {0}, {H5S_UNLIMITED}, {static_cast<hsize_t>(std::max(1, options.chunk_size))}, H5T_STD_U16LE);
@@ -178,20 +157,10 @@ public:
 	}
 
 	// Record final counters and flush all HDF5 buffers to disk.
-	void finish(std::int64_t games, std::int64_t skipped_games) {
-		write_int_attribute(file_, "games", games);
+	void finish(std::int64_t records, std::int64_t skipped_records) {
 		write_int_attribute(file_, "positions", static_cast<std::int64_t>(size_));
-		write_int_attribute(file_, "skipped_games", skipped_games);
-		require_h5(H5Fflush(file_, H5F_SCOPE_GLOBAL), "flush output file");
-	}
-
-	// Record source-line counters for a position-oriented evaluation export.
-	void finish_evaluations(std::int64_t source_records, std::int64_t skipped_records) {
-		write_int_attribute(file_, "games", 0);
-		write_int_attribute(file_, "positions", static_cast<std::int64_t>(size_));
-		write_int_attribute(file_, "source_records", source_records);
+		write_int_attribute(file_, "records", records);
 		write_int_attribute(file_, "skipped_records", skipped_records);
-		write_int_attribute(file_, "skipped_games", 0);
 		require_h5(H5Fflush(file_, H5F_SCOPE_GLOBAL), "flush output file");
 	}
 
@@ -235,47 +204,21 @@ private:
 	hsize_t size_ = 0;
 };
 
-// Parse a CCRL-style white-perspective signed pawn evaluation from a PGN comment.
-std::optional<double> comment_score_white(const std::string &comment) {
-	static const std::regex score_pattern(R"((^|[^A-Za-z0-9_.])([+-](?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+))(?:/[0-9]+)?)");
-	std::smatch match;
-	if (!std::regex_search(comment, match, score_pattern))
-		return std::nullopt;
-	return std::stod(match[2].str());
-}
-
-// Convert white-perspective pawn score to bounded side-to-move V=tanh(score/3).
-float comment_value(const std::string &comment, chess::Color turn) {
-	const double white = comment_score_white(comment).value_or(0.0);
-	const double side = turn == chess::Color::WHITE ? white : -white;
-	return static_cast<float>(std::tanh(side / 3.0));
-}
-
-// Convert a PGN game result to an exact side-to-move terminal target.
-float result_value(const std::string &result, chess::Color turn) {
-	float white = 0.0F;
-	if (result == "1-0")
-		white = 1.0F;
-	if (result == "0-1")
-		white = -1.0F;
-	return turn == chess::Color::WHITE ? white : -white;
-}
-
-// Lichess cloud evaluations use White's point of view; convert cp to the existing target scale.
-float lichess_cp_value(int centipawns, chess::Color turn) {
+// Convert a White-perspective centipawn score to the bounded side-to-move target.
+float cp_value(int centipawns, chess::Color turn) {
 	const double white = static_cast<double>(centipawns) / 100.0;
 	const double side = turn == chess::Color::WHITE ? white : -white;
 	return static_cast<float>(std::tanh(side / 3.0));
 }
 
 // Convert a White-perspective mate sign to an exact side-to-move endpoint.
-float lichess_mate_value(int mate, chess::Color turn) {
+float mate_value(int mate, chess::Color turn) {
 	const float white = mate > 0 ? 1.0F : -1.0F;
 	return turn == chess::Color::WHITE ? white : -white;
 }
 
-// Lichess FEN keys omit move counters, which chess-library expects in its full FEN parser.
-std::string complete_lichess_fen(const std::string &fen) {
+// Add move counters when a record contains the four-field FEN form.
+std::string complete_fen(const std::string &fen) {
 	const auto fields = static_cast<int>(std::count(fen.begin(), fen.end(), ' ')) + 1;
 	if (fields == 4)
 		return fen + " 0 1";
@@ -285,7 +228,7 @@ std::string complete_lichess_fen(const std::string &fen) {
 }
 
 // Match both ordinary UCI and UCI_Chess960 notation against the generated legal moves.
-chess::Move parse_lichess_pv_move(const chess::Board &board, std::string_view token) {
+chess::Move parse_pv_move(const chess::Board &board, std::string_view token) {
 	for (const auto &move : legal_moves(board)) {
 		if (chess::uci::moveToUci(move) == token || chess::uci::moveToUci(move, true) == token)
 			return move;
@@ -293,13 +236,13 @@ chess::Move parse_lichess_pv_move(const chess::Board &board, std::string_view to
 	throw std::invalid_argument("PV starts with an illegal move: " + std::string(token));
 }
 
-struct LichessTarget {
+struct Target {
 	chess::Move move;
 	float value = 0.0F;
 };
 
 // Select the deepest evaluation, breaking equal depths by searched nodes, then use its first PV.
-LichessTarget lichess_target(const nlohmann::json &record, const chess::Board &board) {
+Target target(const nlohmann::json &record, const chess::Board &board) {
 	if (!record.contains("evals") || !record.at("evals").is_array())
 		throw std::invalid_argument("record has no evaluation array");
 	const nlohmann::json *selected = nullptr;
@@ -332,160 +275,14 @@ LichessTarget lichess_target(const nlohmann::json &record, const chess::Board &b
 
 	float value = 0.0F;
 	if (pv.contains("cp") && pv.at("cp").is_number_integer()) {
-		value = lichess_cp_value(pv.at("cp").get<int>(), board.sideToMove());
+		value = cp_value(pv.at("cp").get<int>(), board.sideToMove());
 	} else if (pv.contains("mate") && pv.at("mate").is_number_integer() && pv.at("mate").get<int>() != 0) {
-		value = lichess_mate_value(pv.at("mate").get<int>(), board.sideToMove());
+		value = mate_value(pv.at("mate").get<int>(), board.sideToMove());
 	} else {
 		throw std::invalid_argument("selected principal variation has no cp or mate score");
 	}
-	return {parse_lichess_pv_move(board, first_move), value};
+	return {parse_pv_move(board, first_move), value};
 }
-
-struct StopPgnParsing {};
-
-// Recognize numeric movetext metadata after the PGN parser has removed leading digits.
-bool is_detached_numeric_metadata(std::string_view token) {
-	if (token.empty())
-		return false;
-	bool has_separator = false;
-	for (const char character : token) {
-		if (character == ':' || character == ',') {
-			has_separator = true;
-			continue;
-		}
-		if (character < '0' || character > '9')
-			return false;
-	}
-	return has_separator;
-}
-
-class PreprocessVisitor : public chess::pgn::Visitor {
-public:
-	// Bind parser callbacks to one Gadus writer and option set.
-	PreprocessVisitor(const PreprocessOptions &options, H5Writer &writer) : options_(options), writer_(writer) {}
-
-	// Reset per-game state and stop cleanly after max_games.
-	void startPgn() override {
-		if (options_.max_games >= 0 && games_ >= options_.max_games) {
-			throw StopPgnParsing{};
-		}
-		board_ = chess::Board();
-		result_ = "*";
-		previous_comment_.clear();
-		game_has_eval_ = false;
-		game_invalid_ = false;
-		game_states_.clear();
-		game_moves_.clear();
-		game_values_.clear();
-		detached_comment_.clear();
-		collecting_detached_comment_ = false;
-	}
-
-	// Capture Result and optional non-starting FEN headers before move parsing.
-	void header(std::string_view key, std::string_view value) override {
-		if (key == "Result")
-			result_ = std::string(value);
-		if (key == "FEN" && !value.empty())
-			board_ = chess::Board(value);
-	}
-
-	// Satisfy the visitor interface; no setup is needed after headers.
-	void startMoves() override {}
-
-	// Encode the pre-move state and use the previous post-move comment as its V target.
-	void move(std::string_view san, std::string_view comment) override {
-		if (san.empty()) {
-			if (options_.has_comments)
-				attach_detached_comment(comment);
-			return;
-		}
-		if (consume_detached_comment(san))
-			return;
-		if (is_detached_numeric_metadata(san)) {
-			if (options_.has_comments && !comment.empty())
-				attach_detached_comment(comment);
-			return;
-		}
-		if (game_invalid_)
-			return;
-		try {
-			const auto move = chess::uci::parseSan(board_, san);
-			game_states_.push_back(encode_state(board_));
-			game_moves_.push_back(static_cast<std::uint16_t>(full_action_index(move)));
-			game_values_.push_back(options_.has_comments ? comment_value(previous_comment_, board_.sideToMove()) : result_value(result_, board_.sideToMove()));
-			if (comment_score_white(std::string(comment)).has_value())
-				game_has_eval_ = true;
-			board_.makeMove(move);
-			previous_comment_ = std::string(comment);
-		} catch (const std::exception &error) {
-			game_invalid_ = true;
-			if (parse_warning_count_ < 8) {
-				std::cerr << "Gadus preprocess rejected game after SAN '" << san << "': " << error.what() << std::endl;
-				++parse_warning_count_;
-			}
-		}
-	}
-
-	// Commit complete games whose SAN sequence and requested target source are valid.
-	void endPgn() override {
-		if (game_invalid_ || (options_.has_comments && !game_has_eval_)) {
-			++skipped_games_;
-			return;
-		}
-		writer_.append(game_states_, game_moves_, game_values_);
-		++games_;
-		if (options_.log_every > 0 && games_ % options_.log_every == 0) {
-			std::cout << "preprocess progress: games=" << games_ << " positions=" << writer_.size() << " skipped=" << skipped_games_ << std::endl;
-		}
-	}
-
-	// Return the number of games committed to HDF5.
-	std::int64_t games() const { return games_; }
-	// Return the number of games rejected for invalid SAN or a missing requested target.
-	std::int64_t skipped_games() const { return skipped_games_; }
-
-private:
-	// Attach a parser-separated comment to the state reached by the preceding move.
-	void attach_detached_comment(std::string_view comment) {
-		previous_comment_ = std::string(comment);
-		if (comment_score_white(previous_comment_).has_value())
-			game_has_eval_ = true;
-	}
-
-	// Consume a brace comment that the PGN parser exposed through its SAN callback.
-	bool consume_detached_comment(std::string_view token) {
-		if (!collecting_detached_comment_ && (token.empty() || token.front() != '{'))
-			return false;
-		if (!detached_comment_.empty())
-			detached_comment_.push_back(' ');
-		detached_comment_.append(token);
-		collecting_detached_comment_ = detached_comment_.find('}') == std::string::npos;
-		if (collecting_detached_comment_)
-			return true;
-
-		const auto open = detached_comment_.find('{');
-		const auto close = detached_comment_.rfind('}');
-		attach_detached_comment(std::string_view(detached_comment_).substr(open + 1, close - open - 1));
-		detached_comment_.clear();
-		return true;
-	}
-
-	PreprocessOptions options_;
-	H5Writer &writer_;
-	chess::Board board_;
-	std::string result_;
-	std::string previous_comment_;
-	bool game_has_eval_ = false;
-	bool game_invalid_ = false;
-	std::vector<PackedState> game_states_;
-	std::vector<std::uint16_t> game_moves_;
-	std::vector<float> game_values_;
-	std::string detached_comment_;
-	bool collecting_detached_comment_ = false;
-	std::int64_t games_ = 0;
-	std::int64_t skipped_games_ = 0;
-	int parse_warning_count_ = 0;
-};
 
 // Build an ordered union of one-row hyperslabs for arbitrary batch indices.
 void select_rows(hid_t space, const std::vector<std::int64_t> &indices, int rank) {
@@ -513,7 +310,6 @@ struct SupervisedH5::Impl {
 		info.state_encoding = read_string_attribute(file, "state_encoding");
 		info.move_encoding = read_string_attribute(file, "move_encoding");
 		info.target_schema = read_string_attribute(file, "target_schema");
-		info.has_comments = static_cast<int>(read_int_attribute(file, "has_cmt"));
 		if (info.arch_type != kArchType || info.state_encoding != kStateEncoding || info.move_encoding != kMoveEncoding || info.target_schema != kTargetSchema) {
 			throw std::runtime_error("HDF5 schema does not match the Gadus architecture");
 		}
@@ -702,35 +498,10 @@ SupervisedBatch SupervisedH5::read_contiguous(std::int64_t begin, std::int64_t c
 	};
 }
 
-// Stream PGN input through the visitor and finalize a fresh Gadus dataset.
-void preprocess_pgn(const PreprocessOptions &options) {
-	if (options.has_comments != 0 && options.has_comments != 1) {
-		throw std::invalid_argument("has_comments must be 0 or 1");
-	}
-	std::ifstream input(options.input);
-	if (!input)
-		throw std::runtime_error("PGN not found: " + options.input.string());
-	std::cout << "preprocess start: input=" << options.input.string() << " output=" << options.output.string() << " arch_type=" << kArchType << " has_cmt=" << options.has_comments
-	          << std::endl;
-	H5Writer writer(options);
-	PreprocessVisitor visitor(options, writer);
-	try {
-		chess::pgn::StreamParser parser(input);
-		const auto error = parser.readGames(visitor);
-		if (error.hasError() && error.code() != chess::pgn::StreamParserError::NotEnoughData) {
-			throw std::runtime_error("PGN parse failed: " + error.message());
-		}
-	} catch (const StopPgnParsing &) {
-	}
-	writer.finish(visitor.games(), visitor.skipped_games());
-	std::cout << "preprocess summary: games=" << visitor.games() << " positions=" << writer.size() << " skipped=" << visitor.skipped_games()
-	          << " output=" << options.output.string() << std::endl;
-}
-
-// Stream position-oriented Lichess cloud evaluations into the Gadus supervised schema.
-void preprocess_lichess_evaluations(const PreprocessOptions &options) {
+// Stream JSONL records into the Gadus supervised schema.
+void preprocess(const PreprocessOptions &options) {
 	if (options.input != std::filesystem::path{"-"} && options.input.extension() == ".zst") {
-		throw std::invalid_argument("compressed Lichess input must be streamed with zstdcat and --input -");
+		throw std::invalid_argument("compressed JSONL input must be streamed through standard input with --input -");
 	}
 
 	std::ifstream file;
@@ -738,13 +509,11 @@ void preprocess_lichess_evaluations(const PreprocessOptions &options) {
 	if (options.input != std::filesystem::path{"-"}) {
 		file.open(options.input);
 		if (!file)
-			throw std::runtime_error("evaluation JSONL not found: " + options.input.string());
+			throw std::runtime_error("JSONL input not found: " + options.input.string());
 		input = &file;
 	}
 
-	PreprocessOptions writer_options = options;
-	writer_options.source = "lichess-eval";
-	H5Writer writer(writer_options);
+	H5Writer writer(options);
 	std::vector<PackedState> states;
 	std::vector<std::uint16_t> moves;
 	std::vector<float> values;
@@ -759,13 +528,13 @@ void preprocess_lichess_evaluations(const PreprocessOptions &options) {
 		values.clear();
 	};
 
-	std::cout << "Lichess evaluation preprocess start: input=" << options.input.string() << " output=" << options.output.string() << " arch_type=" << kArchType << std::endl;
-	std::int64_t source_records = 0;
+	std::cout << "preprocess start: input=" << options.input.string() << " output=" << options.output.string() << " arch_type=" << kArchType << std::endl;
+	std::int64_t records = 0;
 	std::int64_t accepted_records = 0;
 	std::int64_t skipped_records = 0;
 	std::string line;
 	while ((options.max_positions < 0 || accepted_records < options.max_positions) && std::getline(*input, line)) {
-		++source_records;
+		++records;
 		const auto state_count = states.size();
 		const auto move_count = moves.size();
 		const auto value_count = values.size();
@@ -776,18 +545,18 @@ void preprocess_lichess_evaluations(const PreprocessOptions &options) {
 			if (!record.is_object() || !record.contains("fen") || !record.at("fen").is_string()) {
 				throw std::invalid_argument("record has no FEN");
 			}
-			chess::Board board(complete_lichess_fen(record.at("fen").get<std::string>()));
-			const auto target = lichess_target(record, board);
+			chess::Board board(complete_fen(record.at("fen").get<std::string>()));
+			const auto selected_target = target(record, board);
 			const auto state = encode_state(board);
-			const auto move = static_cast<std::uint16_t>(full_action_index(target.move));
+			const auto move = static_cast<std::uint16_t>(full_action_index(selected_target.move));
 			states.push_back(state);
 			moves.push_back(move);
-			values.push_back(target.value);
+			values.push_back(selected_target.value);
 			++accepted_records;
 			if (states.size() >= buffer_capacity)
 				flush();
 			if (options.log_every > 0 && accepted_records % options.log_every == 0) {
-				std::cout << "Lichess evaluation preprocess progress: positions=" << accepted_records << " skipped=" << skipped_records << std::endl;
+				std::cout << "preprocess progress: positions=" << accepted_records << " skipped=" << skipped_records << std::endl;
 			}
 		} catch (const std::exception &error) {
 			states.resize(state_count);
@@ -795,13 +564,13 @@ void preprocess_lichess_evaluations(const PreprocessOptions &options) {
 			values.resize(value_count);
 			++skipped_records;
 			if (skipped_records <= 8) {
-				std::cerr << "Lichess evaluation preprocess skipped record " << source_records << ": " << error.what() << std::endl;
+				std::cerr << "preprocess skipped record " << records << ": " << error.what() << std::endl;
 			}
 		}
 	}
 	flush();
-	writer.finish_evaluations(source_records, skipped_records);
-	std::cout << "Lichess evaluation preprocess summary: records=" << source_records << " positions=" << accepted_records << " skipped=" << skipped_records
+	writer.finish(records, skipped_records);
+	std::cout << "preprocess summary: records=" << records << " positions=" << accepted_records << " skipped=" << skipped_records
 	          << " output=" << options.output.string() << std::endl;
 }
 

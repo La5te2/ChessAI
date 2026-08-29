@@ -1,6 +1,6 @@
 #pragma once
 
-// Melano JSONL-to-HDF5 preprocessing and one-shot supervised policy/value training.
+// Melano JSONL preprocessing and supervised policy/value training.
 
 #include "melano/game.hpp"
 #include "melano/precision.hpp"
@@ -55,7 +55,7 @@ private:
 };
 
 struct PreprocessOptions {
-	std::filesystem::path input = "data/evaluations.jsonl";
+	std::filesystem::path input = "data/positions.jsonl";
 	std::filesystem::path output = "data/games.melano.h5";
 	std::int64_t max_positions = -1;
 	int chunk_size = 16384;
@@ -63,8 +63,8 @@ struct PreprocessOptions {
 	int log_every = 10000;
 };
 
-/// Converts evaluation JSONL records into Melano supervision rows.
-void preprocess_jsonl(const PreprocessOptions &options);
+/// Converts JSONL records into Melano state, Policy, and Value targets.
+void preprocess(const PreprocessOptions &options);
 
 struct TrainOptions {
 	std::filesystem::path data = "data/games.melano.h5";

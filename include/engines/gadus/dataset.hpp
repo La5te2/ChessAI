@@ -1,6 +1,6 @@
 #pragma once
 
-// Gadus PGN-to-HDF5 preprocessing and one-shot supervised policy/value training.
+// Gadus JSONL preprocessing and supervised policy/value training.
 
 #include "gadus/game.hpp"
 #include "gadus/precision.hpp"
@@ -22,7 +22,6 @@ struct SupervisedBatch {
 struct DatasetInfo {
 	std::int64_t length = 0;
 	std::int64_t chunk_rows = 1;
-	int has_comments = 1;
 	std::string arch_type;
 	std::string state_encoding;
 	std::string move_encoding;
@@ -57,22 +56,16 @@ private:
 };
 
 struct PreprocessOptions {
-	std::filesystem::path input = "data/games.pgn";
+	std::filesystem::path input = "data/positions.jsonl";
 	std::filesystem::path output = "data/games.gadus.h5";
-	std::string source = "pgn";
-	std::int64_t max_games = -1;
 	std::int64_t max_positions = -1;
 	int chunk_size = 16384;
-	int has_comments = 1;
 	int compression_level = 1;
-	int log_every = 10000;
+	int log_every = 1000000;
 };
 
-/// Parses PGN games and writes Gadus-specific state, policy, and value targets.
-void preprocess_pgn(const PreprocessOptions &options);
-
-/// Converts Lichess cloud-evaluation JSONL records into Gadus supervision rows.
-void preprocess_lichess_evaluations(const PreprocessOptions &options);
+/// Converts JSONL records into Gadus state, Policy, and Value targets.
+void preprocess(const PreprocessOptions &options);
 
 struct TrainOptions {
 	std::filesystem::path data = "data/games.gadus.h5";

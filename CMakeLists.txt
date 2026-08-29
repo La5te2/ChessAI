@@ -205,7 +205,6 @@ if(GADIDAE_BUILD_MELANO)
 set(GADIDAE_MELANO_SOURCES
 	src/engines/melano/attention.cpp
 	src/engines/melano/checkpoint.cpp
-	src/engines/melano/cuda.cpp
 	src/engines/melano/args.cpp
 	src/engines/melano/dataset.cpp
 	src/engines/melano/game.cpp
@@ -236,9 +235,6 @@ else()
 	target_compile_options(melano PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Wpedantic>")
 endif()
 target_compile_definitions(melano PRIVATE H5_USE_110_API)
-if(CMAKE_CUDA_COMPILER AND CAFFE2_USE_CUDA)
-	target_compile_definitions(melano PRIVATE GADIDAE_MELANO_CUDA=1)
-endif()
 
 function(melanoexecutable name source)
 	set(target "melano${name}")

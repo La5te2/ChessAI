@@ -1,7 +1,6 @@
 // Implements Melano exact-state batched PUCT; search.cpp is its CLI front end.
 
 #include "melano/search.hpp"
-#include "melano/cuda.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -476,9 +475,16 @@ struct Searcher::Impl {
 
 		torch::InferenceMode guard;
 		auto states = encode_boards(pending_boards, pin_memory);
-		torch::Tensor probabilities;
+		const auto device_states = states.to(device, true);
+		const auto device_indices = legal_indices.to(device, true);
+		torch::Tensor logits;
 		torch::Tensor raw_values;
-		std::tie(probabilities, raw_values) = inference_graphs.run(model, states, legal_indices, device, options.precision);
+		{
+			AutocastGuard autocast(options.precision, device);
+			std::tie(logits, raw_values) = model->forward_legal(device_states, device_indices.clamp_min(0));
+		}
+		auto probabilities = torch::softmax(
+		    logits.to(torch::kFloat32).masked_fill(device_indices < 0, -std::numeric_limits<float>::infinity()), 1);
 		probabilities = probabilities.to(torch::kCPU).contiguous();
 		auto values = raw_values.reshape({-1}).to(torch::kFloat32).to(torch::kCPU).contiguous();
 
@@ -987,7 +993,6 @@ struct Searcher::Impl {
 	Model model;
 	torch::Device device;
 	SearchOptions options;
-	InferenceGraphs inference_graphs;
 	TrajectoryLruCache persistent_evaluation_cache{0};
 	int active_cpu_threads = 0;
 	double single_evaluation_ms = 0.0;

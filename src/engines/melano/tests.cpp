@@ -5,7 +5,6 @@
 
 #include "melano/checkpoint.hpp"
 #include "melano/attention.hpp"
-#include "melano/cuda.hpp"
 #include "melano/dataset.hpp"
 #include "melano/game.hpp"
 #include "melano/model.hpp"
@@ -241,7 +240,7 @@ int main() {
 		preprocess.chunk_size = 1;
 		preprocess.compression_level = 0;
 		preprocess.log_every = 0;
-		melano::preprocess_jsonl(preprocess);
+		melano::preprocess(preprocess);
 		{
 			melano::SupervisedH5 supervised(h5);
 			const auto batch = supervised.read_contiguous(0, 2);
@@ -337,25 +336,6 @@ int main() {
 			}
 		}
 		require(torch::allclose(legal_values, full_values), "legal-only Policy path changed the Value output");
-		{
-			const auto valid_width = static_cast<std::int64_t>(legal_test_actions.front().size());
-			auto padded_indices = torch::full({1, valid_width + 2}, -1, torch::TensorOptions().dtype(torch::kInt16));
-			auto padded_row = padded_indices.accessor<std::int16_t, 2>();
-			for (std::int64_t column = 0; column < valid_width; ++column) {
-				padded_row[0][column] = static_cast<std::int16_t>(legal_test_actions.front()[static_cast<std::size_t>(column)]);
-			}
-			torch::InferenceMode guard;
-			melano::InferenceGraphs inference_graphs;
-			auto [padded_policy, padded_value] =
-			    inference_graphs.run(model, melano::encode_boards({board}), padded_indices, torch::Device(torch::kCPU), melano::ComputePrecision::Fp32);
-			auto [valid_logits, valid_value] = model->forward_legal(
-			    melano::encode_boards({board}), padded_indices.slice(1, 0, valid_width).to(torch::kInt64));
-			const auto expected_policy = torch::softmax(valid_logits.to(torch::kFloat32), 1);
-			require(torch::allclose(padded_policy.slice(1, 0, valid_width), expected_policy), "padded inference changed legal Policy probabilities");
-			require(torch::equal(padded_policy.slice(1, valid_width), torch::zeros({1, 2}, padded_policy.options())),
-			    "padded inference assigned probability to sentinel actions");
-			require(torch::allclose(padded_value, valid_value), "padded inference changed the Value output");
-		}
 		(policy.mean() + value.mean()).backward();
 		require_finite_gradients(model);
 

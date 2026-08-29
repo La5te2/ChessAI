@@ -1,4 +1,4 @@
-// Melano evaluation-JSONL to HDF5 preprocessing command-line entry point.
+// Melano JSONL preprocessing command-line entry point.
 
 #include "melano/args.hpp"
 #include "melano/dataset.hpp"
@@ -9,7 +9,7 @@ int main(int argc, char **argv) {
 	try {
 		melano::Args args(argc, argv);
 		if (args.has("help")) {
-			std::cout << "Usage: preprocess --input <evaluations.jsonl|-> --output <games.melano.h5> [options]\n"
+			std::cout << "Usage: preprocess --input <path|-> --output <games.melano.h5> [options]\n"
 			          << "  --max-positions <n> --chunk-size <n>\n"
 			          << "  --compression-level <0..9> --log-every <accepted rows>\n";
 			return 0;
@@ -21,7 +21,7 @@ int main(int argc, char **argv) {
 		options.chunk_size = args.get_int("chunk-size", options.chunk_size);
 		options.compression_level = args.get_int("compression-level", options.compression_level);
 		options.log_every = args.get_int("log-every", options.log_every);
-		melano::preprocess_jsonl(options);
+		melano::preprocess(options);
 		return 0;
 	} catch (const std::exception &error) {
 		std::cerr << "preprocess error: " << error.what() << std::endl;
