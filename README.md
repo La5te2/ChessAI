@@ -151,9 +151,7 @@ Gadus checkpoints contain learned parameters and normalization state. Determinis
 Render the learned Gadus relation matrices from one trained checkpoint with:
 
 ```bash
-python scripts/visual.py \
-	--model models/gadus/gadus.pth \
-	--source e4
+python scripts/visual.py --model models/gadus/gadus.pth --source e4
 ```
 
 `--source` selects the source square shown in every heatmap and defaults to `e4`. Rows in the generated contact sheet follow the model's relation blocks, columns follow their computational groups, and each panel uses its own color scale so that learned spatial structure remains visible.
