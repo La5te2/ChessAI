@@ -16,7 +16,7 @@ Melano is a geometry-aware Transformer chess network that jointly predicts a mov
 - $\theta$ denotes the trainable network parameters.
 - $\ell_\theta(s)\in\mathbb R^{1858}$ is the complete vector of Policy logits produced by the network with parameters $\theta$, and $\ell_\theta(s,i)$ is its scalar component for action index $i\in\mathcal I_M$.
 - $\text{P}$, which stands for Policy, is the probability distribution that the network assigns to the legal actions of a specified complete state.
-- $\text{V}$, which stands for Value, is a scalar network output in $[-1,1]$ that estimates the expected game result from the perspective of the side to move.
+- $\text{V}$, which stands for Value, is a bounded scalar network output that estimates the side-to-move position-evaluation target.
 - $Q$ denotes a state or action evaluation defined by a particular procedure. Each definition specifies its arguments and observation perspective.
 - $\mathrm{clip}_{[l,u]}(y)=\min(u,\max(l,y))$ restricts scalar $y$ to the closed interval $[l,u]$.
 
@@ -527,7 +527,7 @@ i_n=i_M(x_n,a_n),
 y_n\in[-1,1].
 $$
 
-The encoded state $s_n$ is the canonical network input, and the compact action index $i_n$ is the corresponding canonical Policy target. The scalar $y_n$ is the Value target, expressed as an estimate of the expected game result from the perspective of the side to move in $x_n$. On this scale, $-1$ denotes a loss, $0$ denotes a draw and $1$ denotes a win, while intermediate values express expectations between these outcomes.
+The encoded state $s_n$ is the canonical network input, and the compact action index $i_n$ is the corresponding canonical Policy target. The scalar $y_n$ is the bounded Value target from the perspective of the side to move in $x_n$. Negative values favor the opposing side, positive values favor the friendly side and zero represents a neutral evaluation.
 
 ### 4.2 Supervised Objective
 
@@ -929,7 +929,7 @@ u(N_{\mathrm{cap}}-N_{\min})
 \right\rceil.
 $$
 
-The MCTS procedure recalculates $N_{\mathrm{target}}$ after each selection-and-evaluation cycle once the root has reached $N_{\min}$. A new cycle starts for a root only while its completed count is smaller than both the current target and the soft cap. The target and soft cap are checked between cycles, so backups completed within the final cycle may carry the final count beyond either threshold. A root with one legal action uses $u=0$ and admits no new cycle after reaching $N_{\min}$. A zero cap sets both $N_{\min}$ and $N_{\mathrm{target}}$ to zero.
+The MCTS procedure recalculates $N_{\mathrm{target}}$ after each selection-and-evaluation cycle once the root has reached $N_{\min}$. A new cycle starts for a root only while its completed count is smaller than both the current target and the soft cap. The number of simulations scheduled from each root is bounded by the remaining distance to both limits, so a cycle cannot exceed the target or cap in force when that cycle begins. Recalculation after the cycle may lower $N_{\mathrm{target}}$ below the completed count, in which case no further cycle begins. A root with one legal action uses $u=0$ and admits no new cycle after reaching $N_{\min}$. A zero cap sets both $N_{\min}$ and $N_{\mathrm{target}}$ to zero.
 
 An invocation configured with an unbounded simulation count bypasses $N_{\mathrm{target}}$ and $N_{\mathrm{cap}}$, so its selection-and-evaluation cycles continue until an execution deadline expires or the caller supplies a stop signal. A bounded invocation observes the same two stopping conditions together with $N_{\mathrm{target}}$ and $N_{\mathrm{cap}}$. When any applicable condition ends an invocation, the evaluator stops selecting leaves and submitting neural-evaluation requests. Completed backups remain in the tree, and Section 5.7 describes the release of virtual visits attached to unresolved requests.
 
@@ -939,7 +939,7 @@ Repeated network evaluation of the same `PackedState` produces the same compact 
 
 One MCTS invocation receives one or more root states and constructs a separate tree for each root. All trees created by that invocation access the same evaluation cache, which allows simulations within one tree and simulations from different trees to reuse completed network records. Let $M_C\geq0$ be the configured memory capacity for records retained across invocations. When $M_C=0$, the cache exists only for the current invocation. When $M_C>0$, the cache persists across invocations and uses TLRU (trajectory-aware least-recently-used) to order its records. A successful lookup moves the accessed record to the most-recent end of this order, and inserting a new record places it at the same end.
 
-TLRU records a directed link whenever evaluation of a child state follows evaluation of its parent state. Let $\mathcal C$ be the set of retained entries, let $E_C\subseteq\mathcal C\times\mathcal C$ contain these links and let $\kappa(v)\in\mathcal C$ identify the cache entry used by tree node $v$. After an invocation completes, a root $x_0$ assigns the following heat to each retained entry $c$ reached by its tree:
+TLRU records a directed link whenever evaluation of a child state follows evaluation of its parent state. Let $\mathcal C$ be the set of retained entries, and let $E_C\subseteq\mathcal C\times\mathcal C$ contain the retained directed links. For a visited tree node $v$ whose network record remains in $\mathcal C$, let $\kappa(v)$ identify that retained entry. Terminal nodes and nodes whose records are not retained contribute no cache identity. After an invocation completes, a root $x_0$ assigns the following heat to each retained entry $c$ reached by its tree:
 
 $$
 H_{x_0}(c)=
@@ -957,7 +957,7 @@ When the approximate memory use exceeds $M_C$, TLRU removes entries from the lea
 
 One MCTS invocation may receive several root states. The evaluator first resolves every initial request whose `PackedState` has a cached record, then groups the remaining requests by `PackedState`. When uncached requests remain, their unique states form one neural batch. Each cached or computed record initializes every root tree with the corresponding `PackedState`.
 
-The batching scheduler retains a latency estimate $\tau$, measured in milliseconds, from one invocation to the next. The estimate begins at zero. Let $\Delta t$ be the measured duration of a neural call that evaluates exactly one uncached state. Such a call supplies the sample
+The batching scheduler retains a latency estimate $\tau$, measured in milliseconds, from one invocation to the next. The estimate begins at zero. When an evaluation operation produces exactly one newly computed record, let $\Delta t$ be the elapsed time of that complete operation. This measurement supplies the sample
 
 $$
 \tau'=\max(0.05,\Delta t).

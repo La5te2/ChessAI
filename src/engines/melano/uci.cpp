@@ -31,7 +31,7 @@ struct EngineOptions {
 };
 
 constexpr int kProgressIntervalMs = 300;
-constexpr int kScoreScale = 1000;
+constexpr double kCentipawnValueScale = 300.0;
 
 // Resolve the explicitly packaged Melano checkpoint beside the executable without
 // introducing a repository fallback or coupling the model name to the EXE name.
@@ -327,8 +327,11 @@ private:
 		return 0;
 	}
 
-	// Map bounded neural value to a monotonic centipawn-like UCI display score.
-	int score_cp(float value) const { return static_cast<int>(std::lround(std::clamp(value, -0.999F, 0.999F) * kScoreScale)); }
+	// Invert the supervised Value transform for a finite centipawn display score.
+	int score_cp(float value) const {
+		const float bounded = std::clamp(value, std::nextafter(-1.0F, 0.0F), std::nextafter(1.0F, 0.0F));
+		return static_cast<int>(std::lround(kCentipawnValueScale * std::atanh(static_cast<double>(bounded))));
+	}
 
 	// Emit final or progressive MultiPV lines using root-side values and search statistics.
 	void emit_info(const melano::SearchResult &result) const {

@@ -19,14 +19,6 @@ namespace melano {
 
 namespace {
 
-std::size_t power_of_two_bucket(std::size_t value) {
-	std::size_t bucket = 1;
-	while (bucket < value) {
-		bucket *= 2;
-	}
-	return bucket;
-}
-
 using Clock = std::chrono::steady_clock;
 
 struct CompactEvaluation {
@@ -458,13 +450,11 @@ struct Searcher::Impl {
 		}
 
 		const bool pin_memory = device.is_cuda();
-		const auto evaluation_width = pin_memory ? power_of_two_bucket(legal_width) : legal_width;
 		auto index_options = torch::TensorOptions().dtype(torch::kInt16).device(torch::kCPU);
 		if (pin_memory) {
 			index_options = index_options.pinned_memory(true);
 		}
-		auto legal_indices = torch::full(
-		    {static_cast<std::int64_t>(pending.size()), static_cast<std::int64_t>(evaluation_width)}, -1, index_options);
+		auto legal_indices = torch::full({static_cast<std::int64_t>(pending.size()), static_cast<std::int64_t>(legal_width)}, -1, index_options);
 		auto index_rows = legal_indices.accessor<std::int16_t, 2>();
 		for (std::size_t row = 0; row < pending.size(); ++row) {
 			for (std::size_t column = 0; column < pending[row].legal_indices.size(); ++column) {
