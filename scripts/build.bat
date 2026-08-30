@@ -9,6 +9,7 @@ set "PUBLISH_DIR=%ROOT_DIR%\build"
 set "WORK_DIR=%PUBLISH_DIR%\.build-work"
 set "BUILD_GADUS=ON"
 set "BUILD_MELANO=ON"
+set "BUILD_ELEGINUS=ON"
 set "BUILD_GRAPHICS=ON"
 
 if not "%GADIDAE_TORCH_DIR%"=="" set "TORCH_DIR=%GADIDAE_TORCH_DIR%"
@@ -18,6 +19,9 @@ if /I "%GADIDAE_BUILD_GADUS%"=="FALSE" set "BUILD_GADUS=OFF"
 if /I "%GADIDAE_BUILD_MELANO%"=="0" set "BUILD_MELANO=OFF"
 if /I "%GADIDAE_BUILD_MELANO%"=="OFF" set "BUILD_MELANO=OFF"
 if /I "%GADIDAE_BUILD_MELANO%"=="FALSE" set "BUILD_MELANO=OFF"
+if /I "%GADIDAE_BUILD_ELEGINUS%"=="0" set "BUILD_ELEGINUS=OFF"
+if /I "%GADIDAE_BUILD_ELEGINUS%"=="OFF" set "BUILD_ELEGINUS=OFF"
+if /I "%GADIDAE_BUILD_ELEGINUS%"=="FALSE" set "BUILD_ELEGINUS=OFF"
 if /I "%GADIDAE_BUILD_GRAPHICS%"=="0" set "BUILD_GRAPHICS=OFF"
 if /I "%GADIDAE_BUILD_GRAPHICS%"=="OFF" set "BUILD_GRAPHICS=OFF"
 if /I "%GADIDAE_BUILD_GRAPHICS%"=="FALSE" set "BUILD_GRAPHICS=OFF"
@@ -28,7 +32,7 @@ if not "%GADIDAE_BUILD_GRAPHICS%"=="" if /I not "%GADIDAE_BUILD_GRAPHICS%"=="AUT
 	echo GADIDAE_BUILD_GRAPHICS must be auto, 0, or 1.
 	exit /b 1
 )
-if "%BUILD_GADUS%"=="OFF" if "%BUILD_MELANO%"=="OFF" if "%BUILD_GRAPHICS%"=="OFF" (
+if "%BUILD_GADUS%"=="OFF" if "%BUILD_MELANO%"=="OFF" if "%BUILD_ELEGINUS%"=="OFF" if "%BUILD_GRAPHICS%"=="OFF" (
 	echo At least one Gadidae architecture must be enabled.
 	exit /b 1
 )
@@ -80,15 +84,17 @@ if not exist "%PUBLISH_DIR%" mkdir "%PUBLISH_DIR%" || exit /b 1
 set "PATH=%NINJA_DIR%;%PATH%"
 set "VSLANG=1033"
 
-cmake -S "%ROOT_DIR%" -B "%WORK_DIR%" -G Ninja -DCMAKE_BUILD_TYPE=Release -DGADIDAE_BUILD_GADUS="%BUILD_GADUS%" -DGADIDAE_BUILD_MELANO="%BUILD_MELANO%" -DGADIDAE_BUILD_GRAPHICS="%BUILD_GRAPHICS%" -DGADIDAE_TORCH_DIR="%TORCH_DIR%" || goto :failed
+cmake -S "%ROOT_DIR%" -B "%WORK_DIR%" -G Ninja -DCMAKE_BUILD_TYPE=Release -DGADIDAE_BUILD_GADUS="%BUILD_GADUS%" -DGADIDAE_BUILD_MELANO="%BUILD_MELANO%" -DGADIDAE_BUILD_ELEGINUS="%BUILD_ELEGINUS%" -DGADIDAE_BUILD_GRAPHICS="%BUILD_GRAPHICS%" -DGADIDAE_TORCH_DIR="%TORCH_DIR%" || goto :failed
 cmake --build "%WORK_DIR%" --parallel || goto :failed
 ctest --test-dir "%WORK_DIR%" --output-on-failure || goto :failed
 
 if "%BUILD_GADUS%"=="ON" if exist "%PUBLISH_DIR%\gadus" rmdir /s /q "%PUBLISH_DIR%\gadus"
 if "%BUILD_MELANO%"=="ON" if exist "%PUBLISH_DIR%\melano" rmdir /s /q "%PUBLISH_DIR%\melano"
+if "%BUILD_ELEGINUS%"=="ON" if exist "%PUBLISH_DIR%\eleginus" rmdir /s /q "%PUBLISH_DIR%\eleginus"
 if "%BUILD_GRAPHICS%"=="ON" if exist "%PUBLISH_DIR%\graphics" rmdir /s /q "%PUBLISH_DIR%\graphics"
 if "%BUILD_GADUS%"=="ON" mkdir "%PUBLISH_DIR%\gadus" || goto :failed
 if "%BUILD_MELANO%"=="ON" mkdir "%PUBLISH_DIR%\melano" || goto :failed
+if "%BUILD_ELEGINUS%"=="ON" mkdir "%PUBLISH_DIR%\eleginus" || goto :failed
 if "%BUILD_GRAPHICS%"=="ON" mkdir "%PUBLISH_DIR%\graphics" || goto :failed
 
 if "%BUILD_GADUS%"=="ON" (
@@ -107,6 +113,13 @@ if "%BUILD_MELANO%"=="ON" (
 	for %%F in ("%WORK_DIR%\melano\*.dll") do copy /y "%%~fF" "%PUBLISH_DIR%\melano\%%~nxF" >nul || goto :failed
 )
 
+if "%BUILD_ELEGINUS%"=="ON" (
+	for %%F in (train search uci) do (
+		if not exist "%WORK_DIR%\eleginus\%%F.exe" goto :failed
+		copy /y "%WORK_DIR%\eleginus\%%F.exe" "%PUBLISH_DIR%\eleginus\%%F.exe" >nul || goto :failed
+	)
+)
+
 if "%BUILD_GRAPHICS%"=="ON" (
 	if not exist "%WORK_DIR%\graphics\Gadidae.exe" goto :failed
 	copy /y "%WORK_DIR%\graphics\Gadidae.exe" "%PUBLISH_DIR%\graphics\Gadidae.exe" >nul || goto :failed
@@ -114,6 +127,7 @@ if "%BUILD_GRAPHICS%"=="ON" (
 
 if "%BUILD_GADUS%"=="ON" echo Gadus build finished: %PUBLISH_DIR%\gadus
 if "%BUILD_MELANO%"=="ON" echo Melano build finished: %PUBLISH_DIR%\melano
+if "%BUILD_ELEGINUS%"=="ON" echo Eleginus build finished: %PUBLISH_DIR%\eleginus
 if "%BUILD_GRAPHICS%"=="ON" (
 	echo Gadidae graphics finished: %PUBLISH_DIR%\graphics
 ) else (

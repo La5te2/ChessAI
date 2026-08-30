@@ -497,4 +497,44 @@ GADIDAE_BUILD_GRAPHICS=1 bash scripts/build.sh
 
 Importing a new style name adds that style to the embedded archive, whereas reimporting an existing name atomically replaces the stored style. The `--curve-step` argument controls the curve-sampling distance and defaults to `1.5`. Smaller values produce smoother, denser meshes and larger archives, whereas larger values reduce archive size and import time.
 
-Every imported third-party style requires a separate declaration in `THIRD_PARTY.md`. The declaration records the author, permanent source URL, license name and version, license-text URL, modifications and every source used by a combined style.
+Every imported third-party style must be declared in the following subsection. A declaration identifies its author when known, permanent source, license and license text. A combined style must identify every source it uses.
+
+### Third-Party Pieces
+
+`src/graphics/piece.inc` contains the fixed built-in geometry, while `src/graphics/pieces.gpack` contains deduplicated and compressed indexed geometry for imported styles. Both files are generated from the SVG sources listed below. The source SVG files are one-time inputs and are not retained by the project. RhosGFX, Chessnut, Spatial and Fantasy use the Lichess repository at commit `c54596c9e1569d378fe20f80d4c790c6fdee54c4`.
+
+#### RhosGFX
+
+- Source: https://github.com/lichess-org/lila/tree/c54596c9e1569d378fe20f80d4c790c6fdee54c4/public/piece/rhosgfx
+- License: CC0 1.0
+- License text: https://creativecommons.org/publicdomain/zero/1.0/legalcode
+
+#### Chessnut
+
+- Author: Alexis Luengas
+- Source: https://github.com/lichess-org/lila/tree/c54596c9e1569d378fe20f80d4c790c6fdee54c4/public/piece/chessnut
+- License: Apache License 2.0
+- License text: https://www.apache.org/licenses/LICENSE-2.0
+
+#### Spatial
+
+- Author: Maurizio Monge
+- Source: https://github.com/lichess-org/lila/tree/c54596c9e1569d378fe20f80d4c790c6fdee54c4/public/piece/spatial
+- License: MIT
+- License text: https://opensource.org/license/mit
+
+#### Fantasy
+
+- Author: Maurizio Monge
+- Source: https://github.com/lichess-org/lila/tree/c54596c9e1569d378fe20f80d4c790c6fdee54c4/public/piece/fantasy
+- License: MIT
+- License text: https://opensource.org/license/mit
+
+#### Cburnett
+
+- Author: Colin M.L. Burnett
+- Source: https://commons.wikimedia.org/wiki/Template:SVG_chess_pieces
+- License: Creative Commons Attribution-ShareAlike 3.0 Unported
+- License text: https://creativecommons.org/licenses/by-sa/3.0/legalcode
+
+The generated geometry is embedded in Gadidae. The application does not load the source SVG files at runtime.

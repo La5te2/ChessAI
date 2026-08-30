@@ -1,4 +1,4 @@
-// Generated drawing geometry. Source and licenses: THIRD_PARTY.md.
+// Generated drawing geometry.
 #pragma once
 #include <array>
 #include <cstdint>

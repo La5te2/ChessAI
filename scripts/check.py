@@ -2,9 +2,18 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import math
+import struct
 import sys
+from array import array
 from collections import Counter
 from pathlib import Path
+
+ELEGINUS_MAGIC = b"ELEGINUS"
+ELEGINUS_TYPE_ID = 3
+ELEGINUS_FIXED_FEATURES = 33542
+ELEGINUS_HEADER = struct.Struct("=8sIII")
+ELEGINUS_TERM = struct.Struct("=II")
 
 ARCHITECTURES = {
     1: {
@@ -87,7 +96,54 @@ def format_mib(byte_count: int) -> str:
     return f"{byte_count / (1024 * 1024):.2f} MiB"
 
 
-def inspect_model(path: Path) -> dict[str, object]:
+def inspect_eleginus(path: Path) -> dict[str, object] | None:
+    with path.open("rb") as stream:
+        header = stream.read(ELEGINUS_HEADER.size)
+        if len(header) < 8 or header[:8] != ELEGINUS_MAGIC:
+            return None
+        if len(header) != ELEGINUS_HEADER.size:
+            raise ValueError("truncated Eleginus checkpoint header")
+        _, type_id, fixed_features, terms = ELEGINUS_HEADER.unpack(header)
+        if type_id != ELEGINUS_TYPE_ID:
+            raise ValueError(f"Eleginus checkpoint has unexpected type_id: {type_id}")
+        if fixed_features != ELEGINUS_FIXED_FEATURES:
+            raise ValueError(
+                f"Eleginus checkpoint has unexpected fixed feature count: {fixed_features}"
+            )
+        features = fixed_features + 2 * terms
+        expected_size = ELEGINUS_HEADER.size + terms * ELEGINUS_TERM.size + features * 4
+        if path.stat().st_size != expected_size:
+            raise ValueError("Eleginus checkpoint size does not match its feature count")
+        descriptors = [ELEGINUS_TERM.unpack(stream.read(ELEGINUS_TERM.size)) for _ in range(terms)]
+        if any(left > right or right >= fixed_features // 2 for left, right in descriptors):
+            raise ValueError("Eleginus checkpoint contains an invalid feature term")
+        if len(set(descriptors)) != len(descriptors):
+            raise ValueError("Eleginus checkpoint contains duplicate feature terms")
+        weights = array("f")
+        weights.fromfile(stream, features)
+
+    return {
+        "architecture": "eleginus",
+        "heads": "value",
+        "arch": {
+            "type_id": type_id,
+            "fixed_features": fixed_features,
+            "terms": terms,
+            "features": features,
+        },
+        "model_children": "none",
+        "parameters": features,
+        "trainable_parameters": features,
+        "parameter_tensors": 1,
+        "buffers": 0,
+        "tensor_memory": features * 4,
+        "dtypes": "float32 (1)",
+        "devices": "cpu",
+        "finite": all(math.isfinite(weight) for weight in weights),
+    }
+
+
+def inspect_libtorch(path: Path) -> dict[str, object]:
     torch = load_torch()
     try:
         archive = torch.jit.load(str(path), map_location="cpu")
@@ -134,9 +190,14 @@ def inspect_model(path: Path) -> dict[str, object]:
     }
 
 
+def inspect_model(path: Path) -> dict[str, object]:
+    eleginus = inspect_eleginus(path)
+    return eleginus if eleginus is not None else inspect_libtorch(path)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Inspect a Gadus or Melano LibTorch checkpoint and detect its architecture."
+        description="Inspect a Gadidae checkpoint and detect its architecture."
     )
     parser.add_argument("model", type=Path, metavar="checkpoint")
     return parser.parse_args()

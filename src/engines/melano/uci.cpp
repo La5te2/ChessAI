@@ -152,7 +152,7 @@ public:
 			} catch (const std::exception &error) {
 				print("info string " + command + " error: " + error.what());
 				if (command == "go") {
-					print("bestmove " + fallback_move());
+					print("bestmove 0000");
 				} else if (command == "isready") {
 					print("readyok");
 				}
@@ -386,16 +386,9 @@ private:
 				print("bestmove " + melano::move_uci(result.move));
 			} catch (const std::exception &error) {
 				print("info string go error: " + std::string(error.what()));
-				const auto moves = melano::legal_moves(board);
-				print("bestmove " + (moves.empty() ? std::string("0000") : melano::move_uci(moves.front())));
+				print("bestmove 0000");
 			}
 		});
-	}
-
-	// Supply a deterministic legal move only when command recovery needs a protocol response.
-	std::string fallback_move() const {
-		const auto moves = melano::legal_moves(board_);
-		return moves.empty() ? "0000" : melano::move_uci(moves.front());
 	}
 
 	EngineOptions options_;
