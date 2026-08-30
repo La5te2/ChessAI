@@ -42,6 +42,7 @@ set "VERIFY_ZLIB=OFF"
 set "VERIFY_JSON=OFF"
 if "%BUILD_GADUS%"=="ON" set "VERIFY_TORCH=ON"
 if "%BUILD_MELANO%"=="ON" set "VERIFY_TORCH=ON"
+if "%BUILD_ELEGINUS%"=="ON" set "VERIFY_TORCH=ON"
 if "%BUILD_GADUS%"=="ON" set "VERIFY_HDF5=ON"
 if "%BUILD_MELANO%"=="ON" set "VERIFY_HDF5=ON"
 if "%BUILD_GADUS%"=="ON" set "VERIFY_ZLIB=ON"
@@ -118,6 +119,7 @@ if "%BUILD_ELEGINUS%"=="ON" (
 		if not exist "%WORK_DIR%\eleginus\%%F.exe" goto :failed
 		copy /y "%WORK_DIR%\eleginus\%%F.exe" "%PUBLISH_DIR%\eleginus\%%F.exe" >nul || goto :failed
 	)
+	for %%F in ("%WORK_DIR%\eleginus\*.dll") do copy /y "%%~fF" "%PUBLISH_DIR%\eleginus\%%~nxF" >nul || goto :failed
 )
 
 if "%BUILD_GRAPHICS%"=="ON" (

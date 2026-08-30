@@ -400,6 +400,23 @@ int main() {
 		const auto after_clear = cached_searcher.search(board);
 		require(after_clear.nn_evaluations == 1 && after_clear.evaluation_reuses == 0, "cache clear did not force root reevaluation");
 
+		// Canonical cache hits must rebuild physical moves before MCTS expansion.
+		auto canonical_cache_options = cached_options;
+		canonical_cache_options.mcts_sims = 4;
+		canonical_cache_options.mcts_min_sims = 4;
+		canonical_cache_options.mcts_batch_size = 2;
+		melano::Searcher canonical_cache_searcher(loaded, torch::Device(torch::kCPU), canonical_cache_options);
+		const auto canonical_white_result = canonical_cache_searcher.search(canonical_white);
+		const auto canonical_black_result = canonical_cache_searcher.search(canonical_black);
+		require(canonical_black_result.evaluation_reuses > 0, "canonical opposite-side position did not reuse its network evaluation");
+		require(melano::index_to_move(melano::move_to_index(canonical_white_result.move, canonical_white.sideToMove()), canonical_white) == canonical_white_result.move,
+		    "cached canonical white search returned an illegal move");
+		require(melano::index_to_move(melano::move_to_index(canonical_black_result.move, canonical_black.sideToMove()), canonical_black) == canonical_black_result.move,
+		    "cached canonical black search returned an illegal move");
+		require(melano::move_to_index(canonical_white_result.move, canonical_white.sideToMove()) ==
+		            melano::move_to_index(canonical_black_result.move, canonical_black.sideToMove()),
+		    "canonical cache reuse changed the selected action");
+
 		// Four simulations cover PUCT selection, neural expansion, and value backup.
 		melano::SearchOptions mcts_options = policy_options;
 		mcts_options.mcts_sims = 4;

@@ -18,7 +18,26 @@ constexpr int kPairOffset = kAttackOffset + 2 * 6 * 6;
 constexpr int kPawnOffset = kPairOffset + 2 * 6 * 6 * 225;
 constexpr int kKingOffset = kPawnOffset + 4 * 8;
 constexpr int kCastlingOffset = kKingOffset + 6;
-static_assert(kCastlingOffset + 2 == FeatureMap::kCoreFeatures);
+static_assert(kCastlingOffset + 2 == FeatureMap::kPrimitiveFeatures);
+
+enum ControlFeature {
+	friendly_control,
+	enemy_control,
+	contested_control,
+	friendly_exclusive_control,
+	enemy_exclusive_control,
+	friendly_hanging_count,
+	enemy_hanging_count,
+	friendly_hanging_value,
+	enemy_hanging_value,
+	friendly_overloaded,
+	enemy_overloaded,
+	friendly_king_escapes,
+	enemy_king_escapes,
+	friendly_king_pressure,
+	enemy_king_pressure
+};
+static_assert(enemy_king_pressure + 1 == FeatureMap::kControlFeatures);
 
 enum TopologyFeature {
 	locked_pawn_pairs,
@@ -93,6 +112,22 @@ struct Token {
 	chess::Bitboard attacks;
 };
 
+struct ControlField {
+	std::array<std::array<std::uint8_t, 64>, 2> count{};
+	std::array<std::array<std::uint16_t, 64>, 2> minimum{};
+	std::array<chess::Bitboard, 2> map{};
+};
+
+struct Coordinates {
+	float material = 0.0F;
+	float openness = 0.0F;
+	float pawn_freedom = 0.0F;
+	float king_exposure = 0.0F;
+	float constraint = 0.0F;
+};
+
+enum class Family { general, mobility, pawn, king, transition };
+
 struct Scratch {
 	std::array<float, FeatureMap::kBaseFeatures> values{};
 	std::array<std::uint32_t, FeatureMap::kBaseFeatures> stamps{};
@@ -150,15 +185,56 @@ chess::Bitboard attacks_for(const chess::Board &board, chess::Square square, che
 	return attacks_for(board, token);
 }
 
-std::array<StructuralSummary, 2> structural_summaries(const chess::Board &board) {
-	std::array<StructuralSummary, 2> summaries;
-	std::array<chess::Bitboard, 2> attack_maps;
-	for (int square = 0; square < 64; ++square) {
-		const auto piece = board.at(chess::Square(square));
-		if (piece != chess::Piece::NONE) {
-			attack_maps[static_cast<std::size_t>(piece.color())] |= attacks_for(board, chess::Square(square), piece);
+int piece_value(int type) noexcept {
+	constexpr std::array<int, 6> values{{100, 320, 330, 500, 900, 20000}};
+	return values[static_cast<std::size_t>(type)];
+}
+
+ControlField control_field(const std::vector<Token> &pieces) {
+	ControlField field;
+	for (auto &side : field.minimum) {
+		side.fill(std::numeric_limits<std::uint16_t>::max());
+	}
+	for (const auto &piece : pieces) {
+		const auto color = static_cast<std::size_t>(piece.color);
+		auto attacks = piece.attacks;
+		field.map[color] |= attacks;
+		while (attacks) {
+			const auto square = static_cast<std::size_t>(attacks.pop());
+			field.count[color][square] = static_cast<std::uint8_t>(std::min(255, field.count[color][square] + 1));
+			field.minimum[color][square] = static_cast<std::uint16_t>(
+				std::min<int>(field.minimum[color][square], piece_value(piece.type)));
 		}
 	}
+	return field;
+}
+
+ControlField control_field(const chess::Board &board) {
+	ControlField field;
+	for (auto &side : field.minimum) {
+		side.fill(std::numeric_limits<std::uint16_t>::max());
+	}
+	for (int square = 0; square < 64; ++square) {
+		const auto source = chess::Square(square);
+		const auto piece = board.at(source);
+		if (piece == chess::Piece::NONE) {
+			continue;
+		}
+		const auto color = static_cast<std::size_t>(piece.color());
+		const int type = static_cast<int>(piece.type().internal());
+		auto attacks = attacks_for(board, source, piece);
+		field.map[color] |= attacks;
+		while (attacks) {
+			const auto target = static_cast<std::size_t>(attacks.pop());
+			field.count[color][target] = static_cast<std::uint8_t>(std::min(255, field.count[color][target] + 1));
+			field.minimum[color][target] = static_cast<std::uint16_t>(std::min<int>(field.minimum[color][target], piece_value(type)));
+		}
+	}
+	return field;
+}
+
+std::array<StructuralSummary, 2> structural_summaries(const chess::Board &board, const ControlField &field) {
+	std::array<StructuralSummary, 2> summaries;
 	for (int square = 0; square < 64; ++square) {
 		const auto source = chess::Square(square);
 		const auto piece = board.at(source);
@@ -169,7 +245,7 @@ std::array<StructuralSummary, 2> structural_summaries(const chess::Board &board)
 		auto &summary = summaries[static_cast<std::size_t>(color)];
 		const auto own = board.us(color);
 		const auto enemy = board.us(~color);
-		const auto enemy_attacks = attack_maps[static_cast<std::size_t>(~color)];
+		const auto enemy_attacks = field.map[static_cast<std::size_t>(~color)];
 		const int type = static_cast<int>(piece.type().internal());
 		const auto attacks = attacks_for(board, source, piece);
 		summary.safe_mobility += static_cast<int>((attacks & ~own & ~enemy_attacks).count());
@@ -196,9 +272,13 @@ std::array<StructuralSummary, 2> structural_summaries(const chess::Board &board)
 		summary.pawn_breaks += static_cast<int>((attacks & enemy & board.pieces(chess::PieceType::PAWN, ~color)).count());
 	}
 	for (int side = 0; side < 2; ++side) {
-		summaries[static_cast<std::size_t>(side)].control = static_cast<int>(attack_maps[static_cast<std::size_t>(side)].count());
+		summaries[static_cast<std::size_t>(side)].control = static_cast<int>(field.map[static_cast<std::size_t>(side)].count());
 	}
 	return summaries;
+}
+
+std::array<StructuralSummary, 2> structural_summaries(const chess::Board &board) {
+	return structural_summaries(board, control_field(board));
 }
 
 std::array<int, 6> summary_values(const StructuralSummary &summary) {
@@ -252,6 +332,60 @@ float phase_of(const std::vector<Token> &pieces) {
 	return std::min(24, phase) / 24.0F;
 }
 
+Family family_of(std::uint32_t index) noexcept {
+	if (index >= FeatureMap::kTransitionOffset) {
+		return Family::transition;
+	}
+	if (index >= FeatureMap::kTopologyOffset) {
+		const int topology = static_cast<int>(index) - FeatureMap::kTopologyOffset;
+		if (topology == locked_pawn_pairs || topology == pawn_files || topology == pawn_contacts ||
+			topology == friendly_pawn_advances || topology == enemy_pawn_advances || topology == friendly_pawn_breaks ||
+			topology == enemy_pawn_breaks) {
+			return Family::pawn;
+		}
+		return Family::mobility;
+	}
+	if (index >= FeatureMap::kControlOffset) {
+		const int control = static_cast<int>(index) - FeatureMap::kControlOffset;
+		if (control == friendly_king_escapes || control == enemy_king_escapes || control == friendly_king_pressure ||
+			control == enemy_king_pressure) {
+			return Family::king;
+		}
+		return Family::mobility;
+	}
+	if (index >= kKingOffset) {
+		return Family::king;
+	}
+	if (index >= kPawnOffset) {
+		return Family::pawn;
+	}
+	if ((index >= kMobilityOffset && index < kPairOffset)) {
+		return Family::mobility;
+	}
+	return Family::general;
+}
+
+std::array<float, FeatureMap::kRegimes> mixture(Family family, const Coordinates &coordinates) noexcept {
+	float structure = coordinates.openness;
+	switch (family) {
+	case Family::pawn:
+		structure = coordinates.pawn_freedom;
+		break;
+	case Family::king:
+		structure = coordinates.king_exposure;
+		break;
+	case Family::transition:
+		structure = coordinates.constraint;
+		break;
+	case Family::general:
+	case Family::mobility:
+		break;
+	}
+	const float endgame = 1.0F - coordinates.material;
+	const float closed = 1.0F - structure;
+	return {{endgame * closed, endgame * structure, coordinates.material * closed, coordinates.material * structure}};
+}
+
 bool candidate_atom(std::uint32_t index) noexcept {
 	return index != kBiasOffset && (index < kPairOffset || index >= kPawnOffset);
 }
@@ -289,6 +423,7 @@ void FeatureMap::extract(const chess::Board &board, std::span<const FeatureTerm>
 	for (auto &piece : pieces) {
 		piece.attacks = attacks_for(board, piece);
 	}
+	const auto controls = control_field(pieces);
 
 	thread_local Scratch scratch;
 	scratch.reset();
@@ -308,6 +443,78 @@ void FeatureMap::extract(const chess::Board &board, std::span<const FeatureTerm>
 	for (int type = 0; type < 5; ++type) {
 		scratch.add(kMaterialOffset + type, static_cast<float>(counts[0][type] - counts[1][type]));
 	}
+
+	const auto friendly_index = static_cast<std::size_t>(friendly);
+	const auto enemy_index = static_cast<std::size_t>(~friendly);
+	const auto contested = controls.map[friendly_index] & controls.map[enemy_index];
+	const int control = FeatureMap::kControlOffset;
+	scratch.add(control + friendly_control, static_cast<float>(controls.map[friendly_index].count()) / 64.0F);
+	scratch.add(control + enemy_control, static_cast<float>(controls.map[enemy_index].count()) / 64.0F);
+	scratch.add(control + contested_control, static_cast<float>(contested.count()) / 64.0F);
+	scratch.add(control + friendly_exclusive_control,
+		static_cast<float>((controls.map[friendly_index] & ~controls.map[enemy_index]).count()) / 64.0F);
+	scratch.add(control + enemy_exclusive_control,
+		static_cast<float>((controls.map[enemy_index] & ~controls.map[friendly_index]).count()) / 64.0F);
+
+	std::array<int, 2> hanging_count{};
+	std::array<int, 2> hanging_value{};
+	std::array<int, 2> overloaded_count{};
+	for (const auto &piece : pieces) {
+		if (piece.type == 5) {
+			continue;
+		}
+		const auto own = static_cast<std::size_t>(piece.color);
+		const auto enemy = static_cast<std::size_t>(~piece.color);
+		const auto square = static_cast<std::size_t>(piece.square.index());
+		const bool attacked = controls.count[enemy][square] != 0;
+		const bool loose = controls.count[own][square] == 0;
+		const bool cheaper_attacker = controls.minimum[enemy][square] < piece_value(piece.type);
+		const bool outnumbered = controls.count[enemy][square] > controls.count[own][square];
+		if (attacked && (loose || cheaper_attacker || outnumbered)) {
+			++hanging_count[own];
+			hanging_value[own] += piece_value(piece.type);
+		}
+	}
+	for (const auto &defender : pieces) {
+		const auto own = static_cast<std::size_t>(defender.color);
+		const auto enemy = static_cast<std::size_t>(~defender.color);
+		int obligations = 0;
+		for (const auto &target : pieces) {
+			if (target.color != defender.color || target.type == 5 || target.square == defender.square) {
+				continue;
+			}
+			const auto square = static_cast<std::size_t>(target.square.index());
+			if (static_cast<bool>(defender.attacks & chess::Bitboard::fromSquare(target.square)) && controls.count[enemy][square] != 0 &&
+				controls.count[own][square] == 1) {
+				++obligations;
+			}
+		}
+		overloaded_count[own] += obligations >= 2 ? 1 : 0;
+	}
+	std::array<int, 2> king_escapes{};
+	std::array<int, 2> king_pressure{};
+	for (int side = 0; side < 2; ++side) {
+		const auto color = static_cast<chess::Color>(side);
+		const auto king = board.kingSq(color);
+		const auto ring = chess::attacks::king(king);
+		king_escapes[static_cast<std::size_t>(side)] =
+			static_cast<int>((ring & ~board.us(color) & ~controls.map[static_cast<std::size_t>(~color)]).count());
+		auto pressure_squares = ring | chess::Bitboard::fromSquare(king);
+		while (pressure_squares) {
+			king_pressure[static_cast<std::size_t>(side)] +=
+				controls.count[static_cast<std::size_t>(~color)][static_cast<std::size_t>(pressure_squares.pop())];
+		}
+	}
+	scratch.add(control + friendly_hanging_count, static_cast<float>(hanging_count[friendly_index]) / 8.0F);
+	scratch.add(control + enemy_hanging_count, static_cast<float>(hanging_count[enemy_index]) / 8.0F);
+	scratch.add(control + friendly_hanging_value, static_cast<float>(hanging_value[friendly_index]) / 900.0F);
+	scratch.add(control + enemy_hanging_value, static_cast<float>(hanging_value[enemy_index]) / 900.0F);
+	scratch.add(control + friendly_overloaded, static_cast<float>(overloaded_count[friendly_index]) / 4.0F);
+	scratch.add(control + enemy_overloaded, static_cast<float>(overloaded_count[enemy_index]) / 4.0F);
+	scratch.add(control + friendly_king_escapes, static_cast<float>(king_escapes[friendly_index]) / 8.0F);
+	scratch.add(control + enemy_king_escapes, static_cast<float>(king_escapes[enemy_index]) / 8.0F);
+	scratch.add(control + friendly_king_pressure, static_cast<float>(king_pressure[friendly_index]) / 16.0F);
+	scratch.add(control + enemy_king_pressure, static_cast<float>(king_pressure[enemy_index]) / 16.0F);
 
 	for (const auto &piece : pieces) {
 		const float sign = piece.side == 0 ? 1.0F : -1.0F;
@@ -395,7 +602,7 @@ void FeatureMap::extract(const chess::Board &board, std::span<const FeatureTerm>
 	scratch.add(kCastlingOffset, static_cast<float>(rights.has(friendly, Side::KING_SIDE) - rights.has(~friendly, Side::KING_SIDE)));
 	scratch.add(kCastlingOffset + 1, static_cast<float>(rights.has(friendly, Side::QUEEN_SIDE) - rights.has(~friendly, Side::QUEEN_SIDE)));
 
-	const auto summaries = structural_summaries(board);
+	const auto summaries = structural_summaries(board, controls);
 	const auto &friendly_summary = summaries[static_cast<std::size_t>(friendly)];
 	const auto &enemy_summary = summaries[static_cast<std::size_t>(~friendly)];
 	int locked_pairs = 0;
@@ -444,6 +651,18 @@ void FeatureMap::extract(const chess::Board &board, std::span<const FeatureTerm>
 	scratch.add(topology + enemy_regions, static_cast<float>(enemy_access.first) / 8.0F);
 	scratch.add(topology + friendly_largest_region, static_cast<float>(friendly_access.second) / 64.0F);
 	scratch.add(topology + enemy_largest_region, static_cast<float>(enemy_access.second) / 64.0F);
+
+	Coordinates coordinates;
+	coordinates.material = phase_of(pieces);
+	coordinates.openness = std::clamp((static_cast<float>(open_file_count) / 8.0F +
+		1.0F - static_cast<float>(locked_pairs) / 8.0F +
+		static_cast<float>(friendly_summary.slider_reach + enemy_summary.slider_reach) / 128.0F) / 3.0F, 0.0F, 1.0F);
+	coordinates.pawn_freedom = std::clamp((static_cast<float>(friendly_summary.pawn_advances + enemy_summary.pawn_advances) / 32.0F +
+		static_cast<float>(friendly_summary.pawn_breaks + enemy_summary.pawn_breaks) / 16.0F) * 0.5F, 0.0F, 1.0F);
+	coordinates.king_exposure = std::clamp((static_cast<float>(king_pressure[0] + king_pressure[1]) / 32.0F +
+		1.0F - static_cast<float>(king_escapes[0] + king_escapes[1]) / 16.0F) * 0.5F, 0.0F, 1.0F);
+	coordinates.constraint = std::clamp(1.0F -
+		static_cast<float>(friendly_summary.safe_mobility + enemy_summary.safe_mobility) / 128.0F, 0.0F, 1.0F);
 
 	if (board.occ().count() <= FeatureMap::kTransitionPieceLimit) {
 		chess::Movelist moves;
@@ -513,10 +732,8 @@ void FeatureMap::extract(const chess::Board &board, std::span<const FeatureTerm>
 		}
 	}
 
-	const float middlegame = phase_of(pieces);
-	const float endgame = 1.0F - middlegame;
 	output.clear();
-	output.reserve(2 * (scratch.active.size() + terms.size()));
+	output.reserve(kRegimes * (scratch.active.size() + terms.size()));
 	if (candidate_atoms) {
 		candidate_atoms->clear();
 		candidate_atoms->reserve(scratch.active.size());
@@ -529,11 +746,11 @@ void FeatureMap::extract(const chess::Board &board, std::span<const FeatureTerm>
 		if (candidate_atoms && candidate_atom(index)) {
 			candidate_atoms->push_back({index, value});
 		}
-		if (middlegame > 0.0F) {
-			output.push_back({2 * index, value * middlegame});
-		}
-		if (endgame > 0.0F) {
-			output.push_back({2 * index + 1, value * endgame});
+		const auto gate = mixture(family_of(index), coordinates);
+		for (std::uint32_t regime = 0; regime < kRegimes; ++regime) {
+			if (gate[regime] != 0.0F) {
+				output.push_back({kRegimes * index + regime, value * gate[regime]});
+			}
 		}
 	}
 	for (std::size_t term_index = 0; term_index < terms.size(); ++term_index) {
@@ -542,12 +759,12 @@ void FeatureMap::extract(const chess::Board &board, std::span<const FeatureTerm>
 		if (value == 0.0F) {
 			continue;
 		}
-		const auto index = static_cast<std::uint32_t>(kFixedFeatures + 2 * term_index);
-		if (middlegame > 0.0F) {
-			output.push_back({index, value * middlegame});
-		}
-		if (endgame > 0.0F) {
-			output.push_back({index + 1, value * endgame});
+		const auto index = static_cast<std::uint32_t>(kFixedFeatures + kRegimes * term_index);
+		const auto gate = mixture(Family::general, coordinates);
+		for (std::uint32_t regime = 0; regime < kRegimes; ++regime) {
+			if (gate[regime] != 0.0F) {
+				output.push_back({index + regime, value * gate[regime]});
+			}
 		}
 	}
 }
@@ -555,8 +772,11 @@ void FeatureMap::extract(const chess::Board &board, std::span<const FeatureTerm>
 void FeatureMap::initialize(std::vector<float> &weights) const {
 	weights.assign(kFixedFeatures, 0.0F);
 	auto set = [&](int base, float middlegame_cp, float endgame_cp) {
-		weights[static_cast<std::size_t>(2 * base)] = middlegame_cp;
-		weights[static_cast<std::size_t>(2 * base + 1)] = endgame_cp;
+		const auto offset = static_cast<std::size_t>(kRegimes * base);
+		weights[offset] = endgame_cp;
+		weights[offset + 1] = endgame_cp;
+		weights[offset + 2] = middlegame_cp;
+		weights[offset + 3] = middlegame_cp;
 	};
 
 	constexpr std::array<float, 5> middlegame_material{{82.0F, 337.0F, 365.0F, 477.0F, 1025.0F}};

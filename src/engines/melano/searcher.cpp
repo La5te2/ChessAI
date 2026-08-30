@@ -2,6 +2,7 @@
 
 #include "melano/search.hpp"
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -86,14 +87,15 @@ public:
 			touch(found->second);
 			return found->second.id;
 		}
-		const std::size_t bytes = entry_bytes(evaluation);
+		auto stored = evaluation;
+		stored.cache_id = 0;
+		stored.legal_moves = std::vector<chess::Move>{};
+		const std::size_t bytes = entry_bytes(stored);
 		if (bytes > capacity_bytes_) {
 			return 0;
 		}
 		recency_.push_back(state);
 		auto recency = std::prev(recency_.end());
-		auto stored = evaluation;
-		stored.cache_id = 0;
 		const auto id = next_id_++;
 		auto [entry, inserted] = entries_.emplace(state, Entry{std::move(stored), recency, {}, id, 0, 0.0, bytes});
 		if (!inserted) {
@@ -268,6 +270,41 @@ private:
 	std::unordered_map<std::uint64_t, Entry *> entries_by_id_;
 };
 
+// Rebind a canonical cached Policy to the physical moves of the requested board.
+void bind_cached_moves(const chess::Board &board, CompactEvaluation &evaluation) {
+	if (evaluation.legal_indices.size() != evaluation.legal_policy.size()) {
+		throw std::logic_error("cached legal index and Policy widths differ");
+	}
+	std::array<float, kActionSize> policy_by_action{};
+	std::array<bool, kActionSize> present{};
+	for (std::size_t index = 0; index < evaluation.legal_indices.size(); ++index) {
+		const int action = evaluation.legal_indices[index];
+		if (action < 0 || action >= kActionSize || present[static_cast<std::size_t>(action)]) {
+			throw std::logic_error("cached legal action set is invalid");
+		}
+		present[static_cast<std::size_t>(action)] = true;
+		policy_by_action[static_cast<std::size_t>(action)] = evaluation.legal_policy[index];
+	}
+
+	auto moves = legal_moves(board);
+	if (moves.size() != evaluation.legal_indices.size()) {
+		throw std::logic_error("cached legal action set does not match the requested board");
+	}
+	evaluation.legal_moves = std::move(moves);
+	evaluation.legal_indices.clear();
+	evaluation.legal_policy.clear();
+	evaluation.legal_indices.reserve(evaluation.legal_moves.size());
+	evaluation.legal_policy.reserve(evaluation.legal_moves.size());
+	for (const auto &move : evaluation.legal_moves) {
+		const int action = move_to_index(move, board.sideToMove());
+		if (!present[static_cast<std::size_t>(action)]) {
+			throw std::logic_error("cached Policy is missing a legal action for the requested board");
+		}
+		evaluation.legal_indices.push_back(action);
+		evaluation.legal_policy.push_back(policy_by_action[static_cast<std::size_t>(action)]);
+	}
+}
+
 struct Node {
 	// Create an edge/node pair with its Policy prior and incoming legal move.
 	explicit Node(float initial_prior = 0.0F, chess::Move incoming = chess::Move::NO_MOVE) : prior(initial_prior), move(incoming) {}
@@ -421,6 +458,7 @@ struct Searcher::Impl {
 		for (std::size_t row = 0; row < boards.size(); ++row) {
 			const auto state = encode_state(boards[row]);
 			if (cache != nullptr && cache->get(state, output[row])) {
+				bind_cached_moves(boards[row], output[row]);
 				output[row].reused = true;
 				row_cached[row] = true;
 				continue;

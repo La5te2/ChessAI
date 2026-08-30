@@ -21,13 +21,17 @@ struct FeatureTerm {
 
 class FeatureMap {
 public:
-	static constexpr int kCoreFeatures = 16708;
+	static constexpr int kPrimitiveFeatures = 16708;
+	static constexpr int kControlOffset = kPrimitiveFeatures;
+	static constexpr int kControlFeatures = 15;
+	static constexpr int kCoreFeatures = kControlOffset + kControlFeatures;
 	static constexpr int kTopologyOffset = kCoreFeatures;
 	static constexpr int kTopologyFeatures = 18;
 	static constexpr int kTransitionOffset = kTopologyOffset + kTopologyFeatures;
 	static constexpr int kTransitionFeatures = 45;
 	static constexpr int kBaseFeatures = kTransitionOffset + kTransitionFeatures;
-	static constexpr int kFixedFeatures = 2 * kBaseFeatures;
+	static constexpr int kRegimes = 4;
+	static constexpr int kFixedFeatures = kRegimes * kBaseFeatures;
 	static constexpr int kTransitionPieceLimit = 10;
 
 	void extract(const chess::Board &board, std::vector<Feature> &output) const;

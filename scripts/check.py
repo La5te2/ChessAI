@@ -11,7 +11,7 @@ from pathlib import Path
 
 ELEGINUS_MAGIC = b"ELEGINUS"
 ELEGINUS_TYPE_ID = 3
-ELEGINUS_FIXED_FEATURES = 33542
+ELEGINUS_FIXED_FEATURES = 67144
 ELEGINUS_HEADER = struct.Struct("=8sIII")
 ELEGINUS_TERM = struct.Struct("=II")
 
@@ -110,21 +110,21 @@ def inspect_eleginus(path: Path) -> dict[str, object] | None:
             raise ValueError(
                 f"Eleginus checkpoint has unexpected fixed feature count: {fixed_features}"
             )
-        features = fixed_features + 2 * terms
-        expected_size = ELEGINUS_HEADER.size + terms * ELEGINUS_TERM.size + features * 4
+        features = fixed_features + 4 * terms
+        expected_size = ELEGINUS_HEADER.size + terms * ELEGINUS_TERM.size + 2 * features * 4
         if path.stat().st_size != expected_size:
             raise ValueError("Eleginus checkpoint size does not match its feature count")
         descriptors = [ELEGINUS_TERM.unpack(stream.read(ELEGINUS_TERM.size)) for _ in range(terms)]
-        if any(left > right or right >= fixed_features // 2 for left, right in descriptors):
+        if any(left > right or right >= fixed_features // 4 for left, right in descriptors):
             raise ValueError("Eleginus checkpoint contains an invalid feature term")
         if len(set(descriptors)) != len(descriptors):
             raise ValueError("Eleginus checkpoint contains duplicate feature terms")
         weights = array("f")
-        weights.fromfile(stream, features)
+        weights.fromfile(stream, 2 * features)
 
     return {
         "architecture": "eleginus",
-        "heads": "value",
+        "heads": "value, uncertainty",
         "arch": {
             "type_id": type_id,
             "fixed_features": fixed_features,
@@ -132,12 +132,12 @@ def inspect_eleginus(path: Path) -> dict[str, object] | None:
             "features": features,
         },
         "model_children": "none",
-        "parameters": features,
-        "trainable_parameters": features,
-        "parameter_tensors": 1,
+        "parameters": 2 * features,
+        "trainable_parameters": 2 * features,
+        "parameter_tensors": 2,
         "buffers": 0,
-        "tensor_memory": features * 4,
-        "dtypes": "float32 (1)",
+        "tensor_memory": 2 * features * 4,
+        "dtypes": "float32 (2)",
         "devices": "cpu",
         "finite": all(math.isfinite(weight) for weight in weights),
     }

@@ -21,6 +21,7 @@ constexpr int kMateThreshold = 29000;
 constexpr int kInfinity = 32000;
 constexpr int kMaximumStaticScore = 25000;
 constexpr std::size_t kMaximumLegalMoves = 256;
+constexpr int kMaximumPrincipalVariation = 128;
 
 enum class Bound : std::uint8_t { exact, lower, upper };
 
@@ -212,6 +213,7 @@ struct Iteration {
 	chess::Move move{chess::Move::NO_MOVE};
 	int score = -kInfinity;
 	std::vector<RootMove> root;
+	std::vector<chess::Move> principal_variation;
 };
 
 class Context {
@@ -274,7 +276,8 @@ public:
 		return std::clamp(model_.centipawns(board), -kMaximumStaticScore, kMaximumStaticScore);
 	}
 
-	int quiescence(chess::Board &board, int ply, int remaining, int alpha, int beta) {
+	int quiescence(chess::Board &board, int ply, int remaining, int alpha, int beta, std::optional<int> initial_evaluation = std::nullopt) {
+		clear_pv(ply);
 		visit(ply);
 		if (const auto terminal = terminal_score(board, ply)) {
 			return *terminal;
@@ -285,7 +288,7 @@ public:
 		int stand_pat = -kInfinity;
 		int best = -kInfinity;
 		if (!in_check) {
-			stand_pat = evaluate(board);
+			stand_pat = initial_evaluation ? *initial_evaluation : evaluate(board);
 			best = mandatory_move_probe ? -kInfinity : stand_pat;
 			if ((!mandatory_move_probe && stand_pat >= beta) || remaining <= 0) {
 				return stand_pat;
@@ -316,7 +319,10 @@ public:
 			board.makeMove(candidate.move);
 			const int score = -quiescence(board, ply + 1, remaining - 1, -beta, -alpha);
 			board.unmakeMove(candidate.move);
-			best = std::max(best, score);
+			if (score > best) {
+				best = score;
+				update_pv(ply, candidate.move);
+			}
 			if (score >= beta) {
 				return score;
 			}
@@ -325,9 +331,22 @@ public:
 		return best;
 	}
 
-	int pvs(chess::Board &board, int depth, int ply, int alpha, int beta) {
+	int pvs(chess::Board &board, int depth, int ply, int alpha, int beta, int uncertainty_budget) {
+		clear_pv(ply);
 		if (depth <= 0) {
-			return quiescence(board, ply, options_.quiescence_depth, alpha, beta);
+			if (uncertainty_budget > 0 && !board.inCheck()) {
+				const auto evaluation = model_.evaluate(board);
+				++evaluated_nodes;
+				if (evaluation.uncertainty >= options_.uncertainty_threshold) {
+					depth = 1;
+					--uncertainty_budget;
+				} else {
+					const int score = std::clamp(static_cast<int>(std::lround(evaluation.centipawns)), -kMaximumStaticScore, kMaximumStaticScore);
+					return quiescence(board, ply, options_.quiescence_depth, alpha, beta, score);
+				}
+			} else {
+				return quiescence(board, ply, options_.quiescence_depth, alpha, beta);
+			}
 		}
 		visit(ply);
 		if (const auto terminal = terminal_score(board, ply)) {
@@ -338,7 +357,7 @@ public:
 		chess::Move preferred(chess::Move::NO_MOVE);
 		if (const auto *entry = state_.table.probe(key)) {
 			preferred = entry->best_move();
-			if (entry->depth >= depth) {
+			if (entry->depth >= depth && !options_.capture_principal_variation) {
 				const int cached = score_from_table(entry->score, ply);
 				if (entry->bound() == Bound::exact) {
 					return cached;
@@ -379,26 +398,28 @@ public:
 			board.makeMove(move);
 			int score;
 			if (index == 0) {
-				score = -pvs(board, depth - 1, ply + 1, -beta, -alpha);
+				score = -pvs(board, depth - 1, ply + 1, -beta, -alpha, uncertainty_budget);
 			} else {
 				const bool reduce = depth >= 3 && current_quiet >= 3 && quiet && !checking && !in_check &&
 					!transition_sensitive && move != preferred;
 				if (reduce) {
-					score = -pvs(board, depth - 1 - reduction_for(depth, current_quiet), ply + 1, -alpha - 1, -alpha);
+					score = -pvs(board, depth - 1 - reduction_for(depth, current_quiet), ply + 1, -alpha - 1, -alpha,
+						uncertainty_budget);
 					if (score > alpha) {
-						score = -pvs(board, depth - 1, ply + 1, -alpha - 1, -alpha);
+						score = -pvs(board, depth - 1, ply + 1, -alpha - 1, -alpha, uncertainty_budget);
 					}
 				} else {
-					score = -pvs(board, depth - 1, ply + 1, -alpha - 1, -alpha);
+					score = -pvs(board, depth - 1, ply + 1, -alpha - 1, -alpha, uncertainty_budget);
 				}
 				if (score > alpha && score < beta) {
-					score = -pvs(board, depth - 1, ply + 1, -beta, -alpha);
+					score = -pvs(board, depth - 1, ply + 1, -beta, -alpha, uncertainty_budget);
 				}
 			}
 			board.unmakeMove(move);
 			if (score > best) {
 				best = score;
 				best_move = move;
+				update_pv(ply, move);
 			}
 			alpha = std::max(alpha, score);
 			if (alpha >= beta) {
@@ -452,11 +473,12 @@ public:
 			board.makeMove(move);
 			int score;
 			if (exact_lines || index == 0) {
-				score = -pvs(board, depth - 1, 1, -kInfinity, exact_lines ? kInfinity : -alpha);
+				score = -pvs(board, depth - 1, 1, -kInfinity, exact_lines ? kInfinity : -alpha,
+					options_.uncertainty_extensions);
 			} else {
-				score = -pvs(board, depth - 1, 1, -alpha - 1, -alpha);
+				score = -pvs(board, depth - 1, 1, -alpha - 1, -alpha, options_.uncertainty_extensions);
 				if (score > alpha) {
-					score = -pvs(board, depth - 1, 1, -kInfinity, -alpha);
+					score = -pvs(board, depth - 1, 1, -kInfinity, -alpha, options_.uncertainty_extensions);
 				}
 			}
 			board.unmakeMove(move);
@@ -464,6 +486,10 @@ public:
 			if (score > result.score) {
 				result.score = score;
 				result.move = move;
+				result.principal_variation.clear();
+				result.principal_variation.push_back(move);
+				const auto child = principal_variation(1);
+				result.principal_variation.insert(result.principal_variation.end(), child.begin(), child.end());
 			}
 			if (!exact_lines) {
 				alpha = std::max(alpha, score);
@@ -481,6 +507,36 @@ public:
 	int selective_depth = 0;
 
 private:
+	void clear_pv(int ply) noexcept {
+		if (ply >= 0 && ply < kMaximumPrincipalVariation) {
+			pv_length_[static_cast<std::size_t>(ply)] = ply;
+		}
+	}
+
+	void update_pv(int ply, chess::Move move) noexcept {
+		if (ply < 0 || ply >= kMaximumPrincipalVariation) {
+			return;
+		}
+		auto &line = pv_[static_cast<std::size_t>(ply)];
+		line[static_cast<std::size_t>(ply)] = move;
+		const int child_length = ply + 1 < kMaximumPrincipalVariation ? pv_length_[static_cast<std::size_t>(ply + 1)] : ply + 1;
+		const int length = std::clamp(child_length, ply + 1, kMaximumPrincipalVariation);
+		if (ply + 1 < kMaximumPrincipalVariation) {
+			const auto &child = pv_[static_cast<std::size_t>(ply + 1)];
+			std::copy(child.begin() + ply + 1, child.begin() + length, line.begin() + ply + 1);
+		}
+		pv_length_[static_cast<std::size_t>(ply)] = length;
+	}
+
+	std::vector<chess::Move> principal_variation(int ply) const {
+		if (ply < 0 || ply >= kMaximumPrincipalVariation) {
+			return {};
+		}
+		const int length = std::clamp(pv_length_[static_cast<std::size_t>(ply)], ply, kMaximumPrincipalVariation);
+		const auto &line = pv_[static_cast<std::size_t>(ply)];
+		return {line.begin() + ply, line.begin() + length};
+	}
+
 	void visit(int ply) {
 		++nodes;
 		selective_depth = std::max(selective_depth, ply);
@@ -492,13 +548,17 @@ private:
 	SearchState &state_;
 	SearchCancel cancel_;
 	Clock::time_point started_;
+	std::array<std::array<chess::Move, kMaximumPrincipalVariation>, kMaximumPrincipalVariation> pv_{};
+	std::array<int, kMaximumPrincipalVariation> pv_length_{};
 };
 
 } // namespace
 
 Searcher::Searcher(const Model &model, SearchOptions options) : model_(&model), options_(options) {
 	if (options.depth <= 0 || options.depth > 64 || options.quiescence_depth < 0 || options.quiescence_depth > 32 ||
-		options.hash_mb == 0 || options.hash_mb > 4096 || options.multipv <= 0 || options.multipv > 256) {
+		options.hash_mb == 0 || options.hash_mb > 4096 || options.multipv <= 0 || options.multipv > 256 ||
+		options.uncertainty_threshold < 0.0F || options.uncertainty_threshold > 1.0F ||
+		options.uncertainty_extensions < 0 || options.uncertainty_extensions > 4) {
 		throw std::invalid_argument("Eleginus search options are outside the supported range");
 	}
 	state_ = std::make_unique<SearchState>(options_.hash_mb);
@@ -528,6 +588,7 @@ SearchResult Searcher::search(const chess::Board &board, const SearchProgress &p
 			result.score_cp = iteration.score;
 			result.depth = depth;
 			result.root = iteration.root;
+			result.principal_variation = iteration.principal_variation;
 			result.nodes = context.nodes;
 			result.evaluated_nodes = context.evaluated_nodes;
 			result.selective_depth = context.selective_depth;

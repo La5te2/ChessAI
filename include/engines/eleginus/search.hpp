@@ -15,6 +15,9 @@ struct SearchOptions {
 	std::uint64_t node_limit = 0;
 	int movetime_ms = 0;
 	int multipv = 1;
+	float uncertainty_threshold = 0.35F;
+	int uncertainty_extensions = 1;
+	bool capture_principal_variation = false;
 };
 
 struct RootMove {
@@ -32,6 +35,7 @@ struct SearchResult {
 	std::uint64_t evaluated_nodes = 0;
 	std::uint64_t elapsed_ms = 0;
 	std::vector<RootMove> root;
+	std::vector<chess::Move> principal_variation;
 };
 
 using SearchProgress = std::function<void(const SearchResult &)>;
