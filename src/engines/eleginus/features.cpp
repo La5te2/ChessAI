@@ -386,26 +386,9 @@ std::array<float, FeatureMap::kRegimes> mixture(Family family, const Coordinates
 	return {{endgame * closed, endgame * structure, coordinates.material * closed, coordinates.material * structure}};
 }
 
-bool candidate_atom(std::uint32_t index) noexcept {
-	return index != kBiasOffset && (index < kPairOffset || index >= kPawnOffset);
-}
-
 } // namespace
 
-std::size_t FeatureMap::candidate_terms() noexcept {
-	std::size_t atoms = 0;
-	for (int index = 0; index < kBaseFeatures; ++index) {
-		atoms += candidate_atom(static_cast<std::uint32_t>(index)) ? 1U : 0U;
-	}
-	return atoms * (atoms + 1U) / 2U;
-}
-
 void FeatureMap::extract(const chess::Board &board, std::vector<Feature> &output) const {
-	extract(board, {}, output);
-}
-
-void FeatureMap::extract(const chess::Board &board, std::span<const FeatureTerm> terms, std::vector<Feature> &output,
-	std::vector<Feature> *candidate_atoms) const {
 	thread_local std::vector<Token> pieces;
 	pieces.clear();
 	pieces.reserve(32);
@@ -733,37 +716,16 @@ void FeatureMap::extract(const chess::Board &board, std::span<const FeatureTerm>
 	}
 
 	output.clear();
-	output.reserve(kRegimes * (scratch.active.size() + terms.size()));
-	if (candidate_atoms) {
-		candidate_atoms->clear();
-		candidate_atoms->reserve(scratch.active.size());
-	}
+	output.reserve(kRegimes * scratch.active.size());
 	for (const auto index : scratch.active) {
 		const float value = scratch.get(index);
 		if (value == 0.0F) {
 			continue;
 		}
-		if (candidate_atoms && candidate_atom(index)) {
-			candidate_atoms->push_back({index, value});
-		}
 		const auto gate = mixture(family_of(index), coordinates);
 		for (std::uint32_t regime = 0; regime < kRegimes; ++regime) {
 			if (gate[regime] != 0.0F) {
 				output.push_back({kRegimes * index + regime, value * gate[regime]});
-			}
-		}
-	}
-	for (std::size_t term_index = 0; term_index < terms.size(); ++term_index) {
-		const auto &term = terms[term_index];
-		const float value = scratch.get(term.left) * scratch.get(term.right);
-		if (value == 0.0F) {
-			continue;
-		}
-		const auto index = static_cast<std::uint32_t>(kFixedFeatures + kRegimes * term_index);
-		const auto gate = mixture(Family::general, coordinates);
-		for (std::uint32_t regime = 0; regime < kRegimes; ++regime) {
-			if (gate[regime] != 0.0F) {
-				output.push_back({index + regime, value * gate[regime]});
 			}
 		}
 	}

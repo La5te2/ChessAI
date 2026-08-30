@@ -12,8 +12,7 @@ from pathlib import Path
 ELEGINUS_MAGIC = b"ELEGINUS"
 ELEGINUS_TYPE_ID = 3
 ELEGINUS_FIXED_FEATURES = 67144
-ELEGINUS_HEADER = struct.Struct("=8sIII")
-ELEGINUS_TERM = struct.Struct("=II")
+ELEGINUS_HEADER = struct.Struct("=8sII")
 
 ARCHITECTURES = {
     1: {
@@ -103,22 +102,17 @@ def inspect_eleginus(path: Path) -> dict[str, object] | None:
             return None
         if len(header) != ELEGINUS_HEADER.size:
             raise ValueError("truncated Eleginus checkpoint header")
-        _, type_id, fixed_features, terms = ELEGINUS_HEADER.unpack(header)
+        _, type_id, fixed_features = ELEGINUS_HEADER.unpack(header)
         if type_id != ELEGINUS_TYPE_ID:
             raise ValueError(f"Eleginus checkpoint has unexpected type_id: {type_id}")
         if fixed_features != ELEGINUS_FIXED_FEATURES:
             raise ValueError(
                 f"Eleginus checkpoint has unexpected fixed feature count: {fixed_features}"
             )
-        features = fixed_features + 4 * terms
-        expected_size = ELEGINUS_HEADER.size + terms * ELEGINUS_TERM.size + 2 * features * 4
+        features = fixed_features
+        expected_size = ELEGINUS_HEADER.size + 2 * features * 4
         if path.stat().st_size != expected_size:
             raise ValueError("Eleginus checkpoint size does not match its feature count")
-        descriptors = [ELEGINUS_TERM.unpack(stream.read(ELEGINUS_TERM.size)) for _ in range(terms)]
-        if any(left > right or right >= fixed_features // 4 for left, right in descriptors):
-            raise ValueError("Eleginus checkpoint contains an invalid feature term")
-        if len(set(descriptors)) != len(descriptors):
-            raise ValueError("Eleginus checkpoint contains duplicate feature terms")
         weights = array("f")
         weights.fromfile(stream, 2 * features)
 
@@ -128,7 +122,6 @@ def inspect_eleginus(path: Path) -> dict[str, object] | None:
         "arch": {
             "type_id": type_id,
             "fixed_features": fixed_features,
-            "terms": terms,
             "features": features,
         },
         "model_children": "none",

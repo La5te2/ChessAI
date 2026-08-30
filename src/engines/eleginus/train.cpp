@@ -4,25 +4,19 @@
 #include "eleginus/search.hpp"
 #include <torch/torch.h>
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <future>
 #include <iostream>
-#include <limits>
-#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
 #include <thread>
-#include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 namespace {
 
-constexpr int kTermParameters = eleginus::FeatureMap::kRegimes;
 constexpr float kTdLambda = 0.7F;
 constexpr float kValueScaleCp = 400.0F;
 
@@ -39,7 +33,6 @@ struct Options {
 	float exploration = 0.08F;
 	float temperature_cp = 80.0F;
 	int log_every = 10;
-	int discover_every = 64;
 	std::uint64_t seed = 2026;
 	std::string device = "auto";
 };
@@ -48,8 +41,6 @@ enum class Outcome { white, draw, black, truncated };
 
 struct Sample {
 	std::vector<eleginus::Feature> features;
-	std::vector<eleginus::Feature> atoms;
-	std::array<float, eleginus::FeatureMap::kRegimes> gate{};
 	chess::Color side = chess::Color::WHITE;
 };
 
@@ -58,24 +49,9 @@ struct GameRecord {
 	Outcome outcome = Outcome::truncated;
 };
 
-struct CandidateStat {
-	std::array<double, kTermParameters> gradient{};
-	std::array<std::array<double, kTermParameters>, kTermParameters> curvature{};
-	double loss = 0.0;
-	std::uint32_t games = 0;
-};
-
-using CandidateStats = std::unordered_map<std::uint64_t, CandidateStat>;
-
-struct DiscoveryState {
-	CandidateStats candidates;
-	std::vector<float> weights;
-};
-
 struct Objective {
 	double loss = 0.0;
 	float gradient = 0.0F;
-	float curvature = 0.0F;
 };
 
 struct SparseBatch {
@@ -120,8 +96,6 @@ Options parse_options(int argc, char **argv) {
 			options.temperature_cp = std::stof(value_after(argc, argv, index));
 		} else if (argument == "--log-every") {
 			options.log_every = std::stoi(value_after(argc, argv, index));
-		} else if (argument == "--discover-every") {
-			options.discover_every = std::stoi(value_after(argc, argv, index));
 		} else if (argument == "--seed") {
 			options.seed = std::stoull(value_after(argc, argv, index));
 		} else if (argument == "--device") {
@@ -129,7 +103,7 @@ Options parse_options(int argc, char **argv) {
 		} else if (argument == "--help") {
 			std::cout << "usage: train --out eleginus.pth [--resume model.pth] [--games 100] [--depth 2] "
 					  << "[--max-plies 320] [--hash 16] [--workers N] [--lr 1] [--exploration 0.08] "
-					  << "[--temperature 80] [--discover-every 64] [--device auto] [--seed 2026]\n";
+					  << "[--temperature 80] [--device auto] [--seed 2026]\n";
 			std::exit(0);
 		} else {
 			throw std::invalid_argument("unknown option: " + argument);
@@ -138,7 +112,7 @@ Options parse_options(int argc, char **argv) {
 	if (options.output.empty() || options.games < 0 || options.depth <= 0 || options.depth > 16 || options.max_plies <= 0 ||
 		options.hash_mb <= 0 || options.workers <= 0 || options.workers > 256 || options.learning_rate <= 0.0F ||
 		options.weight_decay < 0.0F || options.exploration < 0.0F || options.exploration > 1.0F || options.temperature_cp <= 0.0F ||
-		options.log_every <= 0 || options.discover_every <= 0) {
+		options.log_every <= 0) {
 		throw std::invalid_argument("invalid or incomplete Eleginus training options");
 	}
 	return options;
@@ -164,21 +138,6 @@ public:
 		uncertainty_ = tensor_from(model.uncertainty_weights());
 		value_accumulator_ = torch::full_like(weights_, 1.0e-6F);
 		uncertainty_accumulator_ = torch::full_like(uncertainty_, 1.0e-6F);
-	}
-
-	void expand(eleginus::Model &model) {
-		if (static_cast<std::size_t>(weights_.numel()) == model.weights().size()) {
-			return;
-		}
-		const auto previous = weights_.numel();
-		weights_ = tensor_from(model.weights());
-		uncertainty_ = tensor_from(model.uncertainty_weights());
-		auto value_accumulator = torch::full_like(weights_, 1.0e-6F);
-		auto uncertainty_accumulator = torch::full_like(uncertainty_, 1.0e-6F);
-		value_accumulator.narrow(0, 0, previous).copy_(value_accumulator_);
-		uncertainty_accumulator.narrow(0, 0, previous).copy_(uncertainty_accumulator_);
-		value_accumulator_ = std::move(value_accumulator);
-		uncertainty_accumulator_ = std::move(uncertainty_accumulator);
 	}
 
 	void step(eleginus::Model &model, const std::vector<std::int64_t> &indices, const std::vector<float> &value_contributions,
@@ -304,12 +263,7 @@ GameRecord play_game(const eleginus::Model &model, const Options &options, std::
 		}
 		Sample sample;
 		sample.side = leaf.sideToMove();
-		model.extract(leaf, sample.features, &sample.atoms);
-		for (const auto &feature : sample.features) {
-			if (feature.index < sample.gate.size()) {
-				sample.gate[feature.index] = feature.value;
-			}
-		}
+		model.extract(leaf, sample.features);
 		record.samples.push_back(std::move(sample));
 		const auto move = choose_move(result, options, random);
 		if (move.move() == chess::Move::NO_MOVE) {
@@ -322,17 +276,6 @@ GameRecord play_game(const eleginus::Model &model, const Options &options, std::
 		record.samples.clear();
 	}
 	return record;
-}
-
-std::uint64_t candidate_key(std::uint32_t left, std::uint32_t right) noexcept {
-	if (left > right) {
-		std::swap(left, right);
-	}
-	return (static_cast<std::uint64_t>(left) << 32U) | right;
-}
-
-eleginus::FeatureTerm candidate_term(std::uint64_t key) noexcept {
-	return {static_cast<std::uint32_t>(key >> 32U), static_cast<std::uint32_t>(key)};
 }
 
 float score_with(const std::vector<eleginus::Feature> &features, const std::vector<float> &weights) noexcept {
@@ -367,157 +310,13 @@ Objective objective(float score, chess::Color side, float target) noexcept {
 	const float prediction = std::tanh(perspective * score / kValueScaleCp);
 	const float error = prediction - target;
 	const float derivative = perspective * (1.0F - prediction * prediction);
-	return {0.5 * static_cast<double>(error) * error, error * derivative, derivative * derivative};
+	return {0.5 * static_cast<double>(error) * error, error * derivative};
 }
 
-void accumulate_candidates(const Sample &sample, const Objective &objective, CandidateStats &statistics) {
-	if (objective.curvature == 0.0F) {
-		return;
-	}
-	for (std::size_t left = 0; left < sample.atoms.size(); ++left) {
-		for (std::size_t right = left; right < sample.atoms.size(); ++right) {
-			const float value = sample.atoms[left].value * sample.atoms[right].value;
-			if (value == 0.0F) {
-				continue;
-			}
-			const auto key = candidate_key(sample.atoms[left].index, sample.atoms[right].index);
-			auto &statistic = statistics[key];
-			statistic.loss += objective.loss;
-			std::array<double, kTermParameters> phased{};
-			for (std::size_t regime = 0; regime < phased.size(); ++regime) {
-				phased[regime] = static_cast<double>(value) * sample.gate[regime];
-				statistic.gradient[regime] += objective.gradient * phased[regime];
-			}
-			for (std::size_t row = 0; row < phased.size(); ++row) {
-				for (std::size_t column = 0; column < phased.size(); ++column) {
-					statistic.curvature[row][column] += objective.curvature * phased[row] * phased[column];
-				}
-			}
-		}
-	}
-}
-
-struct Selection {
-	std::optional<eleginus::FeatureTerm> term;
-	double evidence = -std::numeric_limits<double>::infinity();
-	double gain = 0.0;
-	std::uint32_t support = 0;
-};
-
-std::pair<double, int> candidate_gain(const CandidateStat &statistic) noexcept {
-	auto matrix = statistic.curvature;
-	std::array<std::array<double, kTermParameters>, kTermParameters> vectors{};
-	for (int index = 0; index < kTermParameters; ++index) {
-		vectors[index][index] = 1.0;
-	}
-	for (int sweep = 0; sweep < 32; ++sweep) {
-		int first = 0;
-		int second = 1;
-		double largest = 0.0;
-		for (int row = 0; row < kTermParameters; ++row) {
-			for (int column = row + 1; column < kTermParameters; ++column) {
-				if (std::abs(matrix[row][column]) > largest) {
-					largest = std::abs(matrix[row][column]);
-					first = row;
-					second = column;
-				}
-			}
-		}
-		if (largest <= 1.0e-12) {
-			break;
-		}
-		const double angle = 0.5 * std::atan2(2.0 * matrix[first][second], matrix[first][first] - matrix[second][second]);
-		const double cosine = std::cos(angle);
-		const double sine = std::sin(angle);
-		for (int index = 0; index < kTermParameters; ++index) {
-			if (index == first || index == second) {
-				continue;
-			}
-			const double left = matrix[index][first];
-			const double right = matrix[index][second];
-			matrix[index][first] = matrix[first][index] = cosine * left + sine * right;
-			matrix[index][second] = matrix[second][index] = -sine * left + cosine * right;
-		}
-		const double a = matrix[first][first];
-		const double b = matrix[first][second];
-		const double c = matrix[second][second];
-		matrix[first][first] = cosine * cosine * a + 2.0 * sine * cosine * b + sine * sine * c;
-		matrix[second][second] = sine * sine * a - 2.0 * sine * cosine * b + cosine * cosine * c;
-		matrix[first][second] = matrix[second][first] = 0.0;
-		for (int row = 0; row < kTermParameters; ++row) {
-			const double left = vectors[row][first];
-			const double right = vectors[row][second];
-			vectors[row][first] = cosine * left + sine * right;
-			vectors[row][second] = -sine * left + cosine * right;
-		}
-	}
-	double maximum = 0.0;
-	for (int index = 0; index < kTermParameters; ++index) {
-		maximum = std::max(maximum, matrix[index][index]);
-	}
-	if (!(maximum > 0.0) || !std::isfinite(maximum)) {
-		return {0.0, 0};
-	}
-	const double tolerance = kTermParameters * std::numeric_limits<float>::epsilon() * maximum;
-	double gain = 0.0;
-	int rank = 0;
-	for (int direction = 0; direction < kTermParameters; ++direction) {
-		const double eigenvalue = matrix[direction][direction];
-		if (eigenvalue <= tolerance) {
-			continue;
-		}
-		double projection = 0.0;
-		for (int row = 0; row < kTermParameters; ++row) {
-			projection += vectors[row][direction] * statistic.gradient[row];
-		}
-		gain += 0.5 * projection * projection / eigenvalue;
-		++rank;
-	}
-	return {std::min(statistic.loss, std::max(0.0, gain)), rank};
-}
-
-Selection select_term(const eleginus::Model &model, const DiscoveryState &discovery) {
-	Selection best;
-	std::unordered_set<std::uint64_t> existing;
-	for (const auto &term : model.terms()) {
-		existing.insert(candidate_key(term.left, term.right));
-	}
-	const auto universe = eleginus::FeatureMap::candidate_terms();
-	const auto remaining = universe > existing.size() ? universe - existing.size() : 0U;
-	if (remaining == 0) {
-		return best;
-	}
-	for (const auto &[key, statistic] : discovery.candidates) {
-		if (existing.contains(key) || statistic.games < 2 || !(statistic.loss > 0.0)) {
-			continue;
-		}
-		const auto [gain, directions] = candidate_gain(statistic);
-		if (directions == 0 || !(gain > 0.0) || !std::isfinite(gain)) {
-			continue;
-		}
-		const double observations = static_cast<double>(statistic.games);
-		if (observations <= kTermParameters + 1.0) {
-			continue;
-		}
-		const double squared_error = 2.0 * statistic.loss;
-		const double residual = std::max(squared_error - 2.0 * gain, squared_error * std::numeric_limits<float>::epsilon());
-		const double correction = 2.0 * kTermParameters * (kTermParameters + 1.0) /
-			(observations - kTermParameters - 1.0);
-		const double complexity = kTermParameters * std::log(observations) + correction + 2.0 * std::log(static_cast<double>(remaining));
-		const double evidence = observations * std::log(squared_error / residual) - complexity;
-		if (evidence > best.evidence ||
-			(evidence == best.evidence && best.term && key < candidate_key(best.term->left, best.term->right))) {
-			best = {candidate_term(key), evidence, gain, statistic.games};
-		}
-	}
-	return best;
-}
-
-double update(const eleginus::Model &model, const GameRecord &record, SparseBatch &batch, DiscoveryState &discovery) {
+double update(const eleginus::Model &model, const GameRecord &record, SparseBatch &batch) {
 	const auto returns = td_returns(model, record);
 	const auto &uncertainty_weights = model.uncertainty_weights();
 	double loss = 0.0;
-	CandidateStats game_candidates;
 	for (std::size_t sample_index = 0; sample_index < record.samples.size(); ++sample_index) {
 		const auto &sample = record.samples[sample_index];
 		const float prediction = white_prediction(model.score(sample.features), sample.side);
@@ -528,7 +327,6 @@ double update(const eleginus::Model &model, const GameRecord &record, SparseBatc
 		const float uncertainty = 1.0F / (1.0F + std::exp(-std::clamp(uncertainty_logit, -20.0F, 20.0F)));
 		loss += value_objective.loss - uncertainty_target * std::log(std::max(uncertainty, 1.0e-7F)) -
 			(1.0F - uncertainty_target) * std::log(std::max(1.0F - uncertainty, 1.0e-7F));
-		accumulate_candidates(sample, objective(score_with(sample.features, discovery.weights), sample.side, target), game_candidates);
 		for (const auto &feature : sample.features) {
 			batch.indices.push_back(static_cast<std::int64_t>(feature.index));
 			batch.value_contributions.push_back(value_objective.gradient * feature.value);
@@ -536,20 +334,6 @@ double update(const eleginus::Model &model, const GameRecord &record, SparseBatc
 		}
 	}
 	batch.samples += record.samples.size();
-	if (!record.samples.empty()) {
-		const double inverse_samples = 1.0 / static_cast<double>(record.samples.size());
-		for (const auto &[key, game] : game_candidates) {
-			auto &total = discovery.candidates[key];
-			total.loss += game.loss * inverse_samples;
-			for (std::size_t row = 0; row < total.gradient.size(); ++row) {
-				total.gradient[row] += game.gradient[row] * inverse_samples;
-				for (std::size_t column = 0; column < total.gradient.size(); ++column) {
-					total.curvature[row][column] += game.curvature[row][column] * inverse_samples;
-				}
-			}
-			++total.games;
-		}
-	}
 	return record.samples.empty() ? 0.0 : loss / static_cast<double>(record.samples.size());
 }
 
@@ -560,8 +344,6 @@ int main(int argc, char **argv) {
 		const auto options = parse_options(argc, argv);
 		auto model = options.resume.empty() ? eleginus::Model() : eleginus::Model::load(options.resume);
 		SparseOptimizer optimizer(model, resolve_device(options.device));
-		DiscoveryState discovery;
-		discovery.weights = model.weights();
 		int white_wins = 0;
 		int black_wins = 0;
 		int draws = 0;
@@ -588,7 +370,6 @@ int main(int argc, char **argv) {
 				records.push_back(future.get());
 			}
 			SparseBatch gradients;
-			bool discover_due = false;
 			bool log_due = false;
 			for (auto &record : records) {
 				if (record.outcome == Outcome::truncated) {
@@ -604,10 +385,7 @@ int main(int argc, char **argv) {
 				} else {
 					++black_wins;
 				}
-				loss += update(model, record, gradients, discovery);
-				if (completed % options.discover_every == 0) {
-					discover_due = true;
-				}
+				loss += update(model, record, gradients);
 				if (completed % options.log_every == 0 || completed == options.games) {
 					log_due = true;
 				}
@@ -617,19 +395,6 @@ int main(int argc, char **argv) {
 			}
 			optimizer.step(model, gradients.indices, gradients.value_contributions, gradients.uncertainty_contributions,
 				gradients.samples, options);
-			if (discover_due) {
-				const auto selection = select_term(model, discovery);
-				std::size_t added = 0;
-				if (selection.term && selection.evidence > 0.0) {
-					added = model.add_terms({*selection.term});
-				}
-				optimizer.expand(model);
-				std::cout << "feature discovery: games=" << completed << " candidates=" << discovery.candidates.size()
-						  << " added=" << added << " evidence=" << selection.evidence << " gain=" << selection.gain
-						  << " support=" << selection.support << " terms=" << model.terms().size() << '\n';
-				discovery = {};
-				discovery.weights = model.weights();
-			}
 			if (log_due) {
 				std::cout << "self-play: games=" << completed << " discarded=" << discarded << " white=" << white_wins
 						  << " draws=" << draws << " black=" << black_wins << " loss=" << loss / static_cast<double>(logged) << '\n';

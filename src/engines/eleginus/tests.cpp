@@ -32,7 +32,6 @@ float base_value(const std::vector<eleginus::Feature> &features, int base) {
 int main() {
 	try {
 		eleginus::FeatureMap map;
-		require(eleginus::FeatureMap::candidate_terms() == 171405, "candidate feature universe has the wrong size");
 		std::vector<eleginus::Feature> features;
 		map.extract(chess::Board(), features);
 		require(!features.empty(), "start position has no active features");
@@ -73,23 +72,12 @@ int main() {
 		require(std::abs(model.score(white_queen) - model.centipawns(white_queen)) < 0.51F, "model score is not expressed in centipawns");
 		require(std::abs(model.uncertainty(white_queen) - 0.1F) < 1.0e-5F, "uncertainty initialization is not position independent");
 
-		auto extended = model;
-		std::vector<eleginus::Feature> extended_features;
-		std::vector<eleginus::Feature> atoms;
-		extended.extract(white_queen, extended_features, &atoms);
-		require(atoms.size() >= 2, "test position has too few candidate atoms");
-		const float original_score = extended.score(extended_features);
-		require(extended.add_terms({{atoms[0].index, atoms[1].index}}) == 1, "feature term was not added");
-		extended.extract(white_queen, extended_features);
-		require(extended.score(extended_features) == original_score, "zero-initialized feature term changed the score");
-
 		const auto path = std::filesystem::temp_directory_path() / "eleginus-test.pth";
-		extended.save(path);
+		model.save(path);
 		const auto loaded = eleginus::Model::load(path);
 		std::filesystem::remove(path);
-		require(loaded.weights() == extended.weights(), "model save/load changed weights");
-		require(loaded.uncertainty_weights() == extended.uncertainty_weights(), "model save/load changed uncertainty weights");
-		require(loaded.terms() == extended.terms(), "model save/load changed feature terms");
+		require(loaded.weights() == model.weights(), "model save/load changed weights");
+		require(loaded.uncertainty_weights() == model.uncertainty_weights(), "model save/load changed uncertainty weights");
 
 		eleginus::SearchOptions options;
 		options.depth = 2;
