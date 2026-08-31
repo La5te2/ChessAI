@@ -12,7 +12,7 @@ if(NOT GADIDAE_BUILD_GADUS AND NOT GADIDAE_BUILD_MELANO AND NOT GADIDAE_BUILD_EL
 endif()
 
 set(GADIDAE_NEEDS_TORCH OFF)
-if(GADIDAE_BUILD_GADUS OR GADIDAE_BUILD_MELANO OR GADIDAE_BUILD_ELEGINUS)
+if(GADIDAE_BUILD_GADUS OR GADIDAE_BUILD_MELANO)
 	set(GADIDAE_NEEDS_TORCH ON)
 endif()
 set(GADIDAE_NEEDS_HDF5 OFF)
@@ -111,7 +111,7 @@ if(MSVC AND GADIDAE_NEEDS_TORCH)
 		message(FATAL_ERROR "No LibTorch runtime DLLs found in ${GADIDAE_TORCH_DIR}/lib")
 	endif()
 	add_custom_target(torchruntime ALL COMMENT "Copying LibTorch runtime")
-	foreach(architecture IN ITEMS gadus melano eleginus)
+	foreach(architecture IN ITEMS gadus melano)
 		string(TOUPPER "${architecture}" architecture_upper)
 		if(GADIDAE_BUILD_${architecture_upper})
 			add_custom_command(TARGET torchruntime POST_BUILD
@@ -125,10 +125,32 @@ endif()
 
 if(GADIDAE_BUILD_ELEGINUS)
 
+add_executable(eleginuscompile src/engines/eleginus/formula.cpp)
+target_compile_definitions(eleginuscompile PRIVATE ELEGINUS_COMPILE)
+target_include_directories(eleginuscompile PRIVATE "${CMAKE_SOURCE_DIR}/include/engines")
+target_include_directories(eleginuscompile SYSTEM PRIVATE "${GADIDAE_API_DIR}/chess")
+set_target_properties(eleginuscompile PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools")
+if(MSVC)
+	target_compile_options(eleginuscompile PRIVATE /W4 /permissive- /utf-8)
+else()
+	target_compile_options(eleginuscompile PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+set(ELEGINUS_CATALOG "${CMAKE_BINARY_DIR}/generated/eleginus/catalog.hpp")
+add_custom_command(OUTPUT "${ELEGINUS_CATALOG}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/generated/eleginus"
+	COMMAND $<TARGET_FILE:eleginuscompile> "${ELEGINUS_CATALOG}.tmp"
+	COMMAND ${CMAKE_COMMAND} -E copy_if_different "${ELEGINUS_CATALOG}.tmp" "${ELEGINUS_CATALOG}"
+	COMMAND ${CMAKE_COMMAND} -E rm "${ELEGINUS_CATALOG}.tmp"
+	DEPENDS eleginuscompile
+	VERBATIM
+)
+
 add_library(eleginus
-	src/engines/eleginus/features.cpp
+	"${ELEGINUS_CATALOG}"
+	src/engines/eleginus/formula.cpp
 	src/engines/eleginus/game.cpp
 	src/engines/eleginus/model.cpp
+	src/engines/eleginus/match.cpp
 	src/engines/eleginus/searcher.cpp
 )
 set_target_properties(eleginus PROPERTIES
@@ -137,6 +159,7 @@ set_target_properties(eleginus PROPERTIES
 	PDB_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/eleginus"
 )
 target_include_directories(eleginus PUBLIC "${CMAKE_SOURCE_DIR}/include/engines")
+target_include_directories(eleginus PRIVATE "${CMAKE_BINARY_DIR}/generated")
 target_include_directories(eleginus SYSTEM PUBLIC "${GADIDAE_API_DIR}/chess")
 target_precompile_headers(eleginus PRIVATE <chess.hpp>)
 target_link_libraries(eleginus PUBLIC Threads::Threads)
@@ -160,10 +183,6 @@ function(eleginusexecutable name source)
 endfunction()
 
 eleginusexecutable(train src/engines/eleginus/train.cpp)
-target_link_libraries(eleginustrain PRIVATE ${TORCH_LIBRARIES})
-if(MSVC)
-	add_dependencies(eleginustrain torchruntime)
-endif()
 eleginusexecutable(search src/engines/eleginus/search.cpp)
 eleginusexecutable(uci src/engines/eleginus/uci.cpp)
 

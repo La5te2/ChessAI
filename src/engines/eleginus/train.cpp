@@ -1,11 +1,14 @@
-#include "eleginus/features.hpp"
 #include "eleginus/game.hpp"
 #include "eleginus/model.hpp"
 #include "eleginus/search.hpp"
-#include <torch/torch.h>
+#include "eleginus/match.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <csignal>
 #include <cstdint>
+#include <cstdlib>
+#include <deque>
 #include <filesystem>
 #include <future>
 #include <iostream>
@@ -14,400 +17,370 @@
 #include <string>
 #include <thread>
 #include <vector>
+#ifdef _WIN32
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
 
 namespace {
 
-constexpr float kTdLambda = 0.7F;
-constexpr float kValueScaleCp = 400.0F;
+	std::atomic<bool> halt{false};
+	static_assert(std::atomic<bool>::is_always_lock_free);
 
-struct Options {
-	std::filesystem::path output;
-	std::filesystem::path resume;
-	int games = 100;
-	int depth = 2;
-	int max_plies = 320;
-	int hash_mb = 16;
-	int workers = static_cast<int>(std::max(1U, std::thread::hardware_concurrency()));
-	float learning_rate = 1.0F;
-	float weight_decay = 1.0e-6F;
-	float exploration = 0.08F;
-	float temperature_cp = 80.0F;
-	int log_every = 10;
-	std::uint64_t seed = 2026;
-	std::string device = "auto";
-};
-
-enum class Outcome { white, draw, black, truncated };
-
-struct Sample {
-	std::vector<eleginus::Feature> features;
-	chess::Color side = chess::Color::WHITE;
-};
-
-struct GameRecord {
-	std::vector<Sample> samples;
-	Outcome outcome = Outcome::truncated;
-};
-
-struct Objective {
-	double loss = 0.0;
-	float gradient = 0.0F;
-};
-
-struct SparseBatch {
-	std::vector<std::int64_t> indices;
-	std::vector<float> value_contributions;
-	std::vector<float> uncertainty_contributions;
-	std::size_t samples = 0;
-};
-
-std::string value_after(int argc, char **argv, int &index) {
-	if (index + 1 >= argc) {
-		throw std::invalid_argument(std::string("missing value after ") + argv[index]);
+	bool stopped() {
+		return halt.load(std::memory_order_relaxed);
 	}
-	return argv[++index];
-}
 
-Options parse_options(int argc, char **argv) {
-	Options options;
-	for (int index = 1; index < argc; ++index) {
-		const std::string argument = argv[index];
-		if (argument == "--out") {
-			options.output = value_after(argc, argv, index);
-		} else if (argument == "--resume") {
-			options.resume = value_after(argc, argv, index);
-		} else if (argument == "--games") {
-			options.games = std::stoi(value_after(argc, argv, index));
-		} else if (argument == "--depth") {
-			options.depth = std::stoi(value_after(argc, argv, index));
-		} else if (argument == "--max-plies") {
-			options.max_plies = std::stoi(value_after(argc, argv, index));
-		} else if (argument == "--hash") {
-			options.hash_mb = std::stoi(value_after(argc, argv, index));
-		} else if (argument == "--workers") {
-			options.workers = std::stoi(value_after(argc, argv, index));
-		} else if (argument == "--lr") {
-			options.learning_rate = std::stof(value_after(argc, argv, index));
-		} else if (argument == "--weight-decay") {
-			options.weight_decay = std::stof(value_after(argc, argv, index));
-		} else if (argument == "--exploration") {
-			options.exploration = std::stof(value_after(argc, argv, index));
-		} else if (argument == "--temperature") {
-			options.temperature_cp = std::stof(value_after(argc, argv, index));
-		} else if (argument == "--log-every") {
-			options.log_every = std::stoi(value_after(argc, argv, index));
-		} else if (argument == "--seed") {
-			options.seed = std::stoull(value_after(argc, argv, index));
-		} else if (argument == "--device") {
-			options.device = value_after(argc, argv, index);
-		} else if (argument == "--help") {
-			std::cout << "usage: train --out eleginus.pth [--resume model.pth] [--games 100] [--depth 2] "
-					  << "[--max-plies 320] [--hash 16] [--workers N] [--lr 1] [--exploration 0.08] "
-					  << "[--temperature 80] [--device auto] [--seed 2026]\n";
-			std::exit(0);
-		} else {
-			throw std::invalid_argument("unknown option: " + argument);
+	void interrupt(int) {
+		halt.store(true, std::memory_order_relaxed);
+	}
+
+#ifdef _WIN32
+	BOOL WINAPI console(DWORD event) {
+		if (event != CTRL_C_EVENT && event != CTRL_BREAK_EVENT)
+			return FALSE;
+		interrupt(0);
+		return TRUE;
+	}
+#endif
+
+	struct Options {
+		std::filesystem::path out = "models/eleginus/current.pth", init, book = "data/openings.gen.bin";
+		int depth = 2, plies = 320, hash = 16, every = 1000, evalDepth = 4;
+		int workers = static_cast<int>(std::max(1U, std::thread::hardware_concurrency()));
+		int batch = 256, log = 10;
+		float lr = 1.0e-3F, decay = 1.0e-6F, clip = 1.0F, explore = 0.08F, temp = 80.0F;
+		std::uint64_t seed = 2026;
+	};
+
+	Options parse(int argc, char **argv) {
+		Options o;
+		for (int i = 1; i < argc; ++i) {
+			const std::string arg = argv[i];
+			if (arg == "--help") {
+				std::cout << "usage: train [--out models/eleginus/current.pth] [--init model.pth] [--depth 2]\n"
+				          << "  [--opening-book data/openings.gen.bin] [--eval-every 1000] [--eval-depth 4]\n"
+				          << "  [--max-plies 320] [--workers N] [--hash 16] [--batch-size 256] [--lr 0.001]\n"
+				          << "  [--weight-decay 0.000001] [--grad-clip 1] [--exploration 0.08] [--temperature 80]\n"
+				          << "  [--log-every 10] [--seed 2026]\n"
+				          << "Train until Ctrl+C. Evaluate 2000 paired games after every K completed training games.\n"
+				          << "Only candidates with a positive 95% Elo lower bound replace --out. No save on exit.\n";
+				std::exit(0);
+			}
+			if (++i == argc)
+				throw std::invalid_argument("missing value after " + arg);
+			const std::string val = argv[i];
+			if (arg == "--out")
+				o.out = val;
+			else if (arg == "--init")
+				o.init = val;
+			else if (arg == "--opening-book")
+				o.book = val;
+			else if (arg == "--eval-every")
+				o.every = std::stoi(val);
+			else if (arg == "--eval-depth")
+				o.evalDepth = std::stoi(val);
+			else if (arg == "--depth")
+				o.depth = std::stoi(val);
+			else if (arg == "--max-plies")
+				o.plies = std::stoi(val);
+			else if (arg == "--hash")
+				o.hash = std::stoi(val);
+			else if (arg == "--workers")
+				o.workers = std::stoi(val);
+			else if (arg == "--batch-size")
+				o.batch = std::stoi(val);
+			else if (arg == "--lr")
+				o.lr = std::stof(val);
+			else if (arg == "--weight-decay")
+				o.decay = std::stof(val);
+			else if (arg == "--grad-clip")
+				o.clip = std::stof(val);
+			else if (arg == "--exploration")
+				o.explore = std::stof(val);
+			else if (arg == "--temperature")
+				o.temp = std::stof(val);
+			else if (arg == "--log-every")
+				o.log = std::stoi(val);
+			else if (arg == "--seed")
+				o.seed = std::stoull(val);
+			else
+				throw std::invalid_argument("unknown option: " + arg);
 		}
-	}
-	if (options.output.empty() || options.games < 0 || options.depth <= 0 || options.depth > 16 || options.max_plies <= 0 ||
-		options.hash_mb <= 0 || options.workers <= 0 || options.workers > 256 || options.learning_rate <= 0.0F ||
-		options.weight_decay < 0.0F || options.exploration < 0.0F || options.exploration > 1.0F || options.temperature_cp <= 0.0F ||
-		options.log_every <= 0) {
-		throw std::invalid_argument("invalid or incomplete Eleginus training options");
-	}
-	return options;
-}
-
-torch::Device resolve_device(const std::string &requested) {
-	if (requested == "auto") {
-		return torch::Device(torch::cuda::is_available() ? torch::kCUDA : torch::kCPU);
-	}
-	if (requested == "cuda" && !torch::cuda::is_available()) {
-		throw std::runtime_error("CUDA was requested but is not available");
-	}
-	if (requested == "cuda" || requested == "cpu") {
-		return torch::Device(requested);
-	}
-	throw std::invalid_argument("Eleginus training device must be auto, cpu or cuda");
-}
-
-class SparseOptimizer {
-public:
-	SparseOptimizer(const eleginus::Model &model, torch::Device device) : device_(std::move(device)) {
-		weights_ = tensor_from(model.weights());
-		uncertainty_ = tensor_from(model.uncertainty_weights());
-		value_accumulator_ = torch::full_like(weights_, 1.0e-6F);
-		uncertainty_accumulator_ = torch::full_like(uncertainty_, 1.0e-6F);
-	}
-
-	void step(eleginus::Model &model, const std::vector<std::int64_t> &indices, const std::vector<float> &value_contributions,
-		const std::vector<float> &uncertainty_contributions, std::size_t samples, const Options &options) {
-		if (indices.empty() || samples == 0) {
-			return;
+		for (float x : {o.lr, o.decay, o.clip, o.explore, o.temp}) {
+			if (!std::isfinite(x))
+				throw std::invalid_argument("nonfinite training option");
 		}
-		torch::NoGradGuard guard;
-		const auto index = torch::from_blob(const_cast<std::int64_t *>(indices.data()), {static_cast<std::int64_t>(indices.size())},
-			torch::TensorOptions().dtype(torch::kInt64)).clone().to(device_);
-		const auto value_source = torch::from_blob(const_cast<float *>(value_contributions.data()),
-			{static_cast<std::int64_t>(value_contributions.size())}, torch::TensorOptions().dtype(torch::kFloat32)).clone().to(device_);
-		const auto uncertainty_source = torch::from_blob(const_cast<float *>(uncertainty_contributions.data()),
-			{static_cast<std::int64_t>(uncertainty_contributions.size())}, torch::TensorOptions().dtype(torch::kFloat32)).clone().to(device_);
-		auto value_gradient = torch::zeros_like(weights_);
-		auto uncertainty_gradient = torch::zeros_like(uncertainty_);
-		value_gradient.index_add_(0, index, value_source).div_(static_cast<double>(samples));
-		uncertainty_gradient.index_add_(0, index, uncertainty_source).div_(static_cast<double>(samples));
-		value_gradient.add_(weights_, options.weight_decay);
-		uncertainty_gradient.add_(uncertainty_, options.weight_decay);
-		value_accumulator_.addcmul_(value_gradient, value_gradient);
-		uncertainty_accumulator_.addcmul_(uncertainty_gradient, uncertainty_gradient);
-		weights_.addcdiv_(value_gradient, value_accumulator_.sqrt(), -options.learning_rate);
-		uncertainty_.addcdiv_(uncertainty_gradient, uncertainty_accumulator_.sqrt(), -options.learning_rate / kValueScaleCp);
-		sync(model);
-	}
-
-	const torch::Device &device() const noexcept { return device_; }
-
-private:
-	torch::Tensor tensor_from(const std::vector<float> &values) const {
-		return torch::from_blob(const_cast<float *>(values.data()), {static_cast<std::int64_t>(values.size())},
-			torch::TensorOptions().dtype(torch::kFloat32)).clone().to(device_);
-	}
-
-	void sync(eleginus::Model &model) const {
-		const auto value_cpu = weights_.to(torch::kCPU).contiguous();
-		const auto uncertainty_cpu = uncertainty_.to(torch::kCPU).contiguous();
-		std::copy_n(value_cpu.data_ptr<float>(), model.weights().size(), model.weights().begin());
-		std::copy_n(uncertainty_cpu.data_ptr<float>(), model.uncertainty_weights().size(), model.uncertainty_weights().begin());
-	}
-
-	torch::Device device_;
-	torch::Tensor weights_;
-	torch::Tensor uncertainty_;
-	torch::Tensor value_accumulator_;
-	torch::Tensor uncertainty_accumulator_;
-};
-
-chess::Move choose_move(const eleginus::SearchResult &result, const Options &options, std::mt19937_64 &random) {
-	if (result.root.empty()) {
-		return chess::Move(chess::Move::NO_MOVE);
-	}
-	std::uniform_real_distribution<float> unit(0.0F, 1.0F);
-	if (unit(random) < options.exploration) {
-		std::uniform_int_distribution<std::size_t> move(0, result.root.size() - 1);
-		return result.root[move(random)].move;
-	}
-	const int best = std::max_element(result.root.begin(), result.root.end(), [](const auto &left, const auto &right) {
-		return left.score_cp < right.score_cp;
-	})->score_cp;
-	std::vector<double> mass;
-	mass.reserve(result.root.size());
-	double total = 0.0;
-	for (const auto &candidate : result.root) {
-		const double value = std::exp(std::clamp((candidate.score_cp - best) / static_cast<double>(options.temperature_cp), -40.0, 0.0));
-		mass.push_back(value);
-		total += value;
-	}
-	std::uniform_real_distribution<double> sample(0.0, total);
-	double selected = sample(random);
-	for (std::size_t index = 0; index < mass.size(); ++index) {
-		selected -= mass[index];
-		if (selected <= 0.0) {
-			return result.root[index].move;
+		if (o.out.empty() || o.book.empty() || o.every < 1 || o.evalDepth < 1 || o.evalDepth > 64 || o.depth < 1 || o.depth > 16 || o.plies < 1 || o.plies > 320 || o.hash < 1 ||
+		    o.hash > 4096 || o.workers < 1 || o.workers > 256 || o.batch < 1 || o.batch > 65536 || o.lr <= 0 || o.decay < 0 || o.lr * o.decay >= 1 || o.clip <= 0 ||
+		    o.explore < 0 || o.explore > 1 || o.temp < 0 || o.log < 1) {
+			throw std::invalid_argument("invalid or incomplete Eleginus training options");
 		}
+		return o;
 	}
-	return result.root.back().move;
-}
 
-Outcome terminal_outcome(const chess::Board &board) {
-	const auto [reason, result] = board.isGameOver();
-	if (reason == chess::GameResultReason::NONE) {
-		return Outcome::truncated;
-	}
-	if (result == chess::GameResult::DRAW) {
-		return Outcome::draw;
-	}
-	const auto winner = result == chess::GameResult::WIN ? board.sideToMove() : ~board.sideToMove();
-	return winner == chess::Color::WHITE ? Outcome::white : Outcome::black;
-}
+	struct Sample {
+		std::vector<eleginus::Feature> x;
+		float y = 0; // Initially the side-to-move flag; replaced by that side's terminal score.
+	};
 
-float outcome_value(Outcome outcome) noexcept {
-	return outcome == Outcome::white ? 1.0F : outcome == Outcome::black ? -1.0F : 0.0F;
-}
+	struct Game {
+		std::vector<Sample> samples;
+		int result = -1; // -1 unfinished, 0 black win, 1 draw, 2 white win.
+	};
 
-std::uint64_t game_seed(std::uint64_t seed, std::uint64_t game) noexcept {
-	std::uint64_t value = seed + 0x9e3779b97f4a7c15ULL * (game + 1U);
-	value = (value ^ (value >> 30U)) * 0xbf58476d1ce4e5b9ULL;
-	value = (value ^ (value >> 27U)) * 0x94d049bb133111ebULL;
-	return value ^ (value >> 31U);
-}
+	class Adam {
+	public:
+		explicit Adam(std::size_t n) : m_(n), v_(n), grad(n) {}
 
-GameRecord play_game(const eleginus::Model &model, const Options &options, std::uint64_t seed) {
-	GameRecord record;
-	record.samples.reserve(static_cast<std::size_t>(options.max_plies));
-	chess::Board board;
-	eleginus::SearchOptions search_options;
-	search_options.depth = options.depth;
-	search_options.hash_mb = static_cast<std::size_t>(options.hash_mb);
-	search_options.multipv = 1;
-	search_options.capture_principal_variation = true;
-	eleginus::Searcher searcher(model, search_options);
-	std::mt19937_64 random(seed);
-	for (int ply = 0; ply < options.max_plies && !eleginus::game_is_over(board); ++ply) {
-		const auto result = searcher.search(board);
-		if (result.principal_variation.empty()) {
-			break;
+		void step(eleginus::Model &model, std::size_t count, const Options &o) {
+			if (count == 0)
+				return;
+			double norm = 0;
+			for (auto &x : grad) {
+				x /= static_cast<float>(count);
+				if (!std::isfinite(x))
+					throw std::runtime_error("nonfinite gradient");
+				norm += static_cast<double>(x) * x;
+			}
+			const float scale = static_cast<float>(std::min(1.0, o.clip / std::max(std::sqrt(norm), 1.0e-12)));
+			b1_ *= 0.9;
+			b2_ *= 0.999;
+			auto &p = model.params();
+			for (std::size_t i = 0; i < p.size(); ++i) {
+				const float g = grad[i] * scale;
+				m_[i] = 0.9F * m_[i] + 0.1F * g;
+				v_[i] = 0.999F * v_[i] + 0.001F * g * g;
+				const double mh = m_[i] / (1.0 - b1_);
+				const double vh = v_[i] / (1.0 - b2_);
+				p[i] = static_cast<float>(p[i] * (1.0 - o.lr * o.decay) - o.lr * mh / (std::sqrt(vh) + 1.0e-8));
+				if (!std::isfinite(p[i]))
+					throw std::runtime_error("nonfinite parameter update");
+			}
+			std::fill(grad.begin(), grad.end(), 0.0F);
 		}
-		chess::Board leaf = board;
-		for (const auto move : result.principal_variation) {
-			leaf.makeMove(move);
+
+	private:
+		std::vector<float> m_, v_; // Adam's moments live only for this training invocation.
+		double b1_ = 1.0, b2_ = 1.0;
+
+	public:
+		std::vector<float> grad;
+	};
+
+	std::uint64_t seedFor(std::uint64_t seed, std::uint64_t game) {
+		auto x = seed + 0x9e3779b97f4a7c15ULL * (game + 1);
+		x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+		x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+		return x ^ (x >> 31);
+	}
+
+	chess::Move choose(const eleginus::SearchResult &r, const Options &o, std::mt19937_64 &rng) {
+		if (r.root.empty())
+			return chess::Move(chess::Move::NO_MOVE);
+		if (std::uniform_real_distribution<float>(0, 1)(rng) < o.explore) {
+			return r.root[std::uniform_int_distribution<std::size_t>(0, r.root.size() - 1)(rng)].move;
 		}
-		Sample sample;
-		sample.side = leaf.sideToMove();
-		model.extract(leaf, sample.features);
-		record.samples.push_back(std::move(sample));
-		const auto move = choose_move(result, options, random);
-		if (move.move() == chess::Move::NO_MOVE) {
-			break;
+		if (o.temp == 0)
+			return r.move;
+		std::vector<double> mass;
+		const auto best = r.root.front().score_cp;
+		for (const auto &a : r.root)
+			mass.push_back(std::exp((a.score_cp - best) / static_cast<double>(o.temp)));
+		return r.root[std::discrete_distribution<std::size_t>(mass.begin(), mass.end())(rng)].move;
+	}
+
+	Game play(const eleginus::Model &model, const Options &o, std::uint64_t seed) {
+		Game game;
+		chess::Board board;
+		eleginus::SearchOptions limits;
+		limits.depth = o.depth;
+		limits.hash_mb = static_cast<std::size_t>(o.hash);
+		// Temperature sampling requires scores, not the bounds returned by a root null-window search.
+		limits.multipv = o.temp > 0 ? 256 : 1;
+		eleginus::Searcher search(model, limits);
+		std::mt19937_64 rng(seed);
+		for (int ply = 0; ply < o.plies && !stopped() && !eleginus::isGameOver(board); ++ply) {
+			const auto result = search.search(board, {}, stopped);
+			if (stopped())
+				break;
+			const auto move = choose(result, o, rng);
+			if (move.move() == chess::Move::NO_MOVE)
+				break;
+			Sample sample;
+			sample.y = board.sideToMove() == chess::Color::WHITE ? 1.0F : 0.0F;
+			model.extract(board, sample.x);
+			game.samples.push_back(std::move(sample));
+			board.makeMove(move);
 		}
-		board.makeMove(move);
-	}
-	record.outcome = terminal_outcome(board);
-	if (record.outcome == Outcome::truncated) {
-		record.samples.clear();
-	}
-	return record;
-}
-
-float score_with(const std::vector<eleginus::Feature> &features, const std::vector<float> &weights) noexcept {
-	float score = 0.0F;
-	for (const auto &feature : features) {
-		score += weights[feature.index] * feature.value;
-	}
-	return score;
-}
-
-float white_prediction(float score, chess::Color side) noexcept {
-	return std::tanh((side == chess::Color::WHITE ? score : -score) / kValueScaleCp);
-}
-
-std::vector<float> td_returns(const eleginus::Model &model, const GameRecord &record) {
-	std::vector<float> predictions(record.samples.size());
-	for (std::size_t index = 0; index < record.samples.size(); ++index) {
-		predictions[index] = white_prediction(model.score(record.samples[index].features), record.samples[index].side);
-	}
-	std::vector<float> returns(predictions.size());
-	float accumulated = 0.0F;
-	for (std::size_t reverse = predictions.size(); reverse-- > 0;) {
-		const float successor = reverse + 1 < predictions.size() ? predictions[reverse + 1] : outcome_value(record.outcome);
-		accumulated = successor - predictions[reverse] + kTdLambda * accumulated;
-		returns[reverse] = accumulated;
-	}
-	return returns;
-}
-
-Objective objective(float score, chess::Color side, float target) noexcept {
-	const float perspective = side == chess::Color::WHITE ? 1.0F : -1.0F;
-	const float prediction = std::tanh(perspective * score / kValueScaleCp);
-	const float error = prediction - target;
-	const float derivative = perspective * (1.0F - prediction * prediction);
-	return {0.5 * static_cast<double>(error) * error, error * derivative};
-}
-
-double update(const eleginus::Model &model, const GameRecord &record, SparseBatch &batch) {
-	const auto returns = td_returns(model, record);
-	const auto &uncertainty_weights = model.uncertainty_weights();
-	double loss = 0.0;
-	for (std::size_t sample_index = 0; sample_index < record.samples.size(); ++sample_index) {
-		const auto &sample = record.samples[sample_index];
-		const float prediction = white_prediction(model.score(sample.features), sample.side);
-		const float target = std::clamp(prediction + returns[sample_index], -1.0F, 1.0F);
-		const auto value_objective = objective(model.score(sample.features), sample.side, target);
-		const float uncertainty_target = std::clamp(std::abs(returns[sample_index]), 0.0F, 1.0F);
-		const float uncertainty_logit = score_with(sample.features, uncertainty_weights);
-		const float uncertainty = 1.0F / (1.0F + std::exp(-std::clamp(uncertainty_logit, -20.0F, 20.0F)));
-		loss += value_objective.loss - uncertainty_target * std::log(std::max(uncertainty, 1.0e-7F)) -
-			(1.0F - uncertainty_target) * std::log(std::max(1.0F - uncertainty, 1.0e-7F));
-		for (const auto &feature : sample.features) {
-			batch.indices.push_back(static_cast<std::int64_t>(feature.index));
-			batch.value_contributions.push_back(value_objective.gradient * feature.value);
-			batch.uncertainty_contributions.push_back((uncertainty - uncertainty_target) * feature.value);
+		const auto [reason, result] = board.isGameOver();
+		if (stopped() || reason == chess::GameResultReason::NONE) {
+			game.samples.clear();
+			return game;
 		}
+		if (result == chess::GameResult::DRAW)
+			game.result = 1;
+		else {
+			const auto winner = result == chess::GameResult::WIN ? board.sideToMove() : ~board.sideToMove();
+			game.result = winner == chess::Color::WHITE ? 2 : 0;
+		}
+		const float white = 0.5F * game.result;
+		for (auto &s : game.samples)
+			s.y = s.y > 0 ? white : 1.0F - white;
+		return game;
 	}
-	batch.samples += record.samples.size();
-	return record.samples.empty() ? 0.0 : loss / static_cast<double>(record.samples.size());
-}
+
+	double learn(eleginus::Model &model, Adam &adam, const std::deque<Game> &replay, std::size_t count, const Options &o, std::mt19937_64 &rng) {
+		std::vector<const Sample *> pool;
+		for (const auto &g : replay)
+			for (const auto &s : g.samples)
+				pool.push_back(&s);
+		if (pool.empty() || count == 0)
+			return 0;
+		std::uniform_int_distribution<std::size_t> pick(0, pool.size() - 1);
+		double loss = 0;
+		std::size_t used = 0;
+		for (std::size_t start = 0; start < count && !stopped(); start += o.batch) {
+			const auto size = std::min(count - start, static_cast<std::size_t>(o.batch));
+			for (std::size_t i = 0; i < size; ++i) {
+				const auto &s = *pool[pick(rng)];
+				eleginus::Model::Cache cache;
+				const float h = model.forward(s.x, cache);
+				if (!std::isfinite(h))
+					throw std::runtime_error("nonfinite training score");
+				// Stable BCE on logits; terminal scores may also equal 1/2.
+				loss += std::max(h, 0.0F) - h * s.y + std::log1p(std::exp(-std::abs(h)));
+				const float e = std::exp(-std::abs(h));
+				const float p = h >= 0 ? 1.0F / (1.0F + e) : e / (1.0F + e);
+				model.backward(s.x, cache, p - s.y, adam.grad);
+			}
+			adam.step(model, size, o);
+			used += size;
+		}
+		return used ? loss / static_cast<double>(used) : 0;
+	}
+
+	bool approve(const eleginus::Model &model, const eleginus::Model &baseline, const std::vector<chess::Board> &book, const Options &o) {
+		std::array<int, 5> pairs{};
+		eleginus::SearchOptions limits;
+		limits.depth = o.evalDepth;
+		limits.hash_mb = static_cast<std::size_t>(o.hash);
+		std::cout << "evaluation start: games=2000 openings=1000 depth=" << o.evalDepth << std::endl;
+		int logged = 0;
+		for (int start = 0; start < eleginus::kOpeningPairs && !stopped();) {
+			const int count = std::min(o.workers, eleginus::kOpeningPairs - start);
+			std::vector<std::future<int>> jobs;
+			for (int i = 0; i < count; ++i) {
+				const auto index = static_cast<std::size_t>(start + i);
+				jobs.push_back(std::async(std::launch::async, [&, index] {
+					const int white = eleginus::match(model, baseline, book[index], chess::Color::WHITE, limits, stopped);
+					if (white < 0)
+						return -1;
+					const int black = eleginus::match(model, baseline, book[index], chess::Color::BLACK, limits, stopped);
+					return black < 0 ? -1 : white + black;
+				}));
+			}
+			for (auto &job : jobs) {
+				const int score = job.get();
+				if (score >= 0)
+					++pairs[score];
+			}
+			start += count;
+			if (!stopped() && (start - logged >= 50 || start == eleginus::kOpeningPairs)) {
+				std::cout << "evaluation step: games=" << 2 * start << "/2000" << std::endl;
+				logged = start;
+			}
+		}
+		if (stopped()) {
+			std::cout << "evaluation cancelled: current unchanged" << std::endl;
+			return false;
+		}
+		const auto result = eleginus::confidence(pairs);
+		const bool accepted = result.low > 0;
+		std::cout << "evaluation result: score=" << result.score << " elo=" << result.elo << " elo_ci95=[" << result.low << "," << result.high
+		          << "] accepted=" << (accepted ? "yes" : "no") << std::endl;
+		return accepted;
+	}
 
 } // namespace
 
 int main(int argc, char **argv) {
 	try {
-		const auto options = parse_options(argc, argv);
-		auto model = options.resume.empty() ? eleginus::Model() : eleginus::Model::load(options.resume);
-		SparseOptimizer optimizer(model, resolve_device(options.device));
-		int white_wins = 0;
-		int black_wins = 0;
-		int draws = 0;
-		int discarded = 0;
-		std::uint64_t attempted = 0;
-		double loss = 0.0;
-
-		std::cout << "self-play start: out=" << options.output.string() << " features=" << model.weights().size()
-				  << " games=" << options.games << " max_plies=" << options.max_plies << " depth=" << options.depth
-				  << " workers=" << options.workers << " device=" << optimizer.device() << " seed=" << options.seed << '\n';
-		int completed = 0;
-		int logged = 0;
-		while (completed < options.games) {
-			const int batch = std::min(options.workers, options.games - completed);
-			std::vector<std::future<GameRecord>> futures;
-			futures.reserve(static_cast<std::size_t>(batch));
-			for (int offset = 0; offset < batch; ++offset) {
-				const auto seed = game_seed(options.seed, attempted++);
-				futures.push_back(std::async(std::launch::async, [&model, &options, seed] { return play_game(model, options, seed); }));
+		const auto o = parse(argc, argv);
+		std::signal(SIGINT, interrupt);
+		std::signal(SIGTERM, interrupt);
+#ifdef _WIN32
+		if (!SetConsoleCtrlHandler(nullptr, FALSE) || !SetConsoleCtrlHandler(console, TRUE))
+			throw std::runtime_error("cannot install console interrupt handler");
+#endif
+		const auto book = eleginus::openings(o.book);
+		const bool hasCurrent = std::filesystem::exists(o.out);
+		auto baseline = hasCurrent ? eleginus::Model::load(o.out) : (o.init.empty() ? eleginus::Model(o.seed) : eleginus::Model::load(o.init));
+		auto model = o.init.empty() ? baseline : eleginus::Model::load(o.init);
+		Adam adam(model.params().size());
+		std::mt19937_64 rng(o.seed);
+		std::deque<Game> replay;
+		constexpr std::size_t history = 64; // Bounded RAM-only replay, never part of a checkpoint.
+		std::uint64_t attempted = 0, completed = 0, discarded = 0, white = 0, black = 0, draws = 0, logged = 0;
+		int since = 0;
+		std::size_t samples = 0;
+		std::cout << "self-play start: out=" << o.out.string() << " formulas=" << model.layout().n << " parameters=" << model.params().size() << " depth=" << o.depth
+		          << " workers=" << o.workers << " seed=" << o.seed << " eval_every=" << o.every << " eval_depth=" << o.evalDepth
+		          << " baseline=" << (hasCurrent ? "current" : "initial") << std::endl;
+		while (!stopped()) {
+			const auto batch = std::min(o.workers, o.every - since);
+			std::vector<std::future<Game>> jobs;
+			for (int i = 0; i < batch; ++i) {
+				const auto seed = seedFor(o.seed, attempted + i);
+				jobs.push_back(std::async(std::launch::async, [&model, &o, seed] { return play(model, o, seed); }));
 			}
-			std::vector<GameRecord> records;
-			records.reserve(futures.size());
-			for (auto &future : futures) {
-				records.push_back(future.get());
-			}
-			SparseBatch gradients;
-			bool log_due = false;
-			for (auto &record : records) {
-				if (record.outcome == Outcome::truncated) {
+			std::vector<Game> games;
+			for (auto &job : jobs)
+				games.push_back(job.get());
+			if (stopped())
+				break;
+			// All searches have finished before parameters change.
+			std::size_t count = 0;
+			for (auto &game : games) {
+				if (game.result < 0) {
 					++discarded;
 					continue;
 				}
 				++completed;
-				++logged;
-				if (record.outcome == Outcome::draw) {
-					++draws;
-				} else if (record.outcome == Outcome::white) {
-					++white_wins;
-				} else {
-					++black_wins;
-				}
-				loss += update(model, record, gradients);
-				if (completed % options.log_every == 0 || completed == options.games) {
-					log_due = true;
-				}
-				if (completed == options.games) {
-					break;
-				}
+				++since;
+				white += game.result == 2;
+				draws += game.result == 1;
+				black += game.result == 0;
+				count += game.samples.size();
+				replay.push_back(std::move(game));
+				if (replay.size() > history)
+					replay.pop_front();
 			}
-			optimizer.step(model, gradients.indices, gradients.value_contributions, gradients.uncertainty_contributions,
-				gradients.samples, options);
-			if (log_due) {
-				std::cout << "self-play: games=" << completed << " discarded=" << discarded << " white=" << white_wins
-						  << " draws=" << draws << " black=" << black_wins << " loss=" << loss / static_cast<double>(logged) << '\n';
-				loss = 0.0;
-				logged = 0;
-				model.save(options.output);
+			const auto loss = learn(model, adam, replay, count, o, rng);
+			samples += count;
+			attempted += batch;
+			if (attempted - logged >= static_cast<std::uint64_t>(o.log) || since == o.every) {
+				std::cout << "self-play step: games=" << attempted << " completed=" << completed << " discarded=" << discarded << " positions=" << samples << " white=" << white
+				          << " draws=" << draws << " black=" << black;
+				if (count)
+					std::cout << " bce=" << loss;
+				std::cout << std::endl;
+				logged = attempted;
+			}
+			if (since == o.every && !stopped()) {
+				if (approve(model, baseline, book, o) && !stopped()) {
+					model.save(o.out);
+					baseline = model;
+					std::cout << "published model: " << o.out.string() << std::endl;
+				}
+				since = 0;
 			}
 		}
-		model.save(options.output);
-		std::cout << "self-play finished: model=" << options.output.string() << '\n';
+		std::cout << "training stopped: no progress saved; current unchanged by exit" << std::endl;
 		return 0;
-	} catch (const std::exception &error) {
-		std::cerr << "train error: " << error.what() << '\n';
+	} catch (const std::exception &e) {
+		std::cerr << "training error: " << e.what() << '\n';
 		return 1;
 	}
 }

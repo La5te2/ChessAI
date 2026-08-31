@@ -272,6 +272,30 @@ build/melano/uci \
 
 The [UCI](#uci) section describes runtime options, output fields and time management.
 
+## Eleginus
+
+Run continuous self-play training from the repository root:
+
+```powershell
+build\eleginus\train.exe `
+	--out models\eleginus\current.pth `
+	--opening-book data\openings.gen.bin `
+	--eval-every 1000 `
+	--depth 2 `
+	--eval-depth 4 `
+	--workers 16
+```
+
+`--eval-every K` schedules an evaluation after every K completed training games. Training starts from the standard initial position and discards games that remain unfinished at `--max-plies` (320 by default). Discarded games do not count toward K.
+
+Each evaluation freezes the candidate and plays 2000 games against the last accepted model. The Polyglot opening book must provide exactly 1000 distinct nonterminal leaf positions reachable from the standard initial position. Each position is played twice with the candidate's color reversed. Both models use `--eval-depth`, select their best move without training exploration, and play to a rule-defined terminal result.
+
+The acceptance test uses a two-sided 95% Hoeffding interval for the mean score over the 1000 opening pairs and converts its endpoints to relative Elo. This interval treats opening pairs as independent samples, rather than treating both games within a pair as independent. A candidate replaces `--out` only when the lower endpoint exceeds zero Elo. The confidence level applies to one evaluation, not to the entire sequence of repeated evaluations.
+
+An existing `--out` supplies the baseline and the starting training weights. `--init` overrides the starting training weights without replacing an existing baseline. When `--out` does not exist, the starting weights also supply the first baseline; no file is created until a candidate passes evaluation.
+
+Ctrl+C stops training or evaluation without saving progress. The accepted checkpoint contains only graybox weights and is replaced atomically. Optimizer state and training samples remain in memory and are discarded on exit. Rejected candidates do not replace the checkpoint or reset the ongoing training process.
+
 ## UCI
 
 Each architecture implements UCI time management within its own engine code. The three engines accept `go wtime`, `btime`, `winc`, `binc` and `movestogo`, and their allocation equations follow the optimum-time calculation in Stockfish's [Time Management](https://github.com/official-stockfish/Stockfish/blob/master/src/timeman.cpp). Let $t$ be the active side's remaining time in milliseconds, $i$ its increment, $o$ the `Move Overhead`, $p$ the number of plies played and $m$ the move horizon. An explicit `movestogo` sets $m$ up to a maximum of 50; otherwise $m=50$. When $t<1000$, the engines replace $m$ by $max(1,\lfloor0.05t\rfloor)$. They then compute

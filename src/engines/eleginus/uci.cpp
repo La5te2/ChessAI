@@ -253,14 +253,14 @@ private:
 				: "cp " + std::to_string(row.score_cp);
 			print("info depth " + std::to_string(result.depth) + " seldepth " + std::to_string(result.selective_depth) +
 				  " multipv " + std::to_string(index + 1) + " score " + score + " nodes " + std::to_string(result.nodes) +
-				  " nps " + std::to_string(nps) + " time " + std::to_string(result.elapsed_ms) + " pv " + eleginus::move_uci(row.move));
+				  " nps " + std::to_string(nps) + " time " + std::to_string(result.elapsed_ms) + " pv " + eleginus::moveToUci(row.move));
 		}
 	}
 
 	void go(const std::string &line) {
 		stop();
 		load_model();
-		if (eleginus::game_is_over(board_)) {
+		if (eleginus::isGameOver(board_)) {
 			print("bestmove 0000");
 			return;
 		}
@@ -276,7 +276,7 @@ private:
 				eleginus::Searcher searcher(*model_, search_options);
 				const auto result = searcher.search(board, [this](const eleginus::SearchResult &partial) { emit_info(partial); },
 					[this] { return stop_requested_.load(); });
-				print("bestmove " + (result.move.move() == chess::Move::NO_MOVE ? fallback_move() : eleginus::move_uci(result.move)));
+				print("bestmove " + (result.move.move() == chess::Move::NO_MOVE ? fallback_move() : eleginus::moveToUci(result.move)));
 			} catch (const std::exception &error) {
 				print("info string search error: " + std::string(error.what()));
 				print("bestmove " + fallback_move());
@@ -285,8 +285,8 @@ private:
 	}
 
 	std::string fallback_move() const {
-		const auto moves = eleginus::legal_moves(board_);
-		return moves.empty() ? "0000" : eleginus::move_uci(moves.front());
+		const auto moves = eleginus::legalmoves(board_);
+		return moves.empty() ? "0000" : eleginus::moveToUci(moves.front());
 	}
 
 	std::filesystem::path model_path_;

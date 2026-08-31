@@ -1,5 +1,6 @@
 BasedOnStyle: LLVM
 UseTab: ForIndentation
+NamespaceIndentation: All
 IndentWidth: 4
 TabWidth: 4
 ContinuationIndentWidth: 4

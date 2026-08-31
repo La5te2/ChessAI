@@ -52,9 +52,9 @@ int main(int argc, char **argv) {
 			const auto nps = static_cast<std::uint64_t>(1000.0 * static_cast<double>(partial.nodes) / static_cast<double>(elapsed));
 			std::cout << "depth=" << partial.depth << " score_cp=" << partial.score_cp << " nodes=" << partial.nodes
 					  << " nps=" << nps << " time_ms=" << partial.elapsed_ms
-					  << " bestmove=" << (partial.move.move() == chess::Move::NO_MOVE ? "0000" : eleginus::move_uci(partial.move)) << '\n';
+					  << " bestmove=" << (partial.move.move() == chess::Move::NO_MOVE ? "0000" : eleginus::moveToUci(partial.move)) << '\n';
 		});
-		std::cout << "bestmove " << (result.move.move() == chess::Move::NO_MOVE ? "0000" : eleginus::move_uci(result.move)) << '\n';
+		std::cout << "bestmove " << (result.move.move() == chess::Move::NO_MOVE ? "0000" : eleginus::moveToUci(result.move)) << '\n';
 		return 0;
 	} catch (const std::exception &error) {
 		std::cerr << "search error: " << error.what() << '\n';

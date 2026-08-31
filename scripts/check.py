@@ -11,8 +11,7 @@ from pathlib import Path
 
 ELEGINUS_MAGIC = b"ELEGINUS"
 ELEGINUS_TYPE_ID = 3
-ELEGINUS_FIXED_FEATURES = 67144
-ELEGINUS_HEADER = struct.Struct("=8sII")
+ELEGINUS_HEADER = struct.Struct("=8sIIIIIIQ")
 
 ARCHITECTURES = {
     1: {
@@ -98,39 +97,31 @@ def format_mib(byte_count: int) -> str:
 def inspect_eleginus(path: Path) -> dict[str, object] | None:
     with path.open("rb") as stream:
         header = stream.read(ELEGINUS_HEADER.size)
-        if len(header) < 8 or header[:8] != ELEGINUS_MAGIC:
+        if header[:8] != ELEGINUS_MAGIC:
             return None
         if len(header) != ELEGINUS_HEADER.size:
             raise ValueError("truncated Eleginus checkpoint header")
-        _, type_id, fixed_features = ELEGINUS_HEADER.unpack(header)
-        if type_id != ELEGINUS_TYPE_ID:
-            raise ValueError(f"Eleginus checkpoint has unexpected type_id: {type_id}")
-        if fixed_features != ELEGINUS_FIXED_FEATURES:
-            raise ValueError(
-                f"Eleginus checkpoint has unexpected fixed feature count: {fixed_features}"
-            )
-        features = fixed_features
-        expected_size = ELEGINUS_HEADER.size + 2 * features * 4
-        if path.stat().st_size != expected_size:
-            raise ValueError("Eleginus checkpoint size does not match its feature count")
+        _, type_id, n, z, width, layers, count, _ = ELEGINUS_HEADER.unpack(header)
+        if type_id != ELEGINUS_TYPE_ID or n == 0 or z != n + 16 or width == 0 or layers == 0:
+            raise ValueError("inconsistent Eleginus dimensions")
+        expected = n + (n + z) * width + layers * (width * width + width)
+        if count != expected or path.stat().st_size != ELEGINUS_HEADER.size + count * 4:
+            raise ValueError("Eleginus checkpoint size does not match its parameter dimensions")
         weights = array("f")
-        weights.fromfile(stream, 2 * features)
+        weights.fromfile(stream, count)
 
+    tensors = 3 + 2 * layers
     return {
         "architecture": "eleginus",
-        "heads": "value, uncertainty",
-        "arch": {
-            "type_id": type_id,
-            "fixed_features": fixed_features,
-            "features": features,
-        },
-        "model_children": "none",
-        "parameters": 2 * features,
-        "trainable_parameters": 2 * features,
-        "parameter_tensors": 2,
+        "heads": "dynamic formula value",
+        "arch": {"type_id": type_id, "formulas": n, "inputs": z, "width": width, "layers": layers},
+        "model_children": "v, E, U, G, b",
+        "parameters": count,
+        "trainable_parameters": count,
+        "parameter_tensors": tensors,
         "buffers": 0,
-        "tensor_memory": 2 * features * 4,
-        "dtypes": "float32 (2)",
+        "tensor_memory": count * 4,
+        "dtypes": f"float32 ({tensors})",
         "devices": "cpu",
         "finite": all(math.isfinite(weight) for weight in weights),
     }

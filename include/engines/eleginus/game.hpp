@@ -6,8 +6,8 @@
 
 namespace eleginus {
 
-std::vector<chess::Move> legal_moves(const chess::Board &board);
-std::string move_uci(const chess::Move &move);
-bool game_is_over(const chess::Board &board);
+	std::vector<chess::Move> legalmoves(const chess::Board &board);
+	std::string moveToUci(const chess::Move &move);
+	bool isGameOver(const chess::Board &board);
 
 } // namespace eleginus
