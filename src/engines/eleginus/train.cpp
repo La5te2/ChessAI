@@ -154,7 +154,7 @@ namespace {
 			}
 			const float scale = static_cast<float>(std::min(1.0, o.clip / std::max(std::sqrt(norm), 1.0e-12)));
 			auto &p = model.params();
-			const auto initial = eleginus::FormulaSet::fixed().initial();
+			const auto initial = eleginus::Model::initial();
 			for (std::size_t i = 0; i < model.formulas(); ++i) {
 				p[i] -= o.lr * (grad[i] * scale + o.decay * (p[i] - initial[i]));
 				if (!std::isfinite(p[i]))

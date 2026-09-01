@@ -127,7 +127,7 @@ if(GADIDAE_BUILD_ELEGINUS)
 
 add_library(eleginus
 	src/engines/eleginus/execute.cpp
-	src/engines/eleginus/formula.cpp
+	src/engines/eleginus/formula.inl
 	src/engines/eleginus/game.cpp
 	src/engines/eleginus/model.cpp
 	src/engines/eleginus/match.cpp

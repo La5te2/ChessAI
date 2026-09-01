@@ -16,11 +16,7 @@ namespace {
 	}
 
 	void checkGrad(eleginus::Model model) {
-		const auto &formulas = eleginus::FormulaSet::fixed();
-		require(formulas.size() == eleginus::kFormulaCount, "fixed formula set has the wrong dimensions");
-		require(formulas.names().size() == eleginus::kFormulaCount && formulas.names()[0] == "tempo" && formulas.names()[1] == "material.pawn" &&
-		        formulas.names()[6] == "pst.pawn.a1" && formulas.names()[390] == "bishopPair" && formulas.names()[621] == "endgame.oppositeBishopPassers",
-		    "formula catalog no longer matches the fixed coordinate order");
+		require(eleginus::Model::initial().size() == eleginus::kFormulaCount, "initial formula weights have the wrong dimensions");
 		std::vector<eleginus::Feature> x;
 		model.extract(chess::Board("r3k2r/ppp2ppp/2n1bn2/3qp3/3P4/2N1BN2/PPP2PPP/R2Q1RK1 b kq - 3 11"), x);
 		require(x.size() > 1 && model.activate(x[0].index, x[1].index), "cannot activate a graybox relation");

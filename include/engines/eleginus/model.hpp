@@ -27,6 +27,7 @@ namespace eleginus {
 		};
 
 		Model();
+		static std::span<const float> initial() noexcept;
 		static Model load(const std::filesystem::path &path);
 		void save(const std::filesystem::path &path) const;
 
@@ -41,7 +42,7 @@ namespace eleginus {
 		bool activate(std::uint16_t row, std::uint16_t condition);
 		bool active(std::uint16_t row, std::uint16_t condition) const;
 		void prune(float threshold);
-		std::size_t formulas() const noexcept { return FormulaSet::fixed().size(); }
+		std::size_t formulas() const noexcept { return kFormulaCount; }
 		std::span<const Relation> relations() const noexcept { return links; }
 		const std::vector<float> &params() const noexcept { return p; }
 		std::vector<float> &params() noexcept { return p; }
