@@ -144,6 +144,11 @@ if [[ "${BUILD_ELEGINUS}" == "ON" ]]; then
 		test -x "${WORK_DIR}/eleginus/${executable}"
 		cp "${WORK_DIR}/eleginus/${executable}" "${PUBLISH_DIR}/eleginus/"
 	done
+	if [[ -f "${ROOT_DIR}/models/eleginus/eleginus.pth" ]]; then
+		cp "${ROOT_DIR}/models/eleginus/eleginus.pth" "${PUBLISH_DIR}/eleginus/eleginus.pth"
+	fi
+	mkdir -p "${ROOT_DIR}/models/eleginus"
+	cp "${WORK_DIR}/eleginus/uci" "${ROOT_DIR}/models/eleginus/eleginus"
 fi
 if [[ "${BUILD_GRAPHICS}" == "ON" ]]; then
 	rm -rf -- "${PUBLISH_DIR}/graphics"

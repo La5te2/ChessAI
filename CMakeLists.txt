@@ -125,28 +125,8 @@ endif()
 
 if(GADIDAE_BUILD_ELEGINUS)
 
-add_executable(eleginuscompile src/engines/eleginus/formula.cpp)
-target_compile_definitions(eleginuscompile PRIVATE ELEGINUS_COMPILE)
-target_include_directories(eleginuscompile PRIVATE "${CMAKE_SOURCE_DIR}/include/engines")
-target_include_directories(eleginuscompile SYSTEM PRIVATE "${GADIDAE_API_DIR}/chess")
-set_target_properties(eleginuscompile PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools")
-if(MSVC)
-	target_compile_options(eleginuscompile PRIVATE /W4 /permissive- /utf-8)
-else()
-	target_compile_options(eleginuscompile PRIVATE -Wall -Wextra -Wpedantic)
-endif()
-set(ELEGINUS_CATALOG "${CMAKE_BINARY_DIR}/generated/eleginus/catalog.hpp")
-add_custom_command(OUTPUT "${ELEGINUS_CATALOG}"
-	COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/generated/eleginus"
-	COMMAND $<TARGET_FILE:eleginuscompile> "${ELEGINUS_CATALOG}.tmp"
-	COMMAND ${CMAKE_COMMAND} -E copy_if_different "${ELEGINUS_CATALOG}.tmp" "${ELEGINUS_CATALOG}"
-	COMMAND ${CMAKE_COMMAND} -E rm "${ELEGINUS_CATALOG}.tmp"
-	DEPENDS eleginuscompile
-	VERBATIM
-)
-
 add_library(eleginus
-	"${ELEGINUS_CATALOG}"
+	src/engines/eleginus/execute.cpp
 	src/engines/eleginus/formula.cpp
 	src/engines/eleginus/game.cpp
 	src/engines/eleginus/model.cpp
@@ -159,14 +139,19 @@ set_target_properties(eleginus PROPERTIES
 	PDB_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/eleginus"
 )
 target_include_directories(eleginus PUBLIC "${CMAKE_SOURCE_DIR}/include/engines")
-target_include_directories(eleginus PRIVATE "${CMAKE_BINARY_DIR}/generated")
 target_include_directories(eleginus SYSTEM PUBLIC "${GADIDAE_API_DIR}/chess")
 target_precompile_headers(eleginus PRIVATE <chess.hpp>)
 target_link_libraries(eleginus PUBLIC Threads::Threads)
 if(MSVC)
 	target_compile_options(eleginus PRIVATE /MP /W4 /permissive- /utf-8)
+	if(MSVC_CXX_ARCHITECTURE_ID STREQUAL "x64")
+		target_compile_options(eleginus PRIVATE /arch:AVX2)
+	endif()
 else()
 	target_compile_options(eleginus PRIVATE -Wall -Wextra -Wpedantic)
+	if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+		target_compile_options(eleginus PRIVATE -mavx2 -mfma -mpopcnt)
+	endif()
 endif()
 
 function(eleginusexecutable name source)

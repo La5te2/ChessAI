@@ -11,7 +11,8 @@ from pathlib import Path
 
 ELEGINUS_MAGIC = b"ELEGINUS"
 ELEGINUS_TYPE_ID = 3
-ELEGINUS_HEADER = struct.Struct("=8sIIIIIIQ")
+ELEGINUS_HEADER = struct.Struct("=8sIII")
+ELEGINUS_RELATION = struct.Struct("=HHf")
 
 ARCHITECTURES = {
     1: {
@@ -101,27 +102,34 @@ def inspect_eleginus(path: Path) -> dict[str, object] | None:
             return None
         if len(header) != ELEGINUS_HEADER.size:
             raise ValueError("truncated Eleginus checkpoint header")
-        _, type_id, n, z, width, layers, count, _ = ELEGINUS_HEADER.unpack(header)
-        if type_id != ELEGINUS_TYPE_ID or n == 0 or z != n + 16 or width == 0 or layers == 0:
+        _, type_id, n, relations = ELEGINUS_HEADER.unpack(header)
+        if type_id != ELEGINUS_TYPE_ID or n == 0 or relations > 2048:
             raise ValueError("inconsistent Eleginus dimensions")
-        expected = n + (n + z) * width + layers * (width * width + width)
-        if count != expected or path.stat().st_size != ELEGINUS_HEADER.size + count * 4:
+        expected = ELEGINUS_HEADER.size + n * 4 + relations * ELEGINUS_RELATION.size
+        if path.stat().st_size != expected:
             raise ValueError("Eleginus checkpoint size does not match its parameter dimensions")
         weights = array("f")
-        weights.fromfile(stream, count)
+        weights.fromfile(stream, n)
+        coordinates = set()
+        for _ in range(relations):
+            row, condition, weight = ELEGINUS_RELATION.unpack(stream.read(ELEGINUS_RELATION.size))
+            if row >= n or condition >= n or (row, condition) in coordinates:
+                raise ValueError("Eleginus checkpoint contains an invalid relation coordinate")
+            coordinates.add((row, condition))
+            weights.append(weight)
 
-    tensors = 3 + 2 * layers
+    count = n + relations
     return {
         "architecture": "eleginus",
-        "heads": "dynamic formula value",
-        "arch": {"type_id": type_id, "formulas": n, "inputs": z, "width": width, "layers": layers},
-        "model_children": "v, E, U, G, b",
+        "heads": "sparse graybox value",
+        "arch": {"type_id": type_id, "formulas": n, "relations": relations},
+        "model_children": "base, relations",
         "parameters": count,
         "trainable_parameters": count,
-        "parameter_tensors": tensors,
+        "parameter_tensors": 2 if relations else 1,
         "buffers": 0,
         "tensor_memory": count * 4,
-        "dtypes": f"float32 ({tensors})",
+        "dtypes": f"float32 ({2 if relations else 1})",
         "devices": "cpu",
         "finite": all(math.isfinite(weight) for weight in weights),
     }

@@ -16,23 +16,21 @@ namespace {
 	}
 
 	void checkGrad(eleginus::Model model) {
+		const auto &formulas = eleginus::FormulaSet::fixed();
+		require(formulas.size() == eleginus::kFormulaCount, "fixed formula set has the wrong dimensions");
+		require(formulas.names().size() == eleginus::kFormulaCount && formulas.names()[0] == "tempo" && formulas.names()[1] == "material.pawn" &&
+		        formulas.names()[6] == "pst.pawn.a1" && formulas.names()[390] == "bishopPair" && formulas.names()[621] == "endgame.oppositeBishopPassers",
+		    "formula catalog no longer matches the fixed coordinate order");
 		std::vector<eleginus::Feature> x;
 		model.extract(chess::Board("r3k2r/ppp2ppp/2n1bn2/3qp3/3P4/2N1BN2/PPP2PPP/R2Q1RK1 b kq - 3 11"), x);
+		require(x.size() > 1 && model.activate(x[0].index, x[1].index), "cannot activate a graybox relation");
 		auto &p = model.params();
-		const auto s = model.layout();
-		for (auto i = s.u; i < s.g; ++i)
-			p[i] = 0.01F * std::sin(static_cast<float>(i));
 		eleginus::Model::Cache cache;
 		const float score = model.forward(x, cache);
 		std::vector<float> grad(p.size());
-		model.backward(x, cache, 1.0F, grad);
-		const std::array<std::size_t, 6> cuts{0, s.e, s.u, s.g, s.b, s.total};
-		// Check the strongest derivative of each parameter family, away from ReLU's zero kink.
-		for (std::size_t family = 0; family + 1 < cuts.size(); ++family) {
-			const auto first = grad.begin() + cuts[family], last = grad.begin() + cuts[family + 1];
-			const auto it = std::max_element(first, last, [](float a, float b) { return std::abs(a) < std::abs(b); });
-			require(it != last && std::abs(*it) > 1.0e-7F, "a graybox parameter family has no gradient");
-			const auto i = static_cast<std::size_t>(it - grad.begin());
+		model.backward(cache, 1.0F, grad);
+		for (const std::size_t i : {static_cast<std::size_t>(x.front().index), p.size() - 1}) {
+			require(std::abs(grad[i]) > 1.0e-7F, "a graybox parameter has no gradient");
 			const auto saved = p[i];
 			constexpr float eps = 0.001F;
 			p[i] = saved + eps;
@@ -40,15 +38,14 @@ namespace {
 			p[i] = saved - eps;
 			const float minus = model.score(x);
 			p[i] = saved;
-			const float numerical = (plus - minus) / (2 * eps);
+			const float numerical = (plus - minus) / (2.0F * eps);
 			require(std::abs(numerical - grad[i]) < 0.002F * (1 + std::abs(grad[i])), "native backward failed finite differences");
 		}
 		std::vector<float> w;
 		model.weights(x, w);
 		float explicitScore = 0;
 		for (const auto &f : x)
-			if (f.index < w.size())
-				explicitScore += w[f.index] * f.value;
+			explicitScore += w[f.index] * static_cast<float>(f.score);
 		require(std::abs(score - explicitScore) < 1.0e-5F, "reordered evaluation changed dynamic weighted sum");
 
 		const auto bce = [](float h) { return std::max(h, 0.0F) - h + std::log1p(std::exp(-std::abs(h))); };
@@ -58,42 +55,40 @@ namespace {
 		require(bce(model.score(x)) < bce(score), "native gradient does not decrease BCE");
 
 		// Repeated pawn keys must not retain king/occupancy/turn-dependent results.
-		const std::array<chess::Board, 9> positions{chess::Board(), chess::Board("rnbqkbnr/pppppppp/8/8/8/5N2/PPPPPPPP/RNBQKB1R b KQkq - 1 1"),
+		const std::array<chess::Board, 11> positions{chess::Board(), chess::Board("rnbqkbnr/pppppppp/8/8/8/5N2/PPPPPPPP/RNBQKB1R b KQkq - 1 1"),
 		    chess::Board("r3k2r/ppp2ppp/2n1bn2/3qp3/3P4/2N1BN2/PPP2PPP/R2Q1RK1 b kq - 3 11"), chess::Board("8/2p5/3p4/1P1Pp1k1/4P3/5K2/8/8 w - - 12 42"),
-		    chess::Board("8/2p5/3p4/1P1Pp1k1/4P3/6K1/8/8 b - - 13 42"), chess::Board("4k3/8/8/8/8/8/4Q3/4K3 w - - 0 1"), chess::Board("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1"),
-		    chess::Board("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1"), chess::Board("4k3/P7/8/8/8/8/7p/4K3 w - - 0 1")};
+		    chess::Board("8/2p5/3p4/1P1Pp1k1/4P3/6K1/8/8 b - - 13 42"), chess::Board("4k3/8/8/8/8/8/5Q2/4K3 w - - 0 1"), chess::Board("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1"),
+		    chess::Board("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1"), chess::Board("4k3/P7/8/8/8/8/7p/4K3 w - - 0 1"),
+		    chess::Board("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1"),
+		    chess::Board("r1bq1rk1/ppp2ppp/2np1n2/2b1p3/2B1P3/2NP1N2/PPP2PPP/R1BQ1RK1 w - - 4 6")};
 		for (int revision = 0; revision < 2; ++revision) {
-			eleginus::Evaluator eval(model);
 			for (int repeat = 0; repeat < 3; ++repeat)
 				for (const auto &board : positions) {
 					model.extract(board, x);
-					for (const auto &f : x)
-						require(f.index < model.layout().z, "inactive formula region changed output indices");
-					const float expected = model.score(board);
-					require(std::abs(eval.score(board) - expected) < 2.0e-5F * (1 + std::abs(expected)), "cached interpolation changed graybox output");
+					for (const auto &f : x) {
+						require(f.index < model.formulas(), "formula execution changed output indices");
+						require(f.condition >= std::abs(f.score) && ((f.condition - f.score) & 1) == 0, "formula score and condition cannot reconstruct both activations");
+					}
+					const float white = model.score(x);
+					const float expected = board.sideToMove() == chess::Color::WHITE ? white : -white;
+					require(std::abs(model.score(board) - expected) < 2.0e-5F * (1 + std::abs(expected)), "direct graybox output changed sparse evaluation");
 				}
-			// A new search rebuilds coefficients even when a caller retains the parameter reference.
+			// A new search reads the model parameters again.
 			p[0] += 0.125F;
-			p[model.layout().u] += 0.05F;
+			p.back() += 0.05F;
 		}
-		// Undo must restore the same signals after captures, promotions, castling and en passant.
-		eleginus::Evaluator eval(model);
-		for (auto board : positions) {
-			model.extract(board, x);
-			const float expected = eval.score(board);
+
+		chess::Board walk;
+		for (unsigned ply = 1; ply < 80; ++ply) {
+			model.extract(walk, x);
+			const float white = model.score(x);
+			const float expected = walk.sideToMove() == chess::Color::WHITE ? white : -white;
+			require(std::abs(model.score(walk) - expected) < 2.0e-5F * (1 + std::abs(expected)), "attack-cache reuse changed formula evaluation");
 			chess::Movelist moves;
-			chess::movegen::legalmoves(moves, board);
-			for (const auto move : moves) {
-				board.makeMove(move);
-				model.score(board);
-				eval.score(board);
-				board.unmakeMove(move);
-				std::vector<eleginus::Feature> restored;
-				model.extract(board, restored);
-				require(std::equal(x.begin(), x.end(), restored.begin(), restored.end(), [](auto a, auto b) { return a.index == b.index && a.value == b.value; }),
-				    "incremental attack state changed signals after undo");
-				require(eval.score(board) == expected, "incremental attack state changed evaluation after undo");
-			}
+			chess::movegen::legalmoves(moves, walk);
+			if (moves.empty())
+				break;
+			walk.makeMove(moves[(17U * ply + 5U) % moves.size()]);
 		}
 	}
 
@@ -108,14 +103,12 @@ int main() {
 
 		std::vector<eleginus::Feature> x;
 		model.extract(queen, x);
-		float base = 0;
-		for (const auto &f : x)
-			base += model.program().weights()[f.index] * f.value;
-		require(model.score(x) == base, "zero U changed the initial HCE score");
+		require(std::isfinite(model.score(x)), "initial kernel model produced a nonfinite score");
 		checkGrad(model);
 
 		const auto path = std::filesystem::temp_directory_path() / "eleginus-test.pth";
-		model.params()[model.layout().u] = 0.02F;
+		model.activate(x.front().index, x.back().index);
+		model.params().back() += 0.02F;
 		model.save(path);
 		const auto loaded = eleginus::Model::load(path);
 		std::filesystem::remove(path);
@@ -127,6 +120,8 @@ int main() {
 		const auto result = eleginus::Searcher(model, options).search(chess::Board("7k/5Q2/6K1/8/8/8/8/8 w - - 0 1"));
 		require(result.move.move() != chess::Move::NO_MOVE && result.score_cp == 29999, "search missed the shortest forced mate");
 		require(result.root.front().move == result.move, "reported PV differs from bestmove");
+		const auto lastPlyMate = eleginus::Searcher(model, options).search(chess::Board("7k/6Q1/6K1/8/8/8/8/8 b - - 100 1"));
+		require(lastPlyMate.score_cp == -30000, "fifty-move adjudication overrode checkmate");
 
 		options.depth = 1;
 		options.quiescence_depth = 0;

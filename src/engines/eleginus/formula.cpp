@@ -1,146 +1,36 @@
 #include "eleginus/formula.hpp"
+#include "eleginus/atom.hpp"
 #include <algorithm>
 #include <array>
 #include <bit>
 #include <cmath>
+#include <optional>
 #include <stdexcept>
 #include <utility>
-#ifdef ELEGINUS_COMPILE
-#include <fstream>
-#include <iomanip>
-#include <iostream>
-#include <limits>
-#include <unordered_map>
-#else
-#include "eleginus/catalog.hpp"
-#include "eleginus/model.hpp"
-#endif
 
 namespace eleginus {
-	// Regions name formula subgraphs, not additional atomic instructions.
-	enum class Region : unsigned {
-		pawns,
-		rookfiles,
-		knightMobility,
-		bishopMobility,
-		rookMobility,
-		queenMobility,
-		pawnThreat,
-		knightThreat,
-		bishopThreat,
-		rookThreat,
-		queenThreat,
-		queenPressure,
-		kingPawns,
-		count
-	};
-	enum class Type : std::uint8_t { F64, U64, B1 };
-#ifdef ELEGINUS_COMPILE
-	using Id = std::uint32_t;
-	enum class Op : std::uint8_t { IMM, LD, NOT, AND, OR, XOR, SHL, SHR, UADD, USUB, CLZ, CTZ, POP, ADD, SUB, MUL, DIV, NEG, ABS, MIN, MAX, EQ, LT, LE, GT, GE, SEL };
-	struct Node {
-		Op op = Op::IMM;
-		Type type = Type::F64;
-		std::uint16_t aux = 0;
-		Id a = 0, b = 0, c = 0;
-		std::uint64_t imm = 0;
-		bool operator==(const Node &) const = default;
-	};
-	struct Root {
-		Id node;
-		float weight;
-	};
-	struct Graph {
-		std::vector<Node> nodes_;
-		std::vector<Root> roots_;
-		std::vector<std::uint8_t> families_;
-		std::array<unsigned, static_cast<unsigned>(Region::count)> sizes_{};
-		void validate() const;
-		void write(const char *path) const;
-	};
-#endif
-#ifndef ELEGINUS_COMPILE
-	// The inference receiver consumes each nonzero signal immediately.
-	struct Projection {
-		static constexpr bool compact = true;
-		Evaluator &eval;
-		void begin(const std::array<double, 4> &coords) { eval.begin(coords); }
-		void put(std::uint32_t index, float value) { eval.accept(index, value); }
-	};
-#endif
 	namespace {
-
 		using Word = std::uint64_t;
-		double real(Word x) noexcept {
-			return std::bit_cast<double>(x);
-		}
-		Word word(double x) noexcept {
-			return std::bit_cast<Word>(x);
-		}
-
-#ifdef ELEGINUS_COMPILE
-		int arity(Op op) noexcept {
-			switch (op) {
-			case Op::IMM:
-			case Op::LD:
-				return 0;
-			case Op::NOT:
-			case Op::CLZ:
-			case Op::CTZ:
-			case Op::POP:
-			case Op::NEG:
-			case Op::ABS:
-				return 1;
-			case Op::AND:
-			case Op::OR:
-			case Op::XOR:
-			case Op::SHL:
-			case Op::SHR:
-			case Op::UADD:
-			case Op::USUB:
-			case Op::ADD:
-			case Op::SUB:
-			case Op::MUL:
-			case Op::DIV:
-			case Op::MIN:
-			case Op::MAX:
-			case Op::EQ:
-			case Op::LT:
-			case Op::LE:
-			case Op::GT:
-			case Op::GE:
-				return 2;
-			case Op::SEL:
-				return 3;
+		std::int64_t number(Word x) noexcept { return std::bit_cast<std::int64_t>(x); }
+		std::array<Word, atomCount> inputs(const chess::Board &board) {
+			std::array<Word, atomCount> in{};
+			const std::array<Word, 2> byColor{board.us(chess::Color::WHITE).getBits(), board.us(chess::Color::BLACK).getBits()};
+			for (int type = 0; type < 6; ++type) {
+				const auto pieces = board.pieces(chess::PieceType(static_cast<chess::PieceType::underlying>(type))).getBits();
+				in[static_cast<std::size_t>(type)] = pieces & byColor[0];
+				in[static_cast<std::size_t>(6 + type)] = pieces & byColor[1];
 			}
-			return -1;
-		}
-
-		bool commutes(Op op) noexcept {
-			return op == Op::AND || op == Op::OR || op == Op::XOR || op == Op::UADD || op == Op::ADD || op == Op::MUL || op == Op::MIN || op == Op::MAX || op == Op::EQ;
-		}
-
-#endif
-#ifndef ELEGINUS_COMPILE
-		std::array<Word, 15> inputs(const chess::Board &board) {
-			std::array<Word, 15> in{};
 			for (int color = 0; color < 2; ++color) {
-				for (int type = 0; type < 6; ++type) {
-					in[static_cast<std::size_t>(color * 6 + type)] =
-					    board.pieces(chess::PieceType(static_cast<chess::PieceType::underlying>(type)), static_cast<chess::Color>(color)).getBits();
-				}
-				for (int side = 0; side < 2; ++side) {
-					const auto flank = side == 0 ? chess::Board::CastlingRights::Side::KING_SIDE : chess::Board::CastlingRights::Side::QUEEN_SIDE;
+				for (int wing = 0; wing < 2; ++wing) {
+					const auto flank = wing == 0 ? chess::Board::CastlingRights::Side::KING_SIDE : chess::Board::CastlingRights::Side::QUEEN_SIDE;
 					if (board.castlingRights().has(static_cast<chess::Color>(color), flank))
-						in[13] |= 1ULL << (2 * color + side);
+						in[atomIndex(Atom::CR)] |= 1ULL << (2 * color + wing);
 				}
 			}
-			in[12] = word(static_cast<int>(board.sideToMove()));
-			in[14] = board.enpassantSq().is_valid() ? 1ULL << board.enpassantSq().index() : 0;
+			in[atomIndex(Atom::STM)] = static_cast<Word>(board.sideToMove());
 			return in;
 		}
 
-#endif
 		std::uint64_t flip(Word x) noexcept {
 			x = ((x & 0x00FF00FF00FF00FFULL) << 8) | ((x >> 8) & 0x00FF00FF00FF00FFULL);
 			x = ((x & 0x0000FFFF0000FFFFULL) << 16) | ((x >> 16) & 0x0000FFFF0000FFFFULL);
@@ -149,103 +39,9 @@ namespace eleginus {
 
 	} // namespace
 
-#ifdef ELEGINUS_COMPILE
-	// Assembly construction shares identical atomic expressions.
-	class Asm {
-	public:
-		Id num(double x, Type type = Type::F64);
-		Id bits(std::uint64_t x);
-		Id input(unsigned slot);
-		Id unary(Op op, Type type, Id a);
-		Id binary(Op op, Type type, Id a, Id b);
-		Id sel(Id condition, Id yes, Id no);
-		void root(Id id, float weight);
-		void family(unsigned group) { families_.push_back(static_cast<std::uint8_t>(group)); }
-		template <class F> void group(Region region, bool, F &&f) {
-			auto &size = sizes_[static_cast<unsigned>(region)];
-			if (size)
-				throw std::logic_error("duplicate formula region");
-			const auto first = roots_.size();
-			f();
-			size = static_cast<unsigned>(roots_.size() - first);
-		}
-		Graph finish();
-
-	protected:
-		const Node &node(Id id) const { return nodes_[id]; }
-
-	private:
-		struct Hash {
-			std::size_t operator()(const Node &n) const noexcept;
-		};
-		Id emit(Node n);
-		std::vector<Node> nodes_;
-		std::vector<Root> roots_;
-		std::vector<std::uint8_t> families_;
-		std::array<unsigned, static_cast<unsigned>(Region::count)> sizes_{};
-		std::unordered_map<Node, Id, Hash> ids_;
-	};
-
-	std::size_t Asm::Hash::operator()(const Node &n) const noexcept {
-		std::uint64_t h = n.imm ^ (static_cast<std::uint64_t>(n.op) << 56) ^ (static_cast<std::uint64_t>(n.type) << 48);
-		for (const Id x : {n.a, n.b, n.c})
-			h ^= x + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-		return static_cast<std::size_t>(h);
-	}
-
-	Id Asm::emit(Node n) {
-		if (commutes(n.op) && n.b < n.a)
-			std::swap(n.a, n.b);
-		const auto found = ids_.find(n);
-		if (found != ids_.end())
-			return found->second;
-		const auto id = static_cast<Id>(nodes_.size());
-		ids_.emplace(n, id);
-		nodes_.push_back(n);
-		return id;
-	}
-
-	Id Asm::num(double x, Type type) {
-		return emit({Op::IMM, type, 0, 0, 0, 0, word(x)});
-	}
-	Id Asm::bits(Word x) {
-		return emit({Op::IMM, Type::U64, 0, 0, 0, 0, x});
-	}
-	Id Asm::input(unsigned slot) {
-		return emit({Op::LD, slot == 12 ? Type::F64 : Type::U64, 0, 0, 0, 0, slot});
-	}
-	Id Asm::unary(Op op, Type type, Id a) {
-		return emit({op, type, 0, a});
-	}
-	Id Asm::binary(Op op, Type type, Id a, Id b) {
-		return emit({op, type, 0, a, b});
-	}
-	Id Asm::sel(Id condition, Id yes, Id no) {
-		const auto type = node(yes).type == Type::U64 ? Type::U64 : node(yes).type == Type::B1 && node(no).type == Type::B1 ? Type::B1 : Type::F64;
-		return emit({Op::SEL, type, 0, condition, yes, no});
-	}
-	void Asm::root(Id id, float weight) {
-		roots_.push_back({id, weight});
-	}
-	Graph Asm::finish() {
-		Graph p;
-		p.nodes_ = std::move(nodes_);
-		p.roots_ = std::move(roots_);
-		p.families_ = std::move(families_);
-		p.sizes_ = sizes_;
-		ids_.clear();
-		return p;
-	}
-
-#endif
-
 	namespace {
 
-		// Cache slots name shared subgraphs, never new atomic instructions.
-		enum class Shared { own, strong, clear, safe, wide, stop, control, area, push, count };
-		enum class Pawn { attack, files, passed, open, count };
-
-		// Builder visits every square; Native visits only the occupied subset.
+		// Sparse square iteration preserves the fixed coordinate order while visiting occupied squares only.
 		struct Squares {
 			Word mask;
 			struct Iterator {
@@ -261,191 +57,75 @@ namespace eleginus {
 			Iterator end() const { return {0}; }
 		};
 
-#ifdef ELEGINUS_COMPILE
-		class Builder : public Asm {
-		public:
-			using Value = Id;
-			using Sum = std::vector<Id>;
-			static constexpr bool direct = false;
-			template <class F> Id memo(Shared, Id, F &&f) { return f(); }
-			template <class F> Id pawn(Pawn, Id, F &&f) { return f(); }
-			Squares squares(Id, int) const { return {~0ULL}; }
-			Squares locations(Id) const { return {~0ULL}; }
-			Id add(Id a, Id b) { return binary(Op::ADD, Type::F64, a, b); }
-			Id sub(Id a, Id b) { return binary(Op::SUB, Type::F64, a, b); }
-			Id mul(Id a, Id b) { return binary(Op::MUL, Type::F64, a, b); }
-			Id land(Id a, Id b) { return sel(a, b, num(0, Type::B1)); }
-			Id lor(Id a, Id b) { return sel(a, num(1, Type::B1), b); }
-			Id lnot(Id a) { return equal(a, num(0)); }
-			Id equal(Id a, Id b) { return binary(Op::EQ, Type::B1, a, b); }
-			Id ge(Id a, Id b) { return binary(Op::GE, Type::B1, a, b); }
-			Id maximum(Id a, Id b) { return binary(Op::MAX, Type::F64, a, b); }
-			Id minimum(Id a, Id b) { return binary(Op::MIN, Type::F64, a, b); }
-			Id bb(Word x) { return bits(x); }
-			Id band(Id a, Id b) { return binary(Op::AND, Type::U64, a, b); }
-			Id bor(Id a, Id b) { return binary(Op::OR, Type::U64, a, b); }
-			Id bnot(Id a) { return unary(Op::NOT, Type::U64, a); }
-			Id shl(Id a, unsigned n) { return binary(Op::SHL, Type::U64, a, bb(n)); }
-			Id shr(Id a, unsigned n) { return binary(Op::SHR, Type::U64, a, bb(n)); }
-			Id pop(Id a) { return unary(Op::POP, Type::F64, a); }
-			Id anyset(Id a) { return lnot(equal(a, bb(0))); }
-			Id pcs(Id role, int type) { return sel(equal(role, num(0)), input(type), input(6 + type)); }
-			Id rel(Id role, Word mask) { return sel(equal(role, num(0)), bb(mask), bb(flip(mask))); }
-			Id rsq(Id role, int square) { return sel(equal(role, num(0)), num(square), num(square ^ 56)); }
-			Id right(Id role, int side) { return anyset(band(input(13), sel(equal(role, num(0)), bb(1ULL << side), bb(1ULL << (side + 2))))); }
-			Id occ() {
-				Id result = input(0);
-				for (unsigned slot = 1; slot < 12; ++slot)
-					result = bor(result, input(slot));
-				return result;
-			}
-
-			// Direction order: forward, backward, east, west, then forward/backward diagonals.
-			Id sh(Id x, Id role, int direction) {
-				const auto east = band(x, bb(0x7F7F7F7F7F7F7F7FULL));
-				const auto west = band(x, bb(0xFEFEFEFEFEFEFEFEULL));
-				const auto white = equal(role, num(0));
-				switch (direction) {
-				case 0:
-					return sel(white, shl(x, 8), shr(x, 8));
-				case 1:
-					return sel(white, shr(x, 8), shl(x, 8));
-				case 2:
-					return shl(east, 1);
-				case 3:
-					return shr(west, 1);
-				case 4:
-					return sel(white, shl(east, 9), shr(east, 7));
-				case 5:
-					return sel(white, shl(west, 7), shr(west, 9));
-				case 6:
-					return sel(white, shr(east, 7), shl(east, 9));
-				case 7:
-					return sel(white, shr(west, 9), shl(west, 7));
-				default:
-					throw std::invalid_argument("invalid shift direction");
-				}
-			}
-
-			Id fill(Id x, Id role) {
-				const auto white = equal(role, num(0));
-				for (unsigned distance : {8U, 16U, 32U})
-					x = bor(x, sel(white, shl(x, distance), shr(x, distance)));
-				return x;
-			}
-
-			Id fromatk(Id role, int type, Id square) {
-				const Node n = node(square);
-				if (n.op == Op::SEL)
-					return sel(n.a, fromatk(role, type, n.b), fromatk(role, type, n.c));
-				if (n.op != Op::IMM)
-					throw std::logic_error("attack macro requires a finite square expansion");
-				const int s = static_cast<int>(real(n.imm));
-				if (type == 0) {
-					return sel(equal(role, num(0)), bb(chess::attacks::pawn(chess::Color::WHITE, chess::Square(s)).getBits()),
-					    bb(chess::attacks::pawn(chess::Color::BLACK, chess::Square(s)).getBits()));
-				}
-				if (type == 1)
-					return bb(chess::attacks::knight(chess::Square(s)).getBits());
-				if (type == 5)
-					return bb(chess::attacks::king(chess::Square(s)).getBits());
-				Id result = bb(0);
-				for (int dr = -1; dr <= 1; ++dr) {
-					for (int df = -1; df <= 1; ++df) {
-						if ((dr == 0 && df == 0) || (type == 2 && (dr == 0 || df == 0)) || (type == 3 && dr != 0 && df != 0))
-							continue;
-						Word ray = 0;
-						for (int r = s / 8 + dr, f = s % 8 + df; r >= 0 && r < 8 && f >= 0 && f < 8; r += dr, f += df)
-							ray |= 1ULL << (8 * r + f);
-						if (!ray)
-							continue;
-						const auto blockers = band(occ(), bb(ray));
-						Id span;
-						if (8 * dr + df > 0) {
-							// Include the first blocker; the zero-blocker case wraps to all bits set.
-							const auto low = band(blockers, binary(Op::USUB, Type::U64, bb(0), blockers));
-							span = binary(Op::UADD, Type::U64, low, binary(Op::USUB, Type::U64, low, bb(1)));
-						} else {
-							const auto shift = binary(Op::UADD, Type::U64, unary(Op::CLZ, Type::U64, blockers), bb(1));
-							span = bnot(binary(Op::SHR, Type::U64, bb(~0ULL), shift));
-						}
-						result = bor(result, band(bb(ray), span));
-					}
-				}
-				return result;
-			}
-
-			Id atk(Id role, int type = 6) { return attacks(role, type, false); }
-			Id atk2(Id role) { return attacks(role, 6, true); }
-			Id div(Id a, Id b) { return binary(Op::DIV, Type::F64, a, b); }
-			Id abs(Id a) { return unary(Op::ABS, Type::F64, a); }
-			Id gt(Id a, Id b) { return binary(Op::GT, Type::B1, a, b); }
-			Id lt(Id a, Id b) { return binary(Op::LT, Type::B1, a, b); }
-			Id le(Id a, Id b) { return binary(Op::LE, Type::B1, a, b); }
-
-			Id sum(const std::vector<Id> &terms) {
-				Id result = num(0);
-				for (const auto term : terms)
-					result = add(result, term);
-				return result;
-			}
-
-		private:
-			Id attacks(Id role, int type, bool twice) {
-				Id seen = bb(0);
-				Id repeated = bb(0);
-				for (int piece = type == 6 ? 0 : type; piece <= (type == 6 ? 5 : type); ++piece) {
-					for (int square = 0; square < 64; ++square) {
-						const auto present = anyset(band(pcs(role, piece), bb(1ULL << square)));
-						const auto current = sel(present, fromatk(role, piece, num(square)), bb(0));
-						if (twice)
-							repeated = bor(repeated, band(seen, current));
-						seen = bor(seen, current);
-					}
-				}
-				return twice ? repeated : seen;
-			}
-		};
-
-#else
 		// Fixed formulas execute directly on scalar and bitboard values.
 		struct Signal {
-			Word bits;
-			Type type;
+			Word bits = 0;
 			Signal() = default;
-			Signal(double x) : bits(word(x)), type(Type::F64) {}
-			Signal(Word x, Type t) : bits(x), type(t) {}
+			explicit Signal(Word x) : bits(x) {}
 		};
 
 		struct Features {
-			static constexpr bool compact = false;
+			static constexpr bool conditions = true;
 			std::vector<Feature> &values;
-			void begin(const std::array<double, 4> &) {}
-			void put(std::uint32_t index, float value) { values.push_back({index, value}); }
+			void put(std::uint32_t index, std::int32_t score, std::int32_t condition) {
+				values.push_back({static_cast<std::uint16_t>(index), score, condition});
+			}
 		};
 
-		template <class Output> class Native {
+		struct Weighted {
+			static constexpr bool conditions = false;
+			std::span<const float> weights;
+			float value = 0.0F;
+			void put(std::uint32_t index, std::int32_t score, std::int32_t) { value += static_cast<float>(score) * weights[index]; }
+		};
+
+		struct Graybox {
+			static constexpr bool conditions = true;
+			struct Storage {
+				std::array<std::int32_t, kFormulaCount> score{}, condition{};
+				std::array<std::uint32_t, kFormulaCount> stamp{};
+				std::uint32_t generation = 0;
+			};
+			std::span<const float> weights;
+			Storage &storage;
+			float value = 0.0F;
+			void put(std::uint32_t index, std::int32_t score, std::int32_t condition) {
+				value += static_cast<float>(score) * weights[index];
+				storage.score[index] = score;
+				storage.condition[index] = condition;
+				storage.stamp[index] = storage.generation;
+			}
+			std::int32_t score(std::uint16_t index) const { return storage.stamp[index] == storage.generation ? storage.score[index] : 0; }
+			std::int32_t condition(std::uint16_t index) const { return storage.stamp[index] == storage.generation ? storage.condition[index] : 0; }
+		};
+
+		template <class Output> class Runtime {
 		public:
 			using Value = Signal;
 			struct Sum {
-				double total = 0;
-				void push_back(Value v) { total += real(v.bits); }
+				std::int64_t total = 0;
+				void push_back(Value v) { total += number(v.bits); }
 			};
-			static constexpr bool direct = true;
+			static constexpr bool conditions = Output::conditions;
 
-			Native(const chess::Board &board, Output &out) : in(inputs(board)), occupied(board.occ().getBits()), output(out) {
+			Runtime(const chess::Board &board, Output &out) : in(inputs(board)), occupied(board.occ().getBits()), output(out) {
 				// Verify both full pawn bitboards on a hit; non-pawn pieces and turn are not dependencies.
 				thread_local std::array<Pawns, 1024> table{};
-				const Word hash = in[0] * 0x9e3779b97f4a7c15ULL ^ std::rotl(in[6] * 0xbf58476d1ce4e5b9ULL, 29);
+				const Word hash = in[atomIndex(Atom::WP)] * 0x9e3779b97f4a7c15ULL ^
+				    std::rotl(in[atomIndex(Atom::BP)] * 0xbf58476d1ce4e5b9ULL, 29);
 				pawnCache = &table[(hash ^ (hash >> 32)) & (table.size() - 1)];
-				if (!pawnCache->valid || pawnCache->white != in[0] || pawnCache->black != in[6]) {
-					pawnCache->white = in[0];
-					pawnCache->black = in[6];
-					pawnCache->ready = 0;
+				if (!pawnCache->valid || pawnCache->white != in[atomIndex(Atom::WP)] || pawnCache->black != in[atomIndex(Atom::BP)]) {
+					pawnCache->white = in[atomIndex(Atom::WP)];
+					pawnCache->black = in[atomIndex(Atom::BP)];
+					pawnCache->shapeReady = false;
+					for (auto &king : pawnCache->kings)
+						king.valid = false;
 					pawnCache->valid = true;
 				}
 				thread_local Attacks attacks;
+				thread_local Rays rays;
 				attackCache = &attacks;
+				rayCache = &rays;
 				const Word changed = attacks.occupied ^ occupied;
 				for (unsigned color = 0; color < 2; ++color) {
 					Word all = 0, twice = 0;
@@ -456,14 +136,23 @@ namespace eleginus {
 						const bool slider = type >= 2 && type <= 4;
 						// Slider maps include the first blocker; changes hidden behind it cannot affect a ray.
 						if (!attacks.valid || attacks.pieces[i] != in[i] || (slider && (changed & map))) {
-							map = overlap = 0;
-							auto pieces = in[i];
-							while (pieces) {
-								const int square = std::countr_zero(pieces);
-								pieces &= pieces - 1;
-								const auto a = fromatk(num(color), type, num(square)).bits;
-								overlap |= map & a;
-								map |= a;
+							if (type == 0) {
+								const Word east = in[i] & 0x7F7F7F7F7F7F7F7FULL;
+								const Word west = in[i] & 0xFEFEFEFEFEFEFEFEULL;
+								const Word left = color == 0 ? east << 9 : east >> 7;
+								const Word right = color == 0 ? west << 7 : west >> 9;
+								map = left | right;
+								overlap = left & right;
+							} else {
+								map = overlap = 0;
+								auto pieces = in[i];
+								while (pieces) {
+									const int square = std::countr_zero(pieces);
+									pieces &= pieces - 1;
+									const auto a = attackFrom(NUM(color), type, NUM(square)).bits;
+									overlap |= map & a;
+									map |= a;
+								}
 							}
 						}
 						twice |= overlap | (all & map);
@@ -476,73 +165,130 @@ namespace eleginus {
 				attacks.occupied = occupied;
 				attacks.valid = true;
 			}
-			Value num(double x, Type t = Type::F64) const { return {word(x), t}; }
-			template <class F> Value memo(Shared key, Value role, F &&f) {
-				const auto i = 2 * static_cast<unsigned>(key) + color(role);
-				if (!(ready & (1U << i))) {
-					shared[i] = f();
-					ready |= 1U << i;
+			Value NUM(std::int64_t x) const { return Value(static_cast<Word>(x)); }
+			std::array<int, 2> pawnShape(Value role) {
+				if (!pawnCache->shapeReady) {
+					for (unsigned side = 0; side < 2; ++side) {
+						int doubled = 0, islands = 0;
+						bool previous = false;
+						for (int file = 0; file < 8; ++file) {
+							const int n = std::popcount(in[6 * side] & (0x0101010101010101ULL << file));
+							doubled += std::max(0, n - 1);
+							islands += n != 0 && !previous;
+							previous = n != 0;
+						}
+						pawnCache->shape[side] = {doubled, islands};
+					}
+					pawnCache->shapeReady = true;
 				}
-				return shared[i];
+				return pawnCache->shape[color(role)];
 			}
-			template <class F> Value pawn(Pawn key, Value role, F &&f) {
-				const auto i = 2 * static_cast<unsigned>(key) + color(role);
-				if (!(pawnCache->ready & (1U << i))) {
-					pawnCache->values[i] = f();
-					pawnCache->ready |= 1U << i;
+			Value kingPawn(Value role, unsigned slot) {
+				auto &entry = pawnCache->kings[color(role)];
+				const Word king = PCS(role, 5).bits;
+				if (!entry.valid || entry.king != king) {
+					entry.king = king;
+					entry.values.fill(0);
+					const unsigned side = color(role);
+					const Word f = REL(role, in[6 * side] & ~attackCache->maps[side ^ 1][0]).bits;
+					const Word e = REL(role, in[6 * (side ^ 1)]).bits;
+					const Word pawns = in[atomIndex(Atom::WP)] | in[atomIndex(Atom::BP)];
+					for (int square : squares(role, 5)) {
+						const int rank = square / 8, file = square % 8;
+						const Word front = rank == 7 ? 0 : ~((1ULL << (8 * (rank + 1))) - 1);
+						// One file visit supplies all shelter/storm distances and the open-file signal.
+						for (int x = std::max(0, file - 1); x <= std::min(7, file + 1); ++x) {
+							const Word mask = 0x0101010101010101ULL << x;
+							entry.values[6] += (pawns & mask) == 0;
+							const std::array<Word, 2> nearest{f & mask & front, e & mask & front};
+							for (unsigned i = 0; i < nearest.size(); ++i) {
+								if (!nearest[i])
+									continue;
+								const int distance = std::countr_zero(nearest[i]) / 8 - rank;
+								if (distance <= 3)
+									++entry.values[2 * (distance - 1) + i];
+							}
+						}
+					}
+					entry.valid = true;
 				}
-				return pawnCache->values[i];
+				return NUM(entry.values[slot]);
 			}
-			Value bb(Word x) const { return {x, Type::U64}; }
-			Value input(unsigned slot) const { return {in[slot], slot == 12 ? Type::F64 : Type::U64}; }
-			Value add(Value a, Value b) const { return num(real(a.bits) + real(b.bits)); }
-			Value sub(Value a, Value b) const { return num(real(a.bits) - real(b.bits)); }
-			Value mul(Value a, Value b) const { return num(real(a.bits) * real(b.bits)); }
-			Value land(Value a, Value b) const { return num(real(a.bits) != 0 && real(b.bits) != 0, Type::B1); }
-			Value lor(Value a, Value b) const { return num(real(a.bits) != 0 || real(b.bits) != 0, Type::B1); }
-			Value lnot(Value a) const { return num(real(a.bits) == 0, Type::B1); }
-			Value equal(Value a, Value b) const { return num(a.type == Type::U64 ? a.bits == b.bits : real(a.bits) == real(b.bits), Type::B1); }
-			Value div(Value a, Value b) const { return num(std::abs(real(b.bits)) > 1.0e-12 ? real(a.bits) / real(b.bits) : 0.0); }
-			Value abs(Value a) const { return num(std::abs(real(a.bits))); }
-			Value gt(Value a, Value b) const { return num(real(a.bits) > real(b.bits), Type::B1); }
-			Value lt(Value a, Value b) const { return num(real(a.bits) < real(b.bits), Type::B1); }
-			Value le(Value a, Value b) const { return num(real(a.bits) <= real(b.bits), Type::B1); }
-			Value ge(Value a, Value b) const { return num(real(a.bits) >= real(b.bits), Type::B1); }
-			Value maximum(Value a, Value b) const { return num(std::max(real(a.bits), real(b.bits))); }
-			Value minimum(Value a, Value b) const { return num(std::min(real(a.bits), real(b.bits))); }
-			Value band(Value a, Value b) const { return bb(a.bits & b.bits); }
-			Value bor(Value a, Value b) const { return bb(a.bits | b.bits); }
-			Value bnot(Value a) const { return bb(~a.bits); }
-			Value pop(Value a) const { return num(std::popcount(a.bits)); }
-			Value anyset(Value a) const { return num(a.bits != 0, Type::B1); }
-			Value pcs(Value role, int type) const { return bb(in[6 * color(role) + type]); }
-			Value rel(Value role, Word mask) const { return bb(color(role) == 0 ? mask : flip(mask)); }
-			Value rsq(Value role, int square) const { return num(square ^ (color(role) == 0 ? 0 : 56)); }
-			Value right(Value role, int side) const { return num((in[13] & (1ULL << (2 * color(role) + side))) != 0, Type::B1); }
-			Value occ() const { return bb(occupied); }
-			bool present(Value role, int type, int square) const { return (pcs(role, type).bits & rel(role, 1ULL << square).bits) != 0; }
-			Squares squares(Value role, int type) const { return {rel(role, pcs(role, type).bits).bits}; }
+			const auto &mobility(Value role, int type, Value area, Value guard) {
+				thread_local std::array<std::array<Mobility, 4>, 2> table{};
+				auto &entry = table[color(role)][type - 1];
+				const Word pieces = PCS(role, type).bits;
+				// Only changes on a previous attack ray can change a stationary piece's count.
+				const Word changed = (entry.area ^ area.bits) | (entry.guard ^ guard.bits) | (type >= 2 ? entry.occupied ^ occupied : 0);
+				if (!entry.valid || entry.pieces != pieces || (changed & entry.reach)) {
+					entry.counts.fill(0);
+					entry.secondary = 0;
+					for (int square : locations(BB(pieces))) {
+						const Word map = attackFrom(role, type, NUM(square)).bits;
+						++entry.counts[std::popcount(map & area.bits)];
+						entry.secondary += std::popcount(map & guard.bits);
+					}
+					entry.pieces = pieces;
+					entry.reach = attacks(role, type).bits;
+					entry.valid = true;
+				}
+				entry.area = area.bits;
+				entry.guard = guard.bits;
+				entry.occupied = occupied;
+				return entry;
+			}
+			Value BB(Word x) const { return Value(x); }
+			Value ATOM(Atom atom) const { return Value(in[atomIndex(atom)]); }
+			Value ADD(Value a, Value b) const { return NUM(number(a.bits) + number(b.bits)); }
+			Value SUB(Value a, Value b) const { return NUM(number(a.bits) - number(b.bits)); }
+			Value MUL(Value a, Value b) const { return NUM(number(a.bits) * number(b.bits)); }
+			Value LAND(Value a, Value b) const { return NUM(number(a.bits) != 0 && number(b.bits) != 0); }
+			Value LOR(Value a, Value b) const { return NUM(number(a.bits) != 0 || number(b.bits) != 0); }
+			Value LNOT(Value a) const { return NUM(number(a.bits) == 0); }
+			Value EQ(Value a, Value b) const { return NUM(a.bits == b.bits); }
+			Value DIV(Value a, Value b) const { return NUM(number(b.bits) != 0 ? number(a.bits) / number(b.bits) : 0); }
+			Value ABS(Value a) const { return NUM(std::abs(number(a.bits))); }
+			Value GT(Value a, Value b) const { return NUM(number(a.bits) > number(b.bits)); }
+			Value LT(Value a, Value b) const { return NUM(number(a.bits) < number(b.bits)); }
+			Value LE(Value a, Value b) const { return NUM(number(a.bits) <= number(b.bits)); }
+			Value GE(Value a, Value b) const { return NUM(number(a.bits) >= number(b.bits)); }
+			Value MAX(Value a, Value b) const { return NUM(std::max(number(a.bits), number(b.bits))); }
+			Value MIN(Value a, Value b) const { return NUM(std::min(number(a.bits), number(b.bits))); }
+			Value AND(Value a, Value b) const { return BB(a.bits & b.bits); }
+			Value OR(Value a, Value b) const { return BB(a.bits | b.bits); }
+			Value NOT(Value a) const { return BB(~a.bits); }
+			Value POP(Value a) const { return NUM(std::popcount(a.bits)); }
+			Value ANY(Value a) const { return NUM(a.bits != 0); }
+			unsigned side(Value role) const { return color(role); }
+			Value PCS(Value role, int type) const { return BB(in[6 * color(role) + type]); }
+			Value REL(Value role, Word mask) const { return BB(color(role) == 0 ? mask : flip(mask)); }
+			Value sq(Value role, int square) const { return NUM(square ^ (color(role) == 0 ? 0 : 56)); }
+			Value RIGHT(Value role, int side) const {
+				return NUM((in[atomIndex(Atom::CR)] & (1ULL << (2 * color(role) + side))) != 0);
+			}
+			Value OCC() const { return BB(occupied); }
+			Squares squares(Value role, int type) const { return {REL(role, PCS(role, type).bits).bits}; }
 			Squares locations(Value set) const { return {set.bits}; }
-			Value sh(Value x, Value role, int direction) const {
+			Value SH(Value x, Value role, int direction) const {
 				const Word east = x.bits & 0x7F7F7F7F7F7F7F7FULL, west = x.bits & 0xFEFEFEFEFEFEFEFEULL;
 				const bool white = color(role) == 0;
 				switch (direction) {
 				case 0:
-					return bb(white ? x.bits << 8 : x.bits >> 8);
+					return BB(white ? x.bits << 8 : x.bits >> 8);
 				case 1:
-					return bb(white ? x.bits >> 8 : x.bits << 8);
+					return BB(white ? x.bits >> 8 : x.bits << 8);
 				case 2:
-					return bb(east << 1);
+					return BB(east << 1);
 				case 3:
-					return bb(west >> 1);
+					return BB(west >> 1);
 				case 4:
-					return bb(white ? east << 9 : east >> 7);
+					return BB(white ? east << 9 : east >> 7);
 				case 5:
-					return bb(white ? west << 7 : west >> 9);
+					return BB(white ? west << 7 : west >> 9);
 				case 6:
-					return bb(white ? east >> 7 : east << 9);
+					return BB(white ? east >> 7 : east << 9);
 				case 7:
-					return bb(white ? west >> 9 : west << 7);
+					return BB(white ? west >> 9 : west << 7);
 				default:
 					throw std::logic_error("invalid shift direction");
 				}
@@ -552,48 +298,53 @@ namespace eleginus {
 					x.bits |= color(role) == 0 ? x.bits << d : x.bits >> d;
 				return x;
 			}
-			Value fromatk(Value role, int type, Value square) {
-				const int s = static_cast<int>(real(square.bits));
+			Value attackFrom(Value role, int type, Value square) {
+				const int s = static_cast<int>(number(square.bits));
 				if (type == 0)
-					return bb(chess::attacks::pawn(static_cast<chess::Color>(color(role)), chess::Square(s)).getBits());
+					return BB(chess::attacks::pawn(static_cast<chess::Color>(color(role)), chess::Square(s)).getBits());
 				if (type == 1)
-					return bb(chess::attacks::knight(chess::Square(s)).getBits());
+					return BB(chess::attacks::knight(chess::Square(s)).getBits());
 				if (type == 5)
-					return bb(chess::attacks::king(chess::Square(s)).getBits());
+					return BB(chess::attacks::king(chess::Square(s)).getBits());
 				if (type == 4)
-					return bor(fromatk(role, 2, square), fromatk(role, 3, square));
-				auto &ray = attackCache->rays[type - 2][s];
+					return OR(attackFrom(role, 2, square), attackFrom(role, 3, square));
+				auto &ray = rayCache->rays[type - 2][s];
 				if (ray.map == 0 || ((ray.occupied ^ occupied) & ray.map))
 					ray.map = (type == 2 ? chess::attacks::bishop(chess::Square(s), chess::Bitboard(occupied)) : chess::attacks::rook(chess::Square(s), chess::Bitboard(occupied)))
 					              .getBits();
 				ray.occupied = occupied;
-				return bb(ray.map);
+				return BB(ray.map);
 			}
-			Value atk(Value role, int type = 6) const { return bb(attackCache->maps[color(role)][type]); }
-			Value atk2(Value role) const { return bb(attackCache->maps[color(role)][7]); }
-			Value sum(const Sum &terms) const { return num(terms.total); }
-			void root(Value v, float) {
-				const float x = static_cast<float>(real(v.bits));
-				if (x != 0)
-					output.put(index, x);
+			Value attacks(Value role, int type = 6) const { return BB(attackCache->maps[color(role)][type]); }
+			Value attacks2(Value role) const { return BB(attackCache->maps[color(role)][7]); }
+			Value sum(const Sum &terms) const { return NUM(terms.total); }
+			void root(Value d, Value t) {
+				const auto di = number(d.bits), ti = number(t.bits);
+				if (di != 0 || ti != 0)
+					output.put(index, static_cast<std::int32_t>(di), static_cast<std::int32_t>(ti));
 				++index;
 			}
-			void skip(unsigned n) { index += n; }
-			template <class F> void group(Region region, bool active, F &&f) {
-				if (active)
-					f();
-				else
-					skip(catalog::sizes[static_cast<unsigned>(region)]);
+			void skip(unsigned n) {
+				index += n;
 			}
-			bool compact() const { return Output::compact; }
-			void coordinates(Value phase, Value open, Value freedom, Value exposure) { output.begin({real(phase.bits), real(open.bits), real(freedom.bits), real(exposure.bits)}); }
 			void finish() const {}
 
 		private:
+			struct KingPawn {
+				Word king = 0;
+				std::array<int, 7> values{}; // Shelter/storm at three distances, then open king files.
+				bool valid = false;
+			};
 			struct Pawns {
 				Word white = 0, black = 0;
-				std::array<Value, 2 * static_cast<unsigned>(Pawn::count)> values{};
-				unsigned ready = 0;
+				std::array<std::array<int, 2>, 2> shape{}; // Doubled pawns and islands, by absolute color.
+				std::array<KingPawn, 2> kings{};
+				bool valid = false, shapeReady = false;
+			};
+			struct Mobility {
+				Word pieces = 0, occupied = 0, area = 0, guard = 0, reach = 0;
+				std::array<int, 28> counts{};
+				int secondary = 0;
 				bool valid = false;
 			};
 			struct Ray {
@@ -604,74 +355,70 @@ namespace eleginus {
 				Word occupied = 0;
 				std::array<std::array<Word, 8>, 2> maps{};
 				std::array<std::array<Word, 6>, 2> twice{};
-				std::array<std::array<Ray, 64>, 2> rays{};
 				bool valid = false;
 			};
-			static unsigned color(Value role) { return static_cast<unsigned>(real(role.bits)); }
+			struct Rays {
+				std::array<std::array<Ray, 64>, 2> rays{};
+			};
+			static unsigned color(Value role) {
+				return static_cast<unsigned>(number(role.bits));
+			}
 			Pawns *pawnCache;
 			Attacks *attackCache;
-			std::array<Value, 2 * static_cast<unsigned>(Shared::count)> shared{};
-			unsigned ready = 0;
-			std::array<Word, 15> in;
+			Rays *rayCache;
+			std::array<Word, atomCount> in;
 			Word occupied;
 			Output &output;
 			unsigned index = 0;
 		};
 
-#endif
-		enum class Family { general, mobility, pawn, king };
 
 		template <class B> class Formulas {
-			using Id = typename B::Value;
+			using IS = typename B::Value;
 			using Sum = typename B::Sum;
+			using Pair = std::array<std::optional<IS>, 2>;
+			struct Difference {
+				IS score, own, enemy;
+				operator IS() const { return score; }
+			};
 
 		public:
-			explicit Formulas(B builder = {}) : b(std::move(builder)) {
-				z = b.num(0.0);
-				o = b.num(1.0);
-				us = b.input(12);
-				them = b.sub(o, us);
-				occ = b.occ();
-				phase = makephase();
-				open = makeopen();
-				freedom = makefreedom();
-				exposure = makeexposure();
-				if constexpr (B::direct)
-					b.coordinates(phase, open, freedom, exposure);
+			explicit Formulas(B runtime) : b(std::move(runtime)) {
+				z = b.NUM(0);
+				o = b.NUM(1);
+				us = b.NUM(0);
+				them = b.NUM(1);
+				occ = b.OCC();
+				phase = phaseUnits();
 			}
 
-			auto build() {
-				reg(o, 0.15F, 0.17F, Family::general);
-				material();
-				pst();
-				bishoppair();
-				b.group(Region::pawns, has(0), [&] { pawns(); });
-				mobility();
-				pieces();
-				threats();
-				kings();
-				endgames();
-				// Context roots feed the graybox, not independently scored formulas.
-				for (const auto id : {phase, open, freedom, exposure})
-					b.root(id, 0.0F);
-				for (const auto side : {us, them}) {
-					for (int type = 0; type < 6; ++type) {
-						b.root(b.mul(cnt(b.pcs(side, type)), b.num(1.0 / 16.0)), 0.0F);
-					}
-				}
+			auto execute() {
+				tempo();
+				emitMaterial();
+				emitPst();
+				emitBishopPair();
+				emitPawns();
+				emitMobility();
+				emitPieces();
+				emitThreats();
+				emitKings();
+				emitEndgames();
 				return b.finish();
 			}
 
 		private:
-			bool has(int type) const {
-				if constexpr (B::direct)
-					return b.pcs(us, type).bits != 0 || b.pcs(them, type).bits != 0;
-				return true;
+			template <class F> IS shared(Pair &pair, IS role, F &&make) {
+				auto &value = pair[b.side(role)];
+				if (!value)
+					value = make();
+				return *value;
 			}
-			static constexpr std::uint64_t filemask(int file) noexcept { return 0x0101010101010101ULL << file; }
-			static constexpr std::uint64_t rankmask(int rank) noexcept { return 0xFFULL << (8 * rank); }
 
-			static std::uint64_t ringmask(int square, int distance) noexcept {
+			bool has(int type) const { return b.PCS(us, type).bits != 0 || b.PCS(them, type).bits != 0; }
+			static constexpr std::uint64_t fileMask(int file) noexcept { return 0x0101010101010101ULL << file; }
+			static constexpr std::uint64_t rankMask(int rank) noexcept { return 0xFFULL << (8 * rank); }
+
+			static std::uint64_t ringMask(int square, int distance) noexcept {
 				static const auto masks = [] {
 					std::array<std::array<Word, 8>, 64> table{};
 					for (int s = 0; s < 64; ++s)
@@ -684,7 +431,7 @@ namespace eleginus {
 				return masks[square][distance];
 			}
 
-			static std::uint64_t diagonalmask(int square) noexcept {
+			static std::uint64_t diagonalMask(int square) noexcept {
 				static const auto masks = [] {
 					std::array<Word, 64> table{};
 					for (int s = 0; s < 64; ++s)
@@ -698,766 +445,1783 @@ namespace eleginus {
 				return masks[square];
 			}
 
-			Id cnt(Id set) { return b.pop(set); }
-			Id diff(Id own, Id enemy) { return b.sub(own, enemy); }
-			Id own(Id role) {
-				return b.memo(Shared::own, role, [&] {
-					Id result = b.pcs(role, 0);
+			IS CNT(IS set) { return b.POP(set); }
+			Difference diff(IS own, IS enemy) { return {b.SUB(own, enemy), own, enemy}; }
+			IS own(IS role) {
+				return shared(owned, role, [&] {
+					IS result = b.PCS(role, 0);
 					for (int type = 1; type < 6; ++type)
-						result = b.bor(result, b.pcs(role, type));
+						result = b.OR(result, b.PCS(role, type));
 					return result;
 				});
 			}
 
-			Id pawnatt(Id role) {
-				return b.pawn(Pawn::attack, role, [&] { return b.bor(b.sh(b.pcs(role, 0), role, 4), b.sh(b.pcs(role, 0), role, 5)); });
+			IS pawnAttacks(IS role) {
+				return shared(pawnAttack, role, [&] { return b.OR(b.SH(b.PCS(role, 0), role, 4), b.SH(b.PCS(role, 0), role, 5)); });
 			}
 
-			Id files(Id set, Id role, Id opponent) { return b.bor(b.fill(set, role), b.fill(set, opponent)); }
+			IS files(IS set, IS role, IS opponent) { return b.OR(b.fill(set, role), b.fill(set, opponent)); }
 
-			Id passers(Id role, Id opponent) {
-				return b.pawn(Pawn::passed, role, [&] {
-					const auto span = b.fill(b.pcs(opponent, 0), opponent);
-					const auto stops = b.bor(span, b.bor(b.sh(span, role, 2), b.sh(span, role, 3)));
-					return b.band(b.pcs(role, 0), b.bnot(stops));
+			IS passedPawns(IS role, IS opponent) {
+				return shared(passedMap, role, [&] {
+					const auto span = b.fill(b.PCS(opponent, 0), opponent);
+					const auto stops = b.OR(span, b.OR(b.SH(span, role, 2), b.SH(span, role, 3)));
+					return b.AND(b.PCS(role, 0), b.NOT(stops));
 				});
 			}
 
-			Id strong(Id role, Id opponent) {
-				return b.memo(Shared::strong, role, [&] { return b.bor(pawnatt(opponent), b.band(b.atk2(opponent), b.bnot(b.atk2(role)))); });
+			IS strongSquares(IS role, IS opponent) {
+				return shared(strongMap, role, [&] { return b.OR(pawnAttacks(opponent), b.AND(b.attacks2(opponent), b.NOT(b.attacks2(role)))); });
 			}
 
-			Id passerkingdistance(Id kingrole, Id passed, int distance) {
+			IS passerKingDistance(IS kingrole, IS passed, int distance) {
 				Sum terms;
 				for (int square : b.locations(passed)) {
-					const auto pawn = b.anyset(b.band(passed, b.bb(1ULL << square)));
-					const auto king = b.anyset(b.band(b.pcs(kingrole, 5), b.bb(ringmask(square, distance))));
-					terms.push_back(b.land(pawn, king));
+					const auto pawn = b.ANY(b.AND(passed, b.BB(1ULL << square)));
+					const auto king = b.ANY(b.AND(b.PCS(kingrole, 5), b.BB(ringMask(square, distance))));
+					terms.push_back(b.LAND(pawn, king));
 				}
 				return b.sum(terms);
 			}
 
-			Id clamp01(Id value) { return b.minimum(o, b.maximum(z, value)); }
-
-			Id makephase() {
-				Id total = z;
+			IS phaseUnits() {
+				IS total = z;
 				constexpr std::array<int, 6> units{{0, 1, 1, 2, 4, 0}};
 				for (const auto role : {us, them}) {
 					for (int type = 1; type <= 4; ++type) {
-						total = b.add(total, b.mul(b.num(units[static_cast<std::size_t>(type)]), cnt(b.pcs(role, type))));
+						total = b.ADD(total, b.MUL(b.NUM(units[static_cast<std::size_t>(type)]), CNT(b.PCS(role, type))));
 					}
 				}
-				return clamp01(b.div(total, b.num(24.0)));
+				return b.MIN(total, b.NUM(24));
 			}
 
-			Id makeopen() {
-				return b.pawn(Pawn::open, us, [&] {
-					Sum terms;
-					const auto allpawns = b.bor(b.pcs(us, 0), b.pcs(them, 0));
-					for (int file = 0; file < 8; ++file)
-						terms.push_back(b.lnot(b.anyset(b.band(allpawns, b.bb(filemask(file))))));
-					return b.div(b.sum(terms), b.num(8.0));
-				});
+			void put(Difference signal) {
+				if constexpr (B::conditions)
+					b.root(signal.score, b.ADD(signal.own, signal.enemy));
+				else
+					b.root(signal.score, z);
 			}
 
-			Id makefreedom() {
-				Id total = z;
-				for (const auto role : {us, them}) {
-					total = b.add(total, cnt(b.band(b.sh(b.pcs(role, 0), role, 0), b.bnot(occ))));
-				}
-				return clamp01(b.div(total, b.num(16.0)));
+			void put(IS signal) {
+				if constexpr (B::conditions)
+					b.root(signal, b.ABS(signal));
+				else
+					b.root(signal, z);
 			}
 
-			Id makeexposure() {
-				Sum terms;
-				const auto allpawns = b.bor(b.pcs(us, 0), b.pcs(them, 0));
-				for (const auto role : {us, them}) {
-					for (int square : b.squares(role, 5)) {
-						const int file = square % 8;
-						Sum exposed;
-						for (int candidate = std::max(0, file - 1); candidate <= std::min(7, file + 1); ++candidate) {
-							exposed.push_back(b.lnot(b.anyset(b.band(allpawns, b.bb(filemask(candidate))))));
-						}
-						const auto king = b.anyset(b.band(b.pcs(role, 5), b.rel(role, 1ULL << square)));
-						terms.push_back(b.mul(king, b.sum(exposed)));
-					}
-				}
-				return clamp01(b.div(b.sum(terms), b.num(6.0)));
+			void tempo() {
+				const auto stm = b.ATOM(Atom::STM);
+				// Tempo: +1 when White moves and -1 when Black moves.
+				put(diff(b.EQ(stm, us), b.EQ(stm, them)));
 			}
 
-			Id structure(Family family) const noexcept {
-				if (family == Family::pawn) {
-					return freedom;
-				}
-				if (family == Family::king) {
-					return exposure;
-				}
-				return open;
+			void emitMaterial() {
+				// Catalog entries material.pawn through material.queen.
+				for (int type = 0; type < 5; ++type)
+					put(diff(CNT(b.PCS(us, type)), CNT(b.PCS(them, type))));
 			}
 
-			void reg(Id formula, float eg, float mg, Family family) {
-				if constexpr (B::direct) {
-					if (b.compact()) {
-						b.root(formula, 0);
-						b.skip(3);
-						return;
-					}
-				} else {
-					b.family(family == Family::pawn ? 1 : family == Family::king ? 2 : 0);
-				}
-				const auto ending = b.sub(o, phase);
-				const auto opened = structure(family);
-				const auto closed = b.sub(o, opened);
-				b.root(b.mul(formula, b.mul(ending, closed)), eg);
-				b.root(b.mul(formula, b.mul(ending, opened)), eg);
-				b.root(b.mul(formula, b.mul(phase, closed)), mg);
-				b.root(b.mul(formula, b.mul(phase, opened)), mg);
-			}
-
-			void material() {
-				constexpr std::array<float, 5> eg{{0.235F, 0.703F, 0.743F, 1.280F, 2.340F}};
-				constexpr std::array<float, 5> mg{{0.205F, 0.843F, 0.913F, 1.193F, 2.563F}};
-				for (int type = 0; type < 5; ++type) {
-					reg(diff(cnt(b.pcs(us, type)), cnt(b.pcs(them, type))), eg[static_cast<std::size_t>(type)], mg[static_cast<std::size_t>(type)], Family::general);
-				}
-			}
-
-			void pst() {
+			void emitPst() {
+				// Catalog entries pst.pawn.a1 through pst.king.h8.
 				for (int type = 0; type < 6; ++type) {
-					for (int square = 0; square < 64; ++square) {
-						if constexpr (B::direct) {
-							if (b.present(us, type, square) == b.present(them, type, square)) {
-								b.skip(4);
-								continue;
+					const auto friendly = b.REL(us, b.PCS(us, type).bits).bits;
+					const auto enemy = b.REL(them, b.PCS(them, type).bits).bits;
+					unsigned next = 0;
+					// Visit occupied normalized squares in index order; opposing activations may cancel in the score but remain part of the condition.
+					for (int square : b.locations(b.BB(friendly | enemy))) {
+						b.skip(square - next);
+						const auto mask = 1ULL << square;
+						put(diff(b.NUM((friendly & mask) != 0), b.NUM((enemy & mask) != 0)));
+						next = square + 1;
+					}
+					b.skip(64 - next);
+				}
+			}
+
+			void emitBishopPair() {
+				// Catalog entry bishopPair.
+				const auto friendly = b.GE(CNT(b.PCS(us, 2)), b.NUM(2));
+				const auto enemy = b.GE(CNT(b.PCS(them, 2)), b.NUM(2));
+				put(diff(friendly, enemy));
+			}
+
+			void emitPawns() {
+				// Catalog entries pawn.passed.rank2 through passer.enemyKing.distance7.
+				const auto fp = b.PCS(us, 0);
+				const auto ep = b.PCS(them, 0);
+				const auto fpass = passedPawns(us, them);
+				const auto epass = passedPawns(them, us);
+				const auto fatt = pawnAttacks(us);
+				const auto eatt = pawnAttacks(them);
+				const auto ffiles = shared(pawnFile, us, [&] { return files(fp, us, them); });
+				const auto efiles = shared(pawnFile, them, [&] { return files(ep, them, us); });
+				const auto fneighbours = b.OR(b.SH(ffiles, us, 2), b.SH(ffiles, us, 3));
+				const auto eneighbours = b.OR(b.SH(efiles, them, 2), b.SH(efiles, them, 3));
+				std::array<std::array<int, 78>, 2> counts{};
+				const auto collect = [&](unsigned side, IS role, IS opponent, IS pawns, IS passed, IS att, IS oppatt, IS neighbours) {
+					auto &values = counts[side];
+					const auto shape = b.pawnShape(role);
+					values[60] += shape[0];
+					values[61] += std::popcount(pawns.bits & ~neighbours.bits);
+					values[62] += std::popcount(pawns.bits & ~att.bits & b.SH(oppatt, opponent, 0).bits);
+					values[63] += shape[1];
+					std::array<Word, 8> sets{};
+					if (passed.bits) {
+						const auto a = b.attacks(role), e = b.attacks(opponent);
+						const auto wide = b.BB(e.bits | b.SH(e, role, 2).bits | b.SH(e, role, 3).bits);
+						const auto control = b.BB((a.bits & ~e.bits) | (b.attacks2(role).bits & ~b.attacks2(opponent).bits));
+						sets = {passed.bits, ~b.SH(b.fill(occ, opponent), opponent, 0).bits, ~b.SH(b.fill(e, opponent), opponent, 0).bits,
+						    ~b.SH(b.fill(wide, opponent), opponent, 0).bits, b.SH(control, role, 1).bits, att.bits, b.SH(occ, opponent, 0).bits,
+						    b.SH(passed, role, 2).bits | b.SH(passed, role, 3).bits};
+					}
+					const Word phalanx = b.SH(pawns, role, 2).bits;
+					const bool white = number(role.bits) == 0;
+					// Visit each pawn once for rank signals and both king-distance histograms.
+					for (int square : b.locations(pawns)) {
+						const Word bit = 1ULL << square;
+						const int rank = white ? square / 8 : 7 - square / 8;
+						if (rank >= 1 && rank <= 6) {
+							const int start = 10 * (rank - 1);
+							values[start + 8] += (phalanx & bit) != 0;
+							values[start + 9] += (att.bits & bit) != 0;
+							if (passed.bits & bit)
+								for (int i = 0; i < 8; ++i)
+									values[start + i] += (sets[i] & bit) != 0;
+						}
+						if (!(passed.bits & bit))
+							continue;
+						for (int k = 0; k < 2; ++k)
+							for (int king : b.locations(b.PCS(k == 0 ? role : opponent, 5))) {
+								const int d = std::max(std::abs(square / 8 - king / 8), std::abs(square % 8 - king % 8));
+								if (d != 3)
+									values[64 + 2 * (d < 3 ? d : d - 1) + k] += 1;
 							}
-						}
-						const int file = square % 8;
-						const int rank = square / 8;
-						const float center = static_cast<float>(7 - std::abs(2 * file - 7) - std::abs(2 * rank - 7));
-						float mg = 0.0F;
-						float eg = 0.0F;
-						if (type == 0) {
-							mg = (5.0F * rank + center) / 400.0F;
-							eg = (8.0F * rank + 0.5F * center) / 400.0F;
-						} else if (type == 1) {
-							mg = 5.0F * center / 400.0F;
-							eg = 4.0F * center / 400.0F;
-						} else if (type == 2) {
-							mg = 3.0F * center / 400.0F;
-							eg = mg;
-						} else if (type == 3) {
-							mg = (rank == 6 ? 18.0F : 1.5F * rank) / 400.0F;
-							eg = (rank == 6 ? 10.0F : static_cast<float>(rank)) / 400.0F;
-						} else if (type == 4) {
-							mg = center / 400.0F;
-							eg = 2.0F * center / 400.0F;
-						} else {
-							mg = ((rank == 0 ? 12.0F : -4.0F * rank) - 2.0F * center) / 400.0F;
-							eg = 6.0F * center / 400.0F;
-						}
-						const auto friendly = cnt(b.band(b.pcs(us, type), b.rel(us, 1ULL << square)));
-						const auto enemy = cnt(b.band(b.pcs(them, type), b.rel(them, 1ULL << square)));
-						reg(diff(friendly, enemy), eg, mg, type == 5 ? Family::king : Family::general);
 					}
-				}
+				};
+				collect(0, us, them, fp, fpass, fatt, eatt, fneighbours);
+				collect(1, them, us, ep, epass, eatt, fatt, eneighbours);
+				for (std::size_t i = 0; i < counts[0].size(); ++i)
+					put(diff(b.NUM(counts[0][i]), b.NUM(counts[1][i])));
 			}
 
-			void bishoppair() {
-				const auto friendly = b.ge(cnt(b.pcs(us, 2)), b.num(2.0));
-				const auto enemy = b.ge(cnt(b.pcs(them, 2)), b.num(2.0));
-				reg(diff(friendly, enemy), 0.18F, 0.12F, Family::general);
-			}
+			IS sq(IS role, int square) { return b.sq(role, square); }
 
-			void pawns() {
-				const auto fp = b.pcs(us, 0);
-				const auto ep = b.pcs(them, 0);
-				const auto fpass = passers(us, them);
-				const auto epass = passers(them, us);
-				const auto fatt = pawnatt(us);
-				const auto eatt = pawnatt(them);
-				const auto ffiles = b.pawn(Pawn::files, us, [&] { return files(fp, us, them); });
-				const auto efiles = b.pawn(Pawn::files, them, [&] { return files(ep, them, us); });
-				const auto fneighbours = b.bor(b.sh(ffiles, us, 2), b.sh(ffiles, us, 3));
-				const auto eneighbours = b.bor(b.sh(efiles, them, 2), b.sh(efiles, them, 3));
-
-				for (int rank = 1; rank < 7; ++rank) {
-					const auto fm = b.rel(us, rankmask(rank));
-					const auto em = b.rel(them, rankmask(rank));
-					const auto fr = b.band(fpass, fm);
-					const auto er = b.band(epass, em);
-					const float progress = static_cast<float>(rank - 1);
-					reg(diff(cnt(fr), cnt(er)), (20.0F + 14.0F * progress * progress) / 400.0F, (10.0F + 8.0F * progress * progress) / 400.0F, Family::pawn);
-					const auto fclear = b.band(fr, b.memo(Shared::clear, us, [&] { return b.bnot(b.sh(b.fill(occ, them), them, 0)); }));
-					const auto eclear = b.band(er, b.memo(Shared::clear, them, [&] { return b.bnot(b.sh(b.fill(occ, us), us, 0)); }));
-					reg(diff(cnt(fclear), cnt(eclear)), (8.0F + 5.0F * progress) / 400.0F, (3.0F + 2.0F * progress) / 400.0F, Family::pawn);
-					const auto fsafe = b.band(fr, b.memo(Shared::safe, us, [&] { return b.bnot(b.sh(b.fill(b.atk(them), them), them, 0)); }));
-					const auto esafe = b.band(er, b.memo(Shared::safe, them, [&] { return b.bnot(b.sh(b.fill(b.atk(us), us), us, 0)); }));
-					reg(diff(cnt(fsafe), cnt(esafe)), (8.0F + 6.0F * progress) / 400.0F, (3.0F + 2.0F * progress) / 400.0F, Family::pawn);
-					const auto fwideatt = b.memo(Shared::wide, us, [&] { return b.bor(b.atk(them), b.bor(b.sh(b.atk(them), us, 2), b.sh(b.atk(them), us, 3))); });
-					const auto ewideatt = b.memo(Shared::wide, them, [&] { return b.bor(b.atk(us), b.bor(b.sh(b.atk(us), them, 2), b.sh(b.atk(us), them, 3))); });
-					const auto fstopclear = b.band(fr, b.memo(Shared::stop, us, [&] { return b.bnot(b.sh(b.fill(fwideatt, them), them, 0)); }));
-					const auto estopclear = b.band(er, b.memo(Shared::stop, them, [&] { return b.bnot(b.sh(b.fill(ewideatt, us), us, 0)); }));
-					reg(diff(cnt(fstopclear), cnt(estopclear)), (6.0F + 4.0F * progress) / 400.0F, (2.0F + 1.5F * progress) / 400.0F, Family::pawn);
-					const auto fpushcontrol = b.memo(Shared::control, us, [&] { return b.bor(b.band(b.atk(us), b.bnot(b.atk(them))), b.band(b.atk2(us), b.bnot(b.atk2(them)))); });
-					const auto epushcontrol =
-					    b.memo(Shared::control, them, [&] { return b.bor(b.band(b.atk(them), b.bnot(b.atk(us))), b.band(b.atk2(them), b.bnot(b.atk2(us)))); });
-					const auto fdefendedpush = b.band(fr, b.sh(fpushcontrol, us, 1));
-					const auto edefendedpush = b.band(er, b.sh(epushcontrol, them, 1));
-					reg(diff(cnt(fdefendedpush), cnt(edefendedpush)), (7.0F + 4.0F * progress) / 400.0F, (3.0F + 2.0F * progress) / 400.0F, Family::pawn);
-					reg(diff(cnt(b.band(fr, fatt)), cnt(b.band(er, eatt))), (10.0F + 6.0F * progress) / 400.0F, (4.0F + 3.0F * progress) / 400.0F, Family::pawn);
-					reg(diff(cnt(b.band(fr, b.sh(occ, them, 0))), cnt(b.band(er, b.sh(occ, us, 0)))), -(8.0F + 6.0F * progress) / 400.0F, -(3.0F + 3.0F * progress) / 400.0F,
-					    Family::pawn);
-					const auto fconnected = b.band(fr, b.bor(b.sh(fr, us, 2), b.sh(fr, us, 3)));
-					const auto econnected = b.band(er, b.bor(b.sh(er, them, 2), b.sh(er, them, 3)));
-					reg(diff(cnt(fconnected), cnt(econnected)), (5.0F + 3.5F * progress) / 400.0F, (2.0F + 1.5F * progress) / 400.0F, Family::pawn);
-					const auto fphalanx = b.band(b.band(fp, b.sh(fp, us, 2)), fm);
-					const auto ephalanx = b.band(b.band(ep, b.sh(ep, them, 2)), em);
-					reg(diff(cnt(fphalanx), cnt(ephalanx)), (8.0F + 4.0F * progress) / 400.0F, (6.0F + 3.0F * progress) / 400.0F, Family::pawn);
-					reg(diff(cnt(b.band(b.band(fp, fatt), fm)), cnt(b.band(b.band(ep, eatt), em))), (8.0F + 3.0F * progress) / 400.0F, (6.0F + 2.0F * progress) / 400.0F,
-					    Family::pawn);
-				}
-
-				Id fdoubled = z;
-				Id edoubled = z;
-				Sum fislands;
-				Sum eislands;
-				for (int file = 0; file < 8; ++file) {
-					const auto fcount = cnt(b.band(fp, b.bb(filemask(file))));
-					const auto ecount = cnt(b.band(ep, b.bb(filemask(file))));
-					fdoubled = b.add(fdoubled, b.maximum(z, b.sub(fcount, o)));
-					edoubled = b.add(edoubled, b.maximum(z, b.sub(ecount, o)));
-					const auto foccupied = b.anyset(b.band(fp, b.bb(filemask(file))));
-					const auto eoccupied = b.anyset(b.band(ep, b.bb(filemask(file))));
-					fislands.push_back(file == 0 ? foccupied : b.land(foccupied, b.lnot(b.anyset(b.band(fp, b.bb(filemask(file - 1)))))));
-					eislands.push_back(file == 0 ? eoccupied : b.land(eoccupied, b.lnot(b.anyset(b.band(ep, b.bb(filemask(file - 1)))))));
-				}
-				reg(diff(fdoubled, edoubled), -0.04F, -0.03F, Family::pawn);
-				reg(diff(cnt(b.band(fp, b.bnot(fneighbours))), cnt(b.band(ep, b.bnot(eneighbours)))), -0.03F, -0.025F, Family::pawn);
-				const auto fback = b.band(b.band(fp, b.bnot(fatt)), b.sh(eatt, them, 0));
-				const auto eback = b.band(b.band(ep, b.bnot(eatt)), b.sh(fatt, us, 0));
-				reg(diff(cnt(fback), cnt(eback)), -0.035F, -0.03F, Family::pawn);
-				reg(diff(b.sum(fislands), b.sum(eislands)), -0.025F, -0.015F, Family::pawn);
-				// Total passer count supplies the omitted distance-three bucket for each king relation.
-				for (int distance = 0; distance <= 7; ++distance) {
-					if (distance == 3) {
-						continue;
-					}
-					const float friendlyweight = static_cast<float>(3 - distance) / 400.0F;
-					const float enemyweight = static_cast<float>(distance - 3) / 400.0F;
-					reg(diff(passerkingdistance(us, fpass, distance), passerkingdistance(them, epass, distance)), friendlyweight, friendlyweight * 0.6F, Family::pawn);
-					reg(diff(passerkingdistance(them, fpass, distance), passerkingdistance(us, epass, distance)), enemyweight, enemyweight * 0.6F, Family::pawn);
-				}
-			}
-
-			Id sq(Id role, int square) { return b.rsq(role, square); }
-
-			std::array<Id, 28> mobilitycounts(Id role, Id opponent, int type, int maximum) {
-				std::array<Sum, 28> buckets{}; // A queen has at most 27 reachable squares.
-				const auto area = b.memo(Shared::area, role, [&] {
-					const auto pawns = b.pcs(role, 0);
-					const auto blocked = b.band(pawns, b.sh(occ, role, 1));
-					const auto early = b.band(pawns, b.rel(role, rankmask(1) | rankmask(2)));
-					return b.band(b.bnot(own(role)), b.bnot(b.bor(blocked, b.bor(early, pawnatt(opponent)))));
+			IS mobilityArea(IS role, IS opponent) {
+				return shared(mobilityAreaCache, role, [&] {
+					const auto pawns = b.PCS(role, 0);
+					const auto blocked = b.AND(pawns, b.SH(occ, role, 1));
+					const auto early = b.AND(pawns, b.REL(role, rankMask(1) | rankMask(2)));
+					return b.AND(b.NOT(own(role)), b.NOT(b.OR(blocked, b.OR(early, pawnAttacks(opponent)))));
 				});
-				for (int square : b.squares(role, type)) {
-					const auto present = b.anyset(b.band(b.pcs(role, type), b.rel(role, 1ULL << square)));
-					const auto count = cnt(b.band(b.fromatk(role, type, sq(role, square)), area));
-					for (int bucket = 0; bucket <= maximum; ++bucket) {
-						buckets[static_cast<std::size_t>(bucket)].push_back(b.land(present, b.equal(count, b.num(bucket))));
-					}
-				}
-				std::array<Id, 28> result{};
-				for (int bucket = 0; bucket <= maximum; ++bucket) {
-					result[static_cast<std::size_t>(bucket)] = b.sum(buckets[static_cast<std::size_t>(bucket)]);
-				}
-				return result;
 			}
-
-			Id secondarymobility(Id role, Id opponent, int type) {
-				Sum terms;
-				Id unsafe = b.bor(pawnatt(opponent), b.bor(b.atk(opponent, 1), b.atk(opponent, 2)));
+			IS secondaryArea(IS role, IS opponent, int type) {
+				if (type < 3)
+					return b.BB(0);
+				IS unsafe = b.OR(pawnAttacks(opponent), b.OR(b.attacks(opponent, 1), b.attacks(opponent, 2)));
 				if (type == 4) {
-					unsafe = b.bor(unsafe, b.atk(opponent, 3));
+					unsafe = b.OR(unsafe, b.attacks(opponent, 3));
 				}
-				const auto area = b.band(b.bnot(own(role)), b.bnot(unsafe));
-				for (int square : b.squares(role, type)) {
-					const auto present = b.anyset(b.band(b.pcs(role, type), b.rel(role, 1ULL << square)));
-					terms.push_back(b.mul(present, cnt(b.band(b.fromatk(role, type, sq(role, square)), area))));
-				}
-				return b.sum(terms);
+				return b.AND(b.NOT(own(role)), b.NOT(unsafe));
 			}
-
-			void mobility() {
-				constexpr std::array<int, 4> maximum{{8, 13, 14, 27}};
+			void emitMobility() {
+				// Catalog entries mobility.knight.0 through mobility.queen.safe.
+				constexpr std::array<int, 4> max{{8, 13, 14, 27}};
 				constexpr std::array<int, 4> reference{{4, 5, 7, 12}};
-				constexpr std::array<float, 4> slope{{0.030F, 0.025F, 0.018F, 0.009F}};
 				for (int type = 1; type <= 4; ++type) {
-					b.group(static_cast<Region>(static_cast<unsigned>(Region::knightMobility) + type - 1), has(type), [&] {
-						const auto friendly = mobilitycounts(us, them, type, maximum[static_cast<std::size_t>(type - 1)]);
-						const auto enemy = mobilitycounts(them, us, type, maximum[static_cast<std::size_t>(type - 1)]);
-						// Material already supplies the omitted reference bucket, so the remaining buckets span every mobility table without a null direction.
-						for (int bucket = 0; bucket <= maximum[static_cast<std::size_t>(type - 1)]; ++bucket) {
-							if (bucket == reference[static_cast<std::size_t>(type - 1)]) {
-								continue;
-							}
-							const float weight = static_cast<float>(bucket - reference[static_cast<std::size_t>(type - 1)]) * slope[static_cast<std::size_t>(type - 1)];
-							reg(diff(friendly[static_cast<std::size_t>(bucket)], enemy[static_cast<std::size_t>(bucket)]), weight * 0.8F, weight, Family::mobility);
-						}
-						if (type >= 3) {
-							reg(diff(secondarymobility(us, them, type), secondarymobility(them, us, type)), type == 3 ? 0.008F : 0.004F, type == 3 ? 0.012F : 0.006F,
-							    Family::mobility);
-						}
-					});
+					const auto &f = b.mobility(us, type, mobilityArea(us, them), secondaryArea(us, them, type));
+					const auto &e = b.mobility(them, type, mobilityArea(them, us), secondaryArea(them, us, type));
+					for (int bucket = 0; bucket <= max[type - 1]; ++bucket) {
+						if (bucket == reference[type - 1])
+							continue;
+						put(diff(b.NUM(f.counts[bucket]), b.NUM(e.counts[bucket])));
+					}
+					if (type >= 3)
+						put(diff(b.NUM(f.secondary), b.NUM(e.secondary)));
 				}
 			}
 
-			Id rookline(Id role, Id opponent) {
+			IS rookLine(IS role, IS opponent) {
 				Sum terms;
 				for (int square : b.squares(role, 3)) {
-					const auto present = b.anyset(b.band(b.pcs(role, 3), b.rel(role, 1ULL << square)));
-					const auto queens = b.bor(b.pcs(role, 4), b.pcs(opponent, 4));
-					terms.push_back(b.mul(present, cnt(b.band(queens, b.bb(filemask(square % 8))))));
+					const auto present = b.ANY(b.AND(b.PCS(role, 3), b.REL(role, 1ULL << square)));
+					const auto queens = b.OR(b.PCS(role, 4), b.PCS(opponent, 4));
+					terms.push_back(b.MUL(present, CNT(b.AND(queens, b.BB(fileMask(square % 8))))));
 				}
 				return b.sum(terms);
 			}
 
-			Id bishopxray(Id role, Id opponent) {
+			IS bishopXray(IS role, IS opponent) {
 				Sum terms;
 				for (int square : b.squares(role, 2)) {
-					const auto present = b.anyset(b.band(b.pcs(role, 2), b.rel(role, 1ULL << square)));
-					terms.push_back(b.mul(present, cnt(b.band(b.pcs(opponent, 0), b.rel(role, diagonalmask(square))))));
+					const auto present = b.ANY(b.AND(b.PCS(role, 2), b.REL(role, 1ULL << square)));
+					terms.push_back(b.MUL(present, CNT(b.AND(b.PCS(opponent, 0), b.REL(role, diagonalMask(square))))));
 				}
 				return b.sum(terms);
 			}
 
-			void pieces() {
+			void emitPieces() {
+				// Catalog entries piece.minorBehindPawn.knight through piece.space.
 				for (int type = 1; type <= 2; ++type) {
-					const auto friendly = cnt(b.band(b.pcs(us, type), b.sh(b.pcs(us, 0), them, 0)));
-					const auto enemy = cnt(b.band(b.pcs(them, type), b.sh(b.pcs(them, 0), us, 0)));
-					reg(diff(friendly, enemy), 0.035F, 0.025F, Family::mobility);
+					const auto friendly = CNT(b.AND(b.PCS(us, type), b.SH(b.PCS(us, 0), them, 0)));
+					const auto enemy = CNT(b.AND(b.PCS(them, type), b.SH(b.PCS(them, 0), us, 0)));
+					put(diff(friendly, enemy));
 				}
 				constexpr std::uint64_t light = 0x55AA55AA55AA55AAULL;
-				const auto bishoppawns = [&](Id role) {
-					const auto l = b.rel(role, light);
-					const auto d = b.bnot(l);
-					return b.add(b.mul(cnt(b.band(b.pcs(role, 2), l)), cnt(b.band(b.pcs(role, 0), l))), b.mul(cnt(b.band(b.pcs(role, 2), d)), cnt(b.band(b.pcs(role, 0), d))));
+				const auto bishoppawns = [&](IS role) {
+					const auto l = b.REL(role, light);
+					const auto d = b.NOT(l);
+					return b.ADD(b.MUL(CNT(b.AND(b.PCS(role, 2), l)), CNT(b.AND(b.PCS(role, 0), l))), b.MUL(CNT(b.AND(b.PCS(role, 2), d)), CNT(b.AND(b.PCS(role, 0), d))));
 				};
-				reg(diff(bishoppawns(us), bishoppawns(them)), -0.006F, -0.008F, Family::general);
-				reg(diff(cnt(b.band(b.pcs(us, 2), b.bnot(pawnatt(us)))), cnt(b.band(b.pcs(them, 2), b.bnot(pawnatt(them))))), -0.01F, -0.018F, Family::mobility);
-				const auto central = filemask(2) | filemask(3) | filemask(4) | filemask(5);
-				const auto fblocked = b.band(b.pcs(us, 0), b.band(b.sh(occ, us, 1), b.rel(us, central & (rankmask(1) | rankmask(2)))));
-				const auto eblocked = b.band(b.pcs(them, 0), b.band(b.sh(occ, them, 1), b.rel(them, central & (rankmask(1) | rankmask(2)))));
-				reg(diff(b.mul(cnt(b.pcs(us, 2)), cnt(fblocked)), b.mul(cnt(b.pcs(them, 2)), cnt(eblocked))), -0.004F, -0.010F, Family::mobility);
-				reg(diff(bishopxray(us, them), bishopxray(them, us)), 0.012F, 0.018F, Family::mobility);
-				reg(diff(cnt(b.band(b.pcs(us, 3), b.rel(us, rankmask(6)))), cnt(b.band(b.pcs(them, 3), b.rel(them, rankmask(6))))), 0.11F, 0.08F, Family::mobility);
-				reg(diff(rookline(us, them), rookline(them, us)), 0.08F, 0.05F, Family::mobility);
+				put(diff(bishoppawns(us), bishoppawns(them)));
+				put(diff(CNT(b.AND(b.PCS(us, 2), b.NOT(pawnAttacks(us)))), CNT(b.AND(b.PCS(them, 2), b.NOT(pawnAttacks(them))))));
+				const auto central = fileMask(2) | fileMask(3) | fileMask(4) | fileMask(5);
+				const auto fblocked = b.AND(b.PCS(us, 0), b.AND(b.SH(occ, us, 1), b.REL(us, central & (rankMask(1) | rankMask(2)))));
+				const auto eblocked = b.AND(b.PCS(them, 0), b.AND(b.SH(occ, them, 1), b.REL(them, central & (rankMask(1) | rankMask(2)))));
+				put(diff(b.MUL(CNT(b.PCS(us, 2)), CNT(fblocked)), b.MUL(CNT(b.PCS(them, 2)), CNT(eblocked))));
+				put(diff(bishopXray(us, them), bishopXray(them, us)));
+				put(diff(CNT(b.AND(b.PCS(us, 3), b.REL(us, rankMask(6)))), CNT(b.AND(b.PCS(them, 3), b.REL(them, rankMask(6))))));
+				put(diff(rookLine(us, them), rookLine(them, us)));
 
-				b.group(Region::rookfiles, has(3), [&] {
-					Id fopen = z;
-					Id eopen = z;
-					Id fsemi = z;
-					Id esemi = z;
+				{
+					IS fopen = z;
+					IS eopen = z;
+					IS fsemi = z;
+					IS esemi = z;
 					for (int file = 0; file < 8; ++file) {
-						const auto mask = b.bb(filemask(file));
-						const auto frooks = cnt(b.band(b.pcs(us, 3), mask));
-						const auto erooks = cnt(b.band(b.pcs(them, 3), mask));
-						const auto fp = b.anyset(b.band(b.pcs(us, 0), mask));
-						const auto ep = b.anyset(b.band(b.pcs(them, 0), mask));
-						fopen = b.add(fopen, b.mul(frooks, b.lnot(b.lor(fp, ep))));
-						eopen = b.add(eopen, b.mul(erooks, b.lnot(b.lor(fp, ep))));
-						fsemi = b.add(fsemi, b.mul(frooks, b.land(b.lnot(fp), ep)));
-						esemi = b.add(esemi, b.mul(erooks, b.land(b.lnot(ep), fp)));
+						const auto mask = b.BB(fileMask(file));
+						const auto frooks = CNT(b.AND(b.PCS(us, 3), mask));
+						const auto erooks = CNT(b.AND(b.PCS(them, 3), mask));
+						const auto fp = b.ANY(b.AND(b.PCS(us, 0), mask));
+						const auto ep = b.ANY(b.AND(b.PCS(them, 0), mask));
+						fopen = b.ADD(fopen, b.MUL(frooks, b.LNOT(b.LOR(fp, ep))));
+						eopen = b.ADD(eopen, b.MUL(erooks, b.LNOT(b.LOR(fp, ep))));
+						fsemi = b.ADD(fsemi, b.MUL(frooks, b.LAND(b.LNOT(fp), ep)));
+						esemi = b.ADD(esemi, b.MUL(erooks, b.LAND(b.LNOT(ep), fp)));
 					}
-					reg(diff(fopen, eopen), 0.0F, 0.20F, Family::mobility);
-					reg(diff(fsemi, esemi), 0.03F, 0.10F, Family::mobility);
-				});
-
-				const auto outposts = [&](Id role, Id opponent, int type) {
-					const auto ranks = b.rel(role, rankmask(3) | rankmask(4) | rankmask(5));
-					const auto future = pawnatt(opponent);
-					const auto viable = b.band(ranks, b.band(pawnatt(role), b.bnot(b.fill(future, opponent))));
-					return cnt(b.band(b.pcs(role, type), viable));
-				};
-				for (int type = 1; type <= 2; ++type) {
-					reg(diff(outposts(us, them, type), outposts(them, us, type)), 0.10F, 0.12F, Family::mobility);
+					put(diff(fopen, eopen));
+					put(diff(fsemi, esemi));
 				}
 
-				const auto restricted = [&](Id role, Id opponent) {
-					const auto guarded = strong(role, opponent);
-					return cnt(b.band(b.band(b.atk(role), b.atk(opponent)), b.bnot(guarded)));
+				const auto outposts = [&](IS role, IS opponent, int type) {
+					const auto ranks = b.REL(role, rankMask(3) | rankMask(4) | rankMask(5));
+					const auto future = pawnAttacks(opponent);
+					const auto viable = b.AND(ranks, b.AND(pawnAttacks(role), b.NOT(b.fill(future, opponent))));
+					return CNT(b.AND(b.PCS(role, type), viable));
 				};
-				reg(diff(restricted(us, them), restricted(them, us)), 0.008F, 0.012F, Family::mobility);
+				for (int type = 1; type <= 2; ++type) {
+					put(diff(outposts(us, them, type), outposts(them, us, type)));
+				}
+
+				const auto restricted = [&](IS role, IS opponent) {
+					const auto guarded = strongSquares(role, opponent);
+					return CNT(b.AND(b.AND(b.attacks(role), b.attacks(opponent)), b.NOT(guarded)));
+				};
+				put(diff(restricted(us, them), restricted(them, us)));
 				constexpr std::uint64_t center = 0x00003C3C3C000000ULL;
-				const auto space = [&](Id role, Id opponent) { return cnt(b.band(b.band(b.atk(role), b.rel(role, center)), b.bnot(pawnatt(opponent)))); };
-				reg(diff(space(us, them), space(them, us)), 0.004F, 0.012F, Family::mobility);
+				const auto space = [&](IS role, IS opponent) { return CNT(b.AND(b.AND(b.attacks(role), b.REL(role, center)), b.NOT(pawnAttacks(opponent)))); };
+				put(diff(space(us, them), space(them, us)));
 			}
 
-			void threats() {
-				const auto evalside = [&](Id role, Id opponent, int victim) {
-					const auto targets = b.pcs(opponent, victim);
-					const auto guarded = strong(role, opponent);
-					const auto weak = b.band(targets, b.bnot(guarded));
-					const auto hanging = b.band(targets, b.band(b.atk(role), b.bor(b.bnot(b.atk(opponent)), b.atk2(role))));
-					const auto minor = b.band(weak, b.bor(b.atk(role, 1), b.atk(role, 2)));
-					const auto rook = b.band(weak, b.atk(role, 3));
-					const auto pushatt = b.memo(Shared::push, role, [&] {
-						const auto pushed = b.band(b.sh(b.pcs(role, 0), role, 0), b.bnot(occ));
-						return b.bor(b.sh(pushed, role, 4), b.sh(pushed, role, 5));
+			void emitThreats() {
+				// Catalog entries threat.pawn.hanging through threat.queenPressure.rook.queenAbsent.
+				const auto evalside = [&](IS role, IS opponent, int victim) {
+					const auto targets = b.PCS(opponent, victim);
+					const auto guarded = strongSquares(role, opponent);
+					const auto weak = b.AND(targets, b.NOT(guarded));
+					const auto hanging = b.AND(targets, b.AND(b.attacks(role), b.OR(b.NOT(b.attacks(opponent)), b.attacks2(role))));
+					const auto minor = b.AND(weak, b.OR(b.attacks(role, 1), b.attacks(role, 2)));
+					const auto rook = b.AND(weak, b.attacks(role, 3));
+					const auto pushatt = shared(pushAttack, role, [&] {
+						const auto pushed = b.AND(b.SH(b.PCS(role, 0), role, 0), b.NOT(occ));
+						return b.OR(b.SH(pushed, role, 4), b.SH(pushed, role, 5));
 					});
-					return std::array<Id, 5>{cnt(hanging), cnt(b.band(targets, pawnatt(role))), cnt(minor), cnt(rook), cnt(b.band(targets, pushatt))};
+					return std::array<IS, 5>{CNT(hanging), CNT(b.AND(targets, pawnAttacks(role))), CNT(minor), CNT(rook), CNT(b.AND(targets, pushatt))};
 				};
-				const auto kingthreat = [&](Id role, Id opponent) {
+				const auto kingthreat = [&](IS role, IS opponent) {
 					const auto targets = own(opponent);
-					const auto guarded = strong(role, opponent);
-					return b.anyset(b.band(b.band(targets, b.bnot(guarded)), b.atk(role, 5)));
+					const auto guarded = strongSquares(role, opponent);
+					return b.ANY(b.AND(b.AND(targets, b.NOT(guarded)), b.attacks(role, 5)));
 				};
-				const auto queenpressure = [&](Id role, Id opponent, int type) {
+				const auto queenpressure = [&](IS role, IS opponent, int type) {
 					Sum terms;
-					const auto guarded = strong(role, opponent);
+					const auto guarded = strongSquares(role, opponent);
 					for (int square : b.squares(opponent, 4)) {
-						const auto queen = b.anyset(b.band(b.pcs(opponent, 4), b.rel(opponent, 1ULL << square)));
-						const auto sources = b.band(b.pcs(role, type), b.fromatk(role, type, sq(opponent, square)));
-						terms.push_back(b.mul(queen, cnt(b.band(sources, b.bnot(guarded)))));
+						const auto queen = b.ANY(b.AND(b.PCS(opponent, 4), b.REL(opponent, 1ULL << square)));
+						const auto sources = b.AND(b.PCS(role, type), b.attackFrom(role, type, sq(opponent, square)));
+						terms.push_back(b.MUL(queen, CNT(b.AND(sources, b.NOT(guarded)))));
 					}
 					return b.sum(terms);
 				};
 
 				for (int victim = 0; victim < 5; ++victim) {
-					b.group(static_cast<Region>(static_cast<unsigned>(Region::pawnThreat) + victim), has(victim), [&] {
+					{
 						const auto friendly = evalside(us, them, victim);
 						const auto enemy = evalside(them, us, victim);
-						const float value = victim == 0 ? 0.07F : victim < 3 ? 0.16F : victim == 3 ? 0.22F : 0.30F;
-						reg(diff(friendly[0], enemy[0]), value, value, Family::mobility);
-						reg(diff(friendly[1], enemy[1]), value * 0.8F, value, Family::mobility);
-						reg(diff(friendly[2], enemy[2]), value * 0.35F, value * 0.45F, Family::mobility);
-						reg(diff(friendly[3], enemy[3]), value * 0.30F, value * 0.40F, Family::mobility);
-						reg(diff(friendly[4], enemy[4]), value * 0.25F, value * 0.35F, Family::pawn);
-					});
+						put(diff(friendly[0], enemy[0]));
+						put(diff(friendly[1], enemy[1]));
+						put(diff(friendly[2], enemy[2]));
+						put(diff(friendly[3], enemy[3]));
+						put(diff(friendly[4], enemy[4]));
+					}
 				}
-				reg(diff(kingthreat(us, them), kingthreat(them, us)), 0.05F, 0.08F, Family::mobility);
-				b.group(Region::queenPressure, has(4), [&] {
+				put(diff(kingthreat(us, them), kingthreat(them, us)));
+				{
 					for (int type = 1; type <= 3; ++type) {
-						const float value = type == 1 ? 0.05F : type == 2 ? 0.06F : 0.04F;
 						const auto friendly = queenpressure(us, them, type);
 						const auto enemy = queenpressure(them, us, type);
-						const auto fqueenless = b.equal(cnt(b.pcs(us, 4)), z);
-						const auto equeenless = b.equal(cnt(b.pcs(them, 4)), z);
-						reg(diff(b.mul(friendly, b.lnot(fqueenless)), b.mul(enemy, b.lnot(equeenless))), value * 0.5F, value, Family::mobility);
-						reg(diff(b.mul(friendly, fqueenless), b.mul(enemy, equeenless)), value * 0.8F, value * 1.4F, Family::mobility);
+						const auto fqueenless = b.EQ(CNT(b.PCS(us, 4)), z);
+						const auto equeenless = b.EQ(CNT(b.PCS(them, 4)), z);
+						put(diff(b.MUL(friendly, b.LNOT(fqueenless)), b.MUL(enemy, b.LNOT(equeenless))));
+						put(diff(b.MUL(friendly, fqueenless), b.MUL(enemy, equeenless)));
 					}
+				}
+			}
+
+			IS ringAttacks(IS attacker, IS defender, int type, int distance) {
+				// The king attack map is exactly its inner ring on a legal board.
+				return distance == 1 ? CNT(b.AND(b.attacks(attacker, type), b.attacks(defender, 5)))
+				                     : CNT(b.AND(b.attacks(attacker, type), kingRegion(defender, false)));
+			}
+
+			IS potentialChecks(IS attacker, IS defender, int type) {
+				Sum terms;
+				for (int square : b.squares(defender, 5)) {
+					const auto king = b.ANY(b.AND(b.PCS(defender, 5), b.REL(defender, 1ULL << square)));
+					// Reversing the defender's pawn direction gives the squares from which an attacking pawn checks the king.
+					const auto geometry = b.attackFrom(type == 0 ? defender : attacker, type, sq(defender, square));
+					const auto destinations = b.AND(geometry, b.AND(b.attacks(attacker, type), b.NOT(own(attacker))));
+					terms.push_back(b.MUL(king, CNT(destinations)));
+				}
+				return b.sum(terms);
+			}
+
+			IS escapes(IS defender, IS attacker) {
+				return CNT(b.AND(b.attacks(defender, 5), b.AND(b.NOT(own(defender)), b.NOT(b.attacks(attacker)))));
+			}
+
+			IS kingPawns(IS defender, IS attacker, int distance, bool friendly) {
+				(void)attacker;
+				return b.kingPawn(defender, 2 * (distance - 1) + !friendly);
+			}
+
+			IS kingOpenFiles(IS role) {
+				return b.kingPawn(role, 6);
+			}
+
+			IS kingRegion(IS role, bool flank) {
+				return shared(flank ? kingFlank : kingRing, role, [&] {
+					IS mask = b.BB(0);
+					for (int square : b.squares(role, 5)) {
+						Word region = ringMask(square, 2);
+						if (flank) {
+							region = 0;
+							for (int file = std::max(0, square % 8 - 1); file <= std::min(7, square % 8 + 1); ++file)
+								region |= fileMask(file);
+						}
+						mask = b.OR(mask, b.REL(role, region));
+					}
+					return mask;
 				});
 			}
 
-			Id ringatt(Id attacker, Id defender, int type, int distance) {
-				Sum terms;
-				for (int square : b.squares(defender, 5)) {
-					const auto king = b.anyset(b.band(b.pcs(defender, 5), b.rel(defender, 1ULL << square)));
-					const auto ring = b.rel(defender, ringmask(square, distance));
-					terms.push_back(b.mul(king, cnt(b.band(b.atk(attacker, type), ring))));
-				}
-				return b.sum(terms);
+			IS flank(IS map, IS defender) {
+				return CNT(b.AND(map, kingRegion(defender, true)));
 			}
 
-			Id potentialchecks(Id attacker, Id defender, int type) {
-				Sum terms;
-				for (int square : b.squares(defender, 5)) {
-					const auto king = b.anyset(b.band(b.pcs(defender, 5), b.rel(defender, 1ULL << square)));
-					// Reversing the defender's pawn direction gives the squares from which an attacking pawn checks the king.
-					const auto geometry = b.fromatk(type == 0 ? defender : attacker, type, sq(defender, square));
-					const auto destinations = b.band(geometry, b.band(b.atk(attacker, type), b.bnot(own(attacker))));
-					terms.push_back(b.mul(king, cnt(destinations)));
-				}
-				return b.sum(terms);
-			}
-
-			Id escapes(Id defender, Id attacker) {
-				Sum terms;
-				for (int square : b.squares(defender, 5)) {
-					const auto king = b.anyset(b.band(b.pcs(defender, 5), b.rel(defender, 1ULL << square)));
-					const auto zone = b.rel(defender, ringmask(square, 1));
-					terms.push_back(b.mul(king, cnt(b.band(zone, b.band(b.bnot(own(defender)), b.bnot(b.atk(attacker)))))));
-				}
-				return b.sum(terms);
-			}
-
-			Id kingpawns(Id defender, Id attacker, int distance, bool friendly) {
-				Sum terms;
-				for (int square : b.squares(defender, 5)) {
-					const int rank = square / 8 + distance;
-					if (rank >= 8) {
-						continue;
-					}
-					const int file = square % 8;
-					const auto king = b.anyset(b.band(b.pcs(defender, 5), b.rel(defender, 1ULL << square)));
-					const auto pawns = friendly ? b.band(b.pcs(defender, 0), b.bnot(pawnatt(attacker))) : b.pcs(attacker, 0);
-					for (int candidate = std::max(0, file - 1); candidate <= std::min(7, file + 1); ++candidate) {
-						const auto exact = b.anyset(b.band(pawns, b.rel(defender, 1ULL << (rank * 8 + candidate))));
-						std::uint64_t closer = 0;
-						for (int near = square / 8 + 1; near < rank; ++near) {
-							closer |= 1ULL << (near * 8 + candidate);
-						}
-						const auto nearest = closer == 0 ? exact : b.land(exact, b.lnot(b.anyset(b.band(pawns, b.rel(defender, closer)))));
-						terms.push_back(b.land(king, nearest));
-					}
-				}
-				return b.sum(terms);
-			}
-
-			Id kingopen(Id role) {
-				Sum terms;
-				const auto allpawns = b.bor(b.pcs(us, 0), b.pcs(them, 0));
-				for (int square : b.squares(role, 5)) {
-					Sum opened;
-					for (int file = std::max(0, square % 8 - 1); file <= std::min(7, square % 8 + 1); ++file) {
-						opened.push_back(b.lnot(b.anyset(b.band(allpawns, b.bb(filemask(file))))));
-					}
-					const auto king = b.anyset(b.band(b.pcs(role, 5), b.rel(role, 1ULL << square)));
-					terms.push_back(b.mul(king, b.sum(opened)));
-				}
-				return b.sum(terms);
-			}
-
-			Id flank(Id map, Id defender) {
-				Sum terms;
-				for (int square : b.squares(defender, 5)) {
-					std::uint64_t mask = 0;
-					for (int file = std::max(0, square % 8 - 1); file <= std::min(7, square % 8 + 1); ++file) {
-						mask |= filemask(file);
-					}
-					const auto king = b.anyset(b.band(b.pcs(defender, 5), b.rel(defender, 1ULL << square)));
-					terms.push_back(b.mul(king, cnt(b.band(map, b.rel(defender, mask)))));
-				}
-				return b.sum(terms);
-			}
-
-			void kings() {
+			void emitKings() {
+				// Catalog entries king.innerRing.pawn through king.castlingQueenSide.
 				Sum friendly;
 				Sum enemy;
 				for (int type = 0; type < 5; ++type) {
-					const auto fi = ringatt(us, them, type, 1);
-					const auto ei = ringatt(them, us, type, 1);
+					const auto fi = ringAttacks(us, them, type, 1);
+					const auto ei = ringAttacks(them, us, type, 1);
 					friendly.push_back(fi);
 					enemy.push_back(ei);
-					const float pressure = type == 0 ? 0.02F : type < 3 ? 0.04F : type == 3 ? 0.05F : 0.07F;
-					reg(diff(fi, ei), pressure * 0.25F, pressure, Family::king);
-					reg(diff(ringatt(us, them, type, 2), ringatt(them, us, type, 2)), pressure * 0.10F, pressure * 0.35F, Family::king);
-					reg(diff(potentialchecks(us, them, type), potentialchecks(them, us, type)), pressure * 0.15F, pressure * 0.45F, Family::king);
+					put(diff(fi, ei));
+					put(diff(ringAttacks(us, them, type, 2), ringAttacks(them, us, type, 2)));
+					put(diff(potentialChecks(us, them, type), potentialChecks(them, us, type)));
 				}
 				const auto fp = b.sum(friendly);
 				const auto ep = b.sum(enemy);
 				for (const int threshold : {2, 4, 6, 8}) {
-					reg(diff(b.ge(fp, b.num(threshold)), b.ge(ep, b.num(threshold))), 0.0F, static_cast<float>(threshold) / 400.0F, Family::king);
+					put(diff(b.GE(fp, b.NUM(threshold)), b.GE(ep, b.NUM(threshold))));
 				}
-				reg(diff(escapes(us, them), escapes(them, us)), 0.01F, 0.02F, Family::king);
-				b.group(Region::kingPawns, has(0), [&] {
+				put(diff(escapes(us, them), escapes(them, us)));
+				{
 					for (int distance = 1; distance <= 3; ++distance) {
-						const float shelter = static_cast<float>(4 - distance) / 400.0F;
-						const float storm = static_cast<float>(4 - distance) / 500.0F;
-						reg(diff(kingpawns(us, them, distance, true), kingpawns(them, us, distance, true)), shelter * 0.5F, shelter, Family::king);
-						reg(diff(kingpawns(them, us, distance, false), kingpawns(us, them, distance, false)), storm * 0.5F, storm, Family::king);
+						put(diff(kingPawns(us, them, distance, true), kingPawns(them, us, distance, true)));
+						put(diff(kingPawns(them, us, distance, false), kingPawns(us, them, distance, false)));
 					}
-				});
-				reg(diff(kingopen(us), kingopen(them)), -0.015F, -0.04F, Family::king);
-				reg(diff(flank(b.atk(us), us), flank(b.atk(them), them)), 0.001F, 0.002F, Family::king);
-				reg(diff(flank(b.atk(us), them), flank(b.atk(them), us)), 0.001F, 0.003F, Family::king);
-				reg(diff(flank(b.atk2(us), us), flank(b.atk2(them), them)), 0.002F, 0.004F, Family::king);
-				reg(diff(flank(b.atk2(us), them), flank(b.atk2(them), us)), 0.002F, 0.006F, Family::king);
-				const auto fblockedstorm = b.band(b.pcs(us, 0), b.sh(b.pcs(them, 0), them, 0));
-				const auto eblockedstorm = b.band(b.pcs(them, 0), b.sh(b.pcs(us, 0), us, 0));
-				reg(diff(flank(fblockedstorm, us), flank(eblockedstorm, them)), 0.006F, 0.014F, Family::king);
-				const auto fnoqueen = b.equal(cnt(b.pcs(us, 4)), z);
-				const auto enoqueen = b.equal(cnt(b.pcs(them, 4)), z);
-				reg(diff(b.mul(fp, enoqueen), b.mul(ep, fnoqueen)), 0.0F, -0.01F, Family::king);
+				}
+				put(diff(kingOpenFiles(us), kingOpenFiles(them)));
+				put(diff(flank(b.attacks(us), us), flank(b.attacks(them), them)));
+				put(diff(flank(b.attacks(us), them), flank(b.attacks(them), us)));
+				put(diff(flank(b.attacks2(us), us), flank(b.attacks2(them), them)));
+				put(diff(flank(b.attacks2(us), them), flank(b.attacks2(them), us)));
+				const auto fblockedstorm = b.AND(b.PCS(us, 0), b.SH(b.PCS(them, 0), them, 0));
+				const auto eblockedstorm = b.AND(b.PCS(them, 0), b.SH(b.PCS(us, 0), us, 0));
+				put(diff(flank(fblockedstorm, us), flank(eblockedstorm, them)));
+				const auto fnoqueen = b.EQ(CNT(b.PCS(us, 4)), z);
+				const auto enoqueen = b.EQ(CNT(b.PCS(them, 4)), z);
+				put(diff(b.MUL(fp, enoqueen), b.MUL(ep, fnoqueen)));
 				for (int side = 0; side < 2; ++side) {
-					const auto friendlyright = b.right(us, side);
-					const auto enemyright = b.right(them, side);
-					reg(diff(friendlyright, enemyright), 0.0F, side == 0 ? 0.03F : 0.02F, Family::king);
+					const auto friendlyright = b.RIGHT(us, side);
+					const auto enemyright = b.RIGHT(them, side);
+					put(diff(friendlyright, enemyright));
 				}
 			}
 
-			Id nonpawn(Id role) {
-				Id total = z;
+			IS nonPawnMaterial(IS role) {
+				IS total = z;
 				constexpr std::array<int, 5> value{{0, 3, 3, 5, 9}};
 				for (int type = 1; type <= 4; ++type) {
-					total = b.add(total, b.mul(b.num(value[static_cast<std::size_t>(type)]), cnt(b.pcs(role, type))));
+					total = b.ADD(total, b.MUL(b.NUM(value[static_cast<std::size_t>(type)]), CNT(b.PCS(role, type))));
 				}
 				return total;
 			}
 
-			void endgames() {
+			void emitEndgames() {
+				// Catalog entries endgame.oppositeBishops through endgame.oppositeBishopPassers.
 				constexpr std::uint64_t light = 0x55AA55AA55AA55AAULL;
-				const auto onefb = b.equal(cnt(b.pcs(us, 2)), o);
-				const auto oneeb = b.equal(cnt(b.pcs(them, 2)), o);
-				const auto opposite = b.lor(b.land(b.anyset(b.band(b.pcs(us, 2), b.bb(light))), b.anyset(b.band(b.pcs(them, 2), b.bnot(b.bb(light))))),
-				    b.land(b.anyset(b.band(b.pcs(us, 2), b.bnot(b.bb(light)))), b.anyset(b.band(b.pcs(them, 2), b.bb(light)))));
-				const auto fpawns = cnt(b.pcs(us, 0));
-				const auto epawns = cnt(b.pcs(them, 0));
-				const auto material = b.add(diff(nonpawn(us), nonpawn(them)), diff(fpawns, epawns));
-				const auto positive = b.gt(material, z);
-				const auto negative = b.lt(material, z);
+				const auto onefb = b.EQ(CNT(b.PCS(us, 2)), o);
+				const auto oneeb = b.EQ(CNT(b.PCS(them, 2)), o);
+				const auto opposite = b.LOR(b.LAND(b.ANY(b.AND(b.PCS(us, 2), b.BB(light))), b.ANY(b.AND(b.PCS(them, 2), b.NOT(b.BB(light))))),
+				    b.LAND(b.ANY(b.AND(b.PCS(us, 2), b.NOT(b.BB(light)))), b.ANY(b.AND(b.PCS(them, 2), b.BB(light)))));
+				const auto fpawns = CNT(b.PCS(us, 0));
+				const auto epawns = CNT(b.PCS(them, 0));
+				const auto material = b.ADD(diff(nonPawnMaterial(us), nonPawnMaterial(them)), diff(fpawns, epawns));
+				const auto positive = b.GT(material, z);
+				const auto negative = b.LT(material, z);
 				const auto direction = diff(positive, negative);
-				reg(b.mul(b.land(b.land(onefb, oneeb), opposite), direction), -0.10F, 0.0F, Family::general);
-				const auto fpawnless = b.equal(fpawns, z);
-				const auto epawnless = b.equal(epawns, z);
-				const auto thin = b.le(b.abs(diff(nonpawn(us), nonpawn(them))), o);
-				reg(diff(b.land(b.land(positive, fpawnless), thin), b.land(b.land(negative, epawnless), thin)), -0.30F, 0.0F, Family::general);
+				put(b.MUL(b.LAND(b.LAND(onefb, oneeb), opposite), direction));
+				const auto fpawnless = b.EQ(fpawns, z);
+				const auto epawnless = b.EQ(epawns, z);
+				const auto thin = b.LE(b.ABS(diff(nonPawnMaterial(us), nonPawnMaterial(them))), o);
+				put(diff(b.LAND(b.LAND(positive, fpawnless), thin), b.LAND(b.LAND(negative, epawnless), thin)));
 
-				Id symmetric = z;
-				Id asymmetric = z;
+				IS symmetric = z;
+				IS asymmetric = z;
 				for (int file = 0; file < 8; ++file) {
-					const auto fp = b.anyset(b.band(b.pcs(us, 0), b.bb(filemask(file))));
-					const auto ep = b.anyset(b.band(b.pcs(them, 0), b.bb(filemask(file))));
-					symmetric = b.add(symmetric, b.land(fp, ep));
-					asymmetric = b.add(asymmetric, b.lor(b.land(fp, b.lnot(ep)), b.land(ep, b.lnot(fp))));
+					const auto fp = b.ANY(b.AND(b.PCS(us, 0), b.BB(fileMask(file))));
+					const auto ep = b.ANY(b.AND(b.PCS(them, 0), b.BB(fileMask(file))));
+					symmetric = b.ADD(symmetric, b.LAND(fp, ep));
+					asymmetric = b.ADD(asymmetric, b.LOR(b.LAND(fp, b.LNOT(ep)), b.LAND(ep, b.LNOT(fp))));
 				}
-				reg(b.mul(direction, b.add(fpawns, epawns)), 0.004F, 0.0F, Family::general);
-				reg(b.mul(direction, symmetric), -0.010F, 0.0F, Family::general);
-				reg(b.mul(direction, asymmetric), 0.014F, 0.0F, Family::general);
-				reg(b.mul(direction, b.equal(phase, z)), 0.04F, 0.0F, Family::general);
-				const auto strongpawns = diff(b.mul(positive, fpawns), b.mul(negative, epawns));
-				reg(strongpawns, 0.012F, 0.0F, Family::general);
-				const auto strongpassers = diff(b.mul(positive, cnt(passers(us, them))), b.mul(negative, cnt(passers(them, us))));
-				reg(b.mul(b.land(b.land(onefb, oneeb), opposite), strongpassers), 0.025F, 0.0F, Family::general);
+				put(b.MUL(direction, b.ADD(fpawns, epawns)));
+				put(b.MUL(direction, symmetric));
+				put(b.MUL(direction, asymmetric));
+				put(b.MUL(direction, b.EQ(phase, z)));
+				const auto strongpawns = diff(b.MUL(positive, fpawns), b.MUL(negative, epawns));
+				put(strongpawns);
+				const auto strongpassers = diff(b.MUL(positive, CNT(passedPawns(us, them))), b.MUL(negative, CNT(passedPawns(them, us))));
+				put(b.MUL(b.LAND(b.LAND(onefb, oneeb), opposite), strongpassers));
 			}
 
 			B b;
-			Id z = 0;
-			Id o = 0;
-			Id us = 0;
-			Id them = 0;
-			Id occ = 0;
-			Id phase = 0;
-			Id open = 0;
-			Id freedom = 0;
-			Id exposure = 0;
+			Pair owned, pawnAttack, passedMap, strongMap, pawnFile, clearPath, safePath, wideAttack, stopPath, controlMap, mobilityAreaCache, pushAttack, kingRing, kingFlank;
+			IS z{};
+			IS o{};
+			IS us{};
+			IS them{};
+			IS occ{};
+			IS phase{};
 		};
 
 	} // namespace
 
-#ifdef ELEGINUS_COMPILE
-	void Graph::validate() const {
-		if (nodes_.empty() || roots_.empty())
-			throw std::runtime_error("empty formula program");
-		if (families_.size() * 4 + kContext != roots_.size() || std::any_of(families_.begin(), families_.end(), [](auto f) { return f >= 3; }))
-			throw std::runtime_error("invalid formula interpolation families");
-		if (std::any_of(sizes_.begin(), sizes_.end(), [](auto size) { return size == 0 || size % 4 != 0; }))
-			throw std::runtime_error("invalid formula activation region");
-		for (Id id = 0; id < nodes_.size(); ++id) {
-			const auto &n = nodes_[id];
-			const int count = arity(n.op);
-			if (count < 0 || n.type > Type::B1 || n.aux != 0)
-				throw std::runtime_error("invalid instruction");
-			if ((count >= 1 && n.a >= id) || (count >= 2 && n.b >= id) || (count >= 3 && n.c >= id)) {
-				throw std::runtime_error("formula DAG is not topologically ordered");
-			}
-			const auto numeric = [](Type t) { return t == Type::F64 || t == Type::B1; };
-			const auto a = count >= 1 ? nodes_[n.a].type : n.type;
-			const auto b = count >= 2 ? nodes_[n.b].type : n.type;
-			if (n.op == Op::IMM) {
-				if (n.type != Type::U64 && (!std::isfinite(real(n.imm)) || (n.type == Type::B1 && real(n.imm) != 0 && real(n.imm) != 1))) {
-					throw std::runtime_error("invalid numeric literal");
-				}
-			} else if (n.op == Op::LD) {
-				if (n.imm >= 15 || n.type != (n.imm == 12 ? Type::F64 : Type::U64))
-					throw std::runtime_error("invalid input register");
-			} else if (n.op >= Op::NOT && n.op <= Op::CTZ) {
-				if (a != Type::U64 || (count == 2 && b != Type::U64) || n.type != Type::U64)
-					throw std::runtime_error("invalid bit instruction types");
-			} else if (n.op == Op::POP) {
-				if (a != Type::U64 || n.type != Type::F64)
-					throw std::runtime_error("invalid POP types");
-			} else if (n.op == Op::SEL) {
-				const auto c = nodes_[n.c].type;
-				if (a != Type::B1 ||
-				    !((b == Type::U64 && c == Type::U64 && n.type == Type::U64) || (numeric(b) && numeric(c) && n.type == Type::F64) ||
-				        (b == Type::B1 && c == Type::B1 && n.type == Type::B1))) {
-					throw std::runtime_error("invalid SEL types");
-				}
-			} else if (n.op >= Op::EQ && n.op <= Op::GE) {
-				if (n.type != Type::B1 || (!(numeric(a) && numeric(b)) && !(n.op == Op::EQ && a == Type::U64 && b == Type::U64))) {
-					throw std::runtime_error("invalid comparison types");
-				}
-			} else if (!numeric(a) || (count == 2 && !numeric(b)) || n.type != Type::F64) {
-				throw std::runtime_error("invalid arithmetic types");
-			}
-		}
-		for (const auto &r : roots_) {
-			if (r.node >= nodes_.size() || nodes_[r.node].type == Type::U64 || !std::isfinite(r.weight))
-				throw std::runtime_error("invalid formula root");
-		}
-	}
-
-	void Graph::write(const char *path) const {
-		std::uint64_t hash = 14695981039346656037ULL;
-		const auto add = [&](std::uint64_t x) {
-			for (int i = 0; i < 8; ++i) {
-				hash = (hash ^ (x & 255)) * 1099511628211ULL;
-				x >>= 8;
-			}
-		};
-		for (const auto &n : nodes_) {
-			add(static_cast<unsigned>(n.op));
-			add(static_cast<unsigned>(n.type));
-			add(n.a);
-			add(n.b);
-			add(n.c);
-			add(n.imm);
-		}
-		for (const auto &r : roots_)
-			add(r.node);
-		add(std::bit_cast<std::uint32_t>(kInputScale));
-		std::ofstream out(path, std::ios::trunc);
-		out.exceptions(std::ios::badbit | std::ios::failbit);
-		out << "// Generated fixed formula metadata.\n#pragma once\n#include <cstdint>\nnamespace eleginus::catalog {\n";
-		out << "inline constexpr float weights[]{\n" << std::scientific << std::setprecision(std::numeric_limits<float>::max_digits10);
-		for (std::size_t i = 0; i < roots_.size(); ++i)
-			out << roots_[i].weight << "F," << (i % 8 == 7 ? "\n" : " ");
-		out << "\n};\ninline constexpr std::uint8_t families[]{\n";
-		for (std::size_t i = 0; i < families_.size(); ++i)
-			out << static_cast<unsigned>(families_[i]) << "," << (i % 24 == 23 ? "\n" : " ");
-		out << "\n};\ninline constexpr unsigned sizes[]{\n";
-		for (auto size : sizes_)
-			out << size << ",";
-		out << "\n};\ninline constexpr std::uint64_t signature = " << hash << "ULL;\n}\n";
-	}
-#else
-	const Program &Program::fixed() {
-		static const Program p = [] {
-			Program result;
-			result.weights_ = catalog::weights;
-			result.families_ = catalog::families;
-			result.signature_ = catalog::signature;
-			return result;
-		}();
-		return p;
-	}
-
-	void Program::evaluate(const chess::Board &board, std::vector<Feature> &out) {
+	void detail::extract(const chess::Board &board, std::vector<Feature> &out) {
 		out.clear();
+		if (out.capacity() < kFormulaCount)
+			out.reserve(kFormulaCount);
 		Features sink{out};
-		Formulas<Native<Features>>(Native(board, sink)).build();
+		Formulas<Runtime<Features>>(Runtime(board, sink)).execute();
 	}
 
-	void Program::evaluate(const chess::Board &board, Evaluator &out) {
-		Projection sink{out};
-		Formulas<Native<Projection>>(Native(board, sink)).build();
+	float detail::score(const chess::Board &board, std::span<const float> weights) {
+		if (weights.size() != FormulaSet::fixed().size())
+			throw std::invalid_argument("formula weight count does not match the fixed formula set");
+		Weighted sink{weights};
+		Formulas<Runtime<Weighted>>(Runtime(board, sink)).execute();
+		return static_cast<float>(sink.value);
 	}
 
-#endif
+	float detail::score(const chess::Board &board, std::span<const float> base, std::span<const std::uint16_t> rows,
+	    std::span<const std::uint16_t> conditions, std::span<const float> relations) {
+		if (base.size() != FormulaSet::fixed().size() || rows.size() != conditions.size() || rows.size() != relations.size())
+			throw std::invalid_argument("graybox coordinates do not match the fixed formula set");
+		thread_local Graybox::Storage storage;
+		if (++storage.generation == 0) {
+			storage.stamp.fill(0);
+			++storage.generation;
+		}
+		Graybox sink{base, storage};
+		Formulas<Runtime<Graybox>>(Runtime(board, sink)).execute();
+		for (std::size_t i = 0; i < relations.size(); ++i)
+			sink.value += relations[i] * static_cast<float>(sink.score(rows[i])) * static_cast<float>(sink.condition(conditions[i]));
+		return sink.value;
+	}
+
 } // namespace eleginus
 
-#ifdef ELEGINUS_COMPILE
-int main(int argc, char **argv) {
-	try {
-		if (argc != 2)
-			throw std::invalid_argument("expected metadata output path");
-		const auto graph = eleginus::Formulas<eleginus::Builder>().build();
-		graph.validate();
-		graph.write(argv[1]);
-		return 0;
-	} catch (const std::exception &e) {
-		std::cerr << "formula compilation failed: " << e.what() << '\n';
-		return 1;
+namespace eleginus {
+	namespace {
+		constexpr std::array<std::string_view, kFormulaCount> catalogNames{{
+			"tempo",
+			"material.pawn",
+			"material.knight",
+			"material.bishop",
+			"material.rook",
+			"material.queen",
+			"pst.pawn.a1",
+			"pst.pawn.b1",
+			"pst.pawn.c1",
+			"pst.pawn.d1",
+			"pst.pawn.e1",
+			"pst.pawn.f1",
+			"pst.pawn.g1",
+			"pst.pawn.h1",
+			"pst.pawn.a2",
+			"pst.pawn.b2",
+			"pst.pawn.c2",
+			"pst.pawn.d2",
+			"pst.pawn.e2",
+			"pst.pawn.f2",
+			"pst.pawn.g2",
+			"pst.pawn.h2",
+			"pst.pawn.a3",
+			"pst.pawn.b3",
+			"pst.pawn.c3",
+			"pst.pawn.d3",
+			"pst.pawn.e3",
+			"pst.pawn.f3",
+			"pst.pawn.g3",
+			"pst.pawn.h3",
+			"pst.pawn.a4",
+			"pst.pawn.b4",
+			"pst.pawn.c4",
+			"pst.pawn.d4",
+			"pst.pawn.e4",
+			"pst.pawn.f4",
+			"pst.pawn.g4",
+			"pst.pawn.h4",
+			"pst.pawn.a5",
+			"pst.pawn.b5",
+			"pst.pawn.c5",
+			"pst.pawn.d5",
+			"pst.pawn.e5",
+			"pst.pawn.f5",
+			"pst.pawn.g5",
+			"pst.pawn.h5",
+			"pst.pawn.a6",
+			"pst.pawn.b6",
+			"pst.pawn.c6",
+			"pst.pawn.d6",
+			"pst.pawn.e6",
+			"pst.pawn.f6",
+			"pst.pawn.g6",
+			"pst.pawn.h6",
+			"pst.pawn.a7",
+			"pst.pawn.b7",
+			"pst.pawn.c7",
+			"pst.pawn.d7",
+			"pst.pawn.e7",
+			"pst.pawn.f7",
+			"pst.pawn.g7",
+			"pst.pawn.h7",
+			"pst.pawn.a8",
+			"pst.pawn.b8",
+			"pst.pawn.c8",
+			"pst.pawn.d8",
+			"pst.pawn.e8",
+			"pst.pawn.f8",
+			"pst.pawn.g8",
+			"pst.pawn.h8",
+			"pst.knight.a1",
+			"pst.knight.b1",
+			"pst.knight.c1",
+			"pst.knight.d1",
+			"pst.knight.e1",
+			"pst.knight.f1",
+			"pst.knight.g1",
+			"pst.knight.h1",
+			"pst.knight.a2",
+			"pst.knight.b2",
+			"pst.knight.c2",
+			"pst.knight.d2",
+			"pst.knight.e2",
+			"pst.knight.f2",
+			"pst.knight.g2",
+			"pst.knight.h2",
+			"pst.knight.a3",
+			"pst.knight.b3",
+			"pst.knight.c3",
+			"pst.knight.d3",
+			"pst.knight.e3",
+			"pst.knight.f3",
+			"pst.knight.g3",
+			"pst.knight.h3",
+			"pst.knight.a4",
+			"pst.knight.b4",
+			"pst.knight.c4",
+			"pst.knight.d4",
+			"pst.knight.e4",
+			"pst.knight.f4",
+			"pst.knight.g4",
+			"pst.knight.h4",
+			"pst.knight.a5",
+			"pst.knight.b5",
+			"pst.knight.c5",
+			"pst.knight.d5",
+			"pst.knight.e5",
+			"pst.knight.f5",
+			"pst.knight.g5",
+			"pst.knight.h5",
+			"pst.knight.a6",
+			"pst.knight.b6",
+			"pst.knight.c6",
+			"pst.knight.d6",
+			"pst.knight.e6",
+			"pst.knight.f6",
+			"pst.knight.g6",
+			"pst.knight.h6",
+			"pst.knight.a7",
+			"pst.knight.b7",
+			"pst.knight.c7",
+			"pst.knight.d7",
+			"pst.knight.e7",
+			"pst.knight.f7",
+			"pst.knight.g7",
+			"pst.knight.h7",
+			"pst.knight.a8",
+			"pst.knight.b8",
+			"pst.knight.c8",
+			"pst.knight.d8",
+			"pst.knight.e8",
+			"pst.knight.f8",
+			"pst.knight.g8",
+			"pst.knight.h8",
+			"pst.bishop.a1",
+			"pst.bishop.b1",
+			"pst.bishop.c1",
+			"pst.bishop.d1",
+			"pst.bishop.e1",
+			"pst.bishop.f1",
+			"pst.bishop.g1",
+			"pst.bishop.h1",
+			"pst.bishop.a2",
+			"pst.bishop.b2",
+			"pst.bishop.c2",
+			"pst.bishop.d2",
+			"pst.bishop.e2",
+			"pst.bishop.f2",
+			"pst.bishop.g2",
+			"pst.bishop.h2",
+			"pst.bishop.a3",
+			"pst.bishop.b3",
+			"pst.bishop.c3",
+			"pst.bishop.d3",
+			"pst.bishop.e3",
+			"pst.bishop.f3",
+			"pst.bishop.g3",
+			"pst.bishop.h3",
+			"pst.bishop.a4",
+			"pst.bishop.b4",
+			"pst.bishop.c4",
+			"pst.bishop.d4",
+			"pst.bishop.e4",
+			"pst.bishop.f4",
+			"pst.bishop.g4",
+			"pst.bishop.h4",
+			"pst.bishop.a5",
+			"pst.bishop.b5",
+			"pst.bishop.c5",
+			"pst.bishop.d5",
+			"pst.bishop.e5",
+			"pst.bishop.f5",
+			"pst.bishop.g5",
+			"pst.bishop.h5",
+			"pst.bishop.a6",
+			"pst.bishop.b6",
+			"pst.bishop.c6",
+			"pst.bishop.d6",
+			"pst.bishop.e6",
+			"pst.bishop.f6",
+			"pst.bishop.g6",
+			"pst.bishop.h6",
+			"pst.bishop.a7",
+			"pst.bishop.b7",
+			"pst.bishop.c7",
+			"pst.bishop.d7",
+			"pst.bishop.e7",
+			"pst.bishop.f7",
+			"pst.bishop.g7",
+			"pst.bishop.h7",
+			"pst.bishop.a8",
+			"pst.bishop.b8",
+			"pst.bishop.c8",
+			"pst.bishop.d8",
+			"pst.bishop.e8",
+			"pst.bishop.f8",
+			"pst.bishop.g8",
+			"pst.bishop.h8",
+			"pst.rook.a1",
+			"pst.rook.b1",
+			"pst.rook.c1",
+			"pst.rook.d1",
+			"pst.rook.e1",
+			"pst.rook.f1",
+			"pst.rook.g1",
+			"pst.rook.h1",
+			"pst.rook.a2",
+			"pst.rook.b2",
+			"pst.rook.c2",
+			"pst.rook.d2",
+			"pst.rook.e2",
+			"pst.rook.f2",
+			"pst.rook.g2",
+			"pst.rook.h2",
+			"pst.rook.a3",
+			"pst.rook.b3",
+			"pst.rook.c3",
+			"pst.rook.d3",
+			"pst.rook.e3",
+			"pst.rook.f3",
+			"pst.rook.g3",
+			"pst.rook.h3",
+			"pst.rook.a4",
+			"pst.rook.b4",
+			"pst.rook.c4",
+			"pst.rook.d4",
+			"pst.rook.e4",
+			"pst.rook.f4",
+			"pst.rook.g4",
+			"pst.rook.h4",
+			"pst.rook.a5",
+			"pst.rook.b5",
+			"pst.rook.c5",
+			"pst.rook.d5",
+			"pst.rook.e5",
+			"pst.rook.f5",
+			"pst.rook.g5",
+			"pst.rook.h5",
+			"pst.rook.a6",
+			"pst.rook.b6",
+			"pst.rook.c6",
+			"pst.rook.d6",
+			"pst.rook.e6",
+			"pst.rook.f6",
+			"pst.rook.g6",
+			"pst.rook.h6",
+			"pst.rook.a7",
+			"pst.rook.b7",
+			"pst.rook.c7",
+			"pst.rook.d7",
+			"pst.rook.e7",
+			"pst.rook.f7",
+			"pst.rook.g7",
+			"pst.rook.h7",
+			"pst.rook.a8",
+			"pst.rook.b8",
+			"pst.rook.c8",
+			"pst.rook.d8",
+			"pst.rook.e8",
+			"pst.rook.f8",
+			"pst.rook.g8",
+			"pst.rook.h8",
+			"pst.queen.a1",
+			"pst.queen.b1",
+			"pst.queen.c1",
+			"pst.queen.d1",
+			"pst.queen.e1",
+			"pst.queen.f1",
+			"pst.queen.g1",
+			"pst.queen.h1",
+			"pst.queen.a2",
+			"pst.queen.b2",
+			"pst.queen.c2",
+			"pst.queen.d2",
+			"pst.queen.e2",
+			"pst.queen.f2",
+			"pst.queen.g2",
+			"pst.queen.h2",
+			"pst.queen.a3",
+			"pst.queen.b3",
+			"pst.queen.c3",
+			"pst.queen.d3",
+			"pst.queen.e3",
+			"pst.queen.f3",
+			"pst.queen.g3",
+			"pst.queen.h3",
+			"pst.queen.a4",
+			"pst.queen.b4",
+			"pst.queen.c4",
+			"pst.queen.d4",
+			"pst.queen.e4",
+			"pst.queen.f4",
+			"pst.queen.g4",
+			"pst.queen.h4",
+			"pst.queen.a5",
+			"pst.queen.b5",
+			"pst.queen.c5",
+			"pst.queen.d5",
+			"pst.queen.e5",
+			"pst.queen.f5",
+			"pst.queen.g5",
+			"pst.queen.h5",
+			"pst.queen.a6",
+			"pst.queen.b6",
+			"pst.queen.c6",
+			"pst.queen.d6",
+			"pst.queen.e6",
+			"pst.queen.f6",
+			"pst.queen.g6",
+			"pst.queen.h6",
+			"pst.queen.a7",
+			"pst.queen.b7",
+			"pst.queen.c7",
+			"pst.queen.d7",
+			"pst.queen.e7",
+			"pst.queen.f7",
+			"pst.queen.g7",
+			"pst.queen.h7",
+			"pst.queen.a8",
+			"pst.queen.b8",
+			"pst.queen.c8",
+			"pst.queen.d8",
+			"pst.queen.e8",
+			"pst.queen.f8",
+			"pst.queen.g8",
+			"pst.queen.h8",
+			"pst.king.a1",
+			"pst.king.b1",
+			"pst.king.c1",
+			"pst.king.d1",
+			"pst.king.e1",
+			"pst.king.f1",
+			"pst.king.g1",
+			"pst.king.h1",
+			"pst.king.a2",
+			"pst.king.b2",
+			"pst.king.c2",
+			"pst.king.d2",
+			"pst.king.e2",
+			"pst.king.f2",
+			"pst.king.g2",
+			"pst.king.h2",
+			"pst.king.a3",
+			"pst.king.b3",
+			"pst.king.c3",
+			"pst.king.d3",
+			"pst.king.e3",
+			"pst.king.f3",
+			"pst.king.g3",
+			"pst.king.h3",
+			"pst.king.a4",
+			"pst.king.b4",
+			"pst.king.c4",
+			"pst.king.d4",
+			"pst.king.e4",
+			"pst.king.f4",
+			"pst.king.g4",
+			"pst.king.h4",
+			"pst.king.a5",
+			"pst.king.b5",
+			"pst.king.c5",
+			"pst.king.d5",
+			"pst.king.e5",
+			"pst.king.f5",
+			"pst.king.g5",
+			"pst.king.h5",
+			"pst.king.a6",
+			"pst.king.b6",
+			"pst.king.c6",
+			"pst.king.d6",
+			"pst.king.e6",
+			"pst.king.f6",
+			"pst.king.g6",
+			"pst.king.h6",
+			"pst.king.a7",
+			"pst.king.b7",
+			"pst.king.c7",
+			"pst.king.d7",
+			"pst.king.e7",
+			"pst.king.f7",
+			"pst.king.g7",
+			"pst.king.h7",
+			"pst.king.a8",
+			"pst.king.b8",
+			"pst.king.c8",
+			"pst.king.d8",
+			"pst.king.e8",
+			"pst.king.f8",
+			"pst.king.g8",
+			"pst.king.h8",
+			"bishopPair",
+			"pawn.passed.rank2",
+			"pawn.clear.rank2",
+			"pawn.safe.rank2",
+			"pawn.wideSafe.rank2",
+			"pawn.controlledPush.rank2",
+			"pawn.supported.rank2",
+			"pawn.blocked.rank2",
+			"pawn.connected.rank2",
+			"pawn.phalanx.rank2",
+			"pawn.pawnSupported.rank2",
+			"pawn.passed.rank3",
+			"pawn.clear.rank3",
+			"pawn.safe.rank3",
+			"pawn.wideSafe.rank3",
+			"pawn.controlledPush.rank3",
+			"pawn.supported.rank3",
+			"pawn.blocked.rank3",
+			"pawn.connected.rank3",
+			"pawn.phalanx.rank3",
+			"pawn.pawnSupported.rank3",
+			"pawn.passed.rank4",
+			"pawn.clear.rank4",
+			"pawn.safe.rank4",
+			"pawn.wideSafe.rank4",
+			"pawn.controlledPush.rank4",
+			"pawn.supported.rank4",
+			"pawn.blocked.rank4",
+			"pawn.connected.rank4",
+			"pawn.phalanx.rank4",
+			"pawn.pawnSupported.rank4",
+			"pawn.passed.rank5",
+			"pawn.clear.rank5",
+			"pawn.safe.rank5",
+			"pawn.wideSafe.rank5",
+			"pawn.controlledPush.rank5",
+			"pawn.supported.rank5",
+			"pawn.blocked.rank5",
+			"pawn.connected.rank5",
+			"pawn.phalanx.rank5",
+			"pawn.pawnSupported.rank5",
+			"pawn.passed.rank6",
+			"pawn.clear.rank6",
+			"pawn.safe.rank6",
+			"pawn.wideSafe.rank6",
+			"pawn.controlledPush.rank6",
+			"pawn.supported.rank6",
+			"pawn.blocked.rank6",
+			"pawn.connected.rank6",
+			"pawn.phalanx.rank6",
+			"pawn.pawnSupported.rank6",
+			"pawn.passed.rank7",
+			"pawn.clear.rank7",
+			"pawn.safe.rank7",
+			"pawn.wideSafe.rank7",
+			"pawn.controlledPush.rank7",
+			"pawn.supported.rank7",
+			"pawn.blocked.rank7",
+			"pawn.connected.rank7",
+			"pawn.phalanx.rank7",
+			"pawn.pawnSupported.rank7",
+			"pawn.doubled",
+			"pawn.isolated",
+			"pawn.backward",
+			"pawn.islands",
+			"passer.friendlyKing.distance0",
+			"passer.enemyKing.distance0",
+			"passer.friendlyKing.distance1",
+			"passer.enemyKing.distance1",
+			"passer.friendlyKing.distance2",
+			"passer.enemyKing.distance2",
+			"passer.friendlyKing.distance4",
+			"passer.enemyKing.distance4",
+			"passer.friendlyKing.distance5",
+			"passer.enemyKing.distance5",
+			"passer.friendlyKing.distance6",
+			"passer.enemyKing.distance6",
+			"passer.friendlyKing.distance7",
+			"passer.enemyKing.distance7",
+			"mobility.knight.0",
+			"mobility.knight.1",
+			"mobility.knight.2",
+			"mobility.knight.3",
+			"mobility.knight.5",
+			"mobility.knight.6",
+			"mobility.knight.7",
+			"mobility.knight.8",
+			"mobility.bishop.0",
+			"mobility.bishop.1",
+			"mobility.bishop.2",
+			"mobility.bishop.3",
+			"mobility.bishop.4",
+			"mobility.bishop.6",
+			"mobility.bishop.7",
+			"mobility.bishop.8",
+			"mobility.bishop.9",
+			"mobility.bishop.10",
+			"mobility.bishop.11",
+			"mobility.bishop.12",
+			"mobility.bishop.13",
+			"mobility.rook.0",
+			"mobility.rook.1",
+			"mobility.rook.2",
+			"mobility.rook.3",
+			"mobility.rook.4",
+			"mobility.rook.5",
+			"mobility.rook.6",
+			"mobility.rook.8",
+			"mobility.rook.9",
+			"mobility.rook.10",
+			"mobility.rook.11",
+			"mobility.rook.12",
+			"mobility.rook.13",
+			"mobility.rook.14",
+			"mobility.rook.safe",
+			"mobility.queen.0",
+			"mobility.queen.1",
+			"mobility.queen.2",
+			"mobility.queen.3",
+			"mobility.queen.4",
+			"mobility.queen.5",
+			"mobility.queen.6",
+			"mobility.queen.7",
+			"mobility.queen.8",
+			"mobility.queen.9",
+			"mobility.queen.10",
+			"mobility.queen.11",
+			"mobility.queen.13",
+			"mobility.queen.14",
+			"mobility.queen.15",
+			"mobility.queen.16",
+			"mobility.queen.17",
+			"mobility.queen.18",
+			"mobility.queen.19",
+			"mobility.queen.20",
+			"mobility.queen.21",
+			"mobility.queen.22",
+			"mobility.queen.23",
+			"mobility.queen.24",
+			"mobility.queen.25",
+			"mobility.queen.26",
+			"mobility.queen.27",
+			"mobility.queen.safe",
+			"piece.minorBehindPawn.knight",
+			"piece.minorBehindPawn.bishop",
+			"piece.bishopPawnColor",
+			"piece.unprotectedBishop",
+			"piece.badBishop",
+			"piece.bishopXrayPawn",
+			"piece.rookSeventh",
+			"piece.rookQueenFile",
+			"piece.rookOpenFile",
+			"piece.rookSemiOpenFile",
+			"piece.outpostKnight",
+			"piece.outpostBishop",
+			"piece.restricted",
+			"piece.space",
+			"threat.pawn.hanging",
+			"threat.pawn.pawn",
+			"threat.pawn.minor",
+			"threat.pawn.rook",
+			"threat.pawn.pawnPush",
+			"threat.knight.hanging",
+			"threat.knight.pawn",
+			"threat.knight.minor",
+			"threat.knight.rook",
+			"threat.knight.pawnPush",
+			"threat.bishop.hanging",
+			"threat.bishop.pawn",
+			"threat.bishop.minor",
+			"threat.bishop.rook",
+			"threat.bishop.pawnPush",
+			"threat.rook.hanging",
+			"threat.rook.pawn",
+			"threat.rook.minor",
+			"threat.rook.rook",
+			"threat.rook.pawnPush",
+			"threat.queen.hanging",
+			"threat.queen.pawn",
+			"threat.queen.minor",
+			"threat.queen.rook",
+			"threat.queen.pawnPush",
+			"threat.king",
+			"threat.queenPressure.knight.queenPresent",
+			"threat.queenPressure.knight.queenAbsent",
+			"threat.queenPressure.bishop.queenPresent",
+			"threat.queenPressure.bishop.queenAbsent",
+			"threat.queenPressure.rook.queenPresent",
+			"threat.queenPressure.rook.queenAbsent",
+			"king.innerRing.pawn",
+			"king.outerRing.pawn",
+			"king.potentialCheck.pawn",
+			"king.innerRing.knight",
+			"king.outerRing.knight",
+			"king.potentialCheck.knight",
+			"king.innerRing.bishop",
+			"king.outerRing.bishop",
+			"king.potentialCheck.bishop",
+			"king.innerRing.rook",
+			"king.outerRing.rook",
+			"king.potentialCheck.rook",
+			"king.innerRing.queen",
+			"king.outerRing.queen",
+			"king.potentialCheck.queen",
+			"king.pressureAtLeast2",
+			"king.pressureAtLeast4",
+			"king.pressureAtLeast6",
+			"king.pressureAtLeast8",
+			"king.escape",
+			"king.shelter.distance1",
+			"king.storm.distance1",
+			"king.shelter.distance2",
+			"king.storm.distance2",
+			"king.shelter.distance3",
+			"king.storm.distance3",
+			"king.openFiles",
+			"king.friendlyAttackFlank",
+			"king.enemyAttackFlank",
+			"king.friendlyDoubleAttackFlank",
+			"king.enemyDoubleAttackFlank",
+			"king.blockedStorm",
+			"king.pressureWithoutQueen",
+			"king.castlingKingSide",
+			"king.castlingQueenSide",
+			"endgame.oppositeBishops",
+			"endgame.pawnlessThinAdvantage",
+			"endgame.totalPawns",
+			"endgame.symmetricPawnFiles",
+			"endgame.asymmetricPawnFiles",
+			"endgame.bareKings",
+			"endgame.strongSidePawns",
+			"endgame.oppositeBishopPassers",
+		}};
+
+		constexpr std::array<float, kFormulaCount> catalogInitial{{
+			0.16F,
+			0.22F,
+			0.773F,
+			0.828F,
+			1.2365F,
+			2.4515F,
+			-0.013125F,
+			-0.009375F,
+			-0.005625F,
+			-0.001875F,
+			-0.001875F,
+			-0.005625F,
+			-0.009375F,
+			-0.013125F,
+			0.006875F,
+			0.010625F,
+			0.014375F,
+			0.018125F,
+			0.018125F,
+			0.014375F,
+			0.010625F,
+			0.006875F,
+			0.026875F,
+			0.030625F,
+			0.034375F,
+			0.038125F,
+			0.038125F,
+			0.034375F,
+			0.030625F,
+			0.026875F,
+			0.046875F,
+			0.050625F,
+			0.054375F,
+			0.058125F,
+			0.058125F,
+			0.054375F,
+			0.050625F,
+			0.046875F,
+			0.063125F,
+			0.066875F,
+			0.070625F,
+			0.074375F,
+			0.074375F,
+			0.070625F,
+			0.066875F,
+			0.063125F,
+			0.075625F,
+			0.079375F,
+			0.083125F,
+			0.086875F,
+			0.086875F,
+			0.083125F,
+			0.079375F,
+			0.075625F,
+			0.088125F,
+			0.091875F,
+			0.095625F,
+			0.099375F,
+			0.099375F,
+			0.095625F,
+			0.091875F,
+			0.088125F,
+			0.100625F,
+			0.104375F,
+			0.108125F,
+			0.111875F,
+			0.111875F,
+			0.108125F,
+			0.104375F,
+			0.100625F,
+			-0.07875F,
+			-0.05625F,
+			-0.03375F,
+			-0.01125F,
+			-0.01125F,
+			-0.03375F,
+			-0.05625F,
+			-0.07875F,
+			-0.05625F,
+			-0.03375F,
+			-0.01125F,
+			0.01125F,
+			0.01125F,
+			-0.01125F,
+			-0.03375F,
+			-0.05625F,
+			-0.03375F,
+			-0.01125F,
+			0.01125F,
+			0.03375F,
+			0.03375F,
+			0.01125F,
+			-0.01125F,
+			-0.03375F,
+			-0.01125F,
+			0.01125F,
+			0.03375F,
+			0.05625F,
+			0.05625F,
+			0.03375F,
+			0.01125F,
+			-0.01125F,
+			-0.01125F,
+			0.01125F,
+			0.03375F,
+			0.05625F,
+			0.05625F,
+			0.03375F,
+			0.01125F,
+			-0.01125F,
+			-0.03375F,
+			-0.01125F,
+			0.01125F,
+			0.03375F,
+			0.03375F,
+			0.01125F,
+			-0.01125F,
+			-0.03375F,
+			-0.05625F,
+			-0.03375F,
+			-0.01125F,
+			0.01125F,
+			0.01125F,
+			-0.01125F,
+			-0.03375F,
+			-0.05625F,
+			-0.07875F,
+			-0.05625F,
+			-0.03375F,
+			-0.01125F,
+			-0.01125F,
+			-0.03375F,
+			-0.05625F,
+			-0.07875F,
+			-0.0525F,
+			-0.0375F,
+			-0.0225F,
+			-0.0075F,
+			-0.0075F,
+			-0.0225F,
+			-0.0375F,
+			-0.0525F,
+			-0.0375F,
+			-0.0225F,
+			-0.0075F,
+			0.0075F,
+			0.0075F,
+			-0.0075F,
+			-0.0225F,
+			-0.0375F,
+			-0.0225F,
+			-0.0075F,
+			0.0075F,
+			0.0225F,
+			0.0225F,
+			0.0075F,
+			-0.0075F,
+			-0.0225F,
+			-0.0075F,
+			0.0075F,
+			0.0225F,
+			0.0375F,
+			0.0375F,
+			0.0225F,
+			0.0075F,
+			-0.0075F,
+			-0.0075F,
+			0.0075F,
+			0.0225F,
+			0.0375F,
+			0.0375F,
+			0.0225F,
+			0.0075F,
+			-0.0075F,
+			-0.0225F,
+			-0.0075F,
+			0.0075F,
+			0.0225F,
+			0.0225F,
+			0.0075F,
+			-0.0075F,
+			-0.0225F,
+			-0.0375F,
+			-0.0225F,
+			-0.0075F,
+			0.0075F,
+			0.0075F,
+			-0.0075F,
+			-0.0225F,
+			-0.0375F,
+			-0.0525F,
+			-0.0375F,
+			-0.0225F,
+			-0.0075F,
+			-0.0075F,
+			-0.0225F,
+			-0.0375F,
+			-0.0525F,
+			0.0F,
+			0.0F,
+			0.0F,
+			0.0F,
+			0.0F,
+			0.0F,
+			0.0F,
+			0.0F,
+			0.003125F,
+			0.003125F,
+			0.003125F,
+			0.003125F,
+			0.003125F,
+			0.003125F,
+			0.003125F,
+			0.003125F,
+			0.00625F,
+			0.00625F,
+			0.00625F,
+			0.00625F,
+			0.00625F,
+			0.00625F,
+			0.00625F,
+			0.00625F,
+			0.009375F,
+			0.009375F,
+			0.009375F,
+			0.009375F,
+			0.009375F,
+			0.009375F,
+			0.009375F,
+			0.009375F,
+			0.0125F,
+			0.0125F,
+			0.0125F,
+			0.0125F,
+			0.0125F,
+			0.0125F,
+			0.0125F,
+			0.0125F,
+			0.015625F,
+			0.015625F,
+			0.015625F,
+			0.015625F,
+			0.015625F,
+			0.015625F,
+			0.015625F,
+			0.015625F,
+			0.035F,
+			0.035F,
+			0.035F,
+			0.035F,
+			0.035F,
+			0.035F,
+			0.035F,
+			0.035F,
+			0.021875F,
+			0.021875F,
+			0.021875F,
+			0.021875F,
+			0.021875F,
+			0.021875F,
+			0.021875F,
+			0.021875F,
+			-0.02625F,
+			-0.01875F,
+			-0.01125F,
+			-0.00375F,
+			-0.00375F,
+			-0.01125F,
+			-0.01875F,
+			-0.02625F,
+			-0.01875F,
+			-0.01125F,
+			-0.00375F,
+			0.00375F,
+			0.00375F,
+			-0.00375F,
+			-0.01125F,
+			-0.01875F,
+			-0.01125F,
+			-0.00375F,
+			0.00375F,
+			0.01125F,
+			0.01125F,
+			0.00375F,
+			-0.00375F,
+			-0.01125F,
+			-0.00375F,
+			0.00375F,
+			0.01125F,
+			0.01875F,
+			0.01875F,
+			0.01125F,
+			0.00375F,
+			-0.00375F,
+			-0.00375F,
+			0.00375F,
+			0.01125F,
+			0.01875F,
+			0.01875F,
+			0.01125F,
+			0.00375F,
+			-0.00375F,
+			-0.01125F,
+			-0.00375F,
+			0.00375F,
+			0.01125F,
+			0.01125F,
+			0.00375F,
+			-0.00375F,
+			-0.01125F,
+			-0.01875F,
+			-0.01125F,
+			-0.00375F,
+			0.00375F,
+			0.00375F,
+			-0.00375F,
+			-0.01125F,
+			-0.01875F,
+			-0.02625F,
+			-0.01875F,
+			-0.01125F,
+			-0.00375F,
+			-0.00375F,
+			-0.01125F,
+			-0.01875F,
+			-0.02625F,
+			-0.02F,
+			-0.01F,
+			0.0F,
+			0.01F,
+			0.01F,
+			0.0F,
+			-0.01F,
+			-0.02F,
+			-0.03F,
+			-0.02F,
+			-0.01F,
+			0.0F,
+			0.0F,
+			-0.01F,
+			-0.02F,
+			-0.03F,
+			-0.025F,
+			-0.015F,
+			-0.005F,
+			0.005F,
+			0.005F,
+			-0.005F,
+			-0.015F,
+			-0.025F,
+			-0.02F,
+			-0.01F,
+			0.0F,
+			0.01F,
+			0.01F,
+			0.0F,
+			-0.01F,
+			-0.02F,
+			-0.025F,
+			-0.015F,
+			-0.005F,
+			0.005F,
+			0.005F,
+			-0.005F,
+			-0.015F,
+			-0.025F,
+			-0.04F,
+			-0.03F,
+			-0.02F,
+			-0.01F,
+			-0.01F,
+			-0.02F,
+			-0.03F,
+			-0.04F,
+			-0.055F,
+			-0.045F,
+			-0.035F,
+			-0.025F,
+			-0.025F,
+			-0.035F,
+			-0.045F,
+			-0.055F,
+			-0.07F,
+			-0.06F,
+			-0.05F,
+			-0.04F,
+			-0.04F,
+			-0.05F,
+			-0.06F,
+			-0.07F,
+			0.15F,
+			0.0375F,
+			0.01375F,
+			0.01375F,
+			0.01F,
+			0.0125F,
+			0.0175F,
+			-0.01375F,
+			0.00875F,
+			0.0175F,
+			0.0175F,
+			0.065F,
+			0.0225F,
+			0.02375F,
+			0.016875F,
+			0.02F,
+			0.02875F,
+			-0.025F,
+			0.015F,
+			0.02625F,
+			0.02375F,
+			0.1475F,
+			0.03125F,
+			0.03375F,
+			0.02375F,
+			0.0275F,
+			0.04F,
+			-0.03625F,
+			0.02125F,
+			0.035F,
+			0.03F,
+			0.285F,
+			0.04F,
+			0.04375F,
+			0.030625F,
+			0.035F,
+			0.05125F,
+			-0.0475F,
+			0.0275F,
+			0.04375F,
+			0.03625F,
+			0.4775F,
+			0.04875F,
+			0.05375F,
+			0.0375F,
+			0.0425F,
+			0.0625F,
+			-0.05875F,
+			0.03375F,
+			0.0525F,
+			0.0425F,
+			0.725F,
+			0.0575F,
+			0.06375F,
+			0.044375F,
+			0.05F,
+			0.07375F,
+			-0.07F,
+			0.04F,
+			0.06125F,
+			0.04875F,
+			-0.035F,
+			-0.0275F,
+			-0.0325F,
+			-0.02F,
+			0.006F,
+			-0.006F,
+			0.004F,
+			-0.004F,
+			0.002F,
+			-0.002F,
+			-0.002F,
+			0.002F,
+			-0.004F,
+			0.004F,
+			-0.006F,
+			0.006F,
+			-0.008F,
+			0.008F,
+			-0.108F,
+			-0.081F,
+			-0.054F,
+			-0.027F,
+			0.027F,
+			0.054F,
+			0.081F,
+			0.108F,
+			-0.1125F,
+			-0.09F,
+			-0.0675F,
+			-0.045F,
+			-0.0225F,
+			0.0225F,
+			0.045F,
+			0.0675F,
+			0.09F,
+			0.1125F,
+			0.135F,
+			0.1575F,
+			0.18F,
+			-0.1134F,
+			-0.0972F,
+			-0.081F,
+			-0.0648F,
+			-0.0486F,
+			-0.0324F,
+			-0.0162F,
+			0.0162F,
+			0.0324F,
+			0.0486F,
+			0.0648F,
+			0.081F,
+			0.0972F,
+			0.1134F,
+			0.01F,
+			-0.0972F,
+			-0.0891F,
+			-0.081F,
+			-0.0729F,
+			-0.0648F,
+			-0.0567F,
+			-0.0486F,
+			-0.0405F,
+			-0.0324F,
+			-0.0243F,
+			-0.0162F,
+			-0.0081F,
+			0.0081F,
+			0.0162F,
+			0.0243F,
+			0.0324F,
+			0.0405F,
+			0.0486F,
+			0.0567F,
+			0.0648F,
+			0.0729F,
+			0.081F,
+			0.0891F,
+			0.0972F,
+			0.1053F,
+			0.1134F,
+			0.1215F,
+			0.005F,
+			0.03F,
+			0.03F,
+			-0.007F,
+			-0.014F,
+			-0.007F,
+			0.015F,
+			0.095F,
+			0.065F,
+			0.1F,
+			0.065F,
+			0.11F,
+			0.11F,
+			0.01F,
+			0.008F,
+			0.07F,
+			0.063F,
+			0.028F,
+			0.0245F,
+			0.021F,
+			0.16F,
+			0.144F,
+			0.064F,
+			0.056F,
+			0.048F,
+			0.16F,
+			0.144F,
+			0.064F,
+			0.056F,
+			0.048F,
+			0.22F,
+			0.198F,
+			0.088F,
+			0.077F,
+			0.066F,
+			0.3F,
+			0.27F,
+			0.12F,
+			0.105F,
+			0.09F,
+			0.065F,
+			0.0375F,
+			0.055F,
+			0.045F,
+			0.066F,
+			0.03F,
+			0.044F,
+			0.0125F,
+			0.0045F,
+			0.006F,
+			0.025F,
+			0.009F,
+			0.012F,
+			0.025F,
+			0.009F,
+			0.012F,
+			0.03125F,
+			0.01125F,
+			0.015F,
+			0.04375F,
+			0.01575F,
+			0.021F,
+			0.0025F,
+			0.005F,
+			0.0075F,
+			0.01F,
+			0.015F,
+			0.005625F,
+			0.0045F,
+			0.00375F,
+			0.003F,
+			0.001875F,
+			0.0015F,
+			-0.0275F,
+			0.0015F,
+			0.002F,
+			0.003F,
+			0.004F,
+			0.01F,
+			-0.005F,
+			0.015F,
+			0.01F,
+			-0.05F,
+			-0.15F,
+			0.002F,
+			-0.005F,
+			0.007F,
+			0.02F,
+			0.006F,
+			0.0125F,
+		}};
+	} // namespace
+
+	const FormulaSet &FormulaSet::fixed() {
+		static const FormulaSet formulas;
+		return formulas;
 	}
-}
-#endif
+
+	std::span<const float> FormulaSet::initial() const noexcept { return catalogInitial; }
+	std::span<const std::string_view> FormulaSet::names() const noexcept { return catalogNames; }
+
+} // namespace eleginus

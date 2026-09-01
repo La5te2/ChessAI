@@ -15,6 +15,7 @@ namespace eleginus {
 		std::uint64_t node_limit = 0;
 		int movetime_ms = 0;
 		int multipv = 1;
+		bool collect_leaf = false;
 	};
 
 	struct RootMove {
@@ -32,6 +33,7 @@ namespace eleginus {
 		std::uint64_t evaluated_nodes = 0;
 		std::uint64_t elapsed_ms = 0;
 		std::vector<RootMove> root;
+		std::vector<Feature> leaf;
 	};
 
 	using SearchProgress = std::function<void(const SearchResult &)>;
