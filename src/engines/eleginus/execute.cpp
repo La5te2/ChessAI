@@ -19,8 +19,8 @@ namespace eleginus {
 			const std::array<Word, 2> byColor{board.us(chess::Color::WHITE).getBits(), board.us(chess::Color::BLACK).getBits()};
 			for (int type = 0; type < 6; ++type) {
 				const auto pieces = board.pieces(chess::PieceType(static_cast<chess::PieceType::underlying>(type))).getBits();
-				in[static_cast<std::size_t>(type)] = pieces & byColor[0];
-				in[static_cast<std::size_t>(6 + type)] = pieces & byColor[1];
+				in[pieceAtomIndex(0, type)] = pieces & byColor[0];
+				in[pieceAtomIndex(1, type)] = pieces & byColor[1];
 			}
 			for (int color = 0; color < 2; ++color) {
 				for (int wing = 0; wing < 2; ++wing) {
@@ -59,12 +59,15 @@ namespace eleginus {
 			Iterator end() const { return {0}; }
 		};
 
-		// Fixed formulas execute directly on scalar and bitboard values.
+		// A signal is the single value representation used throughout the formula algebra.
 		struct Signal {
 			Word bits = 0;
 			Signal() = default;
 			explicit Signal(Word x) : bits(x) {}
 		};
+		// These aliases identify the producing layer.
+		using AtomSignal = Signal;
+		using InterSignal = Signal;
 
 		struct Features {
 			static constexpr bool conditions = true;
@@ -101,10 +104,9 @@ namespace eleginus {
 
 		template <class Output> class Runtime {
 		public:
-			using Value = Signal;
 			struct Sum {
 				std::int64_t total = 0;
-				void add(Value value) { total += number(value.bits); }
+				void add(InterSignal value) { total += number(value.bits); }
 			};
 			static constexpr bool conditions = Output::conditions;
 
@@ -165,47 +167,47 @@ namespace eleginus {
 				attacks.valid = true;
 			}
 			// NUM constructs a signed integer signal; BB constructs a raw bitboard signal.
-			Value NUM(std::int64_t x) const { return Value(static_cast<Word>(x)); }
-			Value BB(Word x) const { return Value(x); }
+			AtomSignal NUM(std::int64_t x) const { return AtomSignal(static_cast<Word>(x)); }
+			AtomSignal BB(Word x) const { return AtomSignal(x); }
 
 			// ATOM reads one irreducible board input.
-			Value ATOM(Atom atom) const { return Value(in[atomIndex(atom)]); }
+			AtomSignal ATOM(Atom atom) const { return AtomSignal(in[atomIndex(atom)]); }
 
 			// ADD, SUB, MUL, ABS and MIN form the integer arithmetic primitives.
-			Value ADD(Value a, Value b) const { return NUM(number(a.bits) + number(b.bits)); }
-			Value SUB(Value a, Value b) const { return NUM(number(a.bits) - number(b.bits)); }
-			Value MUL(Value a, Value b) const { return NUM(number(a.bits) * number(b.bits)); }
-			Value ABS(Value a) const { return NUM(std::abs(number(a.bits))); }
-			Value MIN(Value a, Value b) const { return NUM(std::min(number(a.bits), number(b.bits))); }
+			AtomSignal ADD(InterSignal a, InterSignal b) const { return NUM(number(a.bits) + number(b.bits)); }
+			AtomSignal SUB(InterSignal a, InterSignal b) const { return NUM(number(a.bits) - number(b.bits)); }
+			AtomSignal MUL(InterSignal a, InterSignal b) const { return NUM(number(a.bits) * number(b.bits)); }
+			AtomSignal ABS(InterSignal a) const { return NUM(std::abs(number(a.bits))); }
+			AtomSignal MIN(InterSignal a, InterSignal b) const { return NUM(std::min(number(a.bits), number(b.bits))); }
 
 			// LAND, LOR and LNOT map logical results to zero and one.
-			Value LAND(Value a, Value b) const { return NUM(number(a.bits) != 0 && number(b.bits) != 0); }
-			Value LOR(Value a, Value b) const { return NUM(number(a.bits) != 0 || number(b.bits) != 0); }
-			Value LNOT(Value a) const { return NUM(number(a.bits) == 0); }
+			AtomSignal LAND(InterSignal a, InterSignal b) const { return NUM(number(a.bits) != 0 && number(b.bits) != 0); }
+			AtomSignal LOR(InterSignal a, InterSignal b) const { return NUM(number(a.bits) != 0 || number(b.bits) != 0); }
+			AtomSignal LNOT(InterSignal a) const { return NUM(number(a.bits) == 0); }
 
 			// EQ, GT, LT, LE and GE compare integer signals and return zero or one.
-			Value EQ(Value a, Value b) const { return NUM(a.bits == b.bits); }
-			Value GT(Value a, Value b) const { return NUM(number(a.bits) > number(b.bits)); }
-			Value LT(Value a, Value b) const { return NUM(number(a.bits) < number(b.bits)); }
-			Value LE(Value a, Value b) const { return NUM(number(a.bits) <= number(b.bits)); }
-			Value GE(Value a, Value b) const { return NUM(number(a.bits) >= number(b.bits)); }
+			AtomSignal EQ(InterSignal a, InterSignal b) const { return NUM(a.bits == b.bits); }
+			AtomSignal GT(InterSignal a, InterSignal b) const { return NUM(number(a.bits) > number(b.bits)); }
+			AtomSignal LT(InterSignal a, InterSignal b) const { return NUM(number(a.bits) < number(b.bits)); }
+			AtomSignal LE(InterSignal a, InterSignal b) const { return NUM(number(a.bits) <= number(b.bits)); }
+			AtomSignal GE(InterSignal a, InterSignal b) const { return NUM(number(a.bits) >= number(b.bits)); }
 
 			// AND, OR and NOT combine bitboards; POP and ANY reduce them to integers.
-			Value AND(Value a, Value b) const { return BB(a.bits & b.bits); }
-			Value OR(Value a, Value b) const { return BB(a.bits | b.bits); }
-			Value NOT(Value a) const { return BB(~a.bits); }
-			Value POP(Value a) const { return NUM(std::popcount(a.bits)); }
-			Value ANY(Value a) const { return NUM(a.bits != 0); }
+			AtomSignal AND(InterSignal a, InterSignal b) const { return BB(a.bits & b.bits); }
+			AtomSignal OR(InterSignal a, InterSignal b) const { return BB(a.bits | b.bits); }
+			AtomSignal NOT(InterSignal a) const { return BB(~a.bits); }
+			AtomSignal POP(InterSignal a) const { return NUM(std::popcount(a.bits)); }
+			AtomSignal ANY(InterSignal a) const { return NUM(a.bits != 0); }
 
 			// PCS selects a piece set; REL and SQ normalize coordinates; CR and OCC expose rule and occupancy state.
-			Value PCS(Value role, int type) const { return BB(in[6 * color(role) + type]); }
-			Value REL(Value role, Word mask) const { return BB(color(role) == 0 ? mask : flip(mask)); }
-			Value SQ(Value role, int square) const { return NUM(square ^ (color(role) == 0 ? 0 : 56)); }
-			Value CR(Value role, int wing) const { return NUM((in[atomIndex(Atom::CR)] & (1ULL << (2 * color(role) + wing))) != 0); }
-			Value OCC() const { return BB(occupied); }
+			AtomSignal PCS(InterSignal role, int type) const { return BB(in[pieceAtomIndex(color(role), static_cast<std::size_t>(type))]); }
+			AtomSignal REL(InterSignal role, Word mask) const { return BB(color(role) == 0 ? mask : flip(mask)); }
+			AtomSignal SQ(InterSignal role, int square) const { return NUM(square ^ (color(role) == 0 ? 0 : 56)); }
+			AtomSignal CR(InterSignal role, int wing) const { return NUM((in[atomIndex(Atom::CR)] & (1ULL << (2 * color(role) + wing))) != 0); }
+			AtomSignal OCC() const { return BB(occupied); }
 
 			// SH performs one role-relative step: forward, backward, east, west and the four diagonals.
-			Value SH(Value x, Value role, int direction) const {
+			AtomSignal SH(InterSignal x, InterSignal role, int direction) const {
 				const Word east = x.bits & 0x7F7F7F7F7F7F7F7FULL, west = x.bits & 0xFEFEFEFEFEFEFEFEULL;
 				const bool white = color(role) == 0;
 				switch (direction) {
@@ -231,17 +233,17 @@ namespace eleginus {
 			}
 
 			// Formula traversal and derived shared calculations follow the primitive set.
-			unsigned roleIndex(Value role) const { return color(role); }
-			Squares squares(Value role, int type) const { return {REL(role, PCS(role, type).bits).bits}; }
-			Squares locations(Value set) const { return {set.bits}; }
+			unsigned roleIndex(InterSignal role) const { return color(role); }
+			Squares squares(InterSignal role, int type) const { return {REL(role, PCS(role, type).bits).bits}; }
+			Squares locations(InterSignal set) const { return {set.bits}; }
 
-			Value fill(Value x, Value role) const {
+			InterSignal fill(InterSignal x, InterSignal role) const {
 				for (unsigned d : {8U, 16U, 32U})
 					x.bits |= color(role) == 0 ? x.bits << d : x.bits >> d;
 				return x;
 			}
 
-			Value attackFrom(Value role, int type, Value square) {
+			InterSignal attackFrom(InterSignal role, int type, InterSignal square) {
 				const int s = static_cast<int>(number(square.bits));
 				if (type == 0)
 					return BB(chess::attacks::pawn(static_cast<chess::Color>(color(role)), chess::Square(s)).getBits());
@@ -259,10 +261,10 @@ namespace eleginus {
 				return BB(ray.map);
 			}
 
-			Value attacks(Value role, int type = 6) const { return BB(attackCache->maps[color(role)][type]); }
-			Value doubleAttacks(Value role) const { return BB(attackCache->maps[color(role)][7]); }
+			InterSignal attacks(InterSignal role, int type = 6) const { return BB(attackCache->maps[color(role)][type]); }
+			InterSignal doubleAttacks(InterSignal role) const { return BB(attackCache->maps[color(role)][7]); }
 
-			std::array<int, 2> pawnShape(Value role) {
+			std::array<int, 2> pawnShape(InterSignal role) {
 				if (!pawnCache->shapeReady) {
 					for (unsigned side = 0; side < 2; ++side) {
 						int doubled = 0, islands = 0;
@@ -280,7 +282,7 @@ namespace eleginus {
 				return pawnCache->shape[color(role)];
 			}
 
-			Value kingPawn(Value role, unsigned slot) {
+			InterSignal kingPawn(InterSignal role, unsigned slot) {
 				auto &entry = pawnCache->kings[color(role)];
 				const Word king = PCS(role, 5).bits;
 				if (!entry.valid || entry.king != king) {
@@ -312,7 +314,7 @@ namespace eleginus {
 				return NUM(entry.values[slot]);
 			}
 
-			const auto &mobility(Value role, int type, Value area, Value guard) {
+			const auto &mobility(InterSignal role, int type, InterSignal area, InterSignal guard) {
 				thread_local std::array<std::array<Mobility, 4>, 2> table{};
 				auto &entry = table[color(role)][type - 1];
 				const Word pieces = PCS(role, type).bits;
@@ -336,8 +338,8 @@ namespace eleginus {
 				return entry;
 			}
 
-			Value sum(const Sum &terms) const { return NUM(terms.total); }
-			void root(Value score, Value condition) {
+			InterSignal sum(const Sum &terms) const { return NUM(terms.total); }
+			void root(InterSignal score, InterSignal condition) {
 				const auto s = number(score.bits), c = number(condition.bits);
 				if (s != 0 || c != 0)
 					output.put(index, static_cast<std::int32_t>(s), static_cast<std::int32_t>(c));
@@ -377,7 +379,7 @@ namespace eleginus {
 			struct Rays {
 				std::array<std::array<Ray, 64>, 2> rays{};
 			};
-			static unsigned color(Value role) { return static_cast<unsigned>(number(role.bits)); }
+			static unsigned color(InterSignal role) { return static_cast<unsigned>(number(role.bits)); }
 			Pawns *pawnCache;
 			Attacks *attackCache;
 			Rays *rayCache;
@@ -388,7 +390,7 @@ namespace eleginus {
 		};
 
 		template <class B> class Formulas {
-			using IS = typename B::Value;
+			using IS = InterSignal;
 			using Sum = typename B::Sum;
 			using Pair = std::array<std::optional<IS>, 2>;
 
@@ -396,6 +398,12 @@ namespace eleginus {
 				IS score, own, enemy;
 				operator IS() const { return score; }
 			};
+
+			#define ELEGINUS_FORMULAS
+			#define FORMULA(name) void name()
+			#include "formula.inl"
+			#undef FORMULA
+			#undef ELEGINUS_FORMULAS
 
 		public:
 			explicit Formulas(B runtime) : b(std::move(runtime)) {
@@ -420,6 +428,7 @@ namespace eleginus {
 				endgames();
 				return b.finish();
 			}
+			static std::span<const float> initial() noexcept { return initialWeights; }
 
 		private:
 			template <class F> IS shared(Pair &pair, IS role, F &&make) {
@@ -600,12 +609,6 @@ namespace eleginus {
 				return total;
 			}
 
-#define ELEGINUS_FORMULAS
-#define FORMULA(name) void name()
-#include "formula.inl"
-#undef FORMULA
-#undef ELEGINUS_FORMULAS
-
 			B b;
 			Pair owned, pawnAttack, passedMap, strongMap, pawnFile, mobilityAreaCache, pushAttack, kingRing, kingFlank;
 			IS z{};
@@ -617,6 +620,8 @@ namespace eleginus {
 		};
 
 	} // namespace
+
+	std::span<const float> detail::initial() noexcept { return Formulas<Runtime<Weighted>>::initial(); }
 
 	void detail::extract(const chess::Board &board, std::vector<Feature> &out) {
 		out.clear();

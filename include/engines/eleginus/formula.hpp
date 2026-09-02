@@ -26,6 +26,7 @@ namespace eleginus {
 } // namespace eleginus
 
 namespace eleginus::detail {
+	std::span<const float> initial() noexcept;
 	void extract(const chess::Board &board, std::vector<Feature> &out);
 	float score(const chess::Board &board, std::span<const float> weights);
 	float score(const chess::Board &board, std::span<const float> base, std::span<const std::uint16_t> rows,

@@ -13,11 +13,6 @@
 
 namespace eleginus {
 	namespace {
-
-#define ELEGINUS_INITIAL
-#include "formula.inl"
-#undef ELEGINUS_INITIAL
-
 		constexpr std::array<char, 8> magic{'E', 'L', 'E', 'G', 'I', 'N', 'U', 'S'};
 
 		template <typename T> void write(std::ostream &out, const T &x) {
@@ -42,9 +37,12 @@ namespace eleginus {
 
 	} // namespace
 
-	Model::Model() : p(initialWeights.begin(), initialWeights.end()) {}
+	Model::Model() {
+		const auto values = detail::initial();
+		p.assign(values.begin(), values.end());
+	}
 
-	std::span<const float> Model::initial() noexcept { return initialWeights; }
+	std::span<const float> Model::initial() noexcept { return detail::initial(); }
 
 	float Model::forward(std::span<const Feature> x, Cache &cache) const {
 		const auto n = formulas();
