@@ -199,12 +199,11 @@ namespace eleginus {
 			AtomSignal POP(InterSignal a) const { return NUM(std::popcount(a.bits)); }
 			AtomSignal ANY(InterSignal a) const { return NUM(a.bits != 0); }
 
-			// PCS selects a piece set; REL and SQ normalize coordinates; CR and OCC expose rule and occupancy state.
+			// PCS selects a piece set; REL and SQ normalize coordinates; CR exposes rule state.
 			AtomSignal PCS(InterSignal role, int type) const { return BB(in[pieceAtomIndex(color(role), static_cast<std::size_t>(type))]); }
 			AtomSignal REL(InterSignal role, Word mask) const { return BB(color(role) == 0 ? mask : flip(mask)); }
 			AtomSignal SQ(InterSignal role, int square) const { return NUM(square ^ (color(role) == 0 ? 0 : 56)); }
 			AtomSignal CR(InterSignal role, int wing) const { return NUM((in[atomIndex(Atom::CR)] & (1ULL << (2 * color(role) + wing))) != 0); }
-			AtomSignal OCC() const { return BB(occupied); }
 
 			// SH performs one role-relative step: forward, backward, east, west and the four diagonals.
 			AtomSignal SH(InterSignal x, InterSignal role, int direction) const {
@@ -233,6 +232,7 @@ namespace eleginus {
 			}
 
 			// Formula traversal and derived shared calculations follow the primitive set.
+			InterSignal occ() const { return BB(occupied); }
 			unsigned roleIndex(InterSignal role) const { return color(role); }
 			Squares squares(InterSignal role, int type) const { return {REL(role, PCS(role, type).bits).bits}; }
 			Squares locations(InterSignal set) const { return {set.bits}; }
@@ -411,7 +411,7 @@ namespace eleginus {
 				o = b.NUM(1);
 				us = b.NUM(0);
 				them = b.NUM(1);
-				occ = b.OCC();
+				occ = b.occ();
 				phase = phaseUnits();
 			}
 
