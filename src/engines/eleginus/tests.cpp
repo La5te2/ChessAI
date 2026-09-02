@@ -119,7 +119,7 @@ int main() {
 		const auto lastPlyMate = eleginus::Searcher(model, options).search(chess::Board("7k/6Q1/6K1/8/8/8/8/8 b - - 100 1"));
 		require(lastPlyMate.score_cp == -30000, "fifty-move adjudication overrode checkmate");
 
-		options.depth = 1;
+		options.depth = 4;
 		options.quiescence_depth = 0;
 		options.multipv = 256;
 		const auto rows = eleginus::Searcher(model, options).search(chess::Board("7k/5K2/8/6Q1/8/8/8/8 w - - 0 1")).root;
@@ -130,6 +130,12 @@ int main() {
 		const chess::Board ending("8/8/4k3/2p5/2P5/3K4/8/8 w - - 0 1");
 		options.depth = 4;
 		const auto full = eleginus::Searcher(model, options).search(ending);
+		options.multipv = 2;
+		const auto pair = eleginus::Searcher(model, options).search(ending);
+		require(pair.root.size() == 2, "MultiPV returned the wrong number of root lines");
+		require(std::equal(pair.root.begin(), pair.root.end(), full.root.begin(), [](const auto &left, const auto &right) {
+			return left.move == right.move && left.score_cp == right.score_cp;
+		}), "selective MultiPV differs from exhaustive root search in a fixed tree");
 		options.multipv = 1;
 		const auto narrow = eleginus::Searcher(model, options).search(ending);
 		require(narrow.score_cp == full.score_cp, "aspiration changed a fixed-tree score");

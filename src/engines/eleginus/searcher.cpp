@@ -22,6 +22,7 @@ namespace eleginus {
 		constexpr int kInfinity = 32000;
 		constexpr int kMaximumStaticScore = 25000;
 		constexpr std::size_t kMaximumLegalMoves = 256;
+		constexpr std::size_t kSequentialMultiPVLimit = 8;
 		constexpr int kTransitionPieceLimit = 10;
 		constexpr std::array<int, 6> kPieceValues{100, 320, 330, 500, 900, 0};
 
@@ -68,11 +69,12 @@ namespace eleginus {
 		public:
 			explicit Table(std::size_t megabytes) {
 				const auto bytes = std::max<std::size_t>(sizeof(Cluster), std::max<std::size_t>(1, megabytes) * 1024U * 1024U);
-				clusters.resize(std::max<std::size_t>(1, bytes / sizeof(Cluster)));
+				clusters.resize(std::bit_floor(std::max<std::size_t>(1, bytes / sizeof(Cluster))));
+				mask = clusters.size() - 1;
 			}
 
 			const Entry *probe(std::uint64_t key) const noexcept {
-				for (const auto &entry : clusters[key % clusters.size()].entries) {
+				for (const auto &entry : clusters[key & mask].entries) {
 					if (entry.occupied() && entry.key == key) {
 						return &entry;
 					}
@@ -83,7 +85,7 @@ namespace eleginus {
 			void advance() noexcept { ++generation; }
 
 			void store(std::uint64_t key, int depth, int score, Bound bound, chess::Move move) noexcept {
-				auto &cluster = clusters[key % clusters.size()];
+				auto &cluster = clusters[key & mask];
 				for (auto &entry : cluster.entries) {
 					if (entry.occupied() && entry.key == key) {
 						if (depth >= entry.depth || bound == Bound::exact) {
@@ -114,6 +116,7 @@ namespace eleginus {
 			}
 
 			std::vector<Cluster> clusters;
+			std::size_t mask = 0;
 			std::uint8_t generation = 0;
 		};
 
@@ -496,10 +499,6 @@ namespace eleginus {
 				const int originalBeta = beta;
 
 				const bool inCheck = board.inCheck();
-				chess::Movelist moves;
-				chess::movegen::legalmoves(moves, board);
-				if (moves.empty())
-					return emptyScore(board, ply);
 				const bool sparse = board.occ().count() <= kTransitionPieceLimit;
 				const bool pawnEnding = !board.hasNonPawnMaterial(chess::Color::WHITE) && !board.hasNonPawnMaterial(chess::Color::BLACK);
 				const int staticScore = inCheck ? -kInfinity : evaluate(board);
@@ -509,8 +508,9 @@ namespace eleginus {
 				const bool prune = !pv && !inCheck && !pawnEnding && board.halfMoveClock() < 90 && std::abs(beta) < kMateThreshold;
 				if (prune && ply >= nullBan) {
 					const int margin = (improving ? 70 : 100) * depth;
-					if (depth <= 6 && staticScore - margin >= beta)
-						return staticScore - margin;
+					if (depth <= 6 && staticScore - margin >= beta) {
+						return chess::movegen::anylegalmoves(board) ? staticScore - margin : 0;
+					}
 					if (!nullSearch && !sparse && depth >= 3 && staticScore >= beta && board.hasNonPawnMaterial(board.sideToMove())) {
 						const int reduction = std::min(depth, 3 + depth / 4 + std::min(3, (staticScore - beta) / 200));
 						nullSearch = true;
@@ -520,7 +520,7 @@ namespace eleginus {
 						nullSearch = false;
 						if (score >= beta && score < kMateThreshold) {
 							if (depth < 10)
-								return score;
+								return chess::movegen::anylegalmoves(board) ? score : 0;
 							// Verify deep null cutoffs using real moves with null pruning disabled over this subtree.
 							const int saved = nullBan;
 							nullBan = ply + depth;
@@ -532,6 +532,10 @@ namespace eleginus {
 						}
 					}
 				}
+				chess::Movelist moves;
+				chess::movegen::legalmoves(moves, board);
+				if (moves.empty())
+					return emptyScore(board, ply);
 				auto candidates = ordered(board, moves, ply, preferred);
 				int best = -kInfinity;
 				chess::Move bestMove(chess::Move::NO_MOVE);
@@ -608,11 +612,52 @@ namespace eleginus {
 				return best;
 			}
 
+			Iteration rootLines(chess::Board &board, int depth, const chess::Movelist &moves, chess::Move preferred, std::size_t lineCount) {
+				Iteration result;
+				std::vector<chess::Move> selected;
+				selected.reserve(lineCount);
+				result.root.reserve(lineCount);
+				for (std::size_t line = 0; line < lineCount; ++line) {
+					RootMove best;
+					best.score_cp = -kInfinity;
+					auto candidates = ordered(board, moves, 0, preferred);
+					std::size_t index = 0;
+					for (auto move = candidates.next(); move.move() != chess::Move::NO_MOVE; move = candidates.next()) {
+						if (std::find(selected.begin(), selected.end(), move) != selected.end())
+							continue;
+						checkStop(true);
+						const auto before = nodes;
+						board.makeMove(move);
+						int score;
+						if (index++ == 0) {
+							score = -pvs(board, depth - 1, 1, -kInfinity, kInfinity);
+						} else {
+							score = -pvs(board, depth - 1, 1, -best.score_cp - 1, -best.score_cp);
+							if (score > best.score_cp)
+								score = -pvs(board, depth - 1, 1, -kInfinity, -best.score_cp);
+						}
+						board.unmakeMove(move);
+						if (score > best.score_cp)
+							best = {move, score, nodes - before};
+					}
+					selected.push_back(best.move);
+					result.root.push_back(best);
+					preferred = chess::Move(chess::Move::NO_MOVE);
+				}
+				std::sort(result.root.begin(), result.root.end(), [](const RootMove &left, const RootMove &right) {
+					return left.score_cp != right.score_cp ? left.score_cp > right.score_cp : left.move.move() < right.move.move();
+				});
+				result.move = result.root.front().move;
+				result.score = result.root.front().score_cp;
+				state.table.store(tableKey(board), depth, scoreToTable(result.score, 0), Bound::exact, result.move);
+				return result;
+			}
+
 			Iteration root(chess::Board &board, int depth, int alpha = -kInfinity, int beta = kInfinity) {
 				Iteration result;
 				staticScores.fill(-kInfinity);
-				const bool exactLines = opts.multipv > 1;
-				if (exactLines) {
+				const bool multipleLines = opts.multipv > 1;
+				if (multipleLines) {
 					alpha = -kInfinity;
 					beta = kInfinity;
 				}
@@ -623,10 +668,13 @@ namespace eleginus {
 					result.score = emptyScore(board, 0);
 					return result;
 				}
+				const auto lineCount = std::min<std::size_t>(static_cast<std::size_t>(opts.multipv), moves.size());
 				chess::Move preferred(chess::Move::NO_MOVE);
 				if (const auto *entry = state.table.probe(tableKey(board))) {
 					preferred = entry->bestMove();
 				}
+				if (multipleLines && lineCount < moves.size() && lineCount <= kSequentialMultiPVLimit)
+					return rootLines(board, depth, moves, preferred, lineCount);
 				auto candidates = ordered(board, moves, 0, preferred);
 				result.root.reserve(moves.size());
 				std::size_t index = 0;
@@ -635,7 +683,7 @@ namespace eleginus {
 					const auto before = nodes;
 					board.makeMove(move);
 					int score;
-					if (exactLines || index == 0) {
+					if (multipleLines || index == 0) {
 						score = -pvs(board, depth - 1, 1, -beta, -alpha);
 					} else {
 						score = -pvs(board, depth - 1, 1, -alpha - 1, -alpha);
@@ -649,7 +697,7 @@ namespace eleginus {
 						result.score = score;
 						result.move = move;
 					}
-					if (!exactLines) {
+					if (!multipleLines) {
 						alpha = std::max(alpha, score);
 						if (alpha >= beta)
 							break;
