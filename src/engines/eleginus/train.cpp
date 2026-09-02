@@ -18,9 +18,9 @@
 #include <thread>
 #include <vector>
 #ifdef _WIN32
-#define NOMINMAX
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+	#define NOMINMAX
+	#define WIN32_LEAN_AND_MEAN
+	#include <windows.h>
 #endif
 
 namespace {
@@ -38,8 +38,7 @@ namespace {
 
 #ifdef _WIN32
 	BOOL WINAPI console(DWORD event) {
-		if (event != CTRL_C_EVENT && event != CTRL_BREAK_EVENT)
-			return FALSE;
+		if (event != CTRL_C_EVENT && event != CTRL_BREAK_EVENT) return FALSE;
 		interrupt(0);
 		return TRUE;
 	}
@@ -59,67 +58,46 @@ namespace {
 		for (int i = 1; i < argc; ++i) {
 			const std::string arg = argv[i];
 			if (arg == "--help") {
-				std::cout << "usage: train [--out models/eleginus/current.pth] [--init model.pth] [--depth 2]\n"
-				          << "  [--opening-book data/openings.gen.bin] [--eval-every 1000] [--eval-depth 4]\n"
-				          << "  [--max-plies 320] [--workers N] [--hash 16] [--batch-size 256] [--lr 0.001]\n"
-				          << "  [--weight-decay 0.000001] [--relation-l1 0.00001] [--discover-every 64] [--grad-clip 1]\n"
-				          << "  [--exploration 0.08] [--temperature 80]\n"
-				          << "  [--log-every 10] [--seed 2026]\n"
-				          << "Train until Ctrl+C. Evaluate 2000 paired games after every K completed training games.\n"
-				          << "Only candidates with a positive 95% Elo lower bound replace --out. No save on exit.\n";
+				std::cout << "usage: train [--out models/eleginus/current.pth] [--init model.pth] [--depth 2]\n";
+				std::cout << "  [--opening-book data/openings.gen.bin] [--eval-every 1000] [--eval-depth 4]\n";
+				std::cout << "  [--max-plies 320] [--workers N] [--hash 16] [--batch-size 256] [--lr 0.001]\n";
+				std::cout << "  [--weight-decay 0.000001] [--relation-l1 0.00001] [--discover-every 64] [--grad-clip 1]\n";
+				std::cout << "  [--exploration 0.08] [--temperature 80]\n";
+				std::cout << "  [--log-every 10] [--seed 2026]\n";
+				std::cout << "Train until Ctrl+C. Evaluate 2000 paired games after every K completed training games.\n";
+				std::cout << "Only candidates with a positive 95% Elo lower bound replace --out. No save on exit.\n";
 				std::exit(0);
 			}
-			if (++i == argc)
-				throw std::invalid_argument("missing value after " + arg);
+			if (++i == argc) throw std::invalid_argument("missing value after " + arg);
 			const std::string val = argv[i];
-			if (arg == "--out")
-				o.out = val;
-			else if (arg == "--init")
-				o.init = val;
-			else if (arg == "--opening-book")
-				o.book = val;
-			else if (arg == "--eval-every")
-				o.every = std::stoi(val);
-			else if (arg == "--eval-depth")
-				o.evalDepth = std::stoi(val);
-			else if (arg == "--depth")
-				o.depth = std::stoi(val);
-			else if (arg == "--max-plies")
-				o.plies = std::stoi(val);
-			else if (arg == "--hash")
-				o.hash = std::stoi(val);
-			else if (arg == "--workers")
-				o.workers = std::stoi(val);
-			else if (arg == "--batch-size")
-				o.batch = std::stoi(val);
-			else if (arg == "--lr")
-				o.lr = std::stof(val);
-			else if (arg == "--weight-decay")
-				o.decay = std::stof(val);
-			else if (arg == "--relation-l1")
-				o.sparse = std::stof(val);
-			else if (arg == "--discover-every")
-				o.discover = std::stoi(val);
-			else if (arg == "--grad-clip")
-				o.clip = std::stof(val);
-			else if (arg == "--exploration")
-				o.explore = std::stof(val);
-			else if (arg == "--temperature")
-				o.temp = std::stof(val);
-			else if (arg == "--log-every")
-				o.log = std::stoi(val);
-			else if (arg == "--seed")
-				o.seed = std::stoull(val);
-			else
-				throw std::invalid_argument("unknown option: " + arg);
+			if (arg == "--out") o.out = val;
+			else if (arg == "--init") o.init = val;
+			else if (arg == "--opening-book") o.book = val;
+			else if (arg == "--eval-every") o.every = std::stoi(val);
+			else if (arg == "--eval-depth") o.evalDepth = std::stoi(val);
+			else if (arg == "--depth") o.depth = std::stoi(val);
+			else if (arg == "--max-plies") o.plies = std::stoi(val);
+			else if (arg == "--hash") o.hash = std::stoi(val);
+			else if (arg == "--workers") o.workers = std::stoi(val);
+			else if (arg == "--batch-size") o.batch = std::stoi(val);
+			else if (arg == "--lr") o.lr = std::stof(val);
+			else if (arg == "--weight-decay") o.decay = std::stof(val);
+			else if (arg == "--relation-l1") o.sparse = std::stof(val);
+			else if (arg == "--discover-every") o.discover = std::stoi(val);
+			else if (arg == "--grad-clip") o.clip = std::stof(val);
+			else if (arg == "--exploration") o.explore = std::stof(val);
+			else if (arg == "--temperature") o.temp = std::stof(val);
+			else if (arg == "--log-every") o.log = std::stoi(val);
+			else if (arg == "--seed") o.seed = std::stoull(val);
+			else throw std::invalid_argument("unknown option: " + arg);
 		}
 		for (float x : {o.lr, o.decay, o.sparse, o.clip, o.explore, o.temp}) {
-			if (!std::isfinite(x))
-				throw std::invalid_argument("nonfinite training option");
+			if (!std::isfinite(x)) throw std::invalid_argument("nonfinite training option");
 		}
-		if (o.out.empty() || o.book.empty() || o.every < 1 || o.discover < 1 || o.evalDepth < 1 || o.evalDepth > 64 || o.depth < 1 || o.depth > 16 || o.plies < 1 || o.plies > 320 || o.hash < 1 ||
-		    o.hash > 4096 || o.workers < 1 || o.workers > 256 || o.batch < 1 || o.batch > 65536 || o.lr <= 0 || o.decay < 0 || o.lr * o.decay >= 1 || o.clip <= 0 ||
-		    o.sparse < 0 || o.explore < 0 || o.explore > 1 || o.temp < 0 || o.log < 1) {
+		if (o.out.empty() || o.book.empty() || o.every < 1 || o.discover < 1 || o.evalDepth < 1 || o.evalDepth > 64 || o.depth < 1 || o.depth > 16 ||
+			o.plies < 1 || o.plies > 320 || o.hash < 1 || o.hash > 4096 || o.workers < 1 || o.workers > 256 || o.batch < 1 || o.batch > 65536 ||
+			o.lr <= 0 || o.decay < 0 || o.lr * o.decay >= 1 || o.clip <= 0 || o.sparse < 0 || o.explore < 0 || o.explore > 1 || o.temp < 0 ||
+			o.log < 1) {
 			throw std::invalid_argument("invalid or incomplete Eleginus training options");
 		}
 		return o;
@@ -141,15 +119,12 @@ namespace {
 		void sync(std::size_t n) { grad.resize(n); }
 
 		void step(eleginus::Model &model, std::size_t count, const Options &o) {
-			if (count == 0)
-				return;
-			if (grad.size() != model.params().size())
-				grad.resize(model.params().size());
+			if (count == 0) return;
+			if (grad.size() != model.params().size()) grad.resize(model.params().size());
 			double norm = 0;
 			for (auto &x : grad) {
 				x /= static_cast<float>(count);
-				if (!std::isfinite(x))
-					throw std::runtime_error("nonfinite gradient");
+				if (!std::isfinite(x)) throw std::runtime_error("nonfinite gradient");
 				norm += static_cast<double>(x) * x;
 			}
 			const float scale = static_cast<float>(std::min(1.0, o.clip / std::max(std::sqrt(norm), 1.0e-12)));
@@ -157,8 +132,7 @@ namespace {
 			const auto initial = eleginus::Model::initial();
 			for (std::size_t i = 0; i < model.formulas(); ++i) {
 				p[i] -= o.lr * (grad[i] * scale + o.decay * (p[i] - initial[i]));
-				if (!std::isfinite(p[i]))
-					throw std::runtime_error("nonfinite parameter update");
+				if (!std::isfinite(p[i])) throw std::runtime_error("nonfinite parameter update");
 			}
 			for (std::size_t i = model.formulas(); i < p.size(); ++i) {
 				const float z = p[i] - o.lr * (grad[i] * scale + o.decay * p[i]);
@@ -181,17 +155,16 @@ namespace {
 	}
 
 	chess::Move choose(const eleginus::SearchResult &r, const Options &o, std::mt19937_64 &rng) {
-		if (r.root.empty())
-			return chess::Move(chess::Move::NO_MOVE);
+		if (r.root.empty()) return chess::Move(chess::Move::NO_MOVE);
 		if (std::uniform_real_distribution<float>(0, 1)(rng) < o.explore) {
 			return r.root[std::uniform_int_distribution<std::size_t>(0, r.root.size() - 1)(rng)].move;
 		}
-		if (o.temp == 0)
-			return r.move;
+		if (o.temp == 0) return r.move;
 		std::vector<double> mass;
 		const auto best = r.root.front().score_cp;
-		for (const auto &a : r.root)
+		for (const auto &a : r.root) {
 			mass.push_back(std::exp((a.score_cp - best) / static_cast<double>(o.temp)));
+		}
 		return r.root[std::discrete_distribution<std::size_t>(mass.begin(), mass.end())(rng)].move;
 	}
 
@@ -208,15 +181,12 @@ namespace {
 		std::mt19937_64 rng(seed);
 		for (int ply = 0; ply < o.plies && !stopped() && !eleginus::isGameOver(board); ++ply) {
 			const auto result = search.search(board, {}, stopped);
-			if (stopped())
-				break;
+			if (stopped()) break;
 			const auto move = choose(result, o, rng);
-			if (move.move() == chess::Move::NO_MOVE)
-				break;
+			if (move.move() == chess::Move::NO_MOVE) break;
 			Sample sample;
 			sample.x = result.leaf;
-			if (sample.x.empty())
-				model.extract(board, sample.x);
+			if (sample.x.empty()) model.extract(board, sample.x);
 			game.samples.push_back(std::move(sample));
 			board.makeMove(move);
 		}
@@ -225,25 +195,26 @@ namespace {
 			game.samples.clear();
 			return game;
 		}
-		if (result == chess::GameResult::DRAW)
-			game.result = 1;
+		if (result == chess::GameResult::DRAW) game.result = 1;
 		else {
 			const auto winner = result == chess::GameResult::WIN ? board.sideToMove() : ~board.sideToMove();
 			game.result = winner == chess::Color::WHITE ? 2 : 0;
 		}
 		const float white = 0.5F * game.result;
-		for (auto &s : game.samples)
+		for (auto &s : game.samples) {
 			s.y = white;
+		}
 		return game;
 	}
 
 	double learn(eleginus::Model &model, Prox &solver, const std::deque<Game> &replay, std::size_t count, const Options &o, std::mt19937_64 &rng) {
 		std::vector<const Sample *> pool;
-		for (const auto &g : replay)
-			for (const auto &s : g.samples)
+		for (const auto &g : replay) {
+			for (const auto &s : g.samples) {
 				pool.push_back(&s);
-		if (pool.empty() || count == 0)
-			return 0;
+			}
+		}
+		if (pool.empty() || count == 0) return 0;
 		std::uniform_int_distribution<std::size_t> pick(0, pool.size() - 1);
 		double loss = 0;
 		std::size_t used = 0;
@@ -253,8 +224,7 @@ namespace {
 			for (std::size_t i = 0; i < size; ++i) {
 				const auto &s = *pool[pick(rng)];
 				const float h = model.forward(s.x, cache);
-				if (!std::isfinite(h))
-					throw std::runtime_error("nonfinite training score");
+				if (!std::isfinite(h)) throw std::runtime_error("nonfinite training score");
 				// Stable BCE on logits; terminal scores may also equal 1/2.
 				loss += std::max(h, 0.0F) - h * s.y + std::log1p(std::exp(-std::abs(h)));
 				const float e = std::exp(-std::abs(h));
@@ -271,38 +241,37 @@ namespace {
 		constexpr std::size_t sampleLimit = 2048, addLimit = 16;
 		const auto n = model.formulas();
 		std::size_t total = 0;
-		for (const auto &game : replay)
+		for (const auto &game : replay) {
 			total += game.samples.size();
-		if (total == 0 || model.relations().size() == eleginus::kRelationLimit)
-			return 0;
+		}
+		if (total == 0 || model.relations().size() == eleginus::kRelationLimit) return 0;
 		const std::size_t stride = std::max<std::size_t>(1, total / sampleLimit);
 		std::vector<double> correlation(n * n);
 		std::size_t visited = 0, used = 0;
 		for (const auto &game : replay) {
 			for (const auto &sample : game.samples) {
-				if (visited++ % stride != 0 || used == sampleLimit)
-					continue;
+				if (visited++ % stride != 0 || used == sampleLimit) continue;
 				const float h = model.score(sample.x);
 				const float e = std::exp(-std::abs(h));
 				const float p = h >= 0 ? 1.0F / (1.0F + e) : e / (1.0F + e);
 				const double residual = p - sample.y;
 				for (const auto &row : sample.x) {
-					if (row.score == 0)
-						continue;
+					if (row.score == 0) continue;
 					for (const auto &condition : sample.x) {
-						if (condition.condition != 0)
+						if (condition.condition != 0) {
 							correlation[static_cast<std::size_t>(row.index) * n + condition.index] +=
-							    residual * static_cast<double>(row.score) * condition.condition;
+								residual * static_cast<double>(row.score) * condition.condition;
+						}
 					}
 				}
 				++used;
 			}
 		}
-		if (used == 0)
-			return 0;
+		if (used == 0) return 0;
 		std::vector<std::uint8_t> active(n * n);
-		for (const auto &relation : model.relations())
+		for (const auto &relation : model.relations()) {
 			active[static_cast<std::size_t>(relation.row) * n + relation.condition] = 1;
+		}
 		struct Candidate {
 			double gain;
 			std::uint16_t row, condition;
@@ -314,17 +283,17 @@ namespace {
 				const auto index = row * n + condition;
 				if (!active[index]) {
 					const double gain = std::abs(correlation[index]) / static_cast<double>(used) - o.sparse;
-					if (gain > 0)
-						candidates.push_back({gain, static_cast<std::uint16_t>(row), static_cast<std::uint16_t>(condition)});
+					if (gain > 0) candidates.push_back({gain, static_cast<std::uint16_t>(row), static_cast<std::uint16_t>(condition)});
 				}
 			}
 		}
 		const auto count = std::min({addLimit, candidates.size(), eleginus::kRelationLimit - model.relations().size()});
 		std::partial_sort(candidates.begin(), candidates.begin() + static_cast<std::ptrdiff_t>(count), candidates.end(),
-		    [](const Candidate &a, const Candidate &b) { return a.gain > b.gain; });
+			[](const Candidate &a, const Candidate &b) { return a.gain > b.gain; });
 		std::size_t added = 0;
-		for (std::size_t i = 0; i < count; ++i)
+		for (std::size_t i = 0; i < count; ++i) {
 			added += model.activate(candidates[i].row, candidates[i].condition);
+		}
 		return added;
 	}
 
@@ -342,16 +311,14 @@ namespace {
 				const auto index = static_cast<std::size_t>(start + i);
 				jobs.push_back(std::async(std::launch::async, [&, index] {
 					const int white = eleginus::match(model, baseline, book[index], chess::Color::WHITE, limits, stopped);
-					if (white < 0)
-						return -1;
+					if (white < 0) return -1;
 					const int black = eleginus::match(model, baseline, book[index], chess::Color::BLACK, limits, stopped);
 					return black < 0 ? -1 : white + black;
 				}));
 			}
 			for (auto &job : jobs) {
 				const int score = job.get();
-				if (score >= 0)
-					++pairs[score];
+				if (score >= 0) ++pairs[score];
 			}
 			start += count;
 			if (!stopped() && (start - logged >= 50 || start == eleginus::kOpeningPairs)) {
@@ -365,8 +332,9 @@ namespace {
 		}
 		const auto result = eleginus::confidence(pairs);
 		const bool accepted = result.low > 0;
-		std::cout << "evaluation result: score=" << result.score << " elo=" << result.elo << " elo_ci95=[" << result.low << "," << result.high
-		          << "] accepted=" << (accepted ? "yes" : "no") << std::endl;
+		std::cout << "evaluation result: score=" << result.score << " elo=" << result.elo;
+		std::cout << " elo_ci95=[" << result.low << "," << result.high << "] ";
+		std::cout << "accepted=" << (accepted ? "yes" : "no") << std::endl;
 		return accepted;
 	}
 
@@ -377,10 +345,11 @@ int main(int argc, char **argv) {
 		const auto o = parse(argc, argv);
 		std::signal(SIGINT, interrupt);
 		std::signal(SIGTERM, interrupt);
-#ifdef _WIN32
-		if (!SetConsoleCtrlHandler(nullptr, FALSE) || !SetConsoleCtrlHandler(console, TRUE))
+		#ifdef _WIN32
+		if (!SetConsoleCtrlHandler(nullptr, FALSE) || !SetConsoleCtrlHandler(console, TRUE)) {
 			throw std::runtime_error("cannot install console interrupt handler");
-#endif
+		}
+		#endif
 		const auto book = eleginus::openings(o.book);
 		const bool hasCurrent = std::filesystem::exists(o.out);
 		auto baseline = hasCurrent ? eleginus::Model::load(o.out) : (o.init.empty() ? eleginus::Model() : eleginus::Model::load(o.init));
@@ -392,9 +361,10 @@ int main(int argc, char **argv) {
 		std::uint64_t attempted = 0, completed = 0, discarded = 0, white = 0, black = 0, draws = 0, logged = 0, discovered = 0;
 		int since = 0;
 		std::size_t samples = 0;
-		std::cout << "self-play start: out=" << o.out.string() << " formulas=" << model.formulas() << " parameters=" << model.params().size() << " depth=" << o.depth
-		          << " workers=" << o.workers << " seed=" << o.seed << " eval_every=" << o.every << " eval_depth=" << o.evalDepth
-		          << " baseline=" << (hasCurrent ? "current" : "initial") << std::endl;
+		std::cout << "self-play start: out=" << o.out.string() << " formulas=" << model.formulas();
+		std::cout << " parameters=" << model.params().size() << " depth=" << o.depth << " workers=" << o.workers;
+		std::cout << " seed=" << o.seed << " eval_every=" << o.every << " eval_depth=" << o.evalDepth;
+		std::cout << " baseline=" << (hasCurrent ? "current" : "initial") << std::endl;
 		while (!stopped()) {
 			const auto batch = std::min(o.workers, o.every - since);
 			std::vector<std::future<Game>> jobs;
@@ -403,10 +373,10 @@ int main(int argc, char **argv) {
 				jobs.push_back(std::async(std::launch::async, [&model, &o, seed] { return play(model, o, seed); }));
 			}
 			std::vector<Game> games;
-			for (auto &job : jobs)
+			for (auto &job : jobs) {
 				games.push_back(job.get());
-			if (stopped())
-				break;
+			}
+			if (stopped()) break;
 			// All searches have finished before parameters change.
 			std::size_t count = 0;
 			for (auto &game : games) {
@@ -421,24 +391,21 @@ int main(int argc, char **argv) {
 				black += game.result == 0;
 				count += game.samples.size();
 				replay.push_back(std::move(game));
-				if (replay.size() > history)
-					replay.pop_front();
+				if (replay.size() > history) replay.pop_front();
 			}
 			if (completed / static_cast<std::uint64_t>(o.discover) > discovered) {
 				const auto added = discover(model, replay, o);
 				solver.sync(model.params().size());
 				discovered = completed / static_cast<std::uint64_t>(o.discover);
-				if (added)
-					std::cout << "relation discovery: added=" << added << " active=" << model.relations().size() << std::endl;
+				if (added) std::cout << "relation discovery: added=" << added << " active=" << model.relations().size() << std::endl;
 			}
 			const auto loss = learn(model, solver, replay, count, o, rng);
 			samples += count;
 			attempted += batch;
 			if (attempted - logged >= static_cast<std::uint64_t>(o.log) || since == o.every) {
-				std::cout << "self-play step: games=" << attempted << " completed=" << completed << " discarded=" << discarded << " positions=" << samples << " white=" << white
-				          << " draws=" << draws << " black=" << black;
-				if (count)
-					std::cout << " bce=" << loss;
+				std::cout << "self-play step: games=" << attempted << " completed=" << completed << " discarded=" << discarded;
+				std::cout << " positions=" << samples << " white=" << white << " draws=" << draws << " black=" << black;
+				if (count) std::cout << " bce=" << loss;
 				std::cout << std::endl;
 				logged = attempted;
 			}

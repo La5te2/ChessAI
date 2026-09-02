@@ -278,6 +278,22 @@ The [UCI](#uci) section describes runtime options, output fields and time manage
 
 ### Eleginus
 
+Export the initial Eleginus checkpoint manually from the repository root.
+
+On Windows, run:
+
+```powershell
+build\eleginus\search.exe --export-initial models\eleginus\eleginus.pth
+```
+
+On Linux, run:
+
+```bash
+build/eleginus/search --export-initial models/eleginus/eleginus.pth
+```
+
+Both commands write the initial checkpoint directly to `models/eleginus/eleginus.pth`.
+
 Run continuous self-play training from the repository root:
 
 ```powershell

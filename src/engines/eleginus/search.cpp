@@ -10,8 +10,7 @@
 namespace {
 
 	std::string valueAfter(int argc, char **argv, int &index) {
-		if (index + 1 >= argc)
-			throw std::invalid_argument(std::string("missing value after ") + argv[index]);
+		if (index + 1 >= argc) throw std::invalid_argument(std::string("missing value after ") + argv[index]);
 		return argv[++index];
 	}
 
@@ -39,16 +38,15 @@ int main(int argc, char **argv) {
 			} else if (argument == "--multipv") {
 				options.multipv = std::stoi(valueAfter(argc, argv, index));
 			} else if (argument == "--help") {
-				std::cout << "usage: search [--model eleginus.pth] [--fen FEN] [--depth 6] [--hash 64] [--nodes 0] [--multipv 1]\n"
-				          << "       search --export-initial models/eleginus/eleginus.pth\n";
+				std::cout << "usage: search [--model eleginus.pth] [--fen FEN] [--depth 6] [--hash 64] [--nodes 0] [--multipv 1]\n";
+				std::cout << "       search --export-initial models/eleginus/eleginus.pth\n";
 				return 0;
 			} else {
 				throw std::invalid_argument("unknown option: " + argument);
 			}
 		}
 		if (!exportPath.empty()) {
-			if (!modelPath.empty())
-				throw std::invalid_argument("--export-initial cannot be combined with --model");
+			if (!modelPath.empty()) throw std::invalid_argument("--export-initial cannot be combined with --model");
 			eleginus::Model().save(exportPath);
 			std::cout << "exported " << exportPath.string() << '\n';
 			return 0;
@@ -59,9 +57,9 @@ int main(int argc, char **argv) {
 		const auto result = searcher.search(board, [](const eleginus::SearchResult &partial) {
 			const auto elapsed = std::max<std::uint64_t>(1, partial.elapsed_ms);
 			const auto nps = static_cast<std::uint64_t>(1000.0 * static_cast<double>(partial.nodes) / static_cast<double>(elapsed));
-			std::cout << "depth=" << partial.depth << " score_cp=" << partial.score_cp << " nodes=" << partial.nodes
-			          << " nps=" << nps << " time_ms=" << partial.elapsed_ms
-			          << " bestmove=" << (partial.move.move() == chess::Move::NO_MOVE ? "0000" : eleginus::moveToUci(partial.move)) << '\n';
+			std::cout << "depth=" << partial.depth << " score_cp=" << partial.score_cp << " nodes=" << partial.nodes << " nps=" << nps;
+			std::cout << " time_ms=" << partial.elapsed_ms;
+			std::cout << " bestmove=" << (partial.move.move() == chess::Move::NO_MOVE ? "0000" : eleginus::moveToUci(partial.move)) << '\n';
 		});
 		std::cout << "bestmove " << (result.move.move() == chess::Move::NO_MOVE ? "0000" : eleginus::moveToUci(result.move)) << '\n';
 		return 0;

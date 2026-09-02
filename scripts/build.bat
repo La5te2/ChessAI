@@ -119,8 +119,6 @@ if "%BUILD_ELEGINUS%"=="ON" (
 		copy /y "%WORK_DIR%\eleginus\%%F.exe" "%PUBLISH_DIR%\eleginus\%%F.exe" >nul || goto :failed
 	)
 	if exist "%ROOT_DIR%\models\eleginus\eleginus.pth" copy /y "%ROOT_DIR%\models\eleginus\eleginus.pth" "%PUBLISH_DIR%\eleginus\eleginus.pth" >nul || goto :failed
-	if not exist "%ROOT_DIR%\models\eleginus" mkdir "%ROOT_DIR%\models\eleginus" || goto :failed
-	copy /y "%WORK_DIR%\eleginus\uci.exe" "%ROOT_DIR%\models\eleginus\eleginus.exe" >nul || goto :failed
 )
 
 if "%BUILD_GRAPHICS%"=="ON" (

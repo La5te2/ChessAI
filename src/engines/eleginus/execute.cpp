@@ -4,6 +4,7 @@
 #include <array>
 #include <bit>
 #include <cmath>
+#include <immintrin.h>
 #include <optional>
 #include <stdexcept>
 #include <utility>
@@ -11,6 +12,7 @@
 namespace eleginus {
 	namespace {
 		using Word = std::uint64_t;
+
 		std::int64_t number(Word x) noexcept {
 			return std::bit_cast<std::int64_t>(x);
 		}
@@ -25,8 +27,7 @@ namespace eleginus {
 			for (int color = 0; color < 2; ++color) {
 				for (int wing = 0; wing < 2; ++wing) {
 					const auto flank = wing == 0 ? chess::Board::CastlingRights::Side::KING_SIDE : chess::Board::CastlingRights::Side::QUEEN_SIDE;
-					if (board.castlingRights().has(static_cast<chess::Color>(color), flank))
-						in[atomIndex(Atom::CR)] |= 1ULL << (2 * color + wing);
+					if (board.castlingRights().has(static_cast<chess::Color>(color), flank)) in[atomIndex(Atom::CR)] |= 1ULL << (2 * color + wing);
 				}
 			}
 			in[atomIndex(Atom::STM)] = static_cast<Word>(board.sideToMove());
@@ -38,10 +39,6 @@ namespace eleginus {
 			x = ((x & 0x0000FFFF0000FFFFULL) << 16) | ((x >> 16) & 0x0000FFFF0000FFFFULL);
 			return (x << 32) | (x >> 32);
 		}
-
-	} // namespace
-
-	namespace {
 
 		// Sparse square iteration preserves the fixed coordinate order while visiting occupied squares only.
 		struct Squares {
@@ -72,14 +69,33 @@ namespace eleginus {
 		struct Features {
 			static constexpr bool conditions = true;
 			std::vector<Feature> &values;
-			void put(std::uint32_t index, std::int32_t score, std::int32_t condition) { values.push_back({static_cast<std::uint16_t>(index), score, condition}); }
+			void put(std::uint32_t index, std::int32_t score, std::int32_t condition) {
+				values.push_back({static_cast<std::uint16_t>(index), score, condition});
+			}
+			bool active(std::uint32_t, std::uint32_t) const { return true; }
 		};
+
+		bool activeRange(const FormulaMask *mask, std::uint32_t first, std::uint32_t count) {
+			if (mask == nullptr) return true;
+			const auto last = first + count;
+			while (first < last) {
+				const auto word = first / 64;
+				const auto offset = first % 64;
+				const auto width = std::min<std::uint32_t>(last - first, 64 - offset);
+				const auto bits = width == 64 ? ~0ULL : ((1ULL << width) - 1) << offset;
+				if ((*mask)[word] & bits) return true;
+				first += width;
+			}
+			return false;
+		}
 
 		struct Weighted {
 			static constexpr bool conditions = false;
 			std::span<const float> weights;
+			const FormulaMask *mask = nullptr;
 			float value = 0.0F;
 			void put(std::uint32_t index, std::int32_t score, std::int32_t) { value += static_cast<float>(score) * weights[index]; }
+			bool active(std::uint32_t first, std::uint32_t count) const { return activeRange(mask, first, count); }
 		};
 
 		struct Graybox {
@@ -91,6 +107,7 @@ namespace eleginus {
 			};
 			std::span<const float> weights;
 			Storage &storage;
+			const FormulaMask *mask = nullptr;
 			float value = 0.0F;
 			void put(std::uint32_t index, std::int32_t score, std::int32_t condition) {
 				value += static_cast<float>(score) * weights[index];
@@ -100,7 +117,42 @@ namespace eleginus {
 			}
 			std::int32_t score(std::uint16_t index) const { return storage.stamp[index] == storage.generation ? storage.score[index] : 0; }
 			std::int32_t condition(std::uint16_t index) const { return storage.stamp[index] == storage.generation ? storage.condition[index] : 0; }
+			bool active(std::uint32_t first, std::uint32_t count) const { return activeRange(mask, first, count); }
 		};
+
+		float relationScore(
+			const Graybox &sink, std::span<const std::uint16_t> rows, std::span<const std::uint16_t> conditions, std::span<const float> weights) {
+			std::size_t i = 0;
+			__m256 total = _mm256_setzero_ps();
+			const auto generation = _mm256_set1_epi32(static_cast<int>(sink.storage.generation));
+			for (; i + 8 <= weights.size(); i += 8) {
+				const auto row16 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(rows.data() + i));
+				const auto condition16 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(conditions.data() + i));
+				const auto row32 = _mm256_cvtepu16_epi32(row16);
+				const auto condition32 = _mm256_cvtepu16_epi32(condition16);
+				const auto rowStamp = _mm256_i32gather_epi32(reinterpret_cast<const int *>(sink.storage.stamp.data()), row32, sizeof(std::uint32_t));
+				const auto conditionStamp =
+					_mm256_i32gather_epi32(reinterpret_cast<const int *>(sink.storage.stamp.data()), condition32, sizeof(std::uint32_t));
+				const auto rowMask = _mm256_cmpeq_epi32(rowStamp, generation);
+				const auto conditionMask = _mm256_cmpeq_epi32(conditionStamp, generation);
+				const auto score32 = _mm256_i32gather_epi32(sink.storage.score.data(), row32, sizeof(std::int32_t));
+				const auto value32 = _mm256_i32gather_epi32(sink.storage.condition.data(), condition32, sizeof(std::int32_t));
+				const auto score = _mm256_cvtepi32_ps(_mm256_and_si256(score32, rowMask));
+				const auto condition = _mm256_cvtepi32_ps(_mm256_and_si256(value32, conditionMask));
+				const auto weight = _mm256_loadu_ps(weights.data() + i);
+				total = _mm256_add_ps(total, _mm256_mul_ps(weight, _mm256_mul_ps(score, condition)));
+			}
+			alignas(32) std::array<float, 8> lanes{};
+			_mm256_store_ps(lanes.data(), total);
+			float value = 0.0F;
+			for (const auto lane : lanes) {
+				value += lane;
+			}
+			for (; i < weights.size(); ++i) {
+				value += weights[i] * static_cast<float>(sink.score(rows[i])) * static_cast<float>(sink.condition(conditions[i]));
+			}
+			return value;
+		}
 
 		template <class Output> class Runtime {
 		public:
@@ -111,6 +163,19 @@ namespace eleginus {
 			static constexpr bool conditions = Output::conditions;
 
 			Runtime(const chess::Board &board, Output &out) : in(inputs(board)), occupied(board.occ().getBits()), output(out) {
+				// Pawn and king maps are immutable functions of their piece bitboards.
+				for (unsigned color = 0; color < 2; ++color) {
+					const Word pawns = in[6 * color];
+					const Word east = pawns & 0x7F7F7F7F7F7F7F7FULL;
+					const Word west = pawns & 0xFEFEFEFEFEFEFEFEULL;
+					fixedAttacks[color][0] = color == 0 ? (east << 9) | (west << 7) : (east >> 7) | (west >> 9);
+					Word kings = in[6 * color + 5];
+					while (kings) {
+						const int square = std::countr_zero(kings);
+						kings &= kings - 1;
+						fixedAttacks[color][1] |= chess::attacks::king(chess::Square(square)).getBits();
+					}
+				}
 				// Verify both full pawn bitboards on a hit; non-pawn pieces and turn are not dependencies.
 				thread_local std::array<Pawns, 1024> table{};
 				const Word hash = in[atomIndex(Atom::WP)] * 0x9e3779b97f4a7c15ULL ^ std::rotl(in[atomIndex(Atom::BP)] * 0xbf58476d1ce4e5b9ULL, 29);
@@ -119,31 +184,35 @@ namespace eleginus {
 					pawnCache->white = in[atomIndex(Atom::WP)];
 					pawnCache->black = in[atomIndex(Atom::BP)];
 					pawnCache->shapeReady = false;
-					for (auto &king : pawnCache->kings)
+					for (auto &king : pawnCache->kings) {
 						king.valid = false;
+					}
 					pawnCache->valid = true;
 				}
 				thread_local Attacks attacks;
 				thread_local Rays rays;
 				attackCache = &attacks;
 				rayCache = &rays;
-				const Word changed = attacks.occupied ^ occupied;
+				const Word changed = attackCache->occupied ^ occupied;
 				for (unsigned color = 0; color < 2; ++color) {
 					Word all = 0, twice = 0;
 					for (unsigned type = 0; type < 6; ++type) {
 						const auto i = 6 * color + type;
-						auto &map = attacks.maps[color][type];
-						auto &overlap = attacks.twice[color][type];
+						auto &map = attackCache->maps[color][type];
+						auto &overlap = attackCache->twice[color][type];
 						const bool slider = type >= 2 && type <= 4;
 						// Slider maps include the first blocker; changes hidden behind it cannot affect a ray.
-						if (!attacks.valid || attacks.pieces[i] != in[i] || (slider && (changed & map))) {
+						if (!attackCache->valid || attackCache->pieces[i] != in[i] || (slider && (changed & map))) {
 							if (type == 0) {
 								const Word east = in[i] & 0x7F7F7F7F7F7F7F7FULL;
 								const Word west = in[i] & 0xFEFEFEFEFEFEFEFEULL;
 								const Word left = color == 0 ? east << 9 : east >> 7;
 								const Word right = color == 0 ? west << 7 : west >> 9;
-								map = left | right;
+								map = fixedAttacks[color][0];
 								overlap = left & right;
+							} else if (type == 5) {
+								map = fixedAttacks[color][1];
+								overlap = 0;
 							} else {
 								map = overlap = 0;
 								auto pieces = in[i];
@@ -158,13 +227,13 @@ namespace eleginus {
 						}
 						twice |= overlap | (all & map);
 						all |= map;
-						attacks.pieces[i] = in[i];
+						attackCache->pieces[i] = in[i];
 					}
-					attacks.maps[color][6] = all;
-					attacks.maps[color][7] = twice;
+					attackCache->maps[color][6] = all;
+					attackCache->maps[color][7] = twice;
 				}
-				attacks.occupied = occupied;
-				attacks.valid = true;
+				attackCache->occupied = occupied;
+				attackCache->valid = true;
 			}
 			// NUM constructs a signed integer signal; BB constructs a raw bitboard signal.
 			AtomSignal NUM(std::int64_t x) const { return AtomSignal(static_cast<Word>(x)); }
@@ -238,30 +307,32 @@ namespace eleginus {
 			Squares locations(InterSignal set) const { return {set.bits}; }
 
 			InterSignal fill(InterSignal x, InterSignal role) const {
-				for (unsigned d : {8U, 16U, 32U})
+				for (unsigned d : {8U, 16U, 32U}) {
 					x.bits |= color(role) == 0 ? x.bits << d : x.bits >> d;
+				}
 				return x;
 			}
 
 			InterSignal attackFrom(InterSignal role, int type, InterSignal square) {
 				const int s = static_cast<int>(number(square.bits));
-				if (type == 0)
-					return BB(chess::attacks::pawn(static_cast<chess::Color>(color(role)), chess::Square(s)).getBits());
-				if (type == 1)
-					return BB(chess::attacks::knight(chess::Square(s)).getBits());
-				if (type == 5)
-					return BB(chess::attacks::king(chess::Square(s)).getBits());
-				if (type == 4)
-					return OR(attackFrom(role, 2, square), attackFrom(role, 3, square));
+				if (type == 0) return BB(chess::attacks::pawn(static_cast<chess::Color>(color(role)), chess::Square(s)).getBits());
+				if (type == 1) return BB(chess::attacks::knight(chess::Square(s)).getBits());
+				if (type == 5) return BB(chess::attacks::king(chess::Square(s)).getBits());
+				if (type == 4) return OR(attackFrom(role, 2, square), attackFrom(role, 3, square));
 				auto &ray = rayCache->rays[type - 2][s];
-				if (ray.map == 0 || ((ray.occupied ^ occupied) & ray.map))
-					ray.map = (type == 2 ? chess::attacks::bishop(chess::Square(s), chess::Bitboard(occupied)) : chess::attacks::rook(chess::Square(s), chess::Bitboard(occupied)))
-					              .getBits();
+				if (ray.map == 0 || ((ray.occupied ^ occupied) & ray.map)) {
+					const auto source = chess::Square(s);
+					const auto blockers = chess::Bitboard(occupied);
+					ray.map = type == 2 ? chess::attacks::bishop(source, blockers).getBits() : chess::attacks::rook(source, blockers).getBits();
+				}
 				ray.occupied = occupied;
 				return BB(ray.map);
 			}
 
-			InterSignal attacks(InterSignal role, int type = 6) const { return BB(attackCache->maps[color(role)][type]); }
+			InterSignal attacks(InterSignal role, int type = 6) const {
+				if (type == 0 || type == 5) return BB(fixedAttacks[color(role)][type == 0 ? 0 : 1]);
+				return BB(attackCache->maps[color(role)][type]);
+			}
 			InterSignal doubleAttacks(InterSignal role) const { return BB(attackCache->maps[color(role)][7]); }
 
 			std::array<int, 2> pawnShape(InterSignal role) {
@@ -301,11 +372,9 @@ namespace eleginus {
 							entry.values[6] += (pawns & mask) == 0;
 							const std::array<Word, 2> nearest{f & mask & front, e & mask & front};
 							for (unsigned i = 0; i < nearest.size(); ++i) {
-								if (!nearest[i])
-									continue;
+								if (!nearest[i]) continue;
 								const int distance = std::countr_zero(nearest[i]) / 8 - rank;
-								if (distance <= 3)
-									++entry.values[2 * (distance - 1) + i];
+								if (distance <= 3) ++entry.values[2 * (distance - 1) + i];
 							}
 						}
 					}
@@ -341,12 +410,11 @@ namespace eleginus {
 			InterSignal sum(const Sum &terms) const { return NUM(terms.total); }
 			void root(InterSignal score, InterSignal condition) {
 				const auto s = number(score.bits), c = number(condition.bits);
-				if (s != 0 || c != 0)
-					output.put(index, static_cast<std::int32_t>(s), static_cast<std::int32_t>(c));
+				if (s != 0 || c != 0) output.put(index, static_cast<std::int32_t>(s), static_cast<std::int32_t>(c));
 				++index;
 			}
 			void skip(unsigned n) { index += n; }
-			void finish() const {}
+			bool active(unsigned n) const { return output.active(index, n); }
 
 		private:
 			struct KingPawn {
@@ -384,6 +452,7 @@ namespace eleginus {
 			Attacks *attackCache;
 			Rays *rayCache;
 			std::array<Word, atomCount> in;
+			std::array<std::array<Word, 2>, 2> fixedAttacks{};
 			Word occupied;
 			Output &output;
 			unsigned index = 0;
@@ -399,11 +468,11 @@ namespace eleginus {
 				operator IS() const { return score; }
 			};
 
-			#define ELEGINUS_FORMULAS
-			#define FORMULA(name) void name()
-			#include "formula.inl"
-			#undef FORMULA
-			#undef ELEGINUS_FORMULAS
+#define ELEGINUS_FORMULAS
+#define FORMULA(name) void name()
+#include "formula.inl"
+#undef FORMULA
+#undef ELEGINUS_FORMULAS
 
 		public:
 			explicit Formulas(B runtime) : b(std::move(runtime)) {
@@ -415,7 +484,7 @@ namespace eleginus {
 				phase = phaseUnits();
 			}
 
-			auto execute() {
+			void execute() {
 				tempo();
 				material();
 				pst();
@@ -426,29 +495,34 @@ namespace eleginus {
 				threats();
 				kings();
 				endgames();
-				return b.finish();
 			}
-			static std::span<const float> initial() noexcept { return initialWeights; }
+			static std::span<const float> initial() noexcept {
+				return initialWeights;
+			}
 
 		private:
 			template <class F> IS shared(Pair &pair, IS role, F &&make) {
 				auto &value = pair[b.roleIndex(role)];
-				if (!value)
-					value = make();
+				if (!value) value = make();
 				return *value;
 			}
 
-			static constexpr std::uint64_t fileMask(int file) noexcept { return 0x0101010101010101ULL << file; }
-			static constexpr std::uint64_t rankMask(int rank) noexcept { return 0xFFULL << (8 * rank); }
+			static constexpr std::uint64_t fileMask(int file) noexcept {
+				return 0x0101010101010101ULL << file;
+			}
+			static constexpr std::uint64_t rankMask(int rank) noexcept {
+				return 0xFFULL << (8 * rank);
+			}
 
 			static std::uint64_t ringMask(int square, int distance) noexcept {
 				static const auto masks = [] {
 					std::array<std::array<Word, 8>, 64> table{};
-					for (int s = 0; s < 64; ++s)
+					for (int s = 0; s < 64; ++s) {
 						for (int t = 0; t < 64; ++t) {
 							const int d = std::max(std::abs(t % 8 - s % 8), std::abs(t / 8 - s / 8));
 							table[s][d] |= 1ULL << t;
 						}
+					}
 					return table;
 				}();
 				return masks[square][distance];
@@ -457,24 +531,27 @@ namespace eleginus {
 			static std::uint64_t diagonalMask(int square) noexcept {
 				static const auto masks = [] {
 					std::array<Word, 64> table{};
-					for (int s = 0; s < 64; ++s)
+					for (int s = 0; s < 64; ++s) {
 						for (int t = 0; t < 64; ++t) {
 							const int df = std::abs(t % 8 - s % 8), dr = std::abs(t / 8 - s / 8);
-							if (df && df == dr)
-								table[s] |= 1ULL << t;
+							if (df && df == dr) table[s] |= 1ULL << t;
 						}
+					}
 					return table;
 				}();
 				return masks[square];
 			}
 
-			Difference diff(IS own, IS enemy) { return {b.SUB(own, enemy), own, enemy}; }
+			Difference diff(IS own, IS enemy) {
+				return {b.SUB(own, enemy), own, enemy};
+			}
 
 			IS own(IS role) {
 				return shared(owned, role, [&] {
 					IS result = b.PCS(role, 0);
-					for (int type = 1; type < 6; ++type)
+					for (int type = 1; type < 6; ++type) {
 						result = b.OR(result, b.PCS(role, type));
+					}
 					return result;
 				});
 			}
@@ -483,7 +560,9 @@ namespace eleginus {
 				return shared(pawnAttack, role, [&] { return b.OR(b.SH(b.PCS(role, 0), role, 4), b.SH(b.PCS(role, 0), role, 5)); });
 			}
 
-			IS files(IS set, IS role, IS opponent) { return b.OR(b.fill(set, role), b.fill(set, opponent)); }
+			IS files(IS set, IS role, IS opponent) {
+				return b.OR(b.fill(set, role), b.fill(set, opponent));
+			}
 
 			IS passedPawns(IS role, IS opponent) {
 				return shared(passedMap, role, [&] {
@@ -494,30 +573,29 @@ namespace eleginus {
 			}
 
 			IS strongSquares(IS role, IS opponent) {
-				return shared(strongMap, role, [&] { return b.OR(pawnAttacks(opponent), b.AND(b.doubleAttacks(opponent), b.NOT(b.doubleAttacks(role)))); });
+				return shared(
+					strongMap, role, [&] { return b.OR(pawnAttacks(opponent), b.AND(b.doubleAttacks(opponent), b.NOT(b.doubleAttacks(role)))); });
 			}
 
 			IS phaseUnits() {
 				IS total = z;
 				constexpr std::array<int, 6> units{{0, 1, 1, 2, 4, 0}};
-				for (const auto role : {us, them})
-					for (int type = 1; type <= 4; ++type)
+				for (const auto role : {us, them}) {
+					for (int type = 1; type <= 4; ++type) {
 						total = b.ADD(total, b.MUL(b.NUM(units[static_cast<std::size_t>(type)]), b.POP(b.PCS(role, type))));
+					}
+				}
 				return b.MIN(total, b.NUM(24));
 			}
 
 			void F(Difference signal) {
-				if constexpr (B::conditions)
-					b.root(signal.score, b.ADD(signal.own, signal.enemy));
-				else
-					b.root(signal.score, z);
+				if constexpr (B::conditions) b.root(signal.score, b.ADD(signal.own, signal.enemy));
+				else b.root(signal.score, z);
 			}
 
 			void F(IS signal) {
-				if constexpr (B::conditions)
-					b.root(signal, b.ABS(signal));
-				else
-					b.root(signal, z);
+				if constexpr (B::conditions) b.root(signal, b.ABS(signal));
+				else b.root(signal, z);
 			}
 
 			IS mobilityArea(IS role, IS opponent) {
@@ -530,11 +608,9 @@ namespace eleginus {
 			}
 
 			IS secondaryArea(IS role, IS opponent, int type) {
-				if (type < 3)
-					return b.BB(0);
+				if (type < 3) return b.BB(0);
 				IS unsafe = b.OR(pawnAttacks(opponent), b.OR(b.attacks(opponent, 1), b.attacks(opponent, 2)));
-				if (type == 4)
-					unsafe = b.OR(unsafe, b.attacks(opponent, 3));
+				if (type == 4) unsafe = b.OR(unsafe, b.attacks(opponent, 3));
 				return b.AND(b.NOT(own(role)), b.NOT(unsafe));
 			}
 
@@ -574,14 +650,18 @@ namespace eleginus {
 				return b.sum(terms);
 			}
 
-			IS escapes(IS defender, IS attacker) { return b.POP(b.AND(b.attacks(defender, 5), b.AND(b.NOT(own(defender)), b.NOT(b.attacks(attacker))))); }
+			IS escapes(IS defender, IS attacker) {
+				return b.POP(b.AND(b.attacks(defender, 5), b.AND(b.NOT(own(defender)), b.NOT(b.attacks(attacker)))));
+			}
 
 			IS kingPawns(IS defender, IS attacker, int distance, bool friendly) {
 				(void)attacker;
 				return b.kingPawn(defender, 2 * (distance - 1) + !friendly);
 			}
 
-			IS kingOpenFiles(IS role) { return b.kingPawn(role, 6); }
+			IS kingOpenFiles(IS role) {
+				return b.kingPawn(role, 6);
+			}
 
 			IS kingRegion(IS role, bool flank) {
 				return shared(flank ? kingFlank : kingRing, role, [&] {
@@ -590,8 +670,9 @@ namespace eleginus {
 						Word region = ringMask(square, 2);
 						if (flank) {
 							region = 0;
-							for (int file = std::max(0, square % 8 - 1); file <= std::min(7, square % 8 + 1); ++file)
+							for (int file = std::max(0, square % 8 - 1); file <= std::min(7, square % 8 + 1); ++file) {
 								region |= fileMask(file);
+							}
 						}
 						mask = b.OR(mask, b.REL(role, region));
 					}
@@ -599,13 +680,16 @@ namespace eleginus {
 				});
 			}
 
-			IS flank(IS map, IS defender) { return b.POP(b.AND(map, kingRegion(defender, true))); }
+			IS flank(IS map, IS defender) {
+				return b.POP(b.AND(map, kingRegion(defender, true)));
+			}
 
 			IS nonPawnMaterial(IS role) {
 				IS total = z;
 				constexpr std::array<int, 5> value{{0, 3, 3, 5, 9}};
-				for (int type = 1; type <= 4; ++type)
+				for (int type = 1; type <= 4; ++type) {
 					total = b.ADD(total, b.MUL(b.NUM(value[static_cast<std::size_t>(type)]), b.POP(b.PCS(role, type))));
+				}
 				return total;
 			}
 
@@ -621,28 +705,36 @@ namespace eleginus {
 
 	} // namespace
 
-	std::span<const float> detail::initial() noexcept { return Formulas<Runtime<Weighted>>::initial(); }
+	std::span<const float> detail::initial() noexcept {
+		return Formulas<Runtime<Weighted>>::initial();
+	}
 
 	void detail::extract(const chess::Board &board, std::vector<Feature> &out) {
 		out.clear();
-		if (out.capacity() < kFormulaCount)
-			out.reserve(kFormulaCount);
+		if (out.capacity() < kFormulaCount) out.reserve(kFormulaCount);
 		Features sink{out};
 		Formulas<Runtime<Features>>(Runtime(board, sink)).execute();
 	}
 
 	float detail::score(const chess::Board &board, std::span<const float> weights) {
-		if (weights.size() != kFormulaCount)
-			throw std::invalid_argument("formula weight count does not match the fixed formula set");
+		if (weights.size() != kFormulaCount) throw std::invalid_argument("formula weight count does not match the fixed formula set");
 		Weighted sink{weights};
 		Formulas<Runtime<Weighted>>(Runtime(board, sink)).execute();
 		return static_cast<float>(sink.value);
 	}
 
-	float detail::score(
-	    const chess::Board &board, std::span<const float> base, std::span<const std::uint16_t> rows, std::span<const std::uint16_t> conditions, std::span<const float> relations) {
-		if (base.size() != kFormulaCount || rows.size() != conditions.size() || rows.size() != relations.size())
+	float detail::score(const chess::Board &board, std::span<const float> weights, const FormulaMask &active) {
+		if (weights.size() != kFormulaCount) throw std::invalid_argument("formula weight count does not match the fixed formula set");
+		Weighted sink{weights, &active};
+		Formulas<Runtime<Weighted>>(Runtime(board, sink)).execute();
+		return static_cast<float>(sink.value);
+	}
+
+	float detail::score(const chess::Board &board, std::span<const float> base, std::span<const std::uint16_t> rows,
+		std::span<const std::uint16_t> conditions, std::span<const float> relations) {
+		if (base.size() != kFormulaCount || rows.size() != conditions.size() || rows.size() != relations.size()) {
 			throw std::invalid_argument("graybox coordinates do not match the fixed formula set");
+		}
 		thread_local Graybox::Storage storage;
 		if (++storage.generation == 0) {
 			storage.stamp.fill(0);
@@ -650,8 +742,23 @@ namespace eleginus {
 		}
 		Graybox sink{base, storage};
 		Formulas<Runtime<Graybox>>(Runtime(board, sink)).execute();
-		for (std::size_t i = 0; i < relations.size(); ++i)
-			sink.value += relations[i] * static_cast<float>(sink.score(rows[i])) * static_cast<float>(sink.condition(conditions[i]));
+		sink.value += relationScore(sink, rows, conditions, relations);
+		return sink.value;
+	}
+
+	float detail::score(const chess::Board &board, std::span<const float> base, std::span<const std::uint16_t> rows,
+		std::span<const std::uint16_t> conditions, std::span<const float> relations, const FormulaMask &active) {
+		if (base.size() != kFormulaCount || rows.size() != conditions.size() || rows.size() != relations.size()) {
+			throw std::invalid_argument("graybox coordinates do not match the fixed formula set");
+		}
+		thread_local Graybox::Storage storage;
+		if (++storage.generation == 0) {
+			storage.stamp.fill(0);
+			++storage.generation;
+		}
+		Graybox sink{base, storage, &active};
+		Formulas<Runtime<Graybox>>(Runtime(board, sink)).execute();
+		sink.value += relationScore(sink, rows, conditions, relations);
 		return sink.value;
 	}
 
@@ -667,9 +774,18 @@ namespace eleginus {
 		return detail::score(board, weights);
 	}
 
-	float FormulaSet::evaluate(
-	    const chess::Board &board, std::span<const float> base, std::span<const std::uint16_t> rows, std::span<const std::uint16_t> conditions, std::span<const float> relations) {
+	float FormulaSet::evaluate(const chess::Board &board, std::span<const float> weights, const FormulaMask &active) {
+		return detail::score(board, weights, active);
+	}
+
+	float FormulaSet::evaluate(const chess::Board &board, std::span<const float> base, std::span<const std::uint16_t> rows,
+		std::span<const std::uint16_t> conditions, std::span<const float> relations) {
 		return detail::score(board, base, rows, conditions, relations);
+	}
+
+	float FormulaSet::evaluate(const chess::Board &board, std::span<const float> base, std::span<const std::uint16_t> rows,
+		std::span<const std::uint16_t> conditions, std::span<const float> relations, const FormulaMask &active) {
+		return detail::score(board, base, rows, conditions, relations, active);
 	}
 
 } // namespace eleginus

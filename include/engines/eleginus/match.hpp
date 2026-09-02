@@ -14,7 +14,8 @@ namespace eleginus {
 	};
 
 	std::vector<chess::Board> openings(const std::filesystem::path &path);
-	int match(const Model &candidate, const Model &baseline, chess::Board board, chess::Color side, SearchOptions options, const SearchCancel &cancel);
+	int match(
+		const Model &candidate, const Model &baseline, chess::Board board, chess::Color side, SearchOptions options, const SearchCancel &cancel);
 	MatchScore confidence(const std::array<int, 5> &pairs);
 
 } // namespace eleginus

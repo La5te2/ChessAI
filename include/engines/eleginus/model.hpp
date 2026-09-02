@@ -32,6 +32,7 @@ namespace eleginus {
 		void save(const std::filesystem::path &path) const;
 
 		float score(const chess::Board &board) const;
+		float score(const chess::Board &board, const FormulaMask &active) const;
 		float score(std::span<const Feature> x) const;
 		float forward(std::span<const Feature> x, Cache &cache) const;
 		void backward(const Cache &cache, float delta, std::span<float> grad) const;
@@ -43,6 +44,7 @@ namespace eleginus {
 		bool active(std::uint16_t row, std::uint16_t condition) const;
 		void prune(float threshold);
 		std::size_t formulas() const noexcept { return kFormulaCount; }
+		FormulaMask activeFormulas() const noexcept;
 		std::span<const Relation> relations() const noexcept { return links; }
 		const std::vector<float> &params() const noexcept { return p; }
 		std::vector<float> &params() noexcept { return p; }

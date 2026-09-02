@@ -1,5 +1,5 @@
 BasedOnStyle: LLVM
-UseTab: ForIndentation
+UseTab: Always
 NamespaceIndentation: All
 IndentWidth: 4
 TabWidth: 4
@@ -11,3 +11,7 @@ SortIncludes: Never
 AlignAfterOpenBracket: DontAlign
 AlignOperands: DontAlign
 AllowShortFunctionsOnASingleLine: InlineOnly
+AllowShortIfStatementsOnASingleLine: AllIfsAndElse
+AllowShortLoopsOnASingleLine: false
+IndentPPDirectives: BeforeHash
+PPIndentWidth: 4
