@@ -59,7 +59,7 @@ Build on Windows with:
 
 The Windows build script locates Visual Studio through `vswhere`, initializes an x64 compiler environment and invokes CMake with the Ninja generator.
 
-Gadus, Melano and the graphical client can be enabled independently with `GADIDAE_BUILD_GADUS`, `GADIDAE_BUILD_MELANO` and `GADIDAE_BUILD_GRAPHICS`. Values `0` and `1` disable and enable a component.
+Gadus, Melano, Eleginus and the graphical client can be enabled independently with `GADIDAE_BUILD_GADUS`, `GADIDAE_BUILD_MELANO`, `GADIDAE_BUILD_ELEGINUS` and `GADIDAE_BUILD_GRAPHICS`. Values `0` and `1` disable and enable a component.
 
 Build on Linux with:
 
@@ -89,6 +89,9 @@ build/melano/train
 build/melano/search
 build/melano/uci
 
+build/eleginus/train
+build/eleginus/search
+build/eleginus/uci
 ```
 
 
@@ -101,9 +104,10 @@ The `preprocess`, `train` and `search` entry points provide their current argume
 ```bash
 build/gadus/search --help
 build/melano/train --help
+build/eleginus/search --help
 ```
 
-The Gadus and Melano UCI executables publish their configurable engine options in response to the UCI `uci` command rather than through `--help`.
+The Gadus, Melano and Eleginus UCI executables publish their configurable engine options in response to the UCI `uci` command rather than through `--help`.
 
 ## Commands
 
@@ -272,7 +276,7 @@ build/melano/uci \
 
 The [UCI](#uci) section describes runtime options, output fields and time management.
 
-## Eleginus
+### Eleginus
 
 Run continuous self-play training from the repository root:
 
@@ -296,9 +300,37 @@ An existing `--out` supplies the baseline and the starting training weights. `--
 
 Ctrl+C stops training or evaluation without saving progress. The accepted checkpoint contains only graybox weights and is replaced atomically. Optimizer state and training samples remain in memory and are discarded on exit. Rejected candidates do not replace the checkpoint or reset the ongoing training process.
 
+Analyze one position with Eleginus search using:
+
+```bash
+build/eleginus/search \
+	--model models/eleginus/eleginus.pth \
+	--fen "startpos" \
+	--depth 10 \
+	--hash 64 \
+	--nodes 0 \
+	--multipv 1
+```
+
+`--fen` accepts a complete FEN or the value `startpos`. A positive `--nodes` value stops the search at the requested node count, while `0` leaves the node count unbounded. `--multipv` selects the number of root lines to search and report.
+
+Launch the Eleginus UCI engine on Windows with:
+
+```powershell
+build\eleginus\uci.exe --model models\eleginus\eleginus.pth
+```
+
+The corresponding Linux command is:
+
+```bash
+build/eleginus/uci --model models/eleginus/eleginus.pth
+```
+
+The [UCI](#uci) section describes runtime options, output fields and time management.
+
 ## UCI
 
-Each architecture implements UCI time management within its own engine code. The three engines accept `go wtime`, `btime`, `winc`, `binc` and `movestogo`, and their allocation equations follow the optimum-time calculation in Stockfish's [Time Management](https://github.com/official-stockfish/Stockfish/blob/master/src/timeman.cpp). Let $t$ be the active side's remaining time in milliseconds, $i$ its increment, $o$ the `Move Overhead`, $p$ the number of plies played and $m$ the move horizon. An explicit `movestogo` sets $m$ up to a maximum of 50; otherwise $m=50$. When $t<1000$, the engines replace $m$ by $max(1,\lfloor0.05t\rfloor)$. They then compute
+Each architecture implements UCI time management within its own engine code. Gadus and Melano accept `go wtime`, `btime`, `winc`, `binc` and `movestogo`, and their allocation equations follow the optimum-time calculation in Stockfish's [Time Management](https://github.com/official-stockfish/Stockfish/blob/master/src/timeman.cpp). Let $t$ be the active side's remaining time in milliseconds, $i$ its increment, $o$ the `Move Overhead`, $p$ the number of plies played and $m$ the move horizon. An explicit `movestogo` sets $m$ up to a maximum of 50; otherwise $m=50$. When $t<1000$, the engines replace $m$ by $max(1,\lfloor0.05t\rfloor)$. They then compute
 
 $$
 T=\max\left(1,t+i(m-1)-o(2+m)\right).
@@ -427,17 +459,65 @@ setoption name Move Overhead value 10
 setoption name MultiPV value 5
 ```
 
+### Eleginus
+
+The Eleginus UCI executable loads its checkpoint when `isready` or `go` first requires evaluation. An explicit `--model` argument selects the checkpoint, while the default path is `eleginus.pth` beside the executable. The process retains the loaded model across positions and reloads it before the next search after `ModelPath` changes.
+
+Search runs on a worker thread so the protocol loop can process `stop`. A `position`, `setoption` or `ucinewgame` command first stops and joins an active search before changing engine state. Closing the UCI process also joins the worker.
+
+Eleginus reports MultiPV rows containing the completed iterative depth, the greatest visited ply as `seldepth`, the root-side score, visited nodes, NPS, elapsed time and a one-move principal variation. The static evaluator maps its dimensionless output $H(s)$ to centipawns by
+
+$$
+\operatorname{cp}(s)=
+\operatorname{round}\left(\operatorname{clip}\left(400H(s),-25000,25000\right)\right).
+$$
+
+Search may replace this finite score with a mate score. NPS is $1000n/t$, where $n$ is the number of visited principal and quiescence nodes and $t$ is elapsed time in milliseconds with a denominator of at least one millisecond.
+
+`go depth d` sets the maximum iterative depth. `go nodes N` sets a node limit, and `go movetime M` sets a deadline of $M-o$ milliseconds with a lower bound of one millisecond. In a clock-managed search, Eleginus uses
+
+$$
+t_{\mathrm{search}}=
+\operatorname{clamp}\left(
+\left\lfloor\frac{t}{30}\right\rfloor+
+\left\lfloor\frac{i}{2}\right\rfloor-o,
+1,
+\max(1,t-o)
+\right).
+$$
+
+When a command supplies more than one applicable limit, the search stops at the first reached limit. `go infinite` removes the clock deadline and leaves the search bounded by its maximum supported iterative depth or a subsequent `stop` command.
+
+Eleginus exposes these options:
+
+- `ModelPath` selects the checkpoint.
+- `Hash` sets the transposition-table capacity in MiB and defaults to `64`.
+- `Move Overhead` reserves time for communication and move submission and defaults to `10`.
+- `MultiPV` sets the number of searched and reported root lines and defaults to `1`.
+
+The transposition table belongs to one `go` command and stores depth-qualified exact, lower and upper search bounds. `MultiPV` requires additional root searches or exhaustive root scoring, so increasing it increases search work.
+
+A UCI client may configure Eleginus with commands such as:
+
+```text
+setoption name ModelPath value models/eleginus/eleginus.pth
+setoption name Hash value 256
+setoption name Move Overhead value 10
+setoption name MultiPV value 4
+```
+
 ## Scripts
 
 The `scripts/` directory contains the Windows and Linux build launchers, checkpoint inspection and graphical piece preparation.
 
 ### Checkpoint Inspection
 
-`scripts/check.py` performs a read-only inspection of a Gadus or Melano checkpoint. The report includes its architecture, heads, architecture dimensions, parameter counts, tensor data types, tensor memory, devices, finite-value status, file size and SHA-256 digest.
+`scripts/check.py` performs a read-only inspection of a Gadus, Melano or Eleginus checkpoint. Neural checkpoint reports include heads, architecture dimensions, parameter counts, tensor data types, tensor memory, devices and finite-value status. Eleginus reports include its formula and active-relation counts. Every report includes the detected architecture, file size and SHA-256 digest.
 
 ```bash
 python scripts/check.py models/gadus/gadus.pth
 python scripts/check.py models/melano/melano.pth
+python scripts/check.py models/eleginus/eleginus.pth
 ```
 
 ## Graphics
