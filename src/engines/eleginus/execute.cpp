@@ -308,7 +308,6 @@ namespace eleginus {
 									++entry.values[2 * (distance - 1) + i];
 							}
 						}
-
 					}
 					entry.valid = true;
 				}
