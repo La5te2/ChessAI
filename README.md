@@ -303,7 +303,7 @@ build\eleginus\train.exe `
 	--eval-every 1000 `
 	--depth 2 `
 	--eval-depth 4 `
-	--workers 16
+	--workers 8
 ```
 
 `--eval-every K` schedules an evaluation after every K completed training games. Training starts from the standard initial position and discards games that remain unfinished at `--max-plies` (320 by default). Discarded games do not count toward K.
