@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cctype>
 #include <filesystem>
 #include <iostream>
@@ -125,7 +126,7 @@ namespace {
 			print("id name Gadidae Eleginus");
 			print("id author La5te2");
 			print("option name ModelPath type string default " + model_path_.string());
-			print("option name Hash type spin default " + std::to_string(options_.hash_mb) + " min 1 max 4096");
+			print("option name Hash type spin default " + std::to_string(options_.hash_mb) + " min 0 max 4096");
 			print("option name MultiPV type spin default " + std::to_string(options_.multipv) + " min 1 max 256");
 			print("option name Move Overhead type spin default " + std::to_string(move_overhead_) + " min 0 max 5000");
 			print("uciok");
@@ -155,7 +156,8 @@ namespace {
 				model_path_ = value;
 				loaded_path_.clear();
 			} else if (key == "hash") {
-				options_.hash_mb = static_cast<std::size_t>(std::clamp(parse_int(value, static_cast<int>(options_.hash_mb)), 1, 4096));
+				const auto requested = static_cast<std::size_t>(std::clamp(parse_int(value, static_cast<int>(options_.hash_mb)), 0, 4096));
+				options_.hash_mb = std::bit_floor(requested);
 			} else if (key == "multipv") {
 				options_.multipv = std::clamp(parse_int(value, options_.multipv), 1, 256);
 			} else if (key == "moveoverhead") {

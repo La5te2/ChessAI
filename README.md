@@ -507,11 +507,11 @@ When a command supplies more than one applicable limit, the search stops at the 
 Eleginus exposes these options:
 
 - `ModelPath` selects the checkpoint.
-- `Hash` sets the transposition-table capacity in MiB and defaults to `64`.
+- `Hash` sets the combined cache budget in MiB and defaults to `64`. The engine rounds a requested value down to the nearest power of two. A value of `0` disables both caches, a value of `1` assigns one MiB to the transposition table, and every larger effective budget is divided equally between the transposition table and the static-evaluation cache.
 - `Move Overhead` reserves time for communication and move submission and defaults to `10`.
 - `MultiPV` sets the number of searched and reported root lines and defaults to `1`.
 
-The transposition table belongs to one `go` command and stores depth-qualified exact, lower and upper search bounds. `MultiPV` requires additional root searches or exhaustive root scoring, so increasing it increases search work.
+Both caches belong to one `go` command. The transposition table stores depth-qualified exact, lower and upper search bounds, while the static-evaluation cache reuses evaluations of repeated positions. `MultiPV` requires additional root searches or exhaustive root scoring, so increasing it increases search work.
 
 A UCI client may configure Eleginus with commands such as:
 

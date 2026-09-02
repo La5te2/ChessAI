@@ -95,7 +95,7 @@ namespace {
 			if (!std::isfinite(x)) throw std::invalid_argument("nonfinite training option");
 		}
 		if (o.out.empty() || o.book.empty() || o.every < 1 || o.discover < 1 || o.evalDepth < 1 || o.evalDepth > 64 || o.depth < 1 || o.depth > 16 ||
-			o.plies < 1 || o.plies > 320 || o.hash < 1 || o.hash > 4096 || o.workers < 1 || o.workers > 256 || o.batch < 1 || o.batch > 65536 ||
+			o.plies < 1 || o.plies > 320 || o.hash < 0 || o.hash > 4096 || o.workers < 1 || o.workers > 256 || o.batch < 1 || o.batch > 65536 ||
 			o.lr <= 0 || o.decay < 0 || o.lr * o.decay >= 1 || o.clip <= 0 || o.sparse < 0 || o.explore < 0 || o.explore > 1 || o.temp < 0 ||
 			o.log < 1) {
 			throw std::invalid_argument("invalid or incomplete Eleginus training options");

@@ -10,9 +10,6 @@
 #include <optional>
 #include <stdexcept>
 #include <utility>
-#if defined(_MSC_VER) && defined(_M_X64)
-	#include <intrin.h>
-#endif
 
 namespace eleginus {
 
@@ -29,7 +26,6 @@ namespace eleginus {
 		constexpr int kTransitionPieceLimit = 10;
 		constexpr std::array<int, 6> kPieceValues{100, 320, 330, 500, 900, 0};
 		constexpr std::size_t kBytesPerMiB = 1024U * 1024U;
-		constexpr std::size_t kEvalMiB = 32;
 
 		int toCp(float h) {
 			if (!std::isfinite(h)) throw std::runtime_error("nonfinite Eleginus evaluation");
@@ -77,35 +73,17 @@ namespace eleginus {
 
 		static_assert(sizeof(EvalEntry) == 16);
 
-		std::size_t evalMegabytes(std::size_t hashMegabytes) noexcept {
-			return std::min(kEvalMiB, std::bit_floor(hashMegabytes / 2));
-		}
-
-		#if defined(_MSC_VER) && defined(_M_X64)
-		std::size_t rangeIndex(std::uint64_t key, std::size_t size) noexcept {
-			std::uint64_t high;
-			_umul128(key, static_cast<std::uint64_t>(size), &high);
-			return static_cast<std::size_t>(high);
-		}
-		#elif defined(__SIZEOF_INT128__)
-		std::size_t rangeIndex(std::uint64_t key, std::size_t size) noexcept {
-			return static_cast<std::size_t>((static_cast<__uint128_t>(key) * size) >> 64);
-		}
-		#else
-		std::size_t rangeIndex(std::uint64_t key, std::size_t size) noexcept {
-			return static_cast<std::size_t>(key % size);
-		}
-		#endif
-
 		class Table {
 		public:
 			explicit Table(std::size_t megabytes) {
-				const auto bytes = std::max<std::size_t>(sizeof(Cluster), megabytes * kBytesPerMiB);
+				if (megabytes == 0) return;
+				const auto bytes = megabytes * kBytesPerMiB;
 				clusters.resize(bytes / sizeof(Cluster));
-				if ((clusters.size() & (clusters.size() - 1)) == 0) indexShift = 64U - std::countr_zero(static_cast<std::uint64_t>(clusters.size()));
+				indexShift = 64U - std::countr_zero(static_cast<std::uint64_t>(clusters.size()));
 			}
 
 			const Entry *probe(std::uint64_t key) const noexcept {
+				if (clusters.empty()) return nullptr;
 				for (const auto &entry : clusters[index(key)].entries) {
 					if (entry.occupied() && entry.key == key) return &entry;
 				}
@@ -115,6 +93,7 @@ namespace eleginus {
 			void advance() noexcept { ++generation; }
 
 			void store(std::uint64_t key, int depth, int score, Bound bound, chess::Move move) noexcept {
+				if (clusters.empty()) return;
 				auto &cluster = clusters[index(key)];
 				for (auto &entry : cluster.entries) {
 					if (entry.occupied() && entry.key == key) {
@@ -136,10 +115,7 @@ namespace eleginus {
 			}
 
 		private:
-			std::size_t index(std::uint64_t key) const noexcept {
-				if (indexShift != 0) return static_cast<std::size_t>(key >> indexShift);
-				return rangeIndex(key, clusters.size());
-			}
+			std::size_t index(std::uint64_t key) const noexcept { return static_cast<std::size_t>(key >> indexShift); }
 
 			int quality(const Entry &entry) const noexcept {
 				const int age = static_cast<std::uint8_t>(generation - entry.generation);
@@ -155,7 +131,7 @@ namespace eleginus {
 
 	class SearchState {
 	public:
-		explicit SearchState(std::size_t hashMegabytes) : table(hashMegabytes - evalMegabytes(hashMegabytes)) {}
+		explicit SearchState(std::size_t hashMegabytes) : table(hashMegabytes <= 1 ? hashMegabytes : hashMegabytes / 2) {}
 
 		Table table;
 		std::array<std::array<int, 64 * 64>, 2> history{};
@@ -367,7 +343,7 @@ namespace eleginus {
 		class Context {
 		public:
 			Context(const Model &model, const SearchOptions &options, SearchState &state, SearchCancel cancel)
-				: net(model), active(model.activeFormulas()), evals(evalMegabytes(options.hash_mb) * kBytesPerMiB / sizeof(EvalEntry)), opts(options),
+				: net(model), active(model.activeFormulas()), evals(options.hash_mb / 2 * kBytesPerMiB / sizeof(EvalEntry)), opts(options),
 				state(state), cancelled(std::move(cancel)), started(Clock::now()) {}
 
 			void advance() noexcept { state.table.advance(); }
@@ -723,10 +699,11 @@ namespace eleginus {
 	} // namespace
 
 	Searcher::Searcher(const Model &model, SearchOptions options) : net(&model), opts(options) {
-		if (options.depth <= 0 || options.depth > 64 || options.quiescence_depth < 0 || options.quiescence_depth > 32 || options.hash_mb == 0 ||
-			options.hash_mb > 4096 || options.multipv <= 0 || options.multipv > 256) {
+		if (options.depth <= 0 || options.depth > 64 || options.quiescence_depth < 0 || options.quiescence_depth > 32 || options.hash_mb > 4096 ||
+			options.multipv <= 0 || options.multipv > 256) {
 			throw std::invalid_argument("Eleginus search options are outside the supported range");
 		}
+		opts.hash_mb = std::bit_floor(opts.hash_mb);
 		state = std::make_unique<SearchState>(opts.hash_mb);
 	}
 
