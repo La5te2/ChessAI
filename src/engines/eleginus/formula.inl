@@ -191,9 +191,11 @@ FORMULA(mobility) {
 	}
 }
 
-inline static constexpr std::array<float, 14> piecesInitial{{
+inline static constexpr std::array<float, 34> piecesInitial{{
 	0.03F, 0.03F, -0.007F, -0.014F, -0.007F, 0.015F, 0.095F, 0.065F, 0.1F, 0.065F,
-	0.11F, 0.11F, 0.01F, 0.008F
+	0.11F, 0.11F, 0.01F, 0.008F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F,
+	0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F,
+	0.0F, 0.0F, 0.0F, 0.0F
 }};
 
 FORMULA(pieces) {
@@ -267,6 +269,34 @@ FORMULA(pieces) {
 	const auto space = [&](IS role, IS opponent) { return b.POP(b.AND(b.AND(b.attacks(role), b.REL(role, center)), b.NOT(pawnAttacks(opponent)))); };
 	// Safely controlled squares in the normalized central space region.
 	F(diff(space(us, them), space(them, us)));
+
+	// Knights and bishops placed immediately behind an enemy pawn.
+	for (int type = 1; type <= 2; ++type) {
+		const auto friendly = b.POP(b.AND(b.PCS(us, type), b.SH(b.PCS(them, 0), them, 0)));
+		const auto enemy = b.POP(b.AND(b.PCS(them, type), b.SH(b.PCS(us, 0), us, 0)));
+		F(diff(friendly, enemy));
+	}
+
+	const auto bishopContext = [&](IS role) {
+		std::array<std::array<int, 9>, 2> values{};
+		const Word pawns = b.PCS(role, 0).bits;
+		const Word defended = pawnAttacks(role).bits;
+		const Word earlyCenter = b.REL(role, central & (rankMask(1) | rankMask(2))).bits;
+		const int blocked = std::popcount(pawns & b.SH(occ, role, 1).bits & earlyCenter);
+		for (int square : b.locations(b.PCS(role, 2))) {
+			const Word colorMask = (light & (1ULL << square)) != 0 ? light : ~light;
+			const int sameColorPawns = std::popcount(pawns & colorMask);
+			values[0][sameColorPawns] += (defended & (1ULL << square)) == 0;
+			values[1][sameColorPawns] += blocked;
+		}
+		return values;
+	};
+	const auto friendlyBishops = bishopContext(us);
+	const auto enemyBishops = bishopContext(them);
+	// Each same-color-pawn bucket retains its joint relation with pawn protection and blocked central pawns.
+	for (unsigned state = 0; state < friendlyBishops.size(); ++state)
+		for (unsigned bucket = 0; bucket < friendlyBishops[state].size(); ++bucket)
+			F(diff(b.NUM(friendlyBishops[state][bucket]), b.NUM(enemyBishops[state][bucket])));
 }
 
 inline static constexpr std::array<float, 32> threatsInitial{{
@@ -333,11 +363,18 @@ FORMULA(threats) {
 	}
 }
 
-inline static constexpr std::array<float, 35> kingsInitial{{
+inline static constexpr std::array<float, 108> kingsInitial{{
 	0.0125F, 0.0045F, 0.006F, 0.025F, 0.009F, 0.012F, 0.025F, 0.009F, 0.012F, 0.03125F,
 	0.01125F, 0.015F, 0.04375F, 0.01575F, 0.021F, 0.0025F, 0.005F, 0.0075F, 0.01F, 0.015F,
 	0.005625F, 0.0045F, 0.00375F, 0.003F, 0.001875F, 0.0015F, -0.0275F, 0.0015F, 0.002F, 0.003F,
-	0.004F, 0.01F, -0.005F, 0.015F, 0.01F
+	0.004F, 0.01F, -0.005F, 0.015F, 0.01F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F,
+	0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F,
+	0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F,
+	0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F,
+	0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F,
+	0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F,
+	0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F,
+	0.0F, 0.0F, 0.0F
 }};
 
 FORMULA(kings) {
@@ -389,10 +426,54 @@ FORMULA(kings) {
 		const auto enemyright = b.CR(them, wing);
 		F(diff(friendlyright, enemyright));
 	}
+
+	struct ShelterSignals {
+		std::array<int, 32> own{};
+		std::array<int, 32> storm{};
+		std::array<int, 8> blocked{};
+	};
+	const auto shelter = [&](IS role, IS opponent) {
+		ShelterSignals values;
+		const Word ownPawns = b.REL(role, b.PCS(role, 0).bits & ~pawnAttacks(opponent).bits).bits;
+		const Word enemyPawns = b.REL(role, b.PCS(opponent, 0).bits).bits;
+		for (int square : b.squares(role, 5)) {
+			const int rank = square / 8;
+			const int center = std::clamp(square % 8, 1, 6);
+			const Word fromRank = ~((1ULL << (8 * rank)) - 1);
+			for (int file = center - 1; file <= center + 1; ++file) {
+				const Word mask = fileMask(file);
+				const Word own = ownPawns & mask & fromRank;
+				const Word enemy = enemyPawns & mask & fromRank;
+				const int ownRank = own ? std::countr_zero(own) / 8 : 0;
+				const int enemyRank = enemy ? std::countr_zero(enemy) / 8 : 0;
+				const int edge = std::min(file, 7 - file);
+				++values.own[8 * edge + ownRank];
+				if (ownRank != 0 && ownRank == enemyRank - 1)
+					++values.blocked[enemyRank];
+				else
+					++values.storm[8 * edge + enemyRank];
+			}
+		}
+		return values;
+	};
+	const auto friendlyShelter = shelter(us, them);
+	const auto enemyShelter = shelter(them, us);
+	// Complete shelter and storm geometry: king-edge group crossed with nearest pawn rank.
+	for (unsigned i = 0; i < friendlyShelter.own.size(); ++i)
+		F(diff(b.NUM(friendlyShelter.own[i]), b.NUM(enemyShelter.own[i])));
+	for (unsigned i = 0; i < friendlyShelter.storm.size(); ++i)
+		F(diff(b.NUM(friendlyShelter.storm[i]), b.NUM(enemyShelter.storm[i])));
+	// Blocked pawn storms retain the enemy pawn's normalized rank.
+	for (unsigned i = 0; i < friendlyShelter.blocked.size(); ++i)
+		F(diff(b.NUM(friendlyShelter.blocked[i]), b.NUM(enemyShelter.blocked[i])));
+	// Queen absence remains available as an independent condition for learned king-safety interactions.
+	F(diff(fnoqueen, enoqueen));
 }
 
-inline static constexpr std::array<float, 8> endgamesInitial{{
-	-0.05F, -0.15F, 0.002F, -0.005F, 0.007F, 0.02F, 0.006F, 0.0125F
+inline static constexpr std::array<float, 22> endgamesInitial{{
+	-0.05F, -0.15F, 0.002F, -0.005F, 0.007F, 0.02F, 0.006F, 0.0125F, 0.0F, 0.0F,
+	0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F,
+	0.0F, 0.0F
 }};
 
 FORMULA(endgames) {
@@ -434,6 +515,46 @@ FORMULA(endgames) {
 	const auto strongpassers = diff(b.MUL(positive, b.POP(passedPawns(us, them))), b.MUL(negative, b.POP(passedPawns(them, us))));
 	// Passed pawns of the stronger side in opposite-colored-bishop endings.
 	F(b.MUL(b.LAND(b.LAND(onefb, oneeb), opposite), strongpassers));
+
+	const auto sidePhase = [&](IS role) {
+		return b.ADD(b.ADD(b.POP(b.PCS(role, 1)), b.POP(b.PCS(role, 2))),
+		    b.ADD(b.MUL(b.NUM(2), b.POP(b.PCS(role, 3))), b.MUL(b.NUM(4), b.POP(b.PCS(role, 4)))));
+	};
+	const auto fphase = sidePhase(us);
+	const auto ephase = sidePhase(them);
+	const auto otherPieces = b.ADD(b.ADD(b.POP(b.PCS(us, 1)), b.POP(b.PCS(them, 1))),
+	    b.ADD(b.ADD(b.POP(b.PCS(us, 3)), b.POP(b.PCS(them, 3))), b.ADD(b.POP(b.PCS(us, 4)), b.POP(b.PCS(them, 4)))));
+	const auto pureOpposite = b.LAND(b.LAND(b.LAND(onefb, oneeb), opposite), b.EQ(otherPieces, z));
+	const auto mixedOpposite = b.LAND(b.LAND(b.LAND(onefb, oneeb), opposite), b.GT(otherPieces, z));
+	const auto strongPhase = b.ADD(b.MUL(positive, fphase), b.MUL(negative, ephase));
+	const auto weakPhase = b.ADD(b.MUL(positive, ephase), b.MUL(negative, fphase));
+	const auto strongPawnCount = b.ADD(b.MUL(positive, fpawns), b.MUL(negative, epawns));
+	const auto weakPawnCount = b.ADD(b.MUL(positive, epawns), b.MUL(negative, fpawns));
+	const auto strongPawnLead = b.GE(strongPawnCount, b.ADD(weakPawnCount, b.NUM(2)));
+	IS friendlyPieces = z;
+	IS enemyPieces = z;
+	for (int type = 0; type < 5; ++type) {
+		friendlyPieces = b.ADD(friendlyPieces, b.POP(b.PCS(us, type)));
+		enemyPieces = b.ADD(enemyPieces, b.POP(b.PCS(them, type)));
+	}
+	const auto strongPieceCount = b.ADD(b.MUL(positive, friendlyPieces), b.MUL(negative, enemyPieces));
+	const auto missingStrongPawns = b.SUB(b.NUM(8), strongPawnCount);
+	// Symmetric state signals serve as graybox conditions for the public endgame scaling knowledge.
+	for (const auto signal : {pureOpposite, mixedOpposite, strongPhase, weakPhase, weakPawnCount, strongPawnLead, strongPieceCount,
+	         b.MUL(missingStrongPawns, missingStrongPawns)})
+		F(diff(signal, signal));
+
+	const auto pawnlessStrong = b.EQ(strongPawnCount, z);
+	const auto thinPhase = b.LE(b.SUB(strongPhase, weakPhase), o);
+	const auto strongBelowTwo = b.LT(strongPhase, b.NUM(2));
+	const auto weakAtMostOne = b.LE(weakPhase, o);
+	const auto pawnlessBare = b.LAND(b.LAND(pawnlessStrong, thinPhase), strongBelowTwo);
+	const auto pawnlessWeak = b.LAND(b.LAND(b.LAND(pawnlessStrong, thinPhase), b.LNOT(strongBelowTwo)), weakAtMostOne);
+	const auto pawnlessOther = b.LAND(b.LAND(b.LAND(pawnlessStrong, thinPhase), b.LNOT(strongBelowTwo)), b.LNOT(weakAtMostOne));
+	const auto strongPasserCount = b.ADD(b.MUL(positive, b.POP(passedPawns(us, them))), b.MUL(negative, b.POP(passedPawns(them, us))));
+	for (const auto signal : {pawnlessBare, pawnlessWeak, pawnlessOther, b.MUL(pureOpposite, strongPasserCount),
+	         b.MUL(pureOpposite, strongPawnLead), b.MUL(mixedOpposite, strongPieceCount)})
+		F(diff(signal, signal));
 }
 
 inline static constexpr auto initialWeights = [] {

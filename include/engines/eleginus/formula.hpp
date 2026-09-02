@@ -6,7 +6,7 @@
 #include <vector>
 
 namespace eleginus {
-	inline constexpr std::size_t kFormulaCount = 622;
+	inline constexpr std::size_t kFormulaCount = 729;
 
 	// A formula coordinate is an integer, directional HCE signal. Zero coordinates are omitted.
 	struct Feature {
