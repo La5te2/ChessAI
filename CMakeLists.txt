@@ -12,15 +12,15 @@ if(NOT GADIDAE_BUILD_GADUS AND NOT GADIDAE_BUILD_MELANO AND NOT GADIDAE_BUILD_EL
 endif()
 
 set(GADIDAE_NEEDS_TORCH OFF)
-if(GADIDAE_BUILD_GADUS OR GADIDAE_BUILD_MELANO OR GADIDAE_BUILD_ELEGINUS)
+if(GADIDAE_BUILD_GADUS OR GADIDAE_BUILD_MELANO)
 	set(GADIDAE_NEEDS_TORCH ON)
 endif()
 set(GADIDAE_NEEDS_HDF5 OFF)
-if(GADIDAE_BUILD_GADUS OR GADIDAE_BUILD_MELANO OR GADIDAE_BUILD_ELEGINUS)
+if(GADIDAE_BUILD_GADUS OR GADIDAE_BUILD_MELANO)
 	set(GADIDAE_NEEDS_HDF5 ON)
 endif()
 set(GADIDAE_NEEDS_ZLIB OFF)
-if(GADIDAE_BUILD_GADUS OR GADIDAE_BUILD_MELANO OR GADIDAE_BUILD_ELEGINUS OR GADIDAE_BUILD_GRAPHICS)
+if(GADIDAE_BUILD_GADUS OR GADIDAE_BUILD_MELANO OR GADIDAE_BUILD_GRAPHICS)
 	set(GADIDAE_NEEDS_ZLIB ON)
 endif()
 
@@ -111,7 +111,7 @@ if(MSVC AND GADIDAE_NEEDS_TORCH)
 		message(FATAL_ERROR "No LibTorch runtime DLLs found in ${GADIDAE_TORCH_DIR}/lib")
 	endif()
 	add_custom_target(torchruntime ALL COMMENT "Copying LibTorch runtime")
-	foreach(architecture IN ITEMS gadus melano eleginus)
+	foreach(architecture IN ITEMS gadus melano)
 		string(TOUPPER "${architecture}" architecture_upper)
 		if(GADIDAE_BUILD_${architecture_upper})
 			add_custom_command(TARGET torchruntime POST_BUILD
@@ -129,8 +129,6 @@ add_library(eleginus
 	src/engines/eleginus/execute.cpp
 	src/engines/eleginus/formula.inl
 	src/engines/eleginus/game.cpp
-	src/engines/eleginus/model.cpp
-	src/engines/eleginus/match.cpp
 	src/engines/eleginus/searcher.cpp
 )
 set_target_properties(eleginus PROPERTIES
@@ -167,24 +165,8 @@ function(eleginusexecutable name source)
 	target_link_libraries(${target} PRIVATE eleginus)
 endfunction()
 
-eleginusexecutable(train src/engines/eleginus/train.cpp)
 eleginusexecutable(search src/engines/eleginus/search.cpp)
 eleginusexecutable(uci src/engines/eleginus/uci.cpp)
-eleginusexecutable(preprocess src/engines/eleginus/preprocess.cpp)
-target_include_directories(eleginustrain SYSTEM PRIVATE ${HDF5_INCLUDE_DIRS})
-target_compile_definitions(eleginustrain PRIVATE H5_USE_110_API)
-target_include_directories(eleginuspreprocess SYSTEM PRIVATE "${GADIDAE_API_DIR}/nlohmann/include" ${HDF5_INCLUDE_DIRS})
-target_compile_definitions(eleginuspreprocess PRIVATE H5_USE_110_API)
-if(MSVC)
-	target_link_libraries(eleginustrain PRIVATE ${TORCH_LIBRARIES} ${HDF5_LIBRARIES} "${GADIDAE_ZLIB_STATIC}" Shlwapi)
-	target_link_libraries(eleginuspreprocess PRIVATE ${HDF5_LIBRARIES} "${GADIDAE_ZLIB_STATIC}" Shlwapi)
-else()
-	target_link_libraries(eleginustrain PRIVATE ${TORCH_LIBRARIES} ${HDF5_LIBRARIES} ZLIB::ZLIB)
-	target_link_libraries(eleginuspreprocess PRIVATE ${HDF5_LIBRARIES} ZLIB::ZLIB)
-endif()
-if(MSVC)
-	add_dependencies(eleginustrain torchruntime)
-endif()
 
 add_executable(eleginustests src/engines/eleginus/tests.cpp)
 set_target_properties(eleginustests PROPERTIES

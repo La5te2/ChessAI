@@ -5,6 +5,7 @@ __pycache__/
 /.vscode/
 /api/*
 /build/*
+/references/
 !/api/patch.cmake
 !/api/setup.bat
 !/api/setup.sh

@@ -42,17 +42,13 @@ set "VERIFY_ZLIB=OFF"
 set "VERIFY_JSON=OFF"
 if "%BUILD_GADUS%"=="ON" set "VERIFY_TORCH=ON"
 if "%BUILD_MELANO%"=="ON" set "VERIFY_TORCH=ON"
-if "%BUILD_ELEGINUS%"=="ON" set "VERIFY_TORCH=ON"
 if "%BUILD_GADUS%"=="ON" set "VERIFY_HDF5=ON"
 if "%BUILD_MELANO%"=="ON" set "VERIFY_HDF5=ON"
-if "%BUILD_ELEGINUS%"=="ON" set "VERIFY_HDF5=ON"
 if "%BUILD_GADUS%"=="ON" set "VERIFY_ZLIB=ON"
 if "%BUILD_MELANO%"=="ON" set "VERIFY_ZLIB=ON"
-if "%BUILD_ELEGINUS%"=="ON" set "VERIFY_ZLIB=ON"
 if "%BUILD_GRAPHICS%"=="ON" set "VERIFY_ZLIB=ON"
 if "%BUILD_GADUS%"=="ON" set "VERIFY_JSON=ON"
 if "%BUILD_MELANO%"=="ON" set "VERIFY_JSON=ON"
-if "%BUILD_ELEGINUS%"=="ON" set "VERIFY_JSON=ON"
 if "%BUILD_GRAPHICS%"=="ON" set "VERIFY_JSON=ON"
 if not exist "%NINJA%" (
 	echo Ninja is missing. Run api\setup.bat first.
@@ -118,12 +114,10 @@ if "%BUILD_MELANO%"=="ON" (
 )
 
 if "%BUILD_ELEGINUS%"=="ON" (
-	for %%F in (preprocess train search uci) do (
+	for %%F in (search uci) do (
 		if not exist "%WORK_DIR%\eleginus\%%F.exe" goto :failed
 		copy /y "%WORK_DIR%\eleginus\%%F.exe" "%PUBLISH_DIR%\eleginus\%%F.exe" >nul || goto :failed
 	)
-	for %%F in ("%WORK_DIR%\eleginus\*.dll") do copy /y "%%~fF" "%PUBLISH_DIR%\eleginus\%%~nxF" >nul || goto :failed
-	if exist "%ROOT_DIR%\models\eleginus\eleginus.pth" copy /y "%ROOT_DIR%\models\eleginus\eleginus.pth" "%PUBLISH_DIR%\eleginus\eleginus.pth" >nul || goto :failed
 )
 
 if "%BUILD_GRAPHICS%"=="ON" (

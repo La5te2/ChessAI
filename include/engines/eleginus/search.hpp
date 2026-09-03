@@ -1,6 +1,6 @@
 #pragma once
 
-#include "eleginus/model.hpp"
+#include "chess.hpp"
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -15,13 +15,11 @@ namespace eleginus {
 		std::uint64_t node_limit = 0;
 		int movetime_ms = 0;
 		int multipv = 1;
-		bool collect_leaf = false;
 	};
 
 	struct RootMove {
 		chess::Move move{chess::Move::NO_MOVE};
 		int score_cp = 0;
-		std::uint64_t nodes = 0;
 	};
 
 	struct SearchResult {
@@ -30,10 +28,8 @@ namespace eleginus {
 		int depth = 0;
 		int selective_depth = 0;
 		std::uint64_t nodes = 0;
-		std::uint64_t evaluated_nodes = 0;
 		std::uint64_t elapsed_ms = 0;
 		std::vector<RootMove> root;
-		std::vector<Feature> leaf;
 	};
 
 	using SearchProgress = std::function<void(const SearchResult &)>;
@@ -43,7 +39,7 @@ namespace eleginus {
 
 	class Searcher {
 	public:
-		explicit Searcher(const Model &model, SearchOptions options = {});
+		explicit Searcher(SearchOptions options = {});
 		~Searcher();
 		Searcher(Searcher &&) noexcept;
 		Searcher &operator=(Searcher &&) noexcept;
@@ -53,7 +49,6 @@ namespace eleginus {
 		SearchResult search(const chess::Board &board, const SearchProgress &progress = {}, const SearchCancel &cancel = {});
 
 	private:
-		const Model *net;
 		SearchOptions opts;
 		std::unique_ptr<SearchState> state;
 	};

@@ -1,28 +1,17 @@
 #include "eleginus/game.hpp"
-#include "eleginus/model.hpp"
 #include "eleginus/search.hpp"
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <bit>
 #include <cctype>
-#include <filesystem>
 #include <iostream>
 #include <mutex>
-#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
-
-#if defined(_WIN32)
-	#define NOMINMAX
-	#include <windows.h>
-#elif defined(__linux__)
-	#include <unistd.h>
-#endif
 
 namespace {
 
@@ -57,26 +46,8 @@ namespace {
 		}
 	}
 
-	std::filesystem::path executable_directory(const char *argument_zero) {
-		#if defined(_WIN32)
-		std::array<wchar_t, 32768> buffer{};
-		const DWORD length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
-		if (length > 0 && length < buffer.size()) return std::filesystem::path(std::wstring_view(buffer.data(), length)).parent_path();
-		#elif defined(__linux__)
-		std::array<char, 4096> buffer{};
-		const auto length = readlink("/proc/self/exe", buffer.data(), buffer.size());
-		if (length > 0 && static_cast<std::size_t>(length) < buffer.size()) {
-			return std::filesystem::path(std::string_view(buffer.data(), static_cast<std::size_t>(length))).parent_path();
-		}
-		#endif
-		std::error_code error;
-		const auto absolute = std::filesystem::absolute(argument_zero, error);
-		return error ? std::filesystem::current_path() : absolute.parent_path();
-	}
-
 	class Engine {
 	public:
-		explicit Engine(std::filesystem::path model_path) : model_path_(std::move(model_path)) {}
 		~Engine() { stop(); }
 
 		void loop() {
@@ -88,7 +59,6 @@ namespace {
 					if (command == "uci") {
 						identity();
 					} else if (command == "isready") {
-						load_model();
 						print("readyok");
 					} else if (command == "setoption") {
 						stop();
@@ -125,18 +95,10 @@ namespace {
 		void identity() const {
 			print("id name Gadidae Eleginus");
 			print("id author La5te2");
-			print("option name ModelPath type string default " + model_path_.string());
 			print("option name Hash type spin default " + std::to_string(options_.hash_mb) + " min 0 max 4096");
 			print("option name MultiPV type spin default " + std::to_string(options_.multipv) + " min 1 max 256");
 			print("option name Move Overhead type spin default " + std::to_string(move_overhead_) + " min 0 max 5000");
 			print("uciok");
-		}
-
-		void load_model() {
-			if (model_ && loaded_path_ == model_path_) return;
-			if (model_path_.empty()) throw std::runtime_error("ModelPath is empty");
-			model_.emplace(eleginus::Model::load(model_path_));
-			loaded_path_ = model_path_;
 		}
 
 		void stop() {
@@ -152,10 +114,7 @@ namespace {
 			const auto name = trim(line.substr(name_at + 6, value_at == std::string::npos ? std::string::npos : value_at - name_at - 6));
 			const auto value = value_at == std::string::npos ? std::string() : trim(line.substr(value_at + 7));
 			const auto key = normalized(name);
-			if (key == "modelpath") {
-				model_path_ = value;
-				loaded_path_.clear();
-			} else if (key == "hash") {
+			if (key == "hash") {
 				const auto requested = static_cast<std::size_t>(std::clamp(parse_int(value, static_cast<int>(options_.hash_mb)), 0, 4096));
 				options_.hash_mb = std::bit_floor(requested);
 			} else if (key == "multipv") {
@@ -234,7 +193,6 @@ namespace {
 
 		void go(const std::string &line) {
 			stop();
-			load_model();
 			if (eleginus::isGameOver(board_)) {
 				print("bestmove 0000");
 				return;
@@ -248,7 +206,7 @@ namespace {
 			stop_requested_ = false;
 			worker_ = std::thread([this, board, search_options] {
 				try {
-					eleginus::Searcher searcher(*model_, search_options);
+					eleginus::Searcher searcher(search_options);
 					const auto result = searcher.search(
 						board, [this](const eleginus::SearchResult &partial) { emit_info(partial); }, [this] { return stop_requested_.load(); });
 					print("bestmove " + (result.move.move() == chess::Move::NO_MOVE ? fallback_move() : eleginus::moveToUci(result.move)));
@@ -264,9 +222,6 @@ namespace {
 			return moves.empty() ? "0000" : eleginus::moveToUci(moves.front());
 		}
 
-		std::filesystem::path model_path_;
-		std::filesystem::path loaded_path_;
-		std::optional<eleginus::Model> model_;
 		eleginus::SearchOptions options_;
 		chess::Board board_;
 		int move_overhead_ = 10;
@@ -276,14 +231,9 @@ namespace {
 
 } // namespace
 
-int main(int argc, char **argv) {
+int main() {
 	try {
-		std::filesystem::path model_path = executable_directory(argv[0]) / "eleginus.pth";
-		for (int index = 1; index < argc; ++index) {
-			if (std::string(argv[index]) == "--model" && index + 1 < argc) model_path = argv[++index];
-			else throw std::invalid_argument("usage: uci [--model eleginus.pth]");
-		}
-		Engine(std::move(model_path)).loop();
+		Engine().loop();
 		return 0;
 	} catch (const std::exception &error) {
 		std::cerr << "uci error: " << error.what() << '\n';

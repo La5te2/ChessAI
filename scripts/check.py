@@ -2,16 +2,9 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import math
-import struct
 import sys
-from array import array
 from collections import Counter
 from pathlib import Path
-
-ELEGINUS_MAGIC = b"ELEGINUS"
-ELEGINUS_TYPE_ID = 3
-ELEGINUS_HEADER = struct.Struct("=8sII")
 
 ARCHITECTURES = {
     1: {
@@ -94,40 +87,6 @@ def format_mib(byte_count: int) -> str:
     return f"{byte_count / (1024 * 1024):.2f} MiB"
 
 
-def inspect_eleginus(path: Path) -> dict[str, object] | None:
-    with path.open("rb") as stream:
-        header = stream.read(ELEGINUS_HEADER.size)
-        if header[:8] != ELEGINUS_MAGIC:
-            return None
-        if len(header) != ELEGINUS_HEADER.size:
-            raise ValueError("truncated Eleginus checkpoint header")
-        _, type_id, n = ELEGINUS_HEADER.unpack(header)
-        if type_id != ELEGINUS_TYPE_ID or n == 0:
-            raise ValueError("inconsistent Eleginus dimensions")
-        relations = n * n
-        expected = ELEGINUS_HEADER.size + (n + relations) * 4
-        if path.stat().st_size != expected:
-            raise ValueError("Eleginus checkpoint size does not match its parameter dimensions")
-        weights = array("f")
-        weights.fromfile(stream, n + relations)
-
-    count = n + relations
-    return {
-        "architecture": "eleginus",
-        "heads": "hand-crafted network value",
-        "arch": {"type_id": type_id, "formulas": n, "relations": relations},
-        "model_children": "base, relations",
-        "parameters": count,
-        "trainable_parameters": count,
-        "parameter_tensors": 2,
-        "buffers": 0,
-        "tensor_memory": count * 4,
-        "dtypes": "float32 (2)",
-        "devices": "cpu",
-        "finite": all(math.isfinite(weight) for weight in weights),
-    }
-
-
 def inspect_libtorch(path: Path) -> dict[str, object]:
     torch = load_torch()
     try:
@@ -176,13 +135,12 @@ def inspect_libtorch(path: Path) -> dict[str, object]:
 
 
 def inspect_model(path: Path) -> dict[str, object]:
-    eleginus = inspect_eleginus(path)
-    return eleginus if eleginus is not None else inspect_libtorch(path)
+    return inspect_libtorch(path)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Inspect a Gadidae checkpoint and detect its architecture."
+        description="Inspect a Gadus or Melano checkpoint and detect its architecture."
     )
     parser.add_argument("model", type=Path, metavar="checkpoint")
     return parser.parse_args()
