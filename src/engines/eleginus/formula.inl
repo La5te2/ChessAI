@@ -1,5 +1,3 @@
-#ifdef ELEGINUS_FORMULAS
-
 inline static constexpr std::array<float, 1> tempoWeights{{
 	0.16F
 }};
@@ -579,5 +577,3 @@ inline static constexpr auto formulaWeights = [] {
 	append(endgamesWeights);
 	return values;
 }();
-
-#endif

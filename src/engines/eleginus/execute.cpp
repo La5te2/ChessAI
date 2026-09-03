@@ -465,11 +465,9 @@ namespace eleginus {
 			using Sum = typename B::Sum;
 			using Pair = std::array<std::optional<IS>, 2>;
 
-		#define ELEGINUS_FORMULAS
 		#define FORMULA(name) void name()
 		#include "formula.inl"
 		#undef FORMULA
-		#undef ELEGINUS_FORMULAS
 
 		public:
 			explicit Formulas(B runtime) : b(std::move(runtime)) {
