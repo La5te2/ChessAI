@@ -10,49 +10,66 @@
 namespace eleginus {
 
 	inline constexpr std::uint32_t kArchitectureType = 3;
-	inline constexpr std::size_t kRelationLimit = 2048;
-
-	struct Relation {
-		std::uint16_t row = 0;
-		std::uint16_t condition = 0;
-	};
+	inline constexpr float kCentipawnsPerLogit = 150.0F;
+	inline constexpr std::size_t kRelationCount = kFormulaCount * kFormulaCount;
+	inline constexpr std::size_t kParameterCount = kFormulaCount + kRelationCount;
+	int centipawns(float h);
 
 	class Model {
 	public:
-		struct Cache {
-			std::array<float, kFormulaCount> score{};
-			std::array<float, kFormulaCount> condition{};
-			std::array<std::uint16_t, kFormulaCount> active{};
-			std::uint16_t count = 0;
-		};
-
 		Model();
 		static std::span<const float> initial() noexcept;
 		static Model load(const std::filesystem::path &path);
 		void save(const std::filesystem::path &path) const;
 
 		float score(const chess::Board &board) const;
-		float score(const chess::Board &board, const FormulaMask &active) const;
 		float score(std::span<const Feature> x) const;
-		float forward(std::span<const Feature> x, Cache &cache) const;
-		void backward(const Cache &cache, float delta, std::span<float> grad) const;
-		void weights(std::span<const Feature> x, std::vector<float> &out) const;
 		int centipawns(const chess::Board &board) const;
 		void extract(const chess::Board &board, std::vector<Feature> &out) const;
 
-		bool activate(std::uint16_t row, std::uint16_t condition);
-		bool active(std::uint16_t row, std::uint16_t condition) const;
-		void prune(float threshold);
 		std::size_t formulas() const noexcept { return kFormulaCount; }
-		FormulaMask activeFormulas() const noexcept;
-		std::span<const Relation> relations() const noexcept { return links; }
+		std::size_t relationIndex(std::size_t row, std::size_t condition) const;
+		std::span<const float> base() const noexcept { return {p.data(), kFormulaCount}; }
+		std::span<const float> relations() const noexcept { return {p.data() + kFormulaCount, kRelationCount}; }
 		const std::vector<float> &params() const noexcept { return p; }
-		std::vector<float> &params() noexcept { return p; }
+		void update(std::span<const float> values);
+		bool columnActive(std::size_t condition) const noexcept { return activeColumns[condition] != 0; }
 
 	private:
+		void indexRelations() noexcept;
 		std::vector<float> p;
-		std::vector<Relation> links;
-		std::vector<std::uint16_t> rows, conditions;
+		std::array<std::uint8_t, kFormulaCount> activeColumns{};
+	};
+
+	class Accumulator {
+	public:
+		explicit Accumulator(const Model &model);
+		void reset(const chess::Board &board);
+		void push();
+		void pop();
+		float score(const chess::Board &board);
+
+	private:
+		struct Change {
+			std::uint16_t index;
+			float score;
+			float condition;
+		};
+
+		void extract(const chess::Board &board);
+		void addColumn(std::size_t condition, float scale);
+		void refresh(const chess::Board &board);
+
+		const Model &net;
+		std::array<float, kFormulaCount> scores{};
+		std::array<float, kFormulaCount> conditions{};
+		std::array<float, kFormulaCount> dynamic{};
+		std::array<float, kFormulaCount> nextScores{};
+		std::array<float, kFormulaCount> nextConditions{};
+		std::vector<Feature> features;
+		std::vector<Change> changes;
+		std::vector<std::size_t> frames;
+		std::vector<std::uint8_t> materialized;
 	};
 
 } // namespace eleginus

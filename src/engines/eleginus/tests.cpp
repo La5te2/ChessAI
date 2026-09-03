@@ -18,33 +18,43 @@ namespace {
 		require(eleginus::Model::initial().size() == eleginus::kFormulaCount, "initial formula weights have the wrong dimensions");
 		std::vector<eleginus::Feature> x;
 		model.extract(chess::Board("r3k2r/ppp2ppp/2n1bn2/3qp3/3P4/2N1BN2/PPP2PPP/R2Q1RK1 b kq - 3 11"), x);
-		for (std::size_t i = 0; i < 24 && i + 3 < x.size(); ++i) {
-			model.activate(x[i + 2].index, x[(5 * i + 3) % x.size()].index);
-		}
-		require(x.size() > 1 && model.activate(x[0].index, x[1].index), "cannot activate a graybox relation");
-		require(model.relations().size() > 8, "graybox SIMD test needs a complete vector batch");
-		auto &p = model.params();
+		require(x.size() > 1, "network gradient test needs two active formulas");
+		auto p = model.params();
 		for (std::size_t i = model.formulas(); i < p.size(); ++i) {
 			p[i] = (i & 1U) == 0 ? 0.0003F : -0.0002F;
 		}
-		eleginus::Model::Cache cache;
-		const float score = model.forward(x, cache);
+		model.update(p);
+		const float score = model.score(x);
 		std::vector<float> grad(p.size());
-		model.backward(cache, 1.0F, grad);
-		for (const std::size_t i : {static_cast<std::size_t>(x.front().index), p.size() - 1}) {
-			require(std::abs(grad[i]) > 1.0e-7F, "a graybox parameter has no gradient");
+		for (const auto &row : x) {
+			grad[row.index] += static_cast<float>(row.score);
+			for (const auto &condition : x) {
+				grad[model.relationIndex(row.index, condition.index)] += static_cast<float>(row.score) * condition.condition;
+			}
+		}
+		const auto relation = model.relationIndex(x.front().index, x.back().index);
+		for (const std::size_t i : {static_cast<std::size_t>(x.front().index), relation}) {
+			require(std::abs(grad[i]) > 1.0e-7F, "a network parameter has no gradient");
 			const auto saved = p[i];
 			constexpr float eps = 0.001F;
 			p[i] = saved + eps;
+			model.update(p);
 			const float plus = model.score(x);
 			p[i] = saved - eps;
+			model.update(p);
 			const float minus = model.score(x);
 			p[i] = saved;
+			model.update(p);
 			const float numerical = (plus - minus) / (2.0F * eps);
 			require(std::abs(numerical - grad[i]) < 0.002F * (1 + std::abs(grad[i])), "native backward failed finite differences");
 		}
-		std::vector<float> w;
-		model.weights(x, w);
+		std::vector<float> w(model.base().begin(), model.base().end());
+		for (const auto &condition : x) {
+			const auto offset = static_cast<std::size_t>(condition.index) * eleginus::kFormulaCount;
+			for (std::size_t row = 0; row < eleginus::kFormulaCount; ++row) {
+				w[row] += model.relations()[offset + row] * static_cast<float>(condition.condition);
+			}
+		}
 		float explicitScore = 0;
 		for (const auto &f : x) {
 			explicitScore += w[f.index] * static_cast<float>(f.score);
@@ -56,6 +66,7 @@ namespace {
 		for (std::size_t i = 0; i < p.size(); ++i) {
 			p[i] -= 1.0e-4F * delta * grad[i];
 		}
+		model.update(p);
 		require(bce(model.score(x)) < bce(score), "native gradient does not decrease BCE");
 
 		// Repeated pawn keys must not retain king/occupancy/turn-dependent results.
@@ -84,27 +95,58 @@ namespace {
 					const float white = model.score(x);
 					const float expected = board.sideToMove() == chess::Color::WHITE ? white : -white;
 					const float direct = model.score(board);
-					require(std::abs(direct - expected) < 2.0e-5F * (1 + std::abs(expected)), "direct graybox output changed sparse evaluation");
-					const float active = model.score(board, model.activeFormulas());
-					require(std::abs(active - expected) < 2.0e-5F * (1 + std::abs(expected)), "active formula mask changed graybox evaluation");
+					require(std::abs(direct - expected) < 2.0e-5F * (1 + std::abs(expected)), "direct network output changed formula evaluation");
 				}
 			}
 			// Repeat after changing both a base weight and a relation weight.
 			p[0] += 0.125F;
 			p.back() += 0.05F;
+			model.update(p);
 		}
 
+		// External FEN can be structurally invalid; formula extraction must remain memory-safe.
+		model.extract(chess::Board("4k3/P1P1P1P1/1P1P1P1P/P1P1P1P1/1P1P1P1P/P7/8/1B2K3 w - - 0 1"), x);
+		for (const auto &f : x) require(f.index < model.formulas(), "malformed position escaped the formula dimensions");
+
 		chess::Board walk;
+		eleginus::Accumulator accumulator(model);
+		accumulator.reset(walk);
 		for (unsigned ply = 1; ply < 80; ++ply) {
 			model.extract(walk, x);
 			const float white = model.score(x);
 			const float expected = walk.sideToMove() == chess::Color::WHITE ? white : -white;
 			require(std::abs(model.score(walk) - expected) < 2.0e-5F * (1 + std::abs(expected)), "attack-cache reuse changed formula evaluation");
+			require(std::abs(accumulator.score(walk) - expected) < 2.0e-4F * (1 + std::abs(expected)), "incremental accumulator changed model output");
 			chess::Movelist moves;
 			chess::movegen::legalmoves(moves, walk);
 			if (moves.empty()) break;
-			walk.makeMove(moves[(17U * ply + 5U) % moves.size()]);
+			const auto move = moves[(17U * ply + 5U) % moves.size()];
+			walk.makeMove(move);
+			accumulator.push();
 		}
+
+		chess::Board restore;
+		accumulator.reset(restore);
+		chess::Movelist firstMoves;
+		chess::movegen::legalmoves(firstMoves, restore);
+		const auto first = firstMoves.front();
+		restore.makeMove(first);
+		accumulator.push();
+		chess::Movelist secondMoves;
+		chess::movegen::legalmoves(secondMoves, restore);
+		const auto second = secondMoves.front();
+		restore.makeMove(second);
+		accumulator.push();
+		const float child = accumulator.score(restore);
+		require(std::abs(child - model.score(restore)) < 2.0e-4F * (1 + std::abs(child)), "lazy accumulator changed a grandchild score");
+		accumulator.pop();
+		restore.unmakeMove(second);
+		const float parent = accumulator.score(restore);
+		require(std::abs(parent - model.score(restore)) < 2.0e-4F * (1 + std::abs(parent)), "lazy accumulator failed to materialize its parent");
+		accumulator.pop();
+		restore.unmakeMove(first);
+		const float root = accumulator.score(restore);
+		require(std::abs(root - model.score(restore)) < 2.0e-4F * (1 + std::abs(root)), "accumulator rollback changed the root score");
 	}
 
 } // namespace
@@ -112,18 +154,20 @@ namespace {
 int main() {
 	try {
 		eleginus::Model model;
+		require(eleginus::centipawns(1.0F) == 150 && eleginus::centipawns(-1.0F) == -150, "centipawn conversion differs from the supervised target scale");
 		std::vector<eleginus::Feature> x;
 		model.extract(chess::Board(), x);
 		require(std::isfinite(model.score(x)), "initial formula model produced a nonfinite score");
 		checkGrad(model);
 
 		const auto path = std::filesystem::temp_directory_path() / "eleginus-test.pth";
-		model.activate(x.front().index, x.back().index);
-		model.params().back() += 0.02F;
+		auto values = model.params();
+		values[model.relationIndex(x.front().index, x.back().index)] += 0.02F;
+		model.update(values);
 		model.save(path);
 		const auto loaded = eleginus::Model::load(path);
 		std::filesystem::remove(path);
-		require(loaded.params() == model.params() && loaded.score(x) == model.score(x), "checkpoint changed graybox parameters or output");
+		require(loaded.params() == model.params() && loaded.score(x) == model.score(x), "checkpoint changed network parameters or output");
 
 		eleginus::SearchOptions options;
 		options.depth = 4;

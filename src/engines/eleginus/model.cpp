@@ -3,6 +3,7 @@
 #include <array>
 #include <cmath>
 #include <fstream>
+#include <immintrin.h>
 #include <stdexcept>
 #include <system_error>
 #ifdef _WIN32
@@ -29,166 +30,186 @@ namespace eleginus {
 			return std::all_of(values.begin(), values.end(), [](float x) { return std::isfinite(x); });
 		}
 
-		int toCp(float h) {
-			if (!std::isfinite(h)) throw std::runtime_error("nonfinite Eleginus evaluation");
-			return static_cast<int>(std::lround(std::clamp(400.0F * h, -25000.0F, 25000.0F)));
+		void addScaled(float *target, const float *source, float scale, std::size_t count) noexcept {
+			const auto factor = _mm256_set1_ps(scale);
+			std::size_t i = 0;
+			for (; i + 8 <= count; i += 8) {
+				const auto values = _mm256_loadu_ps(source + i);
+				const auto current = _mm256_loadu_ps(target + i);
+				_mm256_storeu_ps(target + i, _mm256_fmadd_ps(values, factor, current));
+			}
+			for (; i < count; ++i) target[i] += source[i] * scale;
+		}
+
+		float dot(const float *left, const float *right, std::size_t count) noexcept {
+			auto sum = _mm256_setzero_ps();
+			std::size_t i = 0;
+			for (; i + 8 <= count; i += 8) {
+				sum = _mm256_fmadd_ps(_mm256_loadu_ps(left + i), _mm256_loadu_ps(right + i), sum);
+			}
+			const auto high = _mm256_extractf128_ps(sum, 1);
+			auto low = _mm_add_ps(_mm256_castps256_ps128(sum), high);
+			low = _mm_hadd_ps(low, low);
+			low = _mm_hadd_ps(low, low);
+			float result = _mm_cvtss_f32(low);
+			for (; i < count; ++i) result += left[i] * right[i];
+			return result;
 		}
 
 	} // namespace
 
+	int centipawns(float h) {
+		if (!std::isfinite(h)) throw std::runtime_error("nonfinite Eleginus evaluation");
+		return static_cast<int>(std::lround(std::clamp(kCentipawnsPerLogit * h, -25000.0F, 25000.0F)));
+	}
+
 	Model::Model() {
 		const auto values = detail::initial();
-		p.assign(values.begin(), values.end());
+		p.assign(kParameterCount, 0.0F);
+		std::copy(values.begin(), values.end(), p.begin());
+		indexRelations();
 	}
 
 	std::span<const float> Model::initial() noexcept {
 		return detail::initial();
 	}
 
-	float Model::forward(std::span<const Feature> x, Cache &cache) const {
+	float Model::score(std::span<const Feature> x) const {
 		const auto n = formulas();
-		for (std::uint16_t i = 0; i < cache.count; ++i) {
-			cache.score[cache.active[i]] = 0.0F;
-			cache.condition[cache.active[i]] = 0.0F;
-		}
-		cache.count = 0;
 		for (const auto &f : x) {
 			if (f.index >= n) throw std::out_of_range("formula index exceeds model layout");
-			cache.score[f.index] = static_cast<float>(f.score);
-			cache.condition[f.index] = static_cast<float>(f.condition);
-			cache.active[cache.count++] = f.index;
 		}
 		double result = 0.0;
 		for (const auto &f : x) {
 			result += static_cast<double>(f.score) * p[f.index];
 		}
-		for (std::size_t i = 0; i < links.size(); ++i) {
-			result += static_cast<double>(p[n + i]) * cache.score[links[i].row] * cache.condition[links[i].condition];
-		}
-		return static_cast<float>(result);
-	}
-
-	float Model::score(std::span<const Feature> x) const {
-		thread_local std::array<float, kFormulaCount> score{}, condition{};
-		double result = 0.0;
-		for (const auto &f : x) {
-			if (f.index >= formulas()) throw std::out_of_range("formula index exceeds model layout");
-			score[f.index] = static_cast<float>(f.score);
-			condition[f.index] = static_cast<float>(f.condition);
-			result += static_cast<double>(f.score) * p[f.index];
-		}
-		for (std::size_t i = 0; i < links.size(); ++i) {
-			result += static_cast<double>(p[formulas() + i]) * score[links[i].row] * condition[links[i].condition];
-		}
-		for (const auto &f : x) {
-			score[f.index] = 0.0F;
-			condition[f.index] = 0.0F;
+		for (const auto &condition : x) {
+			if (condition.condition == 0) continue;
+			const auto column = n + static_cast<std::size_t>(condition.index) * n;
+			for (const auto &row : x) {
+				result += static_cast<double>(p[column + row.index]) * row.score * condition.condition;
+			}
 		}
 		return static_cast<float>(result);
 	}
 
 	float Model::score(const chess::Board &board) const {
-		float white;
-		if (links.empty()) {
-			white = FormulaSet::evaluate(board, std::span<const float>(p.data(), formulas()));
-		} else {
-			const auto relationWeights = std::span<const float>(p.data() + static_cast<std::ptrdiff_t>(formulas()), links.size());
-			white = FormulaSet::evaluate(board, std::span<const float>(p.data(), formulas()), rows, conditions, relationWeights);
-		}
+		thread_local std::vector<Feature> x;
+		extract(board, x);
+		const float white = score(x);
 		return board.sideToMove() == chess::Color::WHITE ? white : -white;
-	}
-
-	float Model::score(const chess::Board &board, const FormulaMask &active) const {
-		float white;
-		if (links.empty()) {
-			white = FormulaSet::evaluate(board, std::span<const float>(p.data(), formulas()), active);
-		} else {
-			const auto relationWeights = std::span<const float>(p.data() + static_cast<std::ptrdiff_t>(formulas()), links.size());
-			white = FormulaSet::evaluate(board, std::span<const float>(p.data(), formulas()), rows, conditions, relationWeights, active);
-		}
-		return board.sideToMove() == chess::Color::WHITE ? white : -white;
-	}
-
-	FormulaMask Model::activeFormulas() const noexcept {
-		FormulaMask active{};
-		const auto mark = [&](std::size_t index) { active[index / 64] |= 1ULL << (index % 64); };
-		for (std::size_t i = 0; i < formulas(); ++i) {
-			if (p[i] != 0.0F) mark(i);
-		}
-		for (std::size_t i = 0; i < links.size(); ++i) {
-			if (p[formulas() + i] == 0.0F) continue;
-			mark(links[i].row);
-			mark(links[i].condition);
-		}
-		return active;
-	}
-
-	void Model::backward(const Cache &cache, float delta, std::span<float> grad) const {
-		const auto n = formulas();
-		if (grad.size() != p.size()) throw std::invalid_argument("gradient shape does not match model");
-		for (std::uint16_t i = 0; i < cache.count; ++i) {
-			const auto index = cache.active[i];
-			grad[index] += delta * cache.score[index];
-		}
-		for (std::size_t i = 0; i < links.size(); ++i) {
-			grad[n + i] += delta * cache.score[links[i].row] * cache.condition[links[i].condition];
-		}
-	}
-
-	void Model::weights(std::span<const Feature> x, std::vector<float> &out) const {
-		std::array<float, kFormulaCount> condition{};
-		out.assign(p.begin(), p.begin() + static_cast<std::ptrdiff_t>(formulas()));
-		for (const auto &f : x) {
-			condition[f.index] = static_cast<float>(f.condition);
-		}
-		for (std::size_t i = 0; i < links.size(); ++i) {
-			out[links[i].row] += p[formulas() + i] * condition[links[i].condition];
-		}
 	}
 
 	int Model::centipawns(const chess::Board &board) const {
-		return toCp(score(board));
+		return eleginus::centipawns(score(board));
 	}
 
 	void Model::extract(const chess::Board &board, std::vector<Feature> &out) const {
 		FormulaSet::evaluate(board, out);
 	}
 
-	bool Model::active(std::uint16_t row, std::uint16_t condition) const {
-		return std::find_if(links.begin(), links.end(), [=](const Relation &r) { return r.row == row && r.condition == condition; }) != links.end();
-	}
-
-	bool Model::activate(std::uint16_t row, std::uint16_t condition) {
+	std::size_t Model::relationIndex(std::size_t row, std::size_t condition) const {
 		if (row >= formulas() || condition >= formulas()) throw std::out_of_range("relation coordinate exceeds formula layout");
-		if (active(row, condition) || links.size() >= kRelationLimit) return false;
-		links.push_back({row, condition});
-		rows.push_back(row);
-		conditions.push_back(condition);
-		p.push_back(0.0F);
-		return true;
+		return formulas() + condition * formulas() + row;
 	}
 
-	void Model::prune(float threshold) {
-		if (threshold < 0 || !std::isfinite(threshold)) throw std::invalid_argument("invalid relation pruning threshold");
-		const auto n = formulas();
-		std::size_t write = 0;
-		for (std::size_t read = 0; read < links.size(); ++read) {
-			if (std::abs(p[n + read]) <= threshold) continue;
-			links[write] = links[read];
-			rows[write] = rows[read];
-			conditions[write] = conditions[read];
-			p[n + write] = p[n + read];
-			++write;
+	void Model::indexRelations() noexcept {
+		const auto matrix = relations();
+		for (std::size_t condition = 0; condition < kFormulaCount; ++condition) {
+			const auto first = matrix.begin() + static_cast<std::ptrdiff_t>(condition * kFormulaCount);
+			activeColumns[condition] = std::any_of(first, first + static_cast<std::ptrdiff_t>(kFormulaCount), [](float value) { return value != 0.0F; });
 		}
-		links.resize(write);
-		rows.resize(write);
-		conditions.resize(write);
-		p.resize(n + write);
+	}
+
+	void Model::update(std::span<const float> values) {
+		if (values.size() != kParameterCount || !finite(values)) throw std::invalid_argument("invalid Eleginus parameter update");
+		std::copy(values.begin(), values.end(), p.begin());
+		indexRelations();
+	}
+
+	Accumulator::Accumulator(const Model &model) : net(model) {
+		features.reserve(kFormulaCount);
+		changes.reserve(8 * kFormulaCount);
+		frames.reserve(128);
+		materialized.reserve(128);
+	}
+
+	void Accumulator::addColumn(std::size_t condition, float scale) {
+		if (!net.columnActive(condition)) return;
+		const auto matrix = net.relations();
+		const auto offset = condition * kFormulaCount;
+		addScaled(dynamic.data(), matrix.data() + offset, scale, kFormulaCount);
+	}
+
+	void Accumulator::extract(const chess::Board &board) {
+		nextScores.fill(0.0F);
+		nextConditions.fill(0.0F);
+		net.extract(board, features);
+		for (const auto &feature : features) {
+			nextScores[feature.index] = static_cast<float>(feature.score);
+			nextConditions[feature.index] = static_cast<float>(feature.condition);
+		}
+	}
+
+	void Accumulator::reset(const chess::Board &board) {
+		scores.fill(0.0F);
+		conditions.fill(0.0F);
+		std::copy(net.base().begin(), net.base().end(), dynamic.begin());
+		changes.clear();
+		frames.clear();
+		materialized.clear();
+		extract(board);
+		for (std::size_t i = 0; i < kFormulaCount; ++i) {
+			scores[i] = nextScores[i];
+			conditions[i] = nextConditions[i];
+			if (conditions[i] != 0.0F) addColumn(i, conditions[i]);
+		}
+	}
+
+	void Accumulator::push() {
+		frames.push_back(changes.size());
+		materialized.push_back(false);
+	}
+
+	void Accumulator::refresh(const chess::Board &board) {
+		if (frames.empty() || materialized.back()) return;
+		extract(board);
+		for (std::size_t i = 0; i < kFormulaCount; ++i) {
+			if (scores[i] == nextScores[i] && conditions[i] == nextConditions[i]) continue;
+			changes.push_back({static_cast<std::uint16_t>(i), scores[i], conditions[i]});
+			const float delta = nextConditions[i] - conditions[i];
+			if (delta != 0.0F) addColumn(i, delta);
+			scores[i] = nextScores[i];
+			conditions[i] = nextConditions[i];
+		}
+		materialized.back() = true;
+	}
+
+	void Accumulator::pop() {
+		if (frames.empty()) throw std::logic_error("cannot restore the root Eleginus accumulator");
+		const auto first = frames.back();
+		frames.pop_back();
+		if (materialized.back()) {
+			for (std::size_t i = changes.size(); i > first; --i) {
+				const auto &change = changes[i - 1];
+				const float delta = change.condition - conditions[change.index];
+				if (delta != 0.0F) addColumn(change.index, delta);
+				scores[change.index] = change.score;
+				conditions[change.index] = change.condition;
+			}
+		}
+		changes.resize(first);
+		materialized.pop_back();
+	}
+
+	float Accumulator::score(const chess::Board &board) {
+		refresh(board);
+		const float value = dot(scores.data(), dynamic.data(), kFormulaCount);
+		return board.sideToMove() == chess::Color::WHITE ? value : -value;
 	}
 
 	void Model::save(const std::filesystem::path &path) const {
-		const auto n = formulas();
-		if (p.size() != n + links.size() || links.size() > kRelationLimit || !finite(p)) throw std::runtime_error("invalid Eleginus parameters");
+		if (p.size() != kParameterCount || !finite(p)) throw std::runtime_error("invalid Eleginus parameters");
 		if (!path.parent_path().empty()) std::filesystem::create_directories(path.parent_path());
 		auto temporary = path;
 		temporary += ".tmp";
@@ -197,14 +218,8 @@ namespace eleginus {
 			if (!out) throw std::runtime_error("cannot create Eleginus model: " + temporary.string());
 			out.write(magic.data(), magic.size());
 			write(out, kArchitectureType);
-			write(out, static_cast<std::uint32_t>(n));
-			write(out, static_cast<std::uint32_t>(links.size()));
-			out.write(reinterpret_cast<const char *>(p.data()), static_cast<std::streamsize>(n * sizeof(float)));
-			for (std::size_t i = 0; i < links.size(); ++i) {
-				write(out, links[i].row);
-				write(out, links[i].condition);
-				write(out, p[n + i]);
-			}
+			write(out, static_cast<std::uint32_t>(formulas()));
+			out.write(reinterpret_cast<const char *>(p.data()), static_cast<std::streamsize>(p.size() * sizeof(float)));
 			out.close();
 			if (!out) throw std::runtime_error("cannot write Eleginus model: " + temporary.string());
 			#ifdef _WIN32
@@ -228,27 +243,15 @@ namespace eleginus {
 		in.read(tag.data(), tag.size());
 		const auto architecture = read<std::uint32_t>(in);
 		const auto count = read<std::uint32_t>(in);
-		const auto relations = read<std::uint32_t>(in);
 		Model model;
-		if (!in || tag != magic || architecture != kArchitectureType || count != model.formulas() || relations > kRelationLimit) {
+		if (!in || tag != magic || architecture != kArchitectureType || count != model.formulas()) {
 			throw std::runtime_error("checkpoint does not match the fixed Eleginus formulas: " + path.string());
 		}
-		model.p.resize(count);
-		in.read(reinterpret_cast<char *>(model.p.data()), static_cast<std::streamsize>(count * sizeof(float)));
-		for (std::uint32_t i = 0; i < relations; ++i) {
-			const Relation relation{read<std::uint16_t>(in), read<std::uint16_t>(in)};
-			const float value = read<float>(in);
-			if (relation.row >= count || relation.condition >= count || model.active(relation.row, relation.condition)) {
-				throw std::runtime_error("invalid Eleginus relation coordinate: " + path.string());
-			}
-			model.links.push_back(relation);
-			model.rows.push_back(relation.row);
-			model.conditions.push_back(relation.condition);
-			model.p.push_back(value);
-		}
+		in.read(reinterpret_cast<char *>(model.p.data()), static_cast<std::streamsize>(model.p.size() * sizeof(float)));
 		if (!in || in.peek() != std::char_traits<char>::eof() || !finite(model.p)) {
 			throw std::runtime_error("invalid Eleginus model parameters: " + path.string());
 		}
+		model.indexRelations();
 		return model;
 	}
 

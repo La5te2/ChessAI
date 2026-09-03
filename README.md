@@ -89,6 +89,7 @@ build/melano/train
 build/melano/search
 build/melano/uci
 
+build/eleginus/preprocess
 build/eleginus/train
 build/eleginus/search
 build/eleginus/uci
@@ -104,6 +105,8 @@ The `preprocess`, `train` and `search` entry points provide their current argume
 ```bash
 build/gadus/search --help
 build/melano/train --help
+build/eleginus/preprocess --help
+build/eleginus/train --help
 build/eleginus/search --help
 ```
 
@@ -294,27 +297,52 @@ build/eleginus/search --export-initial models/eleginus/eleginus.pth
 
 Both commands write the initial checkpoint directly to `models/eleginus/eleginus.pth`.
 
-Run continuous self-play training from the repository root:
+Preprocess a JSONL stream into the Eleginus HDF5 schema with:
 
-```powershell
-build\eleginus\train.exe `
-	--out models\eleginus\current.pth `
-	--opening-book data\openings.gen.bin `
-	--eval-every 1000 `
-	--depth 2 `
-	--eval-depth 4 `
-	--workers 8
+```bash
+zstdcat data/positions.jsonl.zst | build/eleginus/preprocess \
+	--input - \
+	--output data/positions.eleginus.h5 \
+	--chunk-size 16384 \
+	--compression-level 1 \
+	--max-positions 100000000 \
+	--log-every 10000
 ```
 
-`--eval-every K` schedules an evaluation after every K completed training games. Training starts from the standard initial position and discards games that remain unfinished at `--max-plies` (320 by default). Discarded games do not count toward K.
+Each JSONL record contains a `fen` string and an `evals` array. The preprocessor selects the entry with the greatest `depth`, breaks equal-depth ties by `knodes` and uses the score from its first principal variation. A White-perspective centipawn score $e$ produces the target $y=\sigma(e/150)$; a positive or negative mate score produces $y=1$ or $y=0$, respectively. The HDF5 file stores encoded positions and targets rather than precomputed formula vectors.
 
-Each evaluation freezes the candidate and plays 2000 games against the last accepted model. The Polyglot opening book must provide exactly 1000 distinct nonterminal leaf positions reachable from the standard initial position. Each position is played twice with the candidate's color reversed. Both models use `--eval-depth`, select their best move without training exploration, and play to a rule-defined terminal result.
+Train Eleginus with:
 
-The acceptance test uses a two-sided 95% Hoeffding interval for the mean score over the 1000 opening pairs and converts its endpoints to relative Elo. This interval treats opening pairs as independent samples, rather than treating both games within a pair as independent. A candidate replaces `--out` only when the lower endpoint exceeds zero Elo. The confidence level applies to one evaluation, not to the entire sequence of repeated evaluations.
+```bash
+build/eleginus/train \
+	--data data/positions.eleginus.h5 \
+	--out models/eleginus/eleginus.pth \
+	--epochs 2 \
+	--batch-size 4096 \
+	--max-steps -1 \
+	--workers 8 \
+	--device cuda \
+	--lr 0.001 \
+	--weight-decay 0.000001 \
+	--grad-clip 1 \
+	--save-every 5000 \
+	--log-every 50 \
+	--seed 2026
+```
 
-An existing `--out` supplies the baseline and the starting training weights. `--init` overrides the starting training weights without replacing an existing baseline. When `--out` does not exist, the starting weights also supply the first baseline; no file is created until a candidate passes evaluation.
+For each position, the CPU formula workers produce a score vector $x(s)\in\mathbb R^{729}$ and a condition vector $c(s)\in\mathbb R^{729}$. The HCN logit is
 
-Ctrl+C stops training or evaluation without saving progress. The accepted checkpoint contains only graybox weights and is replaced atomically. Optimizer state and training samples remain in memory and are discarded on exit. Rejected candidates do not replace the checkpoint or reset the ongoing training process.
+$$
+H(s)=\sum_{i=1}^{729}x_i(s)\left(v_i+\sum_{j=1}^{729}c_j(s)R_{j,i}\right).
+$$
+
+Thus every condition may modulate every formula weight through the full relation matrix $R$. The model uses global pairwise formula relations rather than a low-rank or locally restricted approximation. Higher-level chess structures enter through formula values that combine multiple board facts, while the relation layer itself remains pairwise.
+
+During optimization, the trainer represents the relation matrix by $\widehat R=729R$ and evaluates its contribution as $c(s)\widehat R/729$. Loading a checkpoint multiplies $R$ by 729, and saving divides $\widehat R$ by 729. This bijective reparameterization preserves $H(s)$ and the checkpoint representation while reducing the effect of each optimizer-space relation update on $R$ and $H(s)$ by a factor of 729.
+
+Training minimizes binary cross-entropy between $H(s)$ and $y$ with AdamW. The reported loss is the mean over all batches processed since the preceding log entry. Formula extraction runs in parallel CPU workers, while tensor evaluation and optimization use the selected device. `--device auto` selects CUDA when available and otherwise selects CPU. A positive `--max-steps` value caps optimizer updates; `-1` processes every batch selected by `--epochs`. `--save-every` controls periodic atomic checkpoint writes.
+
+Without `--init`, training starts from the fixed handcrafted base weights and a zero relation matrix. `--init` loads the base vector and relation matrix from an Eleginus checkpoint before training. The output checkpoint stores the 729 base weights and the complete $729\times729$ relation matrix; optimizer state is not stored.
 
 Analyze one position with Eleginus search using:
 
@@ -481,11 +509,11 @@ The Eleginus UCI executable loads its checkpoint when `isready` or `go` first re
 
 Search runs on a worker thread so the protocol loop can process `stop`. A `position`, `setoption` or `ucinewgame` command first stops and joins an active search before changing engine state. Closing the UCI process also joins the worker.
 
-Eleginus reports MultiPV rows containing the completed iterative depth, the greatest visited ply as `seldepth`, the root-side score, visited nodes, NPS, elapsed time and a one-move principal variation. The static evaluator maps its dimensionless output $H(s)$ to centipawns by
+Eleginus reports MultiPV rows containing the completed iterative depth, the greatest visited ply as `seldepth`, the root-side score, visited nodes, NPS, elapsed time and a one-move principal variation. For a White-perspective centipawn score $e$, the supervised target is $y=\sigma(e/150)$, so the static evaluator maps its logit $H(s)$ back to centipawns by
 
 $$
 \operatorname{cp}(s)=
-\operatorname{round}\left(\operatorname{clip}\left(400H(s),-25000,25000\right)\right).
+\operatorname{round}\left(\operatorname{clip}\left(150H(s),-25000,25000\right)\right).
 $$
 
 Search may replace this finite score with a mate score. NPS is $1000n/t$, where $n$ is the number of visited principal and quiescence nodes and $t$ is elapsed time in milliseconds with a denominator of at least one millisecond.
@@ -528,7 +556,7 @@ The `scripts/` directory contains the Windows and Linux build launchers, checkpo
 
 ### Checkpoint Inspection
 
-`scripts/check.py` performs a read-only inspection of a Gadus, Melano or Eleginus checkpoint. Neural checkpoint reports include heads, architecture dimensions, parameter counts, tensor data types, tensor memory, devices and finite-value status. Eleginus reports include its formula and active-relation counts. Every report includes the detected architecture, file size and SHA-256 digest.
+`scripts/check.py` performs a read-only inspection of a Gadus, Melano or Eleginus checkpoint. Neural checkpoint reports include heads, architecture dimensions, parameter counts, tensor data types, tensor memory, devices and finite-value status. Eleginus reports include its formula count, complete relation count and parameter count. Every report includes the detected architecture, file size and SHA-256 digest.
 
 ```bash
 python scripts/check.py models/gadus/gadus.pth

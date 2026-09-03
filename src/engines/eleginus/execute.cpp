@@ -4,7 +4,6 @@
 #include <array>
 #include <bit>
 #include <cmath>
-#include <immintrin.h>
 #include <optional>
 #include <stdexcept>
 #include <utility>
@@ -74,85 +73,6 @@ namespace eleginus {
 			}
 			bool active(std::uint32_t, std::uint32_t) const { return true; }
 		};
-
-		bool activeRange(const FormulaMask *mask, std::uint32_t first, std::uint32_t count) {
-			if (mask == nullptr) return true;
-			const auto last = first + count;
-			while (first < last) {
-				const auto word = first / 64;
-				const auto offset = first % 64;
-				const auto width = std::min<std::uint32_t>(last - first, 64 - offset);
-				const auto bits = width == 64 ? ~0ULL : ((1ULL << width) - 1) << offset;
-				if ((*mask)[word] & bits) return true;
-				first += width;
-			}
-			return false;
-		}
-
-		struct Weighted {
-			static constexpr bool conditions = false;
-			std::span<const float> weights;
-			const FormulaMask *mask = nullptr;
-			float value = 0.0F;
-			void put(std::uint32_t index, std::int32_t score, std::int32_t) { value += static_cast<float>(score) * weights[index]; }
-			bool active(std::uint32_t first, std::uint32_t count) const { return activeRange(mask, first, count); }
-		};
-
-		struct Graybox {
-			static constexpr bool conditions = true;
-			struct Storage {
-				std::array<std::int32_t, kFormulaCount> score{}, condition{};
-				std::array<std::uint32_t, kFormulaCount> stamp{};
-				std::uint32_t generation = 0;
-			};
-			std::span<const float> weights;
-			Storage &storage;
-			const FormulaMask *mask = nullptr;
-			float value = 0.0F;
-			void put(std::uint32_t index, std::int32_t score, std::int32_t condition) {
-				value += static_cast<float>(score) * weights[index];
-				storage.score[index] = score;
-				storage.condition[index] = condition;
-				storage.stamp[index] = storage.generation;
-			}
-			std::int32_t score(std::uint16_t index) const { return storage.stamp[index] == storage.generation ? storage.score[index] : 0; }
-			std::int32_t condition(std::uint16_t index) const { return storage.stamp[index] == storage.generation ? storage.condition[index] : 0; }
-			bool active(std::uint32_t first, std::uint32_t count) const { return activeRange(mask, first, count); }
-		};
-
-		float relationScore(
-			const Graybox &sink, std::span<const std::uint16_t> rows, std::span<const std::uint16_t> conditions, std::span<const float> weights) {
-			std::size_t i = 0;
-			__m256 total = _mm256_setzero_ps();
-			const auto generation = _mm256_set1_epi32(static_cast<int>(sink.storage.generation));
-			for (; i + 8 <= weights.size(); i += 8) {
-				const auto row16 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(rows.data() + i));
-				const auto condition16 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(conditions.data() + i));
-				const auto row32 = _mm256_cvtepu16_epi32(row16);
-				const auto condition32 = _mm256_cvtepu16_epi32(condition16);
-				const auto rowStamp = _mm256_i32gather_epi32(reinterpret_cast<const int *>(sink.storage.stamp.data()), row32, sizeof(std::uint32_t));
-				const auto conditionStamp =
-					_mm256_i32gather_epi32(reinterpret_cast<const int *>(sink.storage.stamp.data()), condition32, sizeof(std::uint32_t));
-				const auto rowMask = _mm256_cmpeq_epi32(rowStamp, generation);
-				const auto conditionMask = _mm256_cmpeq_epi32(conditionStamp, generation);
-				const auto score32 = _mm256_i32gather_epi32(sink.storage.score.data(), row32, sizeof(std::int32_t));
-				const auto value32 = _mm256_i32gather_epi32(sink.storage.condition.data(), condition32, sizeof(std::int32_t));
-				const auto score = _mm256_cvtepi32_ps(_mm256_and_si256(score32, rowMask));
-				const auto condition = _mm256_cvtepi32_ps(_mm256_and_si256(value32, conditionMask));
-				const auto weight = _mm256_loadu_ps(weights.data() + i);
-				total = _mm256_add_ps(total, _mm256_mul_ps(weight, _mm256_mul_ps(score, condition)));
-			}
-			alignas(32) std::array<float, 8> lanes{};
-			_mm256_store_ps(lanes.data(), total);
-			float value = 0.0F;
-			for (const auto lane : lanes) {
-				value += lane;
-			}
-			for (; i < weights.size(); ++i) {
-				value += weights[i] * static_cast<float>(sink.score(rows[i])) * static_cast<float>(sink.condition(conditions[i]));
-			}
-			return value;
-		}
 
 		template <class Output> class Runtime {
 		public:
@@ -706,7 +626,7 @@ namespace eleginus {
 	} // namespace
 
 	std::span<const float> detail::initial() noexcept {
-		return Formulas<Runtime<Weighted>>::initial();
+		return Formulas<Runtime<Features>>::initial();
 	}
 
 	void detail::extract(const chess::Board &board, std::vector<Feature> &out) {
@@ -716,76 +636,12 @@ namespace eleginus {
 		Formulas<Runtime<Features>>(Runtime(board, sink)).execute();
 	}
 
-	float detail::score(const chess::Board &board, std::span<const float> weights) {
-		if (weights.size() != kFormulaCount) throw std::invalid_argument("formula weight count does not match the fixed formula set");
-		Weighted sink{weights};
-		Formulas<Runtime<Weighted>>(Runtime(board, sink)).execute();
-		return static_cast<float>(sink.value);
-	}
-
-	float detail::score(const chess::Board &board, std::span<const float> weights, const FormulaMask &active) {
-		if (weights.size() != kFormulaCount) throw std::invalid_argument("formula weight count does not match the fixed formula set");
-		Weighted sink{weights, &active};
-		Formulas<Runtime<Weighted>>(Runtime(board, sink)).execute();
-		return static_cast<float>(sink.value);
-	}
-
-	float detail::score(const chess::Board &board, std::span<const float> base, std::span<const std::uint16_t> rows,
-		std::span<const std::uint16_t> conditions, std::span<const float> relations) {
-		if (base.size() != kFormulaCount || rows.size() != conditions.size() || rows.size() != relations.size()) {
-			throw std::invalid_argument("graybox coordinates do not match the fixed formula set");
-		}
-		thread_local Graybox::Storage storage;
-		if (++storage.generation == 0) {
-			storage.stamp.fill(0);
-			++storage.generation;
-		}
-		Graybox sink{base, storage};
-		Formulas<Runtime<Graybox>>(Runtime(board, sink)).execute();
-		sink.value += relationScore(sink, rows, conditions, relations);
-		return sink.value;
-	}
-
-	float detail::score(const chess::Board &board, std::span<const float> base, std::span<const std::uint16_t> rows,
-		std::span<const std::uint16_t> conditions, std::span<const float> relations, const FormulaMask &active) {
-		if (base.size() != kFormulaCount || rows.size() != conditions.size() || rows.size() != relations.size()) {
-			throw std::invalid_argument("graybox coordinates do not match the fixed formula set");
-		}
-		thread_local Graybox::Storage storage;
-		if (++storage.generation == 0) {
-			storage.stamp.fill(0);
-			++storage.generation;
-		}
-		Graybox sink{base, storage, &active};
-		Formulas<Runtime<Graybox>>(Runtime(board, sink)).execute();
-		sink.value += relationScore(sink, rows, conditions, relations);
-		return sink.value;
-	}
-
 } // namespace eleginus
 
 namespace eleginus {
 
 	void FormulaSet::evaluate(const chess::Board &board, std::vector<Feature> &out) {
 		detail::extract(board, out);
-	}
-
-	float FormulaSet::evaluate(const chess::Board &board, std::span<const float> weights) {
-		return detail::score(board, weights);
-	}
-
-	float FormulaSet::evaluate(const chess::Board &board, std::span<const float> weights, const FormulaMask &active) {
-		return detail::score(board, weights, active);
-	}
-
-	float FormulaSet::evaluate(const chess::Board &board, std::span<const float> base, std::span<const std::uint16_t> rows,
-		std::span<const std::uint16_t> conditions, std::span<const float> relations) {
-		return detail::score(board, base, rows, conditions, relations);
-	}
-
-	float FormulaSet::evaluate(const chess::Board &board, std::span<const float> base, std::span<const std::uint16_t> rows,
-		std::span<const std::uint16_t> conditions, std::span<const float> relations, const FormulaMask &active) {
-		return detail::score(board, base, rows, conditions, relations, active);
 	}
 
 } // namespace eleginus

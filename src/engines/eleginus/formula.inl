@@ -225,7 +225,8 @@ void pieceExtensions() {
 		const int blocked = std::popcount(pawns & b.SH(occ, role, 1).bits & earlyCenter);
 		for (int square : b.locations(b.PCS(role, 2))) {
 			const Word colorMask = (light & (1ULL << square)) != 0 ? light : ~light;
-			const int sameColorPawns = std::popcount(pawns & colorMask);
+			// Eight is the final bucket, which also keeps malformed external positions memory-safe.
+			const int sameColorPawns = std::min(std::popcount(pawns & colorMask), 8);
 			values[0][sameColorPawns] += (defended & (1ULL << square)) == 0;
 			values[1][sameColorPawns] += blocked;
 		}
@@ -567,7 +568,7 @@ FORMULA(endgames) {
 	}
 	const auto strongPieceCount = b.ADD(b.MUL(positive, friendlyPieces), b.MUL(negative, enemyPieces));
 	const auto missingStrongPawns = b.SUB(b.NUM(8), strongPawnCount);
-	// Symmetric state signals serve as graybox conditions for the public endgame scaling knowledge.
+	// Symmetric state signals condition the public endgame scaling knowledge.
 	const std::array firstConditions{
 		pureOpposite,
 		mixedOpposite,

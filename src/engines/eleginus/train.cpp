@@ -1,17 +1,22 @@
-#include "eleginus/game.hpp"
+// Trains the complete Eleginus HCN from compact supervised HDF5 positions.
+
 #include "eleginus/model.hpp"
-#include "eleginus/search.hpp"
-#include "eleginus/match.hpp"
+#include <torch/torch.h>
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
-#include <deque>
+#include <exception>
 #include <filesystem>
 #include <future>
+#include <hdf5.h>
 #include <iostream>
+#include <memory>
+#include <mutex>
+#include <numeric>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -25,16 +30,12 @@
 
 namespace {
 
+	constexpr hsize_t planeCount = 4;
 	std::atomic<bool> halt{false};
 	static_assert(std::atomic<bool>::is_always_lock_free);
 
-	bool stopped() {
-		return halt.load(std::memory_order_relaxed);
-	}
-
-	void interrupt(int) {
-		halt.store(true, std::memory_order_relaxed);
-	}
+	bool stopped() noexcept { return halt.load(std::memory_order_relaxed); }
+	void interrupt(int) noexcept { halt.store(true, std::memory_order_relaxed); }
 
 #ifdef _WIN32
 	BOOL WINAPI console(DWORD event) {
@@ -45,383 +46,494 @@ namespace {
 #endif
 
 	struct Options {
-		std::filesystem::path out = "models/eleginus/current.pth", init, book = "data/openings.gen.bin";
-		int depth = 2, plies = 320, hash = 16, every = 1000, evalDepth = 4, discover = 64;
-		int workers = static_cast<int>(std::max(1U, std::thread::hardware_concurrency()));
-		int batch = 256, log = 10;
-		float lr = 1.0e-3F, decay = 1.0e-6F, sparse = 1.0e-5F, clip = 1.0F, explore = 0.08F, temp = 80.0F;
+		std::filesystem::path data = "data/eleginus.h5";
+		std::filesystem::path out = "models/eleginus/eleginus.pth";
+		std::filesystem::path init;
+		std::string device = "auto";
+		int epochs = 1;
+		int batch = 4096;
+		int workers = static_cast<int>(std::clamp(std::thread::hardware_concurrency() / 2U, 1U, 8U));
+		std::int64_t maxSteps = -1;
+		float lr = 1.0e-3F;
+		float decay = 1.0e-6F;
+		float clip = 1.0F;
+		int save = 5000;
+		int log = 50;
 		std::uint64_t seed = 2026;
 	};
 
 	Options parse(int argc, char **argv) {
-		Options o;
+		Options options;
 		for (int i = 1; i < argc; ++i) {
-			const std::string arg = argv[i];
-			if (arg == "--help") {
-				std::cout << "usage: train [--out models/eleginus/current.pth] [--init model.pth] [--depth 2]\n";
-				std::cout << "  [--opening-book data/openings.gen.bin] [--eval-every 1000] [--eval-depth 4]\n";
-				std::cout << "  [--max-plies 320] [--workers N] [--hash 16] [--batch-size 256] [--lr 0.001]\n";
-				std::cout << "  [--weight-decay 0.000001] [--relation-l1 0.00001] [--discover-every 64] [--grad-clip 1]\n";
-				std::cout << "  [--exploration 0.08] [--temperature 80]\n";
-				std::cout << "  [--log-every 10] [--seed 2026]\n";
-				std::cout << "Train until Ctrl+C. Evaluate 2000 paired games after every K completed training games.\n";
-				std::cout << "Only candidates with a positive 95% Elo lower bound replace --out. No save on exit.\n";
+			const std::string key = argv[i];
+			if (key == "--help") {
+				std::cout << "usage: train --data <eleginus.h5> --out <model.pth> [options]\n";
+				std::cout << "  --init <model.pth> --epochs 1 --batch-size 4096 --max-steps -1\n";
+				std::cout << "  --device auto --workers N --lr 0.001 --weight-decay 0.000001\n";
+				std::cout << "  --grad-clip 1 --save-every 5000 --log-every 50 --seed 2026\n";
 				std::exit(0);
 			}
-			if (++i == argc) throw std::invalid_argument("missing value after " + arg);
-			const std::string val = argv[i];
-			if (arg == "--out") o.out = val;
-			else if (arg == "--init") o.init = val;
-			else if (arg == "--opening-book") o.book = val;
-			else if (arg == "--eval-every") o.every = std::stoi(val);
-			else if (arg == "--eval-depth") o.evalDepth = std::stoi(val);
-			else if (arg == "--depth") o.depth = std::stoi(val);
-			else if (arg == "--max-plies") o.plies = std::stoi(val);
-			else if (arg == "--hash") o.hash = std::stoi(val);
-			else if (arg == "--workers") o.workers = std::stoi(val);
-			else if (arg == "--batch-size") o.batch = std::stoi(val);
-			else if (arg == "--lr") o.lr = std::stof(val);
-			else if (arg == "--weight-decay") o.decay = std::stof(val);
-			else if (arg == "--relation-l1") o.sparse = std::stof(val);
-			else if (arg == "--discover-every") o.discover = std::stoi(val);
-			else if (arg == "--grad-clip") o.clip = std::stof(val);
-			else if (arg == "--exploration") o.explore = std::stof(val);
-			else if (arg == "--temperature") o.temp = std::stof(val);
-			else if (arg == "--log-every") o.log = std::stoi(val);
-			else if (arg == "--seed") o.seed = std::stoull(val);
-			else throw std::invalid_argument("unknown option: " + arg);
+			if (++i == argc) throw std::invalid_argument("missing value after " + key);
+			const std::string value = argv[i];
+			if (key == "--data") options.data = value;
+			else if (key == "--out") options.out = value;
+			else if (key == "--init") options.init = value;
+			else if (key == "--epochs") options.epochs = std::stoi(value);
+			else if (key == "--batch-size") options.batch = std::stoi(value);
+			else if (key == "--max-steps") options.maxSteps = std::stoll(value);
+			else if (key == "--workers") options.workers = std::stoi(value);
+			else if (key == "--device") options.device = value;
+			else if (key == "--lr") options.lr = std::stof(value);
+			else if (key == "--weight-decay") options.decay = std::stof(value);
+			else if (key == "--grad-clip") options.clip = std::stof(value);
+			else if (key == "--save-every") options.save = std::stoi(value);
+			else if (key == "--log-every") options.log = std::stoi(value);
+			else if (key == "--seed") options.seed = std::stoull(value);
+			else throw std::invalid_argument("unknown option: " + key);
 		}
-		for (float x : {o.lr, o.decay, o.sparse, o.clip, o.explore, o.temp}) {
-			if (!std::isfinite(x)) throw std::invalid_argument("nonfinite training option");
+		for (float value : {options.lr, options.decay, options.clip}) {
+			if (!std::isfinite(value)) throw std::invalid_argument("nonfinite training option");
 		}
-		if (o.out.empty() || o.book.empty() || o.every < 1 || o.discover < 1 || o.evalDepth < 1 || o.evalDepth > 64 || o.depth < 1 || o.depth > 16 ||
-			o.plies < 1 || o.plies > 320 || o.hash < 0 || o.hash > 4096 || o.workers < 1 || o.workers > 256 || o.batch < 1 || o.batch > 65536 ||
-			o.lr <= 0 || o.decay < 0 || o.lr * o.decay >= 1 || o.clip <= 0 || o.sparse < 0 || o.explore < 0 || o.explore > 1 || o.temp < 0 ||
-			o.log < 1) {
+		if (options.data.empty() || options.out.empty() || (options.device != "auto" && options.device != "cpu" && options.device != "cuda") ||
+			options.epochs < 1 || options.batch < 1 || options.batch > 65536 || options.workers < 1 || options.workers > 256 ||
+			options.maxSteps == 0 || options.maxSteps < -1 || options.lr <= 0 || options.decay < 0 || options.lr * options.decay >= 1 ||
+			options.clip <= 0 || options.save < 0 || options.log < 1) {
 			throw std::invalid_argument("invalid or incomplete Eleginus training options");
 		}
-		return o;
+		return options;
 	}
 
-	struct Sample {
-		std::vector<eleginus::Feature> x;
-		float y = 0;
+	void require(herr_t status, const std::string &operation) {
+		if (status < 0) throw std::runtime_error("HDF5 operation failed: " + operation);
+	}
+
+	hid_t requireId(hid_t id, const std::string &operation) {
+		if (id < 0) throw std::runtime_error("HDF5 operation failed: " + operation);
+		return id;
+	}
+
+	std::string stringAttribute(hid_t object, const char *name) {
+		if (H5Aexists(object, name) <= 0) throw std::runtime_error(std::string("HDF5 missing attribute: ") + name);
+		const hid_t attribute = requireId(H5Aopen(object, name, H5P_DEFAULT), "open attribute");
+		const hid_t type = requireId(H5Aget_type(attribute), "get attribute type");
+		std::vector<char> text(H5Tget_size(type) + 1, '\0');
+		require(H5Aread(attribute, type, text.data()), "read attribute");
+		H5Tclose(type);
+		H5Aclose(attribute);
+		return text.data();
+	}
+
+	std::int64_t integerAttribute(hid_t object, const char *name) {
+		if (H5Aexists(object, name) <= 0) throw std::runtime_error(std::string("HDF5 missing attribute: ") + name);
+		const hid_t attribute = requireId(H5Aopen(object, name, H5P_DEFAULT), "open attribute");
+		std::int64_t value = 0;
+		require(H5Aread(attribute, H5T_NATIVE_INT64, &value), "read attribute");
+		H5Aclose(attribute);
+		return value;
+	}
+
+	struct RawChunk {
+		std::vector<std::uint64_t> pieces;
+		std::vector<std::uint8_t> states;
+		std::vector<float> values;
+		std::size_t size() const noexcept { return states.size(); }
 	};
 
-	struct Game {
-		std::vector<Sample> samples;
-		int result = -1; // -1 unfinished, 0 black win, 1 draw, 2 white win.
-	};
-
-	class Prox {
+	class Dataset {
 	public:
-		explicit Prox(std::size_t n) : grad(n) {}
-		void sync(std::size_t n) { grad.resize(n); }
-
-		void step(eleginus::Model &model, std::size_t count, const Options &o) {
-			if (count == 0) return;
-			if (grad.size() != model.params().size()) grad.resize(model.params().size());
-			double norm = 0;
-			for (auto &x : grad) {
-				x /= static_cast<float>(count);
-				if (!std::isfinite(x)) throw std::runtime_error("nonfinite gradient");
-				norm += static_cast<double>(x) * x;
+		explicit Dataset(const std::filesystem::path &path) {
+			file = requireId(H5Fopen(path.string().c_str(), H5F_ACC_RDONLY, H5P_DEFAULT), "open training data");
+			if (stringAttribute(file, "arch_type") != "eleginus" || stringAttribute(file, "state_encoding") != "piece-code-bitplanes" ||
+				stringAttribute(file, "target_schema") != "white-expected-score" || integerAttribute(file, "formula_count") != eleginus::kFormulaCount) {
+				throw std::runtime_error("HDF5 schema does not match Eleginus supervised training");
 			}
-			const float scale = static_cast<float>(std::min(1.0, o.clip / std::max(std::sqrt(norm), 1.0e-12)));
-			auto &p = model.params();
-			const auto initial = eleginus::Model::initial();
-			for (std::size_t i = 0; i < model.formulas(); ++i) {
-				p[i] -= o.lr * (grad[i] * scale + o.decay * (p[i] - initial[i]));
-				if (!std::isfinite(p[i])) throw std::runtime_error("nonfinite parameter update");
+			pieces = requireId(H5Dopen2(file, "pieces", H5P_DEFAULT), "open pieces");
+			states = requireId(H5Dopen2(file, "states", H5P_DEFAULT), "open states");
+			values = requireId(H5Dopen2(file, "values", H5P_DEFAULT), "open values");
+			const auto pieceShape = shape(pieces, 2);
+			const auto stateShape = shape(states, 1);
+			const auto valueShape = shape(values, 1);
+			if (pieceShape[1] != planeCount || pieceShape[0] == 0 || stateShape[0] != pieceShape[0] || valueShape[0] != pieceShape[0]) {
+				throw std::runtime_error("Eleginus datasets have incompatible shapes");
 			}
-			for (std::size_t i = model.formulas(); i < p.size(); ++i) {
-				const float z = p[i] - o.lr * (grad[i] * scale + o.decay * p[i]);
-				p[i] = std::copysign(std::max(0.0F, std::abs(z) - o.lr * o.sparse), z);
-			}
-			std::fill(grad.begin(), grad.end(), 0.0F);
-			model.prune(0.0F);
-			grad.resize(model.params().size());
-		}
-
-	public:
-		std::vector<float> grad;
-	};
-
-	std::uint64_t seedFor(std::uint64_t seed, std::uint64_t game) {
-		auto x = seed + 0x9e3779b97f4a7c15ULL * (game + 1);
-		x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
-		x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
-		return x ^ (x >> 31);
-	}
-
-	chess::Move choose(const eleginus::SearchResult &r, const Options &o, std::mt19937_64 &rng) {
-		if (r.root.empty()) return chess::Move(chess::Move::NO_MOVE);
-		if (std::uniform_real_distribution<float>(0, 1)(rng) < o.explore) {
-			return r.root[std::uniform_int_distribution<std::size_t>(0, r.root.size() - 1)(rng)].move;
-		}
-		if (o.temp == 0) return r.move;
-		std::vector<double> mass;
-		const auto best = r.root.front().score_cp;
-		for (const auto &a : r.root) {
-			mass.push_back(std::exp((a.score_cp - best) / static_cast<double>(o.temp)));
-		}
-		return r.root[std::discrete_distribution<std::size_t>(mass.begin(), mass.end())(rng)].move;
-	}
-
-	Game play(const eleginus::Model &model, const Options &o, std::uint64_t seed) {
-		Game game;
-		chess::Board board;
-		eleginus::SearchOptions limits;
-		limits.depth = o.depth;
-		limits.hash_mb = static_cast<std::size_t>(o.hash);
-		limits.collect_leaf = true;
-		// Temperature sampling requires scores, not the bounds returned by a root null-window search.
-		limits.multipv = o.temp > 0 ? 256 : 1;
-		eleginus::Searcher search(model, limits);
-		std::mt19937_64 rng(seed);
-		for (int ply = 0; ply < o.plies && !stopped() && !eleginus::isGameOver(board); ++ply) {
-			const auto result = search.search(board, {}, stopped);
-			if (stopped()) break;
-			const auto move = choose(result, o, rng);
-			if (move.move() == chess::Move::NO_MOVE) break;
-			Sample sample;
-			sample.x = result.leaf;
-			if (sample.x.empty()) model.extract(board, sample.x);
-			game.samples.push_back(std::move(sample));
-			board.makeMove(move);
-		}
-		const auto [reason, result] = board.isGameOver();
-		if (stopped() || reason == chess::GameResultReason::NONE) {
-			game.samples.clear();
-			return game;
-		}
-		if (result == chess::GameResult::DRAW) game.result = 1;
-		else {
-			const auto winner = result == chess::GameResult::WIN ? board.sideToMove() : ~board.sideToMove();
-			game.result = winner == chess::Color::WHITE ? 2 : 0;
-		}
-		const float white = 0.5F * game.result;
-		for (auto &s : game.samples) {
-			s.y = white;
-		}
-		return game;
-	}
-
-	double learn(eleginus::Model &model, Prox &solver, const std::deque<Game> &replay, std::size_t count, const Options &o, std::mt19937_64 &rng) {
-		std::vector<const Sample *> pool;
-		for (const auto &g : replay) {
-			for (const auto &s : g.samples) {
-				pool.push_back(&s);
-			}
-		}
-		if (pool.empty() || count == 0) return 0;
-		std::uniform_int_distribution<std::size_t> pick(0, pool.size() - 1);
-		double loss = 0;
-		std::size_t used = 0;
-		eleginus::Model::Cache cache;
-		for (std::size_t start = 0; start < count && !stopped(); start += o.batch) {
-			const auto size = std::min(count - start, static_cast<std::size_t>(o.batch));
-			for (std::size_t i = 0; i < size; ++i) {
-				const auto &s = *pool[pick(rng)];
-				const float h = model.forward(s.x, cache);
-				if (!std::isfinite(h)) throw std::runtime_error("nonfinite training score");
-				// Stable BCE on logits; terminal scores may also equal 1/2.
-				loss += std::max(h, 0.0F) - h * s.y + std::log1p(std::exp(-std::abs(h)));
-				const float e = std::exp(-std::abs(h));
-				const float p = h >= 0 ? 1.0F / (1.0F + e) : e / (1.0F + e);
-				model.backward(cache, p - s.y, solver.grad);
-			}
-			solver.step(model, size, o);
-			used += size;
-		}
-		return used ? loss / static_cast<double>(used) : 0;
-	}
-
-	std::size_t discover(eleginus::Model &model, const std::deque<Game> &replay, const Options &o) {
-		constexpr std::size_t sampleLimit = 2048, addLimit = 16;
-		const auto n = model.formulas();
-		std::size_t total = 0;
-		for (const auto &game : replay) {
-			total += game.samples.size();
-		}
-		if (total == 0 || model.relations().size() == eleginus::kRelationLimit) return 0;
-		const std::size_t stride = std::max<std::size_t>(1, total / sampleLimit);
-		std::vector<double> correlation(n * n);
-		std::size_t visited = 0, used = 0;
-		for (const auto &game : replay) {
-			for (const auto &sample : game.samples) {
-				if (visited++ % stride != 0 || used == sampleLimit) continue;
-				const float h = model.score(sample.x);
-				const float e = std::exp(-std::abs(h));
-				const float p = h >= 0 ? 1.0F / (1.0F + e) : e / (1.0F + e);
-				const double residual = p - sample.y;
-				for (const auto &row : sample.x) {
-					if (row.score == 0) continue;
-					for (const auto &condition : sample.x) {
-						if (condition.condition != 0) {
-							correlation[static_cast<std::size_t>(row.index) * n + condition.index] +=
-								residual * static_cast<double>(row.score) * condition.condition;
-						}
-					}
+			rows = static_cast<std::int64_t>(pieceShape[0]);
+			const hid_t properties = requireId(H5Dget_create_plist(pieces), "get pieces properties");
+			if (H5Pget_layout(properties) == H5D_CHUNKED) {
+				hsize_t dimensions[2]{};
+				if (H5Pget_chunk(properties, 2, dimensions) != 2 || dimensions[0] == 0) {
+					H5Pclose(properties);
+					throw std::runtime_error("pieces dataset has an invalid chunk shape");
 				}
-				++used;
+				chunkRows = static_cast<std::int64_t>(dimensions[0]);
+			} else {
+				chunkRows = rows;
+			}
+			H5Pclose(properties);
+		}
+
+		~Dataset() {
+			if (pieces >= 0) H5Dclose(pieces);
+			if (states >= 0) H5Dclose(states);
+			if (values >= 0) H5Dclose(values);
+			if (file >= 0) H5Fclose(file);
+		}
+
+		Dataset(const Dataset &) = delete;
+		Dataset &operator=(const Dataset &) = delete;
+
+		std::int64_t count() const noexcept { return rows; }
+		std::int64_t chunk() const noexcept { return chunkRows; }
+
+		RawChunk read(std::int64_t first, std::int64_t count) const {
+			if (first < 0 || count <= 0 || first > rows - count) throw std::out_of_range("HDF5 row range");
+			RawChunk result;
+			result.pieces.resize(static_cast<std::size_t>(count) * planeCount);
+			result.states.resize(static_cast<std::size_t>(count));
+			result.values.resize(static_cast<std::size_t>(count));
+			readRange(pieces, H5T_NATIVE_UINT64, result.pieces.data(), first, count, planeCount);
+			readRange(states, H5T_NATIVE_UINT8, result.states.data(), first, count, 0);
+			readRange(values, H5T_NATIVE_FLOAT, result.values.data(), first, count, 0);
+			if (std::any_of(result.values.begin(), result.values.end(), [](float value) { return !std::isfinite(value) || value < 0 || value > 1; })) {
+				throw std::runtime_error("HDF5 target lies outside [0,1]");
+			}
+			return result;
+		}
+
+	private:
+		static std::vector<hsize_t> shape(hid_t dataset, int rank) {
+			const hid_t space = requireId(H5Dget_space(dataset), "get dataset shape");
+			if (H5Sget_simple_extent_ndims(space) != rank) {
+				H5Sclose(space);
+				throw std::runtime_error("HDF5 dataset has the wrong rank");
+			}
+			std::vector<hsize_t> result(static_cast<std::size_t>(rank));
+			H5Sget_simple_extent_dims(space, result.data(), nullptr);
+			H5Sclose(space);
+			return result;
+		}
+
+		static void readRange(hid_t dataset, hid_t type, void *destination, std::int64_t first, std::int64_t count, hsize_t width) {
+			const hid_t source = requireId(H5Dget_space(dataset), "get dataset range");
+			if (width) {
+				const hsize_t start[] = {static_cast<hsize_t>(first), 0};
+				const hsize_t dimensions[] = {static_cast<hsize_t>(count), width};
+				require(H5Sselect_hyperslab(source, H5S_SELECT_SET, start, nullptr, dimensions, nullptr), "select dataset range");
+				const hid_t memory = requireId(H5Screate_simple(2, dimensions, nullptr), "create range memory");
+				require(H5Dread(dataset, type, memory, source, H5P_DEFAULT, destination), "read dataset range");
+				H5Sclose(memory);
+			} else {
+				const hsize_t start[] = {static_cast<hsize_t>(first)};
+				const hsize_t dimensions[] = {static_cast<hsize_t>(count)};
+				require(H5Sselect_hyperslab(source, H5S_SELECT_SET, start, nullptr, dimensions, nullptr), "select dataset range");
+				const hid_t memory = requireId(H5Screate_simple(1, dimensions, nullptr), "create range memory");
+				require(H5Dread(dataset, type, memory, source, H5P_DEFAULT, destination), "read dataset range");
+				H5Sclose(memory);
+			}
+			H5Sclose(source);
+		}
+
+		hid_t file = -1;
+		hid_t pieces = -1;
+		hid_t states = -1;
+		hid_t values = -1;
+		std::int64_t rows = 0;
+		std::int64_t chunkRows = 1;
+	};
+
+	class PackedBoard final : public chess::Board {
+	public:
+		PackedBoard() : chess::Board(ProtectedCtor::CREATE) {}
+
+		void load(const std::uint64_t *planes, std::uint8_t state) {
+			if (state & 0xE0U) throw std::runtime_error("HDF5 position contains invalid state bits");
+			prev_states_.clear();
+			pieces_bb_.fill(chess::Bitboard(0));
+			occ_bb_.fill(chess::Bitboard(0));
+			board_.fill(chess::Piece::NONE);
+			key_ = 0;
+			cr_.clear();
+			plies_ = 0;
+			stm_ = chess::Color(state & 1U);
+			ep_sq_ = chess::Square::NO_SQ;
+			hfm_ = 0;
+			chess960_ = false;
+			castling_path = {};
+			for (int square = 0; square < 64; ++square) {
+				unsigned code = 0;
+				for (unsigned bit = 0; bit < planeCount; ++bit) code |= static_cast<unsigned>((planes[bit] >> square) & 1ULL) << bit;
+				if (code == 0) continue;
+				if (code > 12) throw std::runtime_error("HDF5 position contains an invalid piece code");
+				const int packed = static_cast<int>(code - 1);
+				const int type = packed % 6;
+				const int color = packed / 6;
+				const auto piece = chess::Piece(chess::PieceType(static_cast<chess::PieceType::underlying>(type)), chess::Color(color));
+				const chess::Bitboard bit(1ULL << square);
+				board_[static_cast<std::size_t>(square)] = piece;
+				pieces_bb_[static_cast<std::size_t>(type)] |= bit;
+				occ_bb_[static_cast<std::size_t>(color)] |= bit;
+			}
+			if (pieces_bb_[5].count() != 2 || (pieces_bb_[5] & occ_bb_[0]).count() != 1 || (pieces_bb_[5] & occ_bb_[1]).count() != 1) {
+				throw std::runtime_error("HDF5 position does not contain one king per side");
+			}
+			for (int color = 0; color < 2; ++color) {
+				for (int wing = 0; wing < 2; ++wing) {
+					if (!(state & (1U << (1 + 2 * color + wing)))) continue;
+					const auto side = wing == 0 ? CastlingRights::Side::KING_SIDE : CastlingRights::Side::QUEEN_SIDE;
+					cr_.setCastlingRight(chess::Color(color), side, wing == 0 ? chess::File::FILE_H : chess::File::FILE_A);
+				}
 			}
 		}
-		if (used == 0) return 0;
-		std::vector<std::uint8_t> active(n * n);
-		for (const auto &relation : model.relations()) {
-			active[static_cast<std::size_t>(relation.row) * n + relation.condition] = 1;
+	};
+
+	struct DenseBatch {
+		torch::Tensor scores;
+		torch::Tensor conditions;
+		torch::Tensor targets;
+	};
+
+	class FormulaPool {
+	public:
+		explicit FormulaPool(int count) {
+			threads.reserve(static_cast<std::size_t>(count));
+			for (int id = 0; id < count; ++id) threads.emplace_back([this, id] { worker(static_cast<std::size_t>(id)); });
 		}
-		struct Candidate {
-			double gain;
-			std::uint16_t row, condition;
+
+		~FormulaPool() {
+			{
+				std::lock_guard lock(mutex);
+				closing = true;
+			}
+			ready.notify_all();
+			for (auto &thread : threads) thread.join();
+		}
+
+		DenseBatch build(const RawChunk &raw, const std::vector<std::size_t> &order, std::size_t first, std::size_t count, bool pinned) {
+			const auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU).pinned_memory(pinned);
+			DenseBatch result{
+				torch::zeros({static_cast<std::int64_t>(count), static_cast<std::int64_t>(eleginus::kFormulaCount)}, options),
+				torch::zeros({static_cast<std::int64_t>(count), static_cast<std::int64_t>(eleginus::kFormulaCount)}, options),
+				torch::empty({static_cast<std::int64_t>(count)}, options),
+			};
+			{
+				std::lock_guard lock(mutex);
+				job = {&raw, &order, first, count, result.scores.data_ptr<float>(), result.conditions.data_ptr<float>(), result.targets.data_ptr<float>()};
+				finished = 0;
+				failure = nullptr;
+				++generation;
+			}
+			ready.notify_all();
+			std::unique_lock lock(mutex);
+			done.wait(lock, [&] { return finished == threads.size(); });
+			if (failure) std::rethrow_exception(failure);
+			return result;
+		}
+
+	private:
+		struct Job {
+			const RawChunk *raw = nullptr;
+			const std::vector<std::size_t> *order = nullptr;
+			std::size_t first = 0;
+			std::size_t count = 0;
+			float *scores = nullptr;
+			float *conditions = nullptr;
+			float *targets = nullptr;
 		};
-		std::vector<Candidate> candidates;
-		candidates.reserve(n * n - model.relations().size());
-		for (std::size_t row = 0; row < n; ++row) {
-			for (std::size_t condition = 0; condition < n; ++condition) {
-				const auto index = row * n + condition;
-				if (!active[index]) {
-					const double gain = std::abs(correlation[index]) / static_cast<double>(used) - o.sparse;
-					if (gain > 0) candidates.push_back({gain, static_cast<std::uint16_t>(row), static_cast<std::uint16_t>(condition)});
+
+		void worker(std::size_t id) {
+			std::uint64_t seen = 0;
+			PackedBoard board;
+			std::vector<eleginus::Feature> features;
+			features.reserve(eleginus::kFormulaCount);
+			while (true) {
+				Job current;
+				{
+					std::unique_lock lock(mutex);
+					ready.wait(lock, [&] { return closing || generation != seen; });
+					if (closing) return;
+					seen = generation;
+					current = job;
 				}
+				try {
+					for (std::size_t row = id; row < current.count; row += threads.size()) {
+						const std::size_t source = (*current.order)[current.first + row];
+						board.load(current.raw->pieces.data() + source * planeCount, current.raw->states[source]);
+						eleginus::FormulaSet::evaluate(board, features);
+						const auto offset = row * eleginus::kFormulaCount;
+						for (const auto &feature : features) {
+							current.scores[offset + feature.index] = static_cast<float>(feature.score);
+							current.conditions[offset + feature.index] = static_cast<float>(feature.condition);
+						}
+						current.targets[row] = current.raw->values[source];
+					}
+				} catch (...) {
+					std::lock_guard lock(mutex);
+					if (!failure) failure = std::current_exception();
+				}
+				{
+					std::lock_guard lock(mutex);
+					++finished;
+				}
+				done.notify_one();
 			}
 		}
-		const auto count = std::min({addLimit, candidates.size(), eleginus::kRelationLimit - model.relations().size()});
-		std::partial_sort(candidates.begin(), candidates.begin() + static_cast<std::ptrdiff_t>(count), candidates.end(),
-			[](const Candidate &a, const Candidate &b) { return a.gain > b.gain; });
-		std::size_t added = 0;
-		for (std::size_t i = 0; i < count; ++i) {
-			added += model.activate(candidates[i].row, candidates[i].condition);
-		}
-		return added;
+
+		std::vector<std::thread> threads;
+		std::mutex mutex;
+		std::condition_variable ready;
+		std::condition_variable done;
+		Job job;
+		std::uint64_t generation = 0;
+		std::size_t finished = 0;
+		bool closing = false;
+		std::exception_ptr failure;
+	};
+
+	torch::Device resolveDevice(const std::string &requested) {
+		if (requested == "auto") return torch::Device(torch::cuda::is_available() ? torch::kCUDA : torch::kCPU);
+		if (requested == "cuda" && !torch::cuda::is_available()) throw std::runtime_error("CUDA training was requested but CUDA is unavailable");
+		return torch::Device(requested);
 	}
 
-	bool approve(const eleginus::Model &model, const eleginus::Model &baseline, const std::vector<chess::Board> &book, const Options &o) {
-		std::array<int, 5> pairs{};
-		eleginus::SearchOptions limits;
-		limits.depth = o.evalDepth;
-		limits.hash_mb = static_cast<std::size_t>(o.hash);
-		std::cout << "evaluation start: games=2000 openings=1000 depth=" << o.evalDepth << std::endl;
-		int logged = 0;
-		for (int start = 0; start < eleginus::kOpeningPairs && !stopped();) {
-			const int count = std::min(o.workers, eleginus::kOpeningPairs - start);
-			std::vector<std::future<int>> jobs;
-			for (int i = 0; i < count; ++i) {
-				const auto index = static_cast<std::size_t>(start + i);
-				jobs.push_back(std::async(std::launch::async, [&, index] {
-					const int white = eleginus::match(model, baseline, book[index], chess::Color::WHITE, limits, stopped);
-					if (white < 0) return -1;
-					const int black = eleginus::match(model, baseline, book[index], chess::Color::BLACK, limits, stopped);
-					return black < 0 ? -1 : white + black;
-				}));
-			}
-			for (auto &job : jobs) {
-				const int score = job.get();
-				if (score >= 0) ++pairs[score];
-			}
-			start += count;
-			if (!stopped() && (start - logged >= 50 || start == eleginus::kOpeningPairs)) {
-				std::cout << "evaluation step: games=" << 2 * start << "/2000" << std::endl;
-				logged = start;
-			}
+	class Solver {
+	public:
+		Solver(const eleginus::Model &model, const Options &options) : device(resolveDevice(options.device)), clip(options.clip) {
+			constexpr float relationScale = static_cast<float>(eleginus::kFormulaCount);
+			const auto cpu = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+			const auto initialValues = eleginus::Model::initial();
+			initial = torch::from_blob(const_cast<float *>(initialValues.data()), {static_cast<std::int64_t>(eleginus::kFormulaCount)}, cpu).clone().to(device);
+			base = torch::from_blob(const_cast<float *>(model.base().data()), {static_cast<std::int64_t>(eleginus::kFormulaCount)}, cpu).clone().to(device);
+			base = (base - initial).detach().set_requires_grad(true);
+			relation = torch::from_blob(const_cast<float *>(model.relations().data()),
+				{static_cast<std::int64_t>(eleginus::kFormulaCount), static_cast<std::int64_t>(eleginus::kFormulaCount)}, cpu).clone().to(device);
+			relation = (relation * relationScale).detach().set_requires_grad(true);
+			parameters = {base, relation};
+			optimizer = std::make_unique<torch::optim::AdamW>(parameters, torch::optim::AdamWOptions(options.lr).weight_decay(options.decay));
+			lossTotal = torch::zeros({}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
 		}
-		if (stopped()) {
-			std::cout << "evaluation cancelled: current unchanged" << std::endl;
-			return false;
+
+		const torch::Device &trainingDevice() const noexcept { return device; }
+
+		double step(const DenseBatch &batch, bool report) {
+			constexpr float inverseRelationScale = 1.0F / static_cast<float>(eleginus::kFormulaCount);
+			auto scores = batch.scores.to(device, torch::kFloat32, device.is_cuda(), false);
+			auto conditions = batch.conditions.to(device, torch::kFloat32, device.is_cuda(), false);
+			auto targets = batch.targets.to(device, torch::kFloat32, device.is_cuda(), false);
+			auto dynamic = initial + base + inverseRelationScale * torch::matmul(conditions, relation);
+			auto logits = (scores * dynamic).sum(1);
+			auto loss = torch::nn::functional::binary_cross_entropy_with_logits(logits, targets);
+			lossTotal.add_(loss.detach());
+			++lossCount;
+			double reported = 0.0;
+			if (report) {
+				reported = (lossTotal / lossCount).item<double>();
+				if (!std::isfinite(reported)) throw std::runtime_error("nonfinite training loss");
+				lossTotal.zero_();
+				lossCount = 0;
+			}
+			optimizer->zero_grad();
+			loss.backward();
+			torch::nn::utils::clip_grad_norm_(parameters, clip);
+			optimizer->step();
+			return reported;
 		}
-		const auto result = eleginus::confidence(pairs);
-		const bool accepted = result.low > 0;
-		std::cout << "evaluation result: score=" << result.score << " elo=" << result.elo;
-		std::cout << " elo_ci95=[" << result.low << "," << result.high << "] ";
-		std::cout << "accepted=" << (accepted ? "yes" : "no") << std::endl;
-		return accepted;
+
+		void save(eleginus::Model &model, const std::filesystem::path &path) const {
+			constexpr float inverseRelationScale = 1.0F / static_cast<float>(eleginus::kFormulaCount);
+			torch::NoGradGuard guard;
+			const auto cpuBase = (initial + base).to(torch::kCPU).contiguous();
+			const auto cpuRelation = (inverseRelationScale * relation).to(torch::kCPU).contiguous();
+			std::vector<float> values(eleginus::kParameterCount);
+			std::copy_n(cpuBase.data_ptr<float>(), eleginus::kFormulaCount, values.begin());
+			std::copy_n(cpuRelation.data_ptr<float>(), eleginus::kRelationCount, values.begin() + static_cast<std::ptrdiff_t>(eleginus::kFormulaCount));
+			model.update(values);
+			model.save(path);
+		}
+
+	private:
+		torch::Device device;
+		float clip;
+		torch::Tensor initial;
+		torch::Tensor base;
+		torch::Tensor relation;
+		torch::Tensor lossTotal;
+		std::int64_t lossCount = 0;
+		std::vector<torch::Tensor> parameters;
+		std::unique_ptr<torch::optim::AdamW> optimizer;
+	};
+
+	std::int64_t stepsPerEpoch(std::int64_t rows, std::int64_t chunk, int batch) {
+		const auto full = rows / chunk;
+		const auto remainder = rows % chunk;
+		return full * ((chunk + batch - 1) / batch) + (remainder ? (remainder + batch - 1) / batch : 0);
 	}
 
 } // namespace
 
 int main(int argc, char **argv) {
 	try {
-		const auto o = parse(argc, argv);
+		const auto options = parse(argc, argv);
 		std::signal(SIGINT, interrupt);
 		std::signal(SIGTERM, interrupt);
 		#ifdef _WIN32
-		if (!SetConsoleCtrlHandler(nullptr, FALSE) || !SetConsoleCtrlHandler(console, TRUE)) {
-			throw std::runtime_error("cannot install console interrupt handler");
-		}
+		if (!SetConsoleCtrlHandler(nullptr, FALSE) || !SetConsoleCtrlHandler(console, TRUE)) throw std::runtime_error("cannot install console interrupt handler");
 		#endif
-		const auto book = eleginus::openings(o.book);
-		const bool hasCurrent = std::filesystem::exists(o.out);
-		auto baseline = hasCurrent ? eleginus::Model::load(o.out) : (o.init.empty() ? eleginus::Model() : eleginus::Model::load(o.init));
-		auto model = o.init.empty() ? baseline : eleginus::Model::load(o.init);
-		Prox solver(model.params().size());
-		std::mt19937_64 rng(o.seed);
-		std::deque<Game> replay;
-		constexpr std::size_t history = 64; // Bounded RAM-only replay, never part of a checkpoint.
-		std::uint64_t attempted = 0, completed = 0, discarded = 0, white = 0, black = 0, draws = 0, logged = 0, discovered = 0;
-		int since = 0;
-		std::size_t samples = 0;
-		std::cout << "self-play start: out=" << o.out.string() << " formulas=" << model.formulas();
-		std::cout << " parameters=" << model.params().size() << " depth=" << o.depth << " workers=" << o.workers;
-		std::cout << " seed=" << o.seed << " eval_every=" << o.every << " eval_depth=" << o.evalDepth;
-		std::cout << " baseline=" << (hasCurrent ? "current" : "initial") << std::endl;
-		while (!stopped()) {
-			const auto batch = std::min(o.workers, o.every - since);
-			std::vector<std::future<Game>> jobs;
-			for (int i = 0; i < batch; ++i) {
-				const auto seed = seedFor(o.seed, attempted + i);
-				jobs.push_back(std::async(std::launch::async, [&model, &o, seed] { return play(model, o, seed); }));
-			}
-			std::vector<Game> games;
-			for (auto &job : jobs) {
-				games.push_back(job.get());
-			}
-			if (stopped()) break;
-			// All searches have finished before parameters change.
-			std::size_t count = 0;
-			for (auto &game : games) {
-				if (game.result < 0) {
-					++discarded;
-					continue;
+		Dataset data(options.data);
+		auto model = options.init.empty() ? eleginus::Model() : eleginus::Model::load(options.init);
+		Solver solver(model, options);
+		FormulaPool formulas(options.workers);
+		std::mt19937_64 random(options.seed);
+		const auto epochSteps = stepsPerEpoch(data.count(), data.chunk(), options.batch);
+		std::cout << "training start: data=" << options.data.string() << " out=" << options.out.string();
+		std::cout << " device=" << solver.trainingDevice() << " epochs=" << options.epochs << " batch_size=" << options.batch;
+		std::cout << " workers=" << options.workers << " parameters=" << eleginus::kParameterCount << " lr=" << options.lr << std::endl;
+		std::cout << "training input: rows=" << data.count() << " hdf5_chunk_rows=" << data.chunk();
+		std::cout << " steps_per_epoch=" << epochSteps << " loader=chunk_shuffle_prefetch" << std::endl;
+		std::int64_t globalStep = 0;
+		std::int64_t trainedRows = 0;
+		for (int epoch = 0; epoch < options.epochs && !stopped(); ++epoch) {
+			std::vector<std::int64_t> starts;
+			for (std::int64_t first = 0; first < data.count(); first += data.chunk()) starts.push_back(first);
+			std::shuffle(starts.begin(), starts.end(), random);
+			auto launch = [&](std::size_t position) {
+				const auto first = starts[position];
+				const auto count = std::min(data.chunk(), data.count() - first);
+				return std::async(std::launch::async, [&data, first, count] { return data.read(first, count); });
+			};
+			auto pending = launch(0);
+			for (std::size_t chunk = 0; chunk < starts.size() && !stopped();) {
+				auto raw = pending.get();
+				++chunk;
+				if (chunk < starts.size()) pending = launch(chunk);
+				std::vector<std::size_t> order(raw.size());
+				std::iota(order.begin(), order.end(), 0);
+				std::shuffle(order.begin(), order.end(), random);
+				for (std::size_t first = 0; first < raw.size() && !stopped(); first += static_cast<std::size_t>(options.batch)) {
+					if (options.maxSteps > 0 && globalStep >= options.maxSteps) break;
+					const auto count = std::min(static_cast<std::size_t>(options.batch), raw.size() - first);
+					auto batch = formulas.build(raw, order, first, count, solver.trainingDevice().is_cuda());
+					const bool report = (globalStep + 1) % options.log == 0 || globalStep == 0;
+					const double loss = solver.step(batch, report);
+					++globalStep;
+					trainedRows += static_cast<std::int64_t>(count);
+					if (report) {
+						std::cout << "train step: epoch=" << epoch << " global_step=" << globalStep << " loss=" << loss;
+						std::cout << " lr=" << options.lr << " positions=" << trainedRows << std::endl;
+					}
+					if (options.save > 0 && globalStep % options.save == 0) {
+						solver.save(model, options.out);
+						std::cout << "saved model: step=" << globalStep << " path=" << options.out.string() << std::endl;
+					}
 				}
-				++completed;
-				++since;
-				white += game.result == 2;
-				draws += game.result == 1;
-				black += game.result == 0;
-				count += game.samples.size();
-				replay.push_back(std::move(game));
-				if (replay.size() > history) replay.pop_front();
+				if (options.maxSteps > 0 && globalStep >= options.maxSteps) break;
 			}
-			if (completed / static_cast<std::uint64_t>(o.discover) > discovered) {
-				const auto added = discover(model, replay, o);
-				solver.sync(model.params().size());
-				discovered = completed / static_cast<std::uint64_t>(o.discover);
-				if (added) std::cout << "relation discovery: added=" << added << " active=" << model.relations().size() << std::endl;
-			}
-			const auto loss = learn(model, solver, replay, count, o, rng);
-			samples += count;
-			attempted += batch;
-			if (attempted - logged >= static_cast<std::uint64_t>(o.log) || since == o.every) {
-				std::cout << "self-play step: games=" << attempted << " completed=" << completed << " discarded=" << discarded;
-				std::cout << " positions=" << samples << " white=" << white << " draws=" << draws << " black=" << black;
-				if (count) std::cout << " bce=" << loss;
-				std::cout << std::endl;
-				logged = attempted;
-			}
-			if (since == o.every && !stopped()) {
-				if (approve(model, baseline, book, o) && !stopped()) {
-					model.save(o.out);
-					baseline = model;
-					std::cout << "published model: " << o.out.string() << std::endl;
-				}
-				since = 0;
-			}
+			if (options.maxSteps > 0 && globalStep >= options.maxSteps) break;
 		}
-		std::cout << "training stopped: no progress saved; current unchanged by exit" << std::endl;
+		if (globalStep == 0) throw std::runtime_error("training stopped before the first optimizer step");
+		solver.save(model, options.out);
+		std::cout << "training complete: steps=" << globalStep << " positions=" << trainedRows << " model=" << options.out.string() << std::endl;
 		return 0;
-	} catch (const std::exception &e) {
-		std::cerr << "training error: " << e.what() << '\n';
+	} catch (const std::exception &error) {
+		std::cerr << "training error: " << error.what() << std::endl;
 		return 1;
 	}
 }

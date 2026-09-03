@@ -11,8 +11,7 @@ from pathlib import Path
 
 ELEGINUS_MAGIC = b"ELEGINUS"
 ELEGINUS_TYPE_ID = 3
-ELEGINUS_HEADER = struct.Struct("=8sIII")
-ELEGINUS_RELATION = struct.Struct("=HHf")
+ELEGINUS_HEADER = struct.Struct("=8sII")
 
 ARCHITECTURES = {
     1: {
@@ -102,34 +101,28 @@ def inspect_eleginus(path: Path) -> dict[str, object] | None:
             return None
         if len(header) != ELEGINUS_HEADER.size:
             raise ValueError("truncated Eleginus checkpoint header")
-        _, type_id, n, relations = ELEGINUS_HEADER.unpack(header)
-        if type_id != ELEGINUS_TYPE_ID or n == 0 or relations > 2048:
+        _, type_id, n = ELEGINUS_HEADER.unpack(header)
+        if type_id != ELEGINUS_TYPE_ID or n == 0:
             raise ValueError("inconsistent Eleginus dimensions")
-        expected = ELEGINUS_HEADER.size + n * 4 + relations * ELEGINUS_RELATION.size
+        relations = n * n
+        expected = ELEGINUS_HEADER.size + (n + relations) * 4
         if path.stat().st_size != expected:
             raise ValueError("Eleginus checkpoint size does not match its parameter dimensions")
         weights = array("f")
-        weights.fromfile(stream, n)
-        coordinates = set()
-        for _ in range(relations):
-            row, condition, weight = ELEGINUS_RELATION.unpack(stream.read(ELEGINUS_RELATION.size))
-            if row >= n or condition >= n or (row, condition) in coordinates:
-                raise ValueError("Eleginus checkpoint contains an invalid relation coordinate")
-            coordinates.add((row, condition))
-            weights.append(weight)
+        weights.fromfile(stream, n + relations)
 
     count = n + relations
     return {
         "architecture": "eleginus",
-        "heads": "sparse graybox value",
+        "heads": "hand-crafted network value",
         "arch": {"type_id": type_id, "formulas": n, "relations": relations},
         "model_children": "base, relations",
         "parameters": count,
         "trainable_parameters": count,
-        "parameter_tensors": 2 if relations else 1,
+        "parameter_tensors": 2,
         "buffers": 0,
         "tensor_memory": count * 4,
-        "dtypes": f"float32 ({2 if relations else 1})",
+        "dtypes": "float32 (2)",
         "devices": "cpu",
         "finite": all(math.isfinite(weight) for weight in weights),
     }
