@@ -318,13 +318,13 @@ namespace eleginus {
 			}
 
 			// The Chess-algebra is designed to be expressive and efficient, with a focus on chess-specific computations.
-
+			// It mainly consists of three layers: Atoms, InterSignals and the final output.
 			// NUM constructs a signed integer signal; BB constructs a raw bitboard signal.
 			AtomSignal NUM(std::int64_t x) const { return AtomSignal(static_cast<Word>(x)); }
 			AtomSignal BB(Word x) const { return AtomSignal(x); }
 
-			// ATOM reads one irreducible board input.
-			AtomSignal ATOM(Atom atom) const { return AtomSignal(in[atomIndex(atom)]); }
+			// INP reads one irreducible board input.
+			AtomSignal INP(Atom atom) const { return AtomSignal(in[atomIndex(atom)]); }
 
 			// ADD, SUB, MUL, ABS and MIN form the integer arithmetic primitives.
 			AtomSignal ADD(InterSignal a, InterSignal b) const { return NUM(number(a.bits) + number(b.bits)); }

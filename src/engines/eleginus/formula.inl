@@ -3,7 +3,7 @@ inline static constexpr std::array<FormulaParam, 1> tempoWeights{{
 }};
 
 FORMULA(tempo) {
-	const auto stm = b.ATOM(Atom::STM);
+	const auto stm = b.INP(Atom::STM);
 	// Tempo: +1 when White moves and -1 when Black moves.
 	F(diff(b.EQ(stm, us), b.EQ(stm, them)));
 }
@@ -393,7 +393,7 @@ FORMULA(threats) {
 		F(diff(friendly[3], enemy[3]));
 		F(diff(friendly[4], enemy[4]));
 	}
-	const auto stm = b.ATOM(Atom::STM);
+	const auto stm = b.INP(Atom::STM);
 	const auto white = b.EQ(stm, us);
 	const auto black = b.EQ(stm, them);
 	for (int victim = 0; victim < 5; ++victim) {
