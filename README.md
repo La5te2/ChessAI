@@ -290,13 +290,13 @@ Eleginus preprocessing reads JSONL records containing `fen` and `evals`. It sele
 The preprocessor stores each accepted position with `chess::Board::Compact` in 24 bytes. The resulting HDF5 file contains a `states` dataset with shape $[N,24]$ and a `centipawns` dataset with shape $[N]$.
 
 ```bash
-build/eleginus/preprocess \
-	--input data/positions.jsonl \
-	--output data/positions.eleginus.h5 \
-	--chunk-rows 16384 \
-	--max-positions 0 \
-	--compression 1 \
-	--log-every 100000
+zstdcat data/positions.jsonl.zst | build/eleginus/preprocess \
+		--input - \
+		--output data/positions.eleginus.h5 \
+		--chunk-rows 16384 \
+		--max-positions 200000000 \
+		--compression 1 \
+		--log-every 10000
 ```
 
 The offline optimizer restores each position, evaluates the compiled formulas and adjusts every formula's base coefficient and five material-response coefficients. It also optimizes the two king-pressure parameters, seven winnability parameters and five endgame-scaling parameters. The current formula set therefore exposes 4178 trainable parameters.

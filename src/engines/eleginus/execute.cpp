@@ -719,6 +719,7 @@ namespace eleginus {
 				for (const auto &source : formulaWeights) result.push_back({source.base, source.material});
 				return result;
 			}
+			static FormulaGlobals globals() noexcept { return formulaGlobals; }
 
 		private:
 			template <class F> InterSignal shared(Pair &pair, InterSignal role, F &&make) {
@@ -916,6 +917,6 @@ namespace eleginus {
 		return Formulas<Runtime<ScoreOutput>>::parameters();
 	}
 
-	FormulaGlobals FormulaSet::globals() { return {}; }
+	FormulaGlobals FormulaSet::globals() { return Formulas<Runtime<ScoreOutput>>::globals(); }
 
 } // namespace eleginus

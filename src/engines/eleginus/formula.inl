@@ -1,6 +1,4 @@
-inline static constexpr std::array<FormulaParam, 1> tempoWeights{{
-	0.16F
-}};
+#include "weights.inl"
 
 FORMULA(tempo) {
 	const auto stm = b.INP(Atom::STM);
@@ -8,58 +6,12 @@ FORMULA(tempo) {
 	F(diff(b.EQ(stm, us), b.EQ(stm, them)));
 }
 
-inline static constexpr std::array<FormulaParam, 5> materialWeights{{
-	0.22F, 0.773F, 0.828F, 1.2365F, 2.4515F
-}};
-
 FORMULA(material) {
 	// Material: friendly minus enemy piece count, once for pawn, knight, bishop, rook and queen.
 	for (int type = 0; type < 5; ++type) {
 		F(diff(b.POP(b.PCS(us, type)), b.POP(b.PCS(them, type))));
 	}
 }
-
-inline static constexpr std::array<FormulaParam, 384> pstWeights{{
-	-0.013125F, -0.009375F, -0.005625F, -0.001875F, -0.001875F, -0.005625F, -0.009375F, -0.013125F, 0.006875F, 0.010625F,
-	0.014375F, 0.018125F, 0.018125F, 0.014375F, 0.010625F, 0.006875F, 0.026875F, 0.030625F, 0.034375F, 0.038125F,
-	0.038125F, 0.034375F, 0.030625F, 0.026875F, 0.046875F, 0.050625F, 0.054375F, 0.058125F, 0.058125F, 0.054375F,
-	0.050625F, 0.046875F, 0.063125F, 0.066875F, 0.070625F, 0.074375F, 0.074375F, 0.070625F, 0.066875F, 0.063125F,
-	0.075625F, 0.079375F, 0.083125F, 0.086875F, 0.086875F, 0.083125F, 0.079375F, 0.075625F, 0.088125F, 0.091875F,
-	0.095625F, 0.099375F, 0.099375F, 0.095625F, 0.091875F, 0.088125F, 0.100625F, 0.104375F, 0.108125F, 0.111875F,
-	0.111875F, 0.108125F, 0.104375F, 0.100625F, -0.07875F, -0.05625F, -0.03375F, -0.01125F, -0.01125F, -0.03375F,
-	-0.05625F, -0.07875F, -0.05625F, -0.03375F, -0.01125F, 0.01125F, 0.01125F, -0.01125F, -0.03375F, -0.05625F,
-	-0.03375F, -0.01125F, 0.01125F, 0.03375F, 0.03375F, 0.01125F, -0.01125F, -0.03375F, -0.01125F, 0.01125F,
-	0.03375F, 0.05625F, 0.05625F, 0.03375F, 0.01125F, -0.01125F, -0.01125F, 0.01125F, 0.03375F, 0.05625F,
-	0.05625F, 0.03375F, 0.01125F, -0.01125F, -0.03375F, -0.01125F, 0.01125F, 0.03375F, 0.03375F, 0.01125F,
-	-0.01125F, -0.03375F, -0.05625F, -0.03375F, -0.01125F, 0.01125F, 0.01125F, -0.01125F, -0.03375F, -0.05625F,
-	-0.07875F, -0.05625F, -0.03375F, -0.01125F, -0.01125F, -0.03375F, -0.05625F, -0.07875F, -0.0525F, -0.0375F,
-	-0.0225F, -0.0075F, -0.0075F, -0.0225F, -0.0375F, -0.0525F, -0.0375F, -0.0225F, -0.0075F, 0.0075F,
-	0.0075F, -0.0075F, -0.0225F, -0.0375F, -0.0225F, -0.0075F, 0.0075F, 0.0225F, 0.0225F, 0.0075F,
-	-0.0075F, -0.0225F, -0.0075F, 0.0075F, 0.0225F, 0.0375F, 0.0375F, 0.0225F, 0.0075F, -0.0075F,
-	-0.0075F, 0.0075F, 0.0225F, 0.0375F, 0.0375F, 0.0225F, 0.0075F, -0.0075F, -0.0225F, -0.0075F,
-	0.0075F, 0.0225F, 0.0225F, 0.0075F, -0.0075F, -0.0225F, -0.0375F, -0.0225F, -0.0075F, 0.0075F,
-	0.0075F, -0.0075F, -0.0225F, -0.0375F, -0.0525F, -0.0375F, -0.0225F, -0.0075F, -0.0075F, -0.0225F,
-	-0.0375F, -0.0525F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F,
-	0.003125F, 0.003125F, 0.003125F, 0.003125F, 0.003125F, 0.003125F, 0.003125F, 0.003125F, 0.00625F, 0.00625F,
-	0.00625F, 0.00625F, 0.00625F, 0.00625F, 0.00625F, 0.00625F, 0.009375F, 0.009375F, 0.009375F, 0.009375F,
-	0.009375F, 0.009375F, 0.009375F, 0.009375F, 0.0125F, 0.0125F, 0.0125F, 0.0125F, 0.0125F, 0.0125F,
-	0.0125F, 0.0125F, 0.015625F, 0.015625F, 0.015625F, 0.015625F, 0.015625F, 0.015625F, 0.015625F, 0.015625F,
-	0.035F, 0.035F, 0.035F, 0.035F, 0.035F, 0.035F, 0.035F, 0.035F, 0.021875F, 0.021875F,
-	0.021875F, 0.021875F, 0.021875F, 0.021875F, 0.021875F, 0.021875F, -0.02625F, -0.01875F, -0.01125F, -0.00375F,
-	-0.00375F, -0.01125F, -0.01875F, -0.02625F, -0.01875F, -0.01125F, -0.00375F, 0.00375F, 0.00375F, -0.00375F,
-	-0.01125F, -0.01875F, -0.01125F, -0.00375F, 0.00375F, 0.01125F, 0.01125F, 0.00375F, -0.00375F, -0.01125F,
-	-0.00375F, 0.00375F, 0.01125F, 0.01875F, 0.01875F, 0.01125F, 0.00375F, -0.00375F, -0.00375F, 0.00375F,
-	0.01125F, 0.01875F, 0.01875F, 0.01125F, 0.00375F, -0.00375F, -0.01125F, -0.00375F, 0.00375F, 0.01125F,
-	0.01125F, 0.00375F, -0.00375F, -0.01125F, -0.01875F, -0.01125F, -0.00375F, 0.00375F, 0.00375F, -0.00375F,
-	-0.01125F, -0.01875F, -0.02625F, -0.01875F, -0.01125F, -0.00375F, -0.00375F, -0.01125F, -0.01875F, -0.02625F,
-	-0.02F, -0.01F, 0.0F, 0.01F, 0.01F, 0.0F, -0.01F, -0.02F, -0.03F, -0.02F,
-	-0.01F, 0.0F, 0.0F, -0.01F, -0.02F, -0.03F, -0.025F, -0.015F, -0.005F, 0.005F,
-	0.005F, -0.005F, -0.015F, -0.025F, -0.02F, -0.01F, 0.0F, 0.01F, 0.01F, 0.0F,
-	-0.01F, -0.02F, -0.025F, -0.015F, -0.005F, 0.005F, 0.005F, -0.005F, -0.015F, -0.025F,
-	-0.04F, -0.03F, -0.02F, -0.01F, -0.01F, -0.02F, -0.03F, -0.04F, -0.055F, -0.045F,
-	-0.035F, -0.025F, -0.025F, -0.035F, -0.045F, -0.055F, -0.07F, -0.06F, -0.05F, -0.04F,
-	-0.04F, -0.05F, -0.06F, -0.07F
-}};
 
 FORMULA(pst) {
 	// Piece-square tables: friendly minus enemy occupancy at each normalized square, ordered by piece type then square.
@@ -78,27 +30,12 @@ FORMULA(pst) {
 	}
 }
 
-inline static constexpr std::array<FormulaParam, 1> bishopPairWeights{{
-	0.15F
-}};
-
 FORMULA(bishopPair) {
 	// Bishop pair: one signal when a side retains at least two bishops.
 	const auto friendly = b.GE(b.POP(b.PCS(us, 2)), b.NUM(2));
 	const auto enemy = b.GE(b.POP(b.PCS(them, 2)), b.NUM(2));
 	F(diff(friendly, enemy));
 }
-
-inline static constexpr std::array<FormulaParam, 78> pawnsWeights{{
-	0.0375F, 0.01375F, 0.01375F, 0.01F, 0.0125F, 0.0175F, -0.01375F, 0.00875F, 0.0175F, 0.0175F,
-	0.065F, 0.0225F, 0.02375F, 0.016875F, 0.02F, 0.02875F, -0.025F, 0.015F, 0.02625F, 0.02375F,
-	0.1475F, 0.03125F, 0.03375F, 0.02375F, 0.0275F, 0.04F, -0.03625F, 0.02125F, 0.035F, 0.03F,
-	0.285F, 0.04F, 0.04375F, 0.030625F, 0.035F, 0.05125F, -0.0475F, 0.0275F, 0.04375F, 0.03625F,
-	0.4775F, 0.04875F, 0.05375F, 0.0375F, 0.0425F, 0.0625F, -0.05875F, 0.03375F, 0.0525F, 0.0425F,
-	0.725F, 0.0575F, 0.06375F, 0.044375F, 0.05F, 0.07375F, -0.07F, 0.04F, 0.06125F, 0.04875F,
-	-0.035F, -0.0275F, 0.006F, -0.006F, 0.004F, -0.004F, 0.002F, -0.002F, 0.0F, 0.0F,
-	-0.002F, 0.002F, -0.004F, 0.004F, -0.006F, 0.006F, -0.008F, 0.008F
-}};
 
 FORMULA(pawns) {
 	// Pawn ranks: ten signals for each normalized rank 2 through 7.
@@ -199,16 +136,6 @@ FORMULA(pawns) {
 	}
 }
 
-inline static constexpr std::array<FormulaParam, 64> mobilityWeights{{
-	-0.108F, -0.081F, -0.054F, -0.027F, 0.027F, 0.054F, 0.081F, 0.108F, -0.1125F, -0.09F,
-	-0.0675F, -0.045F, -0.0225F, 0.0225F, 0.045F, 0.0675F, 0.09F, 0.1125F, 0.135F, 0.1575F,
-	0.18F, -0.1134F, -0.0972F, -0.081F, -0.0648F, -0.0486F, -0.0324F, -0.0162F, 0.0162F, 0.0324F,
-	0.0486F, 0.0648F, 0.081F, 0.0972F, 0.1134F, 0.0F, -0.0972F, -0.0891F, -0.081F, -0.0729F,
-	-0.0648F, -0.0567F, -0.0486F, -0.0405F, -0.0324F, -0.0243F, -0.0162F, -0.0081F, 0.0081F, 0.0162F,
-	0.0243F, 0.0324F, 0.0405F, 0.0486F, 0.0567F, 0.0648F, 0.0729F, 0.081F, 0.0891F, 0.0972F,
-	0.1053F, 0.1134F, 0.1215F, 0.0F
-}};
-
 FORMULA(mobility) {
 	// Mobility histograms use Clockwork's primary area for knights and bishops and the sum of its
 	// primary and secondary histograms for rooks and queens; one recoverable reference bucket is omitted.
@@ -235,11 +162,6 @@ FORMULA(mobility) {
 	}
 }
 
-inline static constexpr std::array<FormulaParam, 23> piecesWeights{{
-	0.03F, 0.03F, -0.007F, -0.014F, -0.007F, -0.0065F, -0.0055F, -0.011F, -0.0175F, -0.0245F,
-	-0.03F, -0.037F, -0.041F, -0.0525F, 0.015F, 0.095F, 0.065F, 0.1F, 0.065F, 0.11F,
-	0.11F, 0.01F, 0.008F
-}};
 FORMULA(pieces) {
 	// Knights and bishops placed immediately behind a pawn of either color.
 	const auto allPawns = b.OR(b.PCS(us, 0), b.PCS(them, 0));
@@ -322,13 +244,6 @@ FORMULA(pieces) {
 	F(diff(space(us, them), space(them, us)));
 }
 
-inline static constexpr std::array<FormulaParam, 42> threatsWeights{{
-	0.07F, 0.063F, 0.028F, 0.0245F, 0.021F, 0.16F, 0.144F, 0.064F, 0.056F, 0.048F,
-	0.16F, 0.144F, 0.064F, 0.056F, 0.048F, 0.22F, 0.198F, 0.088F, 0.077F, 0.066F,
-	0.3F, 0.27F, 0.12F, 0.105F, 0.09F, -0.0005F, -0.0105F, -0.0065F, -0.0035F, -0.001F,
-	-0.002F, 0.2805F, 0.0055F, 0.012F, 0.12F, 0.065F, 0.0375F, 0.055F, 0.045F, 0.066F,
-	0.03F, 0.044F
-}};
 FORMULA(threats) {
 	// Build shared threat sets once per attacking side, then count each victim type.
 	const auto evalside = [&](InterSignal role, InterSignal opponent) {
@@ -416,20 +331,8 @@ FORMULA(threats) {
 	}
 }
 
-inline static constexpr std::array<FormulaParam, 96> kingsWeights{{
-	0.0125F, 0.0045F, 0.006F, 0.025F, 0.009F, 0.012F, 0.025F, 0.009F, 0.012F, 0.03125F,
-	0.01125F, 0.015F, 0.04375F, 0.01575F, 0.021F, 0.000006103515625F, 0.015F,
-	0.005625F, 0.0045F, 0.00375F, 0.003F, 0.001875F, 0.0015F, -0.0275F, 0.0015F, 0.002F, 0.003F,
-	0.004F, 0.01F, -0.005F, 0.015F, 0.01F, -0.05F, -0.0015F, -0.001F, -0.0065F, -0.005F,
-	-0.0085F, -0.024F, -0.025F, 0.0025F, -0.0095F, -0.0035F, 0.0035F, 0.0005F, -0.0115F, -0.02F,
-	-0.002F, -0.0105F, 0.0025F, 0.005F, 0.001F, -0.0115F, -0.03F, 0.007F, 0.0035F, 0.0155F,
-	0.0205F, 0.018F, 0.011F, -0.0025F, 0.0F, 0.0F, 0.0165F, -0.0015F, 0.001F, 0.0115F,
-	0.025F, 0.0085F, -0.0815F, -0.024F, 0.002F, 0.0005F, 0.0025F, 0.002F, 0.0035F, -0.0745F,
-	-0.018F, -0.002F, -0.002F, -0.002F, 0.002F, 0.006F, -0.0385F, -0.0045F, 0.0045F, 0.004F,
-	0.0045F, 0.008F, 0.0005F, -0.03F, 0.012F, 0.0115F, 0.0015F, -0.0005F, 0.005F
-}};
 FORMULA(kings) {
-	static const SigmoidCurve pressureCurve{5.0F, 1.5F};
+	static const SigmoidCurve pressureCurve{formulaGlobals.pressureCenter, formulaGlobals.pressureWidth};
 	b.prepareKingPawns(us);
 	b.prepareKingPawns(them);
 	// Each attacking piece type emits inner-ring attacks, outer-ring attacks and potential checking moves.
@@ -503,8 +406,10 @@ FORMULA(kings) {
 }
 
 FORMULA(endgames) {
-	static constexpr WinnableParams winnable{0.002F, -0.005F, 0.007F, 0.02F, 0.006F, 0.0125F, 0.0F};
-	static constexpr EndgameScaleParams scale{0.20F, 0.35F, 0.75F, 0.08F, 0.025F};
+	static constexpr WinnableParams winnable{formulaGlobals.winnable[0], formulaGlobals.winnable[1], formulaGlobals.winnable[2],
+		formulaGlobals.winnable[3], formulaGlobals.winnable[4], formulaGlobals.winnable[5], formulaGlobals.winnable[6]};
+	static constexpr EndgameScaleParams scale{formulaGlobals.scale[0], formulaGlobals.scale[1], formulaGlobals.scale[2], formulaGlobals.scale[3],
+		formulaGlobals.scale[4]};
 	// Conversion and draw scaling follow the favored side selected by the complete preceding HCE score.
 	constexpr std::uint64_t light = 0x55AA55AA55AA55AAULL;
 	const auto onefb = b.EQ(b.POP(b.PCS(us, 2)), o);
@@ -543,33 +448,3 @@ FORMULA(endgames) {
 	// Pawnless and opposite-colored-bishop structures contract the complete score toward a draw.
 	b.SCALE(thinPawnless, pure, mixed, strongPawns, strongPassers, scale);
 }
-
-inline static constexpr auto formulaWeights = [] {
-	constexpr std::size_t count = tempoWeights.size() + materialWeights.size() + pstWeights.size() + bishopPairWeights.size() + pawnsWeights.size() +
-		mobilityWeights.size() + piecesWeights.size() + threatsWeights.size() + kingsWeights.size();
-	constexpr std::array<float, 5> fixed{{0.0F, 0.0F, 0.0F, 0.0F, 0.0F}};
-	constexpr std::array<float, 5> bishopPairResponse{{-0.05F, 0.0F, 0.0F, 0.0F, 0.0F}};
-	constexpr std::array<float, 5> pawnResponse{{0.0F, -0.02F, -0.02F, -0.04F, -0.08F}};
-	constexpr std::array<float, 5> threatResponse{{0.0F, 0.02F, 0.02F, 0.05F, 0.12F}};
-	constexpr std::array<float, 5> kingResponse{{0.0F, 0.03F, 0.03F, 0.08F, 0.25F}};
-	std::array<FormulaParam, count> values{};
-	std::size_t index = 0;
-	const auto append = [&](const auto &part, const std::array<float, 5> &response) {
-		for (FormulaParam value : part) {
-			for (std::size_t type = 0; type < response.size(); ++type) {
-				value.material[type] += value.base * response[type];
-			}
-			values[index++] = value;
-		}
-	};
-	append(tempoWeights, fixed);
-	append(materialWeights, fixed);
-	append(pstWeights, fixed);
-	append(bishopPairWeights, bishopPairResponse);
-	append(pawnsWeights, pawnResponse);
-	append(mobilityWeights, fixed);
-	append(piecesWeights, fixed);
-	append(threatsWeights, threatResponse);
-	append(kingsWeights, kingResponse);
-	return values;
-}();

@@ -21,10 +21,10 @@ namespace eleginus {
 	};
 
 	struct FormulaGlobals {
-		float pressureCenter = 5.0F;
-		float pressureWidth = 1.5F;
-		std::array<float, 7> winnable{{0.002F, -0.005F, 0.007F, 0.02F, 0.006F, 0.0125F, 0.0F}};
-		std::array<float, 5> scale{{0.20F, 0.35F, 0.75F, 0.08F, 0.025F}};
+		float pressureCenter = 0.0F;
+		float pressureWidth = 0.0F;
+		std::array<float, 7> winnable{};
+		std::array<float, 5> scale{};
 	};
 
 	class FormulaSet {
