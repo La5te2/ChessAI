@@ -136,6 +136,65 @@ namespace eleginus {
 			float total = 0.0F;
 		};
 
+		class FeatureOutput {
+		public:
+			FeatureOutput(std::span<const float> weights, std::span<std::int32_t> values, FormulaContext &context)
+				: weights(weights), values(values), context(context) {
+				if (weights.size() != values.size()) throw std::invalid_argument("formula feature buffer has the wrong size");
+				std::ranges::fill(values, 0);
+			}
+
+			void put(std::uint32_t index, std::int32_t score) {
+				values[index] = score;
+				total = std::fma(weights[index], static_cast<float>(score), total);
+			}
+
+			std::size_t size() const noexcept { return values.size(); }
+			int direction() const noexcept { return (total > 0.0F) - (total < 0.0F); }
+			void winnable(float value) noexcept {
+				if (total > 0.0F) total = std::max(0.0F, total + value);
+				else if (total < 0.0F) total = std::min(0.0F, total - value);
+			}
+			void scale(float value) noexcept { total *= value; }
+			void sigmoid(std::int64_t value) noexcept {
+				if (sigmoidCount < sigmoidInputs.size()) sigmoidInputs[sigmoidCount++] = static_cast<float>(value);
+			}
+			void mark(std::uint32_t index) noexcept {
+				if (sigmoidCount == sigmoidInputs.size()) {
+					context.pressureIndex = index;
+					context.pressure = sigmoidInputs;
+				}
+				sigmoidCount = 0;
+			}
+			void endgame(const std::array<float, 14> &facts) noexcept {
+				const float totalPawns = facts[0];
+				for (std::size_t branch = 0; branch < 2; ++branch) {
+					const float strongPawns = facts[4 + branch];
+					const float strongPassers = facts[6 + branch];
+					context.winnable[branch] = {{totalPawns, facts[1], facts[2], facts[3], strongPawns, facts[8] * strongPassers, 1.0F}};
+					context.scale[branch] = {{facts[9 + branch] * facts[11], facts[12], facts[13], strongPawns, strongPassers}};
+				}
+			}
+
+		private:
+			std::span<const float> weights;
+			std::span<std::int32_t> values;
+			FormulaContext &context;
+			std::array<float, 2> sigmoidInputs{};
+			std::size_t sigmoidCount = 0;
+			float total = 0.0F;
+		};
+
+		std::array<float, 5> materialCoordinates(const chess::Board &board) noexcept {
+			constexpr std::array<float, 5> initial{{16.0F, 4.0F, 4.0F, 4.0F, 2.0F}};
+			std::array<float, 5> coordinate{};
+			for (int type = 0; type < 5; ++type) {
+				const auto pieces = board.pieces(chess::PieceType(static_cast<chess::PieceType::underlying>(type))).getBits();
+				coordinate[static_cast<std::size_t>(type)] = static_cast<float>(std::popcount(pieces)) / initial[static_cast<std::size_t>(type)] - 1.0F;
+			}
+			return coordinate;
+		}
+
 		template <class Output> class Runtime {
 		public:
 			struct Sum {
@@ -454,7 +513,17 @@ namespace eleginus {
 			InterSignal sum(const Sum &terms) const { return NUM(terms.total); }
 
 			// SIG applies a bounded nonlinear response to an aggregate integer signal.
-			InterSignal SIG(InterSignal value, const SigmoidCurve &curve) const { return NUM(curve(number(value.bits))); }
+			InterSignal SIG(InterSignal value, const SigmoidCurve &curve) const {
+				if constexpr (requires { output.sigmoid(std::int64_t{}); }) output.sigmoid(number(value.bits));
+				return NUM(curve(number(value.bits)));
+			}
+			void END(const std::array<InterSignal, 14> &facts) const {
+				if constexpr (requires { output.endgame(std::array<float, 14>{}); }) {
+					std::array<float, 14> values{};
+					for (std::size_t i = 0; i < values.size(); ++i) values[i] = static_cast<float>(number(facts[i].bits));
+					output.endgame(values);
+				}
+			}
 			// WIN adjusts score magnitude without allowing the preferred side to change.
 			void WIN(InterSignal pawns, InterSignal symmetric, InterSignal asymmetric, InterSignal pawnEnding, InterSignal strongPawns,
 				InterSignal oppositePassers, const WinnableParams &params) {
@@ -481,6 +550,7 @@ namespace eleginus {
 			}
 			void root(InterSignal score) {
 				const auto value = number(score.bits);
+				if constexpr (requires { output.mark(std::uint32_t{}); }) output.mark(index);
 				if (value != 0) output.put(index, static_cast<std::int32_t>(value));
 				++index;
 			}
@@ -549,8 +619,8 @@ namespace eleginus {
 			unsigned index = 0;
 		};
 
-		template <class B> class Formulas {
-			using Sum = typename B::Sum;
+		template <class Backend> class Formulas {
+			using Sum = typename Backend::Sum;
 			using Pair = std::array<std::optional<InterSignal>, 2>;
 
 			#define FORMULA(name) void name()
@@ -587,7 +657,7 @@ namespace eleginus {
 			}();
 
 		public:
-			explicit Formulas(B runtime) : b(std::move(runtime)) {
+			explicit Formulas(Backend runtime) : b(std::move(runtime)) {
 				z = b.NUM(0);
 				o = b.NUM(1);
 				us = b.NUM(0);
@@ -627,11 +697,7 @@ namespace eleginus {
 					}
 					auto &entry = cache[(signature * 0x9e3779b9U) >> 28];
 					if (!entry.valid || entry.signature != signature) {
-						constexpr std::array<float, 5> initial{{16.0F, 4.0F, 4.0F, 4.0F, 2.0F}};
-						std::array<float, 5> coordinate{};
-						for (std::size_t type = 0; type < coordinate.size(); ++type) {
-							coordinate[type] = static_cast<float>(counts[type]) / initial[type] - 1.0F;
-						}
+						const auto coordinate = materialCoordinates(board);
 						entry.values = baseWeights;
 						for (std::size_t i : materialFormulaIndices) {
 							float value = formulaWeights[i].base;
@@ -645,6 +711,13 @@ namespace eleginus {
 					}
 					return entry.values;
 				}
+			}
+
+			static std::vector<FormulaParameter> parameters() {
+				std::vector<FormulaParameter> result;
+				result.reserve(formulaWeights.size());
+				for (const auto &source : formulaWeights) result.push_back({source.base, source.material});
+				return result;
 			}
 
 		private:
@@ -814,7 +887,7 @@ namespace eleginus {
 				return total;
 			}
 
-			B b;
+			Backend b;
 			Pair owned, strongMap, mobilityAreaCache, pushAttack, kingRing, kingFlank;
 			InterSignal z{};
 			InterSignal o{};
@@ -830,5 +903,19 @@ namespace eleginus {
 		Formulas(Runtime(board, sink)).execute();
 		return sink.finish();
 	}
+
+	void FormulaSet::features(const chess::Board &board, std::span<std::int32_t> signals, FormulaContext &context) {
+		const auto weights = Formulas<Runtime<FeatureOutput>>::weights(board);
+		context = {};
+		FeatureOutput sink(weights, signals, context);
+		Formulas(Runtime(board, sink)).execute();
+		context.material = materialCoordinates(board);
+	}
+
+	std::vector<FormulaParameter> FormulaSet::parameters() {
+		return Formulas<Runtime<ScoreOutput>>::parameters();
+	}
+
+	FormulaGlobals FormulaSet::globals() { return {}; }
 
 } // namespace eleginus

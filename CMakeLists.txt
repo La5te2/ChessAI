@@ -12,15 +12,15 @@ if(NOT GADIDAE_BUILD_GADUS AND NOT GADIDAE_BUILD_MELANO AND NOT GADIDAE_BUILD_EL
 endif()
 
 set(GADIDAE_NEEDS_TORCH OFF)
-if(GADIDAE_BUILD_GADUS OR GADIDAE_BUILD_MELANO)
+if(GADIDAE_BUILD_GADUS OR GADIDAE_BUILD_MELANO OR GADIDAE_BUILD_ELEGINUS)
 	set(GADIDAE_NEEDS_TORCH ON)
 endif()
 set(GADIDAE_NEEDS_HDF5 OFF)
-if(GADIDAE_BUILD_GADUS OR GADIDAE_BUILD_MELANO)
+if(GADIDAE_BUILD_GADUS OR GADIDAE_BUILD_MELANO OR GADIDAE_BUILD_ELEGINUS)
 	set(GADIDAE_NEEDS_HDF5 ON)
 endif()
 set(GADIDAE_NEEDS_ZLIB OFF)
-if(GADIDAE_BUILD_GADUS OR GADIDAE_BUILD_MELANO OR GADIDAE_BUILD_GRAPHICS)
+if(GADIDAE_BUILD_GADUS OR GADIDAE_BUILD_MELANO OR GADIDAE_BUILD_ELEGINUS OR GADIDAE_BUILD_GRAPHICS)
 	set(GADIDAE_NEEDS_ZLIB ON)
 endif()
 
@@ -111,7 +111,7 @@ if(MSVC AND GADIDAE_NEEDS_TORCH)
 		message(FATAL_ERROR "No LibTorch runtime DLLs found in ${GADIDAE_TORCH_DIR}/lib")
 	endif()
 	add_custom_target(torchruntime ALL COMMENT "Copying LibTorch runtime")
-	foreach(architecture IN ITEMS gadus melano)
+	foreach(architecture IN ITEMS gadus melano eleginus)
 		string(TOUPPER "${architecture}" architecture_upper)
 		if(GADIDAE_BUILD_${architecture_upper})
 			add_custom_command(TARGET torchruntime POST_BUILD
@@ -167,6 +167,24 @@ endfunction()
 
 eleginusexecutable(search src/engines/eleginus/search.cpp)
 eleginusexecutable(uci src/engines/eleginus/uci.cpp)
+eleginusexecutable(preprocess src/engines/eleginus/preprocess.cpp)
+eleginusexecutable(optimizer src/engines/eleginus/optimizer.cpp)
+foreach(target IN ITEMS eleginuspreprocess eleginusoptimizer)
+	target_include_directories(${target} SYSTEM PRIVATE
+		"${GADIDAE_API_DIR}/nlohmann/include"
+		${HDF5_INCLUDE_DIRS}
+	)
+	if(MSVC)
+		target_link_libraries(${target} PRIVATE ${HDF5_LIBRARIES} "${GADIDAE_ZLIB_STATIC}" Shlwapi)
+	else()
+		target_link_libraries(${target} PRIVATE ${HDF5_LIBRARIES} ZLIB::ZLIB)
+	endif()
+	target_compile_definitions(${target} PRIVATE H5_USE_110_API)
+endforeach()
+target_link_libraries(eleginusoptimizer PRIVATE ${TORCH_LIBRARIES})
+if(MSVC)
+	add_dependencies(eleginusoptimizer torchruntime)
+endif()
 
 add_executable(eleginustests src/engines/eleginus/tests.cpp)
 set_target_properties(eleginustests PROPERTIES

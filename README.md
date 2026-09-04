@@ -285,6 +285,47 @@ $$
 
 Here, $N$ is the number of formulas compiled into the engine. Search accumulates the weighted sum while producing the formula signals.
 
+Eleginus preprocessing reads JSONL records containing `fen` and `evals`. It selects the evaluation with the greatest depth, breaks equal-depth ties by `knodes`, and reads the integer White-perspective `cp` value from its first principal variation. Records with an invalid FEN, an invalid piece configuration or no usable centipawn evaluation are skipped.
+
+The preprocessor stores each accepted position with `chess::Board::Compact` in 24 bytes. The resulting HDF5 file contains a `states` dataset with shape $[N,24]$ and a `centipawns` dataset with shape $[N]$.
+
+```bash
+build/eleginus/preprocess \
+	--input data/positions.jsonl \
+	--output data/positions.eleginus.h5 \
+	--chunk-rows 16384 \
+	--max-positions 0 \
+	--compression 1 \
+	--log-every 100000
+```
+
+The offline optimizer restores each position, evaluates the compiled formulas and adjusts every formula's base coefficient and five material-response coefficients. It also optimizes the two king-pressure parameters, seven winnability parameters and five endgame-scaling parameters. The current formula set therefore exposes 4178 trainable parameters.
+
+Formula extraction runs on CPU workers. AdamW optimization runs on the device selected by `--device`; `auto` selects CUDA when available and otherwise selects CPU. The objective is Huber regression against the clipped centipawn target. A deterministic subset of rows supplies validation statistics.
+
+```bash
+build/eleginus/optimizer \
+	--data data/positions.eleginus.h5 \
+	--out models/eleginus/eleginus-weights.tsv \
+	--epochs 3 \
+	--batch-size 4096 \
+	--chunk-rows 16384 \
+	--workers 8 \
+	--device cuda \
+	--lr 0.001 \
+	--weight-decay 0 \
+	--grad-clip 1 \
+	--cp-scale 150 \
+	--cp-clip 2000 \
+	--huber-delta 100 \
+	--validation-permille 10 \
+	--save-every 0 \
+	--log-every 50 \
+	--seed 2026
+```
+
+The optimizer writes the learned formula coefficients and postprocessing parameters to a TSV file. Eleginus UCI continues to use the coefficients compiled into the source; applying an optimized result therefore requires transferring the selected values into the formula definitions.
+
 Analyze one position with Eleginus search using:
 
 ```bash

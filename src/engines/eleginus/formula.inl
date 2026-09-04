@@ -527,13 +527,16 @@ FORMULA(endgames) {
 	const auto symmetric = b.NUM(std::popcount(ffiles.bits & efiles.bits) >> 3);
 	const auto asymmetric = b.NUM(std::popcount(ffiles.bits ^ efiles.bits) >> 3);
 	const auto pawnEnding = b.LAND(b.EQ(nonPawnMaterial(us), z), b.EQ(nonPawnMaterial(them), z));
+	const auto fpassers = b.POP(passedPawns(us, them));
+	const auto epassers = b.POP(passedPawns(them, us));
 	const auto strongPawns = b.ADD(b.MUL(positive, fpawns), b.MUL(negative, epawns));
-	const auto strongPassers = b.ADD(b.MUL(positive, b.POP(passedPawns(us, them))), b.MUL(negative, b.POP(passedPawns(them, us))));
+	const auto strongPassers = b.ADD(b.MUL(positive, fpassers), b.MUL(negative, epassers));
 	const auto favoredPawnless = b.LOR(b.LAND(positive, fpawnless), b.LAND(negative, epawnless));
 	const auto thinPawnless = b.LAND(favoredPawnless, thin);
 	const auto pure = b.LAND(b.LAND(b.LAND(onefb, oneeb), opposite),
 		b.LAND(b.EQ(nonPawnMaterial(us), b.NUM(3)), b.EQ(nonPawnMaterial(them), b.NUM(3))));
 	const auto mixed = b.LAND(b.LAND(b.LAND(onefb, oneeb), opposite), b.LNOT(pure));
+	b.END({b.ADD(fpawns, epawns), symmetric, asymmetric, pawnEnding, fpawns, epawns, fpassers, epassers, opposite, fpawnless, epawnless, thin, pure, mixed});
 
 	// Pawn count and pawn-file geometry adjust how readily the current advantage converts.
 	b.WIN(b.ADD(fpawns, epawns), symmetric, asymmetric, pawnEnding, strongPawns, b.MUL(opposite, strongPassers), winnable);

@@ -1,7 +1,6 @@
 #include "eleginus/game.hpp"
 
 namespace eleginus {
-
 	std::vector<chess::Move> legalmoves(const chess::Board &board) {
 		chess::Movelist moves;
 		chess::movegen::legalmoves(moves, board);
@@ -15,5 +14,9 @@ namespace eleginus {
 	bool isGameOver(const chess::Board &board) {
 		return board.isGameOver().first != chess::GameResultReason::NONE;
 	}
+
+	PackedBoard packBoard(const chess::Board &board) { return chess::Board::Compact::encode(board); }
+
+	chess::Board unpackBoard(const PackedBoard &packed) { return chess::Board::Compact::decode(packed); }
 
 } // namespace eleginus
