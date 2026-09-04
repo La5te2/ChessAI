@@ -1,4 +1,4 @@
-inline static constexpr std::array<float, 1> tempoWeights{{
+inline static constexpr std::array<FormulaParam, 1> tempoWeights{{
 	0.16F
 }};
 
@@ -8,7 +8,7 @@ FORMULA(tempo) {
 	F(diff(b.EQ(stm, us), b.EQ(stm, them)));
 }
 
-inline static constexpr std::array<float, 5> materialWeights{{
+inline static constexpr std::array<FormulaParam, 5> materialWeights{{
 	0.22F, 0.773F, 0.828F, 1.2365F, 2.4515F
 }};
 
@@ -19,7 +19,7 @@ FORMULA(material) {
 	}
 }
 
-inline static constexpr std::array<float, 384> pstWeights{{
+inline static constexpr std::array<FormulaParam, 384> pstWeights{{
 	-0.013125F, -0.009375F, -0.005625F, -0.001875F, -0.001875F, -0.005625F, -0.009375F, -0.013125F, 0.006875F, 0.010625F,
 	0.014375F, 0.018125F, 0.018125F, 0.014375F, 0.010625F, 0.006875F, 0.026875F, 0.030625F, 0.034375F, 0.038125F,
 	0.038125F, 0.034375F, 0.030625F, 0.026875F, 0.046875F, 0.050625F, 0.054375F, 0.058125F, 0.058125F, 0.054375F,
@@ -78,7 +78,7 @@ FORMULA(pst) {
 	}
 }
 
-inline static constexpr std::array<float, 1> bishopPairWeights{{
+inline static constexpr std::array<FormulaParam, 1> bishopPairWeights{{
 	0.15F
 }};
 
@@ -89,7 +89,7 @@ FORMULA(bishopPair) {
 	F(diff(friendly, enemy));
 }
 
-inline static constexpr std::array<float, 78> pawnsWeights{{
+inline static constexpr std::array<FormulaParam, 78> pawnsWeights{{
 	0.0375F, 0.01375F, 0.01375F, 0.01F, 0.0125F, 0.0175F, -0.01375F, 0.00875F, 0.0175F, 0.0175F,
 	0.065F, 0.0225F, 0.02375F, 0.016875F, 0.02F, 0.02875F, -0.025F, 0.015F, 0.02625F, 0.02375F,
 	0.1475F, 0.03125F, 0.03375F, 0.02375F, 0.0275F, 0.04F, -0.03625F, 0.02125F, 0.035F, 0.03F,
@@ -128,7 +128,7 @@ FORMULA(pawns) {
 		int doubled = 0;
 		int isolated = 0;
 	};
-	const auto collect = [&](IS role, IS opponent, IS pawns, IS passed, IS att, IS neighbours) {
+	const auto collect = [&](InterSignal role, InterSignal opponent, InterSignal pawns, InterSignal passed, InterSignal att, InterSignal neighbours) {
 		PawnSignals signals;
 		(void)pawns;
 		(void)att;
@@ -199,7 +199,7 @@ FORMULA(pawns) {
 	}
 }
 
-inline static constexpr std::array<float, 64> mobilityWeights{{
+inline static constexpr std::array<FormulaParam, 64> mobilityWeights{{
 	-0.108F, -0.081F, -0.054F, -0.027F, 0.027F, 0.054F, 0.081F, 0.108F, -0.1125F, -0.09F,
 	-0.0675F, -0.045F, -0.0225F, 0.0225F, 0.045F, 0.0675F, 0.09F, 0.1125F, 0.135F, 0.1575F,
 	0.18F, -0.1134F, -0.0972F, -0.081F, -0.0648F, -0.0486F, -0.0324F, -0.0162F, 0.0162F, 0.0324F,
@@ -235,7 +235,7 @@ FORMULA(mobility) {
 	}
 }
 
-inline static constexpr std::array<float, 23> piecesWeights{{
+inline static constexpr std::array<FormulaParam, 23> piecesWeights{{
 	0.03F, 0.03F, -0.007F, -0.014F, -0.007F, -0.0065F, -0.0055F, -0.011F, -0.0175F, -0.0245F,
 	-0.03F, -0.037F, -0.041F, -0.0525F, 0.015F, 0.095F, 0.065F, 0.1F, 0.065F, 0.11F,
 	0.11F, 0.01F, 0.008F
@@ -249,7 +249,7 @@ FORMULA(pieces) {
 		F(diff(friendly, enemy));
 	}
 	constexpr std::uint64_t light = 0x55AA55AA55AA55AAULL;
-	const auto bishoppawns = [&](IS role) {
+	const auto bishoppawns = [&](InterSignal role) {
 		const auto l = b.REL(role, light);
 		const auto d = b.NOT(l);
 		const auto lightValue = b.MUL(b.POP(b.AND(b.PCS(role, 2), l)), b.POP(b.AND(b.PCS(role, 0), l)));
@@ -265,7 +265,7 @@ FORMULA(pieces) {
 	const auto eblocked = b.AND(b.PCS(them, 0), b.AND(b.SH(occ, them, 1), b.REL(them, central)));
 	// Bishops restricted by blocked central friendly pawns.
 	F(diff(b.MUL(b.POP(b.PCS(us, 2)), b.POP(fblocked)), b.MUL(b.POP(b.PCS(them, 2)), b.POP(eblocked))));
-	const auto bishopPawnBuckets = [&](IS role) {
+	const auto bishopPawnBuckets = [&](InterSignal role) {
 		std::array<int, 9> result{};
 		const Word pawns = b.PCS(role, 0).bits;
 		const Word defended = pawnAttacks(role).bits;
@@ -299,7 +299,7 @@ FORMULA(pieces) {
 	F(diff(b.POP(b.AND(b.PCS(us, 3), openfiles)), b.POP(b.AND(b.PCS(them, 3), openfiles))));
 	F(diff(b.POP(b.AND(b.PCS(us, 3), fsemifiles)), b.POP(b.AND(b.PCS(them, 3), esemifiles))));
 
-	const auto outposts = [&](IS role, IS opponent, int type) {
+	const auto outposts = [&](InterSignal role, InterSignal opponent, int type) {
 		const auto ranks = b.REL(role, rankMask(3) | rankMask(4) | rankMask(5));
 		const auto future = pawnAttacks(opponent);
 		const auto viable = b.AND(ranks, b.AND(pawnAttacks(role), b.NOT(b.fill(future, opponent))));
@@ -310,19 +310,19 @@ FORMULA(pieces) {
 		F(diff(outposts(us, them, type), outposts(them, us, type)));
 	}
 
-	const auto restricted = [&](IS role, IS opponent) {
+	const auto restricted = [&](InterSignal role, InterSignal opponent) {
 		const auto guarded = strongSquares(role, opponent);
 		return b.POP(b.AND(b.AND(b.attacks(role), b.attacks(opponent)), b.NOT(guarded)));
 	};
 	// Contested attack squares whose protection is unfavorable.
 	F(diff(restricted(us, them), restricted(them, us)));
 	constexpr std::uint64_t center = 0x00003C3C3C000000ULL;
-	const auto space = [&](IS role, IS opponent) { return b.POP(b.AND(b.AND(b.attacks(role), b.REL(role, center)), b.NOT(pawnAttacks(opponent)))); };
+	const auto space = [&](InterSignal role, InterSignal opponent) { return b.POP(b.AND(b.AND(b.attacks(role), b.REL(role, center)), b.NOT(pawnAttacks(opponent)))); };
 	// Safely controlled squares in the normalized central space region.
 	F(diff(space(us, them), space(them, us)));
 }
 
-inline static constexpr std::array<float, 42> threatsWeights{{
+inline static constexpr std::array<FormulaParam, 42> threatsWeights{{
 	0.07F, 0.063F, 0.028F, 0.0245F, 0.021F, 0.16F, 0.144F, 0.064F, 0.056F, 0.048F,
 	0.16F, 0.144F, 0.064F, 0.056F, 0.048F, 0.22F, 0.198F, 0.088F, 0.077F, 0.066F,
 	0.3F, 0.27F, 0.12F, 0.105F, 0.09F, -0.0005F, -0.0105F, -0.0065F, -0.0035F, -0.001F,
@@ -331,8 +331,8 @@ inline static constexpr std::array<float, 42> threatsWeights{{
 }};
 FORMULA(threats) {
 	// Build shared threat sets once per attacking side, then count each victim type.
-	const auto evalside = [&](IS role, IS opponent) {
-		std::array<std::array<IS, 5>, 5> result{};
+	const auto evalside = [&](InterSignal role, InterSignal opponent) {
+		std::array<std::array<InterSignal, 5>, 5> result{};
 		const auto guarded = strongSquares(role, opponent);
 		const auto targets = own(opponent);
 		const auto pawns = b.PCS(opponent, 0);
@@ -357,19 +357,19 @@ FORMULA(threats) {
 		}
 		return result;
 	};
-	const auto kingthreat = [&](IS role, IS opponent) {
+	const auto kingthreat = [&](InterSignal role, InterSignal opponent) {
 		const auto targets = own(opponent);
 		const auto guarded = strongSquares(role, opponent);
 		return b.ANY(b.AND(b.AND(targets, b.NOT(guarded)), b.attacks(role, 5)));
 	};
-	const auto queenpressure = [&](IS role, IS opponent, int type) {
+	const auto queenpressure = [&](InterSignal role, InterSignal opponent, int type) {
 		if (number(b.POP(b.PCS(opponent, 4)).bits) != 1) return z;
 		Sum terms;
 		auto safe = b.AND(mobilityArea(role, opponent), b.AND(b.NOT(b.PCS(role, 0)), b.NOT(strongSquares(role, opponent))));
 		if (type >= 2) safe = b.AND(safe, b.doubleAttacks(role));
 		for (int square : b.squares(opponent, 4)) {
 			const auto queen = b.ANY(b.AND(b.PCS(opponent, 4), b.REL(opponent, 1ULL << square)));
-			IS destinations;
+			InterSignal destinations;
 			if (type == 1) {
 				destinations = b.attackFrom(role, 1, b.SQ(opponent, square));
 			} else {
@@ -416,9 +416,9 @@ FORMULA(threats) {
 	}
 }
 
-inline static constexpr std::array<float, 99> kingsWeights{{
+inline static constexpr std::array<FormulaParam, 96> kingsWeights{{
 	0.0125F, 0.0045F, 0.006F, 0.025F, 0.009F, 0.012F, 0.025F, 0.009F, 0.012F, 0.03125F,
-	0.01125F, 0.015F, 0.04375F, 0.01575F, 0.021F, 0.0025F, 0.005F, 0.0075F, 0.01F, 0.015F,
+	0.01125F, 0.015F, 0.04375F, 0.01575F, 0.021F, 0.000006103515625F, 0.015F,
 	0.005625F, 0.0045F, 0.00375F, 0.003F, 0.001875F, 0.0015F, -0.0275F, 0.0015F, 0.002F, 0.003F,
 	0.004F, 0.01F, -0.005F, 0.015F, 0.01F, -0.05F, -0.0015F, -0.001F, -0.0065F, -0.005F,
 	-0.0085F, -0.024F, -0.025F, 0.0025F, -0.0095F, -0.0035F, 0.0035F, 0.0005F, -0.0115F, -0.02F,
@@ -429,6 +429,7 @@ inline static constexpr std::array<float, 99> kingsWeights{{
 	0.0045F, 0.008F, 0.0005F, -0.03F, 0.012F, 0.0115F, 0.0015F, -0.0005F, 0.005F
 }};
 FORMULA(kings) {
+	static const SigmoidCurve pressureCurve{5.0F, 1.5F};
 	b.prepareKingPawns(us);
 	b.prepareKingPawns(them);
 	// Each attacking piece type emits inner-ring attacks, outer-ring attacks and potential checking moves.
@@ -449,10 +450,8 @@ FORMULA(kings) {
 	}
 	const auto fp = b.sum(friendly);
 	const auto ep = b.sum(enemy);
-	// Total king pressure crossing four fixed thresholds.
-	for (const int threshold : {2, 4, 6, 8}) {
-		F(diff(b.GE(fp, b.NUM(threshold)), b.GE(ep, b.NUM(threshold))));
-	}
+	// Total king pressure follows a smooth bounded response instead of discrete thresholds.
+	F(diff(b.SIG(fp, pressureCurve), b.SIG(ep, pressureCurve)));
 	// King escape squares not occupied by friendly pieces or controlled by the opponent.
 	F(diff(escapes(us, them), escapes(them, us)));
 	// Pawn shelter and enemy pawn storm at distances one through three.
@@ -503,11 +502,10 @@ FORMULA(kings) {
 	}
 }
 
-inline static constexpr std::array<float, 10> endgamesWeights{{
-	-0.05F, -0.15F, 0.002F, -0.005F, 0.007F, 0.02F, 0.006F, 0.0125F, -0.12F, -0.04F
-}};
 FORMULA(endgames) {
-	// Endgame structure follows the favored side selected by the complete preceding HCE score.
+	static constexpr WinnableParams winnable{0.002F, -0.005F, 0.007F, 0.02F, 0.006F, 0.0125F, 0.0F};
+	static constexpr EndgameScaleParams scale{0.20F, 0.35F, 0.75F, 0.08F, 0.025F};
+	// Conversion and draw scaling follow the favored side selected by the complete preceding HCE score.
 	constexpr std::uint64_t light = 0x55AA55AA55AA55AAULL;
 	const auto onefb = b.EQ(b.POP(b.PCS(us, 2)), o);
 	const auto oneeb = b.EQ(b.POP(b.PCS(them, 2)), o);
@@ -521,59 +519,54 @@ FORMULA(endgames) {
 	const auto direction = b.direction();
 	const auto positive = b.GT(direction, z);
 	const auto negative = b.LT(direction, z);
-	const auto sidePhase = [&](IS role) {
-		return b.ADD(b.ADD(b.POP(b.PCS(role, 1)), b.POP(b.PCS(role, 2))),
-			b.ADD(b.MUL(b.NUM(2), b.POP(b.PCS(role, 3))), b.MUL(b.NUM(4), b.POP(b.PCS(role, 4)))));
-	};
-	const auto fphase = sidePhase(us);
-	const auto ephase = sidePhase(them);
-	F(b.MUL(b.LAND(b.LAND(onefb, oneeb), opposite), direction));
 	const auto fpawnless = b.EQ(fpawns, z);
 	const auto epawnless = b.EQ(epawns, z);
 	const auto thin = b.LE(b.ABS(diff(nonPawnMaterial(us), nonPawnMaterial(them))), o);
-	// A thin non-pawn imbalance whose favored side has no pawns.
-	F(diff(b.LAND(b.LAND(positive, fpawnless), thin), b.LAND(b.LAND(negative, epawnless), thin)));
-
 	const auto ffiles = files(us);
 	const auto efiles = files(them);
 	const auto symmetric = b.NUM(std::popcount(ffiles.bits & efiles.bits) >> 3);
 	const auto asymmetric = b.NUM(std::popcount(ffiles.bits ^ efiles.bits) >> 3);
-	// Total pawns, symmetric pawn files, asymmetric pawn files and bare kings, each signed by the favored side.
-	F(b.MUL(direction, b.ADD(fpawns, epawns)));
-	F(b.MUL(direction, symmetric));
-	F(b.MUL(direction, asymmetric));
-	F(b.MUL(direction, b.EQ(phase, z)));
-	const auto strongpawns = diff(b.MUL(positive, fpawns), b.MUL(negative, epawns));
-	// Pawn count belonging to the favored side.
-	F(strongpawns);
-	const auto strongpassers = diff(b.MUL(positive, b.POP(passedPawns(us, them))), b.MUL(negative, b.POP(passedPawns(them, us))));
-	// Passed pawns of the favored side in opposite-colored-bishop endings.
-	F(b.MUL(b.LAND(b.LAND(onefb, oneeb), opposite), strongpassers));
-	const auto pure = b.LAND(b.LAND(b.LAND(onefb, oneeb), opposite), b.LAND(b.EQ(fphase, o), b.EQ(ephase, o)));
-	// Pure and mixed opposite-colored-bishop endings, signed by the favored side.
-	F(b.MUL(direction, pure));
-	F(b.MUL(direction, b.LAND(b.LAND(b.LAND(onefb, oneeb), opposite), b.LNOT(pure))));
+	const auto pawnEnding = b.LAND(b.EQ(nonPawnMaterial(us), z), b.EQ(nonPawnMaterial(them), z));
+	const auto strongPawns = b.ADD(b.MUL(positive, fpawns), b.MUL(negative, epawns));
+	const auto strongPassers = b.ADD(b.MUL(positive, b.POP(passedPawns(us, them))), b.MUL(negative, b.POP(passedPawns(them, us))));
+	const auto favoredPawnless = b.LOR(b.LAND(positive, fpawnless), b.LAND(negative, epawnless));
+	const auto thinPawnless = b.LAND(favoredPawnless, thin);
+	const auto pure = b.LAND(b.LAND(b.LAND(onefb, oneeb), opposite),
+		b.LAND(b.EQ(nonPawnMaterial(us), b.NUM(3)), b.EQ(nonPawnMaterial(them), b.NUM(3))));
+	const auto mixed = b.LAND(b.LAND(b.LAND(onefb, oneeb), opposite), b.LNOT(pure));
+
+	// Pawn count and pawn-file geometry adjust how readily the current advantage converts.
+	b.WIN(b.ADD(fpawns, epawns), symmetric, asymmetric, pawnEnding, strongPawns, b.MUL(opposite, strongPassers), winnable);
+	// Pawnless and opposite-colored-bishop structures contract the complete score toward a draw.
+	b.SCALE(thinPawnless, pure, mixed, strongPawns, strongPassers, scale);
 }
 
 inline static constexpr auto formulaWeights = [] {
 	constexpr std::size_t count = tempoWeights.size() + materialWeights.size() + pstWeights.size() + bishopPairWeights.size() + pawnsWeights.size() +
-		mobilityWeights.size() + piecesWeights.size() + threatsWeights.size() + kingsWeights.size() + endgamesWeights.size();
-	std::array<float, count> values{};
+		mobilityWeights.size() + piecesWeights.size() + threatsWeights.size() + kingsWeights.size();
+	constexpr std::array<float, 5> fixed{{0.0F, 0.0F, 0.0F, 0.0F, 0.0F}};
+	constexpr std::array<float, 5> bishopPairResponse{{-0.05F, 0.0F, 0.0F, 0.0F, 0.0F}};
+	constexpr std::array<float, 5> pawnResponse{{0.0F, -0.02F, -0.02F, -0.04F, -0.08F}};
+	constexpr std::array<float, 5> threatResponse{{0.0F, 0.02F, 0.02F, 0.05F, 0.12F}};
+	constexpr std::array<float, 5> kingResponse{{0.0F, 0.03F, 0.03F, 0.08F, 0.25F}};
+	std::array<FormulaParam, count> values{};
 	std::size_t index = 0;
-	const auto append = [&](const auto &part) {
-		for (float value : part) {
+	const auto append = [&](const auto &part, const std::array<float, 5> &response) {
+		for (FormulaParam value : part) {
+			for (std::size_t type = 0; type < response.size(); ++type) {
+				value.material[type] += value.base * response[type];
+			}
 			values[index++] = value;
 		}
 	};
-	append(tempoWeights);
-	append(materialWeights);
-	append(pstWeights);
-	append(bishopPairWeights);
-	append(pawnsWeights);
-	append(mobilityWeights);
-	append(piecesWeights);
-	append(threatsWeights);
-	append(kingsWeights);
-	append(endgamesWeights);
+	append(tempoWeights, fixed);
+	append(materialWeights, fixed);
+	append(pstWeights, fixed);
+	append(bishopPairWeights, bishopPairResponse);
+	append(pawnsWeights, pawnResponse);
+	append(mobilityWeights, fixed);
+	append(piecesWeights, fixed);
+	append(threatsWeights, threatResponse);
+	append(kingsWeights, kingResponse);
 	return values;
 }();

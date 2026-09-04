@@ -33,6 +33,17 @@ namespace {
 			}
 		}
 
+		const std::array<std::pair<chess::Board, chess::Board>, 2> mirrors{{
+			{chess::Board("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1"),
+				chess::Board("r3k2r/pppbbppp/2n2q1P/1P2p3/3pn3/BN2PNP1/P1PPQPB1/R3K2R b KQkq - 0 1")},
+			{chess::Board("8/2p5/3p4/1P1Pp1k1/4P3/5K2/8/8 w - - 12 42"),
+				chess::Board("8/8/5k2/4p3/1p1pP1K1/3P4/2P5/8 b - - 12 42")},
+		}};
+		for (const auto &[board, mirror] : mirrors) {
+			const float sum = eleginus::FormulaSet::score(board) + eleginus::FormulaSet::score(mirror);
+			require(std::abs(sum) < 1.0e-5F, "formula evaluation lost color-mirror antisymmetry");
+		}
+
 		// External FEN can be structurally invalid; formula extraction must remain memory-safe.
 		require(std::isfinite(eleginus::FormulaSet::score(chess::Board("4k3/P1P1P1P1/1P1P1P1P/P1P1P1P1/1P1P1P1P/P7/8/1B2K3 w - - 0 1"))),
 			"malformed position escaped formula evaluation");

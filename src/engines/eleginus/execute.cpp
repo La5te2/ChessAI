@@ -13,6 +13,54 @@ namespace eleginus {
 	namespace {
 		using Word = std::uint64_t;
 
+		struct FormulaParam {
+			float base = 0.0F;
+			std::array<float, 5> material{};
+
+			constexpr FormulaParam() = default;
+			constexpr FormulaParam(float value) : base(value) {}
+			constexpr FormulaParam(float value, float pawn, float knight, float bishop, float rook, float queen)
+				: base(value), material{{pawn, knight, bishop, rook, queen}} {}
+		};
+
+		struct WinnableParams {
+			float pawns;
+			float symmetric;
+			float asymmetric;
+			float pawnEnding;
+			float strongPawns;
+			float oppositePassers;
+			float bias;
+		};
+
+		struct EndgameScaleParams {
+			float pawnless;
+			float pureOpposite;
+			float mixedOpposite;
+			float passerStep;
+			float pawnStep;
+		};
+
+		class SigmoidCurve {
+		public:
+			static constexpr int scale = 4096;
+
+			SigmoidCurve(float center, float width) {
+				for (std::size_t x = 0; x < values.size(); ++x) {
+					const float y = 1.0F / (1.0F + std::exp(-(static_cast<float>(x) - center) / width));
+					values[x] = static_cast<std::int32_t>(std::lround(scale * y));
+				}
+			}
+
+			std::int32_t operator()(std::int64_t value) const noexcept {
+				const auto last = static_cast<std::int64_t>(values.size() - 1);
+				return values[static_cast<std::size_t>(std::clamp(value, std::int64_t{0}, last))];
+			}
+
+		private:
+			std::array<std::int32_t, 65> values{};
+		};
+
 		std::int64_t number(Word x) noexcept {
 			return std::bit_cast<std::int64_t>(x);
 		}
@@ -74,8 +122,14 @@ namespace eleginus {
 				total = std::fma(values[index], static_cast<float>(score), total);
 			}
 
+			std::size_t size() const noexcept { return values.size(); }
 			float finish() const noexcept { return total; }
 			int direction() const noexcept { return (total > 0.0F) - (total < 0.0F); }
+			void winnable(float value) noexcept {
+				if (total > 0.0F) total = std::max(0.0F, total + value);
+				else if (total < 0.0F) total = std::min(0.0F, total - value);
+			}
+			void scale(float value) noexcept { total *= value; }
 
 		private:
 			std::span<const float> values;
@@ -203,6 +257,9 @@ namespace eleginus {
 				attackCache->occupied = occupied;
 				attackCache->valid = true;
 			}
+
+			// The Chess-algebra is designed to be expressive and efficient, with a focus on chess-specific computations.
+
 			// NUM constructs a signed integer signal; BB constructs a raw bitboard signal.
 			AtomSignal NUM(std::int64_t x) const { return AtomSignal(static_cast<Word>(x)); }
 			AtomSignal BB(Word x) const { return AtomSignal(x); }
@@ -259,7 +316,9 @@ namespace eleginus {
 				}
 			}
 
-			// Formula traversal and derived shared calculations follow the primitive set.
+			// InterSignal traversal and derived shared calculations follow the primitive set.
+			// It is between Atoms and the final output, and is where most chess-specific logic is implemented.
+			// Atoms and InterSignals forms the Formula of the evaluation, which is then executed by the Runtime to produce a final score.
 			InterSignal occ() const { return BB(occupied); }
 			unsigned roleIndex(InterSignal role) const { return color(role); }
 			Squares squares(InterSignal role, int type) const { return {REL(role, PCS(role, type).bits).bits}; }
@@ -393,10 +452,40 @@ namespace eleginus {
 			}
 
 			InterSignal sum(const Sum &terms) const { return NUM(terms.total); }
+
+			// SIG applies a bounded nonlinear response to an aggregate integer signal.
+			InterSignal SIG(InterSignal value, const SigmoidCurve &curve) const { return NUM(curve(number(value.bits))); }
+			// WIN adjusts score magnitude without allowing the preferred side to change.
+			void WIN(InterSignal pawns, InterSignal symmetric, InterSignal asymmetric, InterSignal pawnEnding, InterSignal strongPawns,
+				InterSignal oppositePassers, const WinnableParams &params) {
+				const float value = params.bias + params.pawns * static_cast<float>(number(pawns.bits)) +
+					params.symmetric * static_cast<float>(number(symmetric.bits)) +
+					params.asymmetric * static_cast<float>(number(asymmetric.bits)) +
+					params.pawnEnding * static_cast<float>(number(pawnEnding.bits)) +
+					params.strongPawns * static_cast<float>(number(strongPawns.bits)) +
+					params.oppositePassers * static_cast<float>(number(oppositePassers.bits));
+				output.winnable(value);
+			}
+			// SCALE contracts evaluations in explicitly drawish material configurations.
+			void SCALE(InterSignal thinPawnless, InterSignal pureOpposite, InterSignal mixedOpposite, InterSignal strongPawns,
+				InterSignal strongPassers, const EndgameScaleParams &params) {
+				float factor = 1.0F;
+				if (number(thinPawnless.bits) != 0) factor = std::min(factor, params.pawnless);
+				if (number(pureOpposite.bits) != 0) {
+					factor = std::min(factor, params.pureOpposite + params.pawnStep * static_cast<float>(number(strongPawns.bits)) +
+						params.passerStep * static_cast<float>(number(strongPassers.bits)));
+				} else if (number(mixedOpposite.bits) != 0) {
+					factor = std::min(factor, params.mixedOpposite + params.passerStep * static_cast<float>(number(strongPassers.bits)));
+				}
+				output.scale(std::clamp(factor, 0.0F, 1.0F));
+			}
 			void root(InterSignal score) {
 				const auto value = number(score.bits);
 				if (value != 0) output.put(index, static_cast<std::int32_t>(value));
 				++index;
+			}
+			void complete() const {
+				if (index != output.size()) throw std::logic_error("formula and weight counts differ");
 			}
 			InterSignal direction() const { return NUM(output.direction()); }
 			void skip(unsigned n) { index += n; }
@@ -461,13 +550,41 @@ namespace eleginus {
 		};
 
 		template <class B> class Formulas {
-			using IS = InterSignal;
 			using Sum = typename B::Sum;
-			using Pair = std::array<std::optional<IS>, 2>;
+			using Pair = std::array<std::optional<InterSignal>, 2>;
 
-		#define FORMULA(name) void name()
-		#include "formula.inl"
-		#undef FORMULA
+			#define FORMULA(name) void name()
+			#include "formula.inl"
+			#undef FORMULA
+
+			inline static constexpr auto baseWeights = [] {
+				std::array<float, formulaWeights.size()> values{};
+				for (std::size_t i = 0; i < values.size(); ++i) values[i] = formulaWeights[i].base;
+				return values;
+			}();
+			inline static constexpr bool materialModulation = [] {
+				for (const auto &param : formulaWeights) {
+					for (float response : param.material) {
+						if (response != 0.0F) return true;
+					}
+				}
+				return false;
+			}();
+			inline static constexpr std::size_t materialFormulaCount = [] {
+				std::size_t count = 0;
+				for (const auto &param : formulaWeights) {
+					if (std::ranges::any_of(param.material, [](float response) { return response != 0.0F; })) ++count;
+				}
+				return count;
+			}();
+			inline static constexpr auto materialFormulaIndices = [] {
+				std::array<std::size_t, materialFormulaCount> indices{};
+				std::size_t count = 0;
+				for (std::size_t i = 0; i < formulaWeights.size(); ++i) {
+					if (std::ranges::any_of(formulaWeights[i].material, [](float response) { return response != 0.0F; })) indices[count++] = i;
+				}
+				return indices;
+			}();
 
 		public:
 			explicit Formulas(B runtime) : b(std::move(runtime)) {
@@ -476,7 +593,6 @@ namespace eleginus {
 				us = b.NUM(0);
 				them = b.NUM(1);
 				occ = b.occ();
-				phase = phaseUnits();
 			}
 
 			void execute() {
@@ -490,13 +606,49 @@ namespace eleginus {
 				threats();
 				kings();
 				endgames();
-		}
-			static std::span<const float> weights() noexcept {
-				return formulaWeights;
+				b.complete();
+			}
+			static std::span<const float> weights(const chess::Board &board) noexcept {
+				if constexpr (!materialModulation) {
+					return baseWeights;
+				} else {
+					struct Entry {
+						std::uint32_t signature = 0;
+						bool valid = false;
+						std::array<float, formulaWeights.size()> values{};
+					};
+					thread_local std::array<Entry, 16> cache{};
+					std::array<unsigned, 5> counts{};
+					std::uint32_t signature = 0;
+					for (int type = 0; type < 5; ++type) {
+						counts[static_cast<std::size_t>(type)] = static_cast<unsigned>(
+							std::popcount(board.pieces(chess::PieceType(static_cast<chess::PieceType::underlying>(type))).getBits()));
+						signature |= counts[static_cast<std::size_t>(type)] << (6 * type);
+					}
+					auto &entry = cache[(signature * 0x9e3779b9U) >> 28];
+					if (!entry.valid || entry.signature != signature) {
+						constexpr std::array<float, 5> initial{{16.0F, 4.0F, 4.0F, 4.0F, 2.0F}};
+						std::array<float, 5> coordinate{};
+						for (std::size_t type = 0; type < coordinate.size(); ++type) {
+							coordinate[type] = static_cast<float>(counts[type]) / initial[type] - 1.0F;
+						}
+						entry.values = baseWeights;
+						for (std::size_t i : materialFormulaIndices) {
+							float value = formulaWeights[i].base;
+							for (std::size_t type = 0; type < coordinate.size(); ++type) {
+								value = std::fma(formulaWeights[i].material[type], coordinate[type], value);
+							}
+							entry.values[i] = value;
+						}
+						entry.signature = signature;
+						entry.valid = true;
+					}
+					return entry.values;
+				}
 			}
 
 		private:
-			template <class F> IS shared(Pair &pair, IS role, F &&make) {
+			template <class F> InterSignal shared(Pair &pair, InterSignal role, F &&make) {
 				auto &value = pair[b.roleIndex(role)];
 				if (!value) value = make();
 				return *value;
@@ -537,11 +689,11 @@ namespace eleginus {
 				return masks[square];
 			}
 
-			IS diff(IS own, IS enemy) { return b.SUB(own, enemy); }
+			InterSignal diff(InterSignal own, InterSignal enemy) { return b.SUB(own, enemy); }
 
-			IS own(IS role) {
+			InterSignal own(InterSignal role) {
 				return shared(owned, role, [&] {
-					IS result = b.PCS(role, 0);
+					InterSignal result = b.PCS(role, 0);
 					for (int type = 1; type < 6; ++type) {
 						result = b.OR(result, b.PCS(role, type));
 					}
@@ -549,38 +701,27 @@ namespace eleginus {
 				});
 			}
 
-			IS pawnAttacks(IS role) {
+			InterSignal pawnAttacks(InterSignal role) {
 				return b.attacks(role, 0);
 			}
 
-			IS files(IS role) {
+			InterSignal files(InterSignal role) {
 				return b.pawnFiles(role);
 			}
 
-			IS passedPawns(IS role, IS opponent) {
+			InterSignal passedPawns(InterSignal role, InterSignal opponent) {
 				(void)opponent;
 				return b.passedPawns(role);
 			}
 
-			IS strongSquares(IS role, IS opponent) {
+			InterSignal strongSquares(InterSignal role, InterSignal opponent) {
 				return shared(
 					strongMap, role, [&] { return b.OR(pawnAttacks(opponent), b.AND(b.doubleAttacks(opponent), b.NOT(b.doubleAttacks(role)))); });
 			}
 
-			IS phaseUnits() {
-				IS total = z;
-				constexpr std::array<int, 6> units{{0, 1, 1, 2, 4, 0}};
-				for (const auto role : {us, them}) {
-					for (int type = 1; type <= 4; ++type) {
-						total = b.ADD(total, b.MUL(b.NUM(units[static_cast<std::size_t>(type)]), b.POP(b.PCS(role, type))));
-					}
-				}
-				return b.MIN(total, b.NUM(24));
-			}
+			void F(InterSignal signal) { b.root(signal); }
 
-			void F(IS signal) { b.root(signal); }
-
-			IS mobilityArea(IS role, IS opponent) {
+			InterSignal mobilityArea(InterSignal role, InterSignal opponent) {
 				return shared(mobilityAreaCache, role, [&] {
 					const auto pawns = b.PCS(role, 0);
 					const auto blocked = b.AND(pawns, b.SH(occ, role, 1));
@@ -589,14 +730,14 @@ namespace eleginus {
 				});
 			}
 
-			IS secondaryArea(IS role, IS opponent, int type) {
+			InterSignal secondaryArea(InterSignal role, InterSignal opponent, int type) {
 				if (type < 3) return b.BB(0);
-				IS unsafe = b.OR(b.attacks(opponent, 1), b.attacks(opponent, 2));
+				InterSignal unsafe = b.OR(b.attacks(opponent, 1), b.attacks(opponent, 2));
 				if (type == 4) unsafe = b.OR(unsafe, b.attacks(opponent, 3));
 				return b.AND(mobilityArea(role, opponent), b.NOT(unsafe));
 			}
 
-			IS rookLine(IS role, IS opponent) {
+			InterSignal rookLine(InterSignal role, InterSignal opponent) {
 				Sum terms;
 				for (int square : b.squares(role, 3)) {
 					const auto present = b.ANY(b.AND(b.PCS(role, 3), b.REL(role, 1ULL << square)));
@@ -606,7 +747,7 @@ namespace eleginus {
 				return b.sum(terms);
 			}
 
-			IS bishopXray(IS role, IS opponent) {
+			InterSignal bishopXray(InterSignal role, InterSignal opponent) {
 				Sum terms;
 				for (int square : b.squares(role, 2)) {
 					const auto present = b.ANY(b.AND(b.PCS(role, 2), b.REL(role, 1ULL << square)));
@@ -615,7 +756,7 @@ namespace eleginus {
 				return b.sum(terms);
 			}
 
-			IS potentialChecks(IS attacker, IS defender, int type) {
+			InterSignal potentialChecks(InterSignal attacker, InterSignal defender, int type) {
 				if (type == 0) return z;
 				Sum terms;
 				for (int square : b.locations(b.PCS(defender, 5))) {
@@ -628,22 +769,22 @@ namespace eleginus {
 				return b.sum(terms);
 			}
 
-			IS escapes(IS defender, IS attacker) {
+			InterSignal escapes(InterSignal defender, InterSignal attacker) {
 				return b.POP(b.AND(b.attacks(defender, 5), b.AND(b.NOT(own(defender)), b.NOT(b.attacks(attacker)))));
 			}
 
-			IS kingPawns(IS defender, IS attacker, int distance, bool friendly) {
+			InterSignal kingPawns(InterSignal defender, InterSignal attacker, int distance, bool friendly) {
 				(void)attacker;
 				return b.kingPawn(defender, 2 * (distance - 1) + !friendly);
 			}
 
-			IS kingOpenFiles(IS role) {
+			InterSignal kingOpenFiles(InterSignal role) {
 				return b.kingPawn(role, 6);
 			}
 
-			IS kingRegion(IS role, bool flank) {
+			InterSignal kingRegion(InterSignal role, bool flank) {
 				return shared(flank ? kingFlank : kingRing, role, [&] {
-					IS mask = b.BB(0);
+					InterSignal mask = b.BB(0);
 					for (int square : b.squares(role, 5)) {
 						Word region = ringMask(square, 2);
 						if (flank) {
@@ -660,12 +801,12 @@ namespace eleginus {
 				});
 			}
 
-			IS flank(IS map, IS defender) {
+			InterSignal flank(InterSignal map, InterSignal defender) {
 				return b.POP(b.AND(map, kingRegion(defender, true)));
 			}
 
-			IS nonPawnMaterial(IS role) {
-				IS total = z;
+			InterSignal nonPawnMaterial(InterSignal role) {
+				InterSignal total = z;
 				constexpr std::array<int, 5> value{{0, 3, 3, 5, 9}};
 				for (int type = 1; type <= 4; ++type) {
 					total = b.ADD(total, b.MUL(b.NUM(value[static_cast<std::size_t>(type)]), b.POP(b.PCS(role, type))));
@@ -675,18 +816,17 @@ namespace eleginus {
 
 			B b;
 			Pair owned, strongMap, mobilityAreaCache, pushAttack, kingRing, kingFlank;
-			IS z{};
-			IS o{};
-			IS us{};
-			IS them{};
-			IS occ{};
-			IS phase{};
+			InterSignal z{};
+			InterSignal o{};
+			InterSignal us{};
+			InterSignal them{};
+			InterSignal occ{};
 		};
 
 	} // namespace
 
 	float FormulaSet::score(const chess::Board &board) {
-		ScoreOutput sink(Formulas<Runtime<ScoreOutput>>::weights());
+		ScoreOutput sink(Formulas<Runtime<ScoreOutput>>::weights(board));
 		Formulas(Runtime(board, sink)).execute();
 		return sink.finish();
 	}
