@@ -1,42 +1,15 @@
 #include "eleginus/formula.hpp"
-#include "eleginus/game.hpp"
 #include "eleginus/search.hpp"
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <iostream>
-#include <numeric>
 #include <stdexcept>
-#include <vector>
 
 namespace {
 
 	void require(bool ok, const char *message) {
 		if (!ok) throw std::runtime_error(message);
-	}
-
-	float reconstruct(std::span<const std::int32_t> signals, const eleginus::FormulaContext &context,
-		const std::vector<eleginus::FormulaParameter> &parameters) {
-		float score = 0.0F;
-		for (std::size_t i = 0; i < parameters.size(); ++i) {
-			float weight = parameters[i].base;
-			for (std::size_t type = 0; type < context.material.size(); ++type) {
-				weight = std::fma(parameters[i].material[type], context.material[type], weight);
-			}
-			score = std::fma(weight, static_cast<float>(signals[i]), score);
-		}
-
-		const auto globals = eleginus::FormulaSet::globals();
-		if (score != 0.0F) {
-			const std::size_t branch = score < 0.0F;
-			const float win = std::inner_product(context.winnable[branch].begin(), context.winnable[branch].end(), globals.winnable.begin(), 0.0F);
-			score = score > 0.0F ? std::max(0.0F, score + win) : std::min(0.0F, score - win);
-			const auto &facts = context.scale[branch];
-			float factor = facts[0] != 0.0F ? globals.scale[0] : 1.0F;
-			if (facts[1] != 0.0F) factor = std::min(factor, globals.scale[1] + globals.scale[4] * facts[3] + globals.scale[3] * facts[4]);
-			else if (facts[2] != 0.0F) factor = std::min(factor, globals.scale[2] + globals.scale[3] * facts[4]);
-			score *= std::clamp(factor, 0.0F, 1.0F);
-		}
-		return score;
 	}
 
 	void checkFormulas() {
@@ -71,22 +44,7 @@ namespace {
 			require(std::abs(sum) < 1.0e-5F, "formula evaluation lost color-mirror antisymmetry");
 		}
 
-		const auto parameters = eleginus::FormulaSet::parameters();
-		std::vector<std::int32_t> signals(parameters.size());
-		for (const auto &board : positions) {
-			const auto packed = eleginus::packBoard(board);
-			const auto restored = eleginus::unpackBoard(packed);
-			require(eleginus::packBoard(restored) == packed, "packed board codec is not reversible");
-			eleginus::FormulaContext context;
-			eleginus::FormulaSet::features(restored, signals, context);
-			require(context.pressureIndex < signals.size(), "king-pressure formula index is invalid");
-			require(std::all_of(context.material.begin(), context.material.end(), [](float value) { return std::isfinite(value); }),
-				"material coordinates are not finite");
-			require(std::abs(reconstruct(signals, context, parameters) - eleginus::FormulaSet::score(restored)) < 1.0e-5F,
-				"extracted formula context does not reconstruct the production score");
-		}
-
-		// External FEN can be structurally invalid; formula extraction must remain memory-safe.
+		// External FEN can be structurally invalid; formula evaluation must remain memory-safe.
 		require(std::isfinite(eleginus::FormulaSet::score(chess::Board("4k3/P1P1P1P1/1P1P1P1P/P1P1P1P1/1P1P1P1P/P7/8/1B2K3 w - - 0 1"))),
 			"malformed position escaped formula evaluation");
 	}

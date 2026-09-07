@@ -89,6 +89,7 @@ build/melano/train
 build/melano/search
 build/melano/uci
 
+build/eleginus/train
 build/eleginus/search
 build/eleginus/uci
 ```
@@ -103,6 +104,7 @@ The preprocessing, training and search entry points provide their current argume
 ```bash
 build/gadus/search --help
 build/melano/train --help
+build/eleginus/train --help
 build/eleginus/search --help
 ```
 
@@ -277,54 +279,54 @@ The [UCI](#uci) section describes runtime options, output fields and time manage
 
 ### Eleginus
 
-Eleginus is a self-contained HCE engine. Let $x_i(s)$ denote formula signal $i$ and $w_i$ its source-defined weight. Its White-perspective evaluation is
+Eleginus is a self-contained HCE engine. Let $x_i(s)$ denote formula signal $i$, $b_i$ its base coefficient, $r_i$ its five material-response coefficients and $m(s)$ the normalized material coordinates. Its White-perspective linear score is
 
 $$
-H(s)=\sum_{i=1}^{N}w_i x_i(s).
+H_0(s)=\sum_{i=1}^{N}\left(b_i+r_i^{\mathsf T}m(s)\right)x_i(s).
 $$
 
-Here, $N$ is the number of formulas compiled into the engine. Search accumulates the weighted sum while producing the formula signals.
+Here, $N$ is the number of formulas compiled into the engine. King-pressure, winnability and endgame-scaling formulas transform $H_0(s)$ into the final score $H(s)$. The compiled formula set contains 694 signals and 4178 trainable values: 694 base coefficients, 3470 material responses and 14 postprocessing parameters.
 
-Eleginus preprocessing reads JSONL records containing `fen` and `evals`. It selects the evaluation with the greatest depth, breaks equal-depth ties by `knodes`, and reads the integer White-perspective `cp` value from its first principal variation. Records with an invalid FEN, an invalid piece configuration or no usable centipawn evaluation are skipped.
+Training generates complete games from the 1000 leaf positions in `data/openings.gen.bin`. Each visited position receives the final White expected score $y\in\{0,\tfrac12,1\}$ and contributes one sample. Before each optimization run, the tuner fits a positive scale $K$ for the candidate and minimizes
 
-The preprocessor stores each accepted position with `chess::Board::Compact` in 24 bytes. The resulting HDF5 file contains a `states` dataset with shape $[N,24]$ and a `centipawns` dataset with shape $[N]$.
+$$
+L(\theta)=\frac1M\sum_{n=1}^{M}\left[\sigma\!\left(KH_\theta(s_n)\right)-y_n\right]^2.
+$$
 
-```bash
-zstdcat data/positions.jsonl.zst | build/eleginus/preprocess \
-		--input - \
-		--output data/positions.eleginus.h5 \
-		--chunk-rows 16384 \
-		--max-positions 200000000 \
-		--compression 1 \
-		--log-every 10000
-```
-
-The offline optimizer restores each position, evaluates the compiled formulas and adjusts every formula's base coefficient and five material-response coefficients. It also optimizes the two king-pressure parameters, seven winnability parameters and five endgame-scaling parameters. The current formula set therefore exposes 4178 trainable parameters.
-
-Formula extraction runs on CPU workers. AdamW optimization runs on the device selected by `--device`; `auto` selects CUDA when available and otherwise selects CPU. The objective is Huber regression against the clipped centipawn target. A deterministic subset of rows supplies validation statistics.
+Self-play search and formula extraction run on CPU workers. AdamW runs on the device selected by `--device`; `auto` selects CUDA when available and otherwise selects CPU. The accepted baseline generates `--eval-every` games by traversing the 1000 opening leaves repeatedly in order. Every traversal uses independent game seeds; `--eval-every 1000` covers the book once, while `--eval-every 10000` covers it ten times. When `--exploration` triggers, move selection is limited to the first four root moves whose score is within 50 cp of the best move; ordinary plies use the best move. Completed games form the training set, while games that reach `--max-plies` without a result are discarded.
 
 ```bash
-build/eleginus/optimizer \
-	--data data/positions.eleginus.h5 \
-	--out models/eleginus/eleginus-weights.tsv \
-	--epochs 3 \
+build/eleginus/train \
+	--out models/eleginus/current.pth \
+	--opening-book data/openings.gen.bin \
+	--depth 2 \
+	--eval-depth 4 \
+	--eval-every 10000 \
+	--epochs 450 \
+	--max-plies 320 \
+	--workers 4 \
+	--hash 16 \
 	--batch-size 4096 \
-	--chunk-rows 16384 \
-	--workers 8 \
 	--device cuda \
 	--lr 0.001 \
-	--weight-decay 0 \
-	--grad-clip 1 \
-	--cp-scale 150 \
-	--cp-clip 2000 \
-	--huber-delta 100 \
-	--validation-permille 10 \
-	--save-every 0 \
-	--log-every 50 \
+	--exploration 0.08 \
+	--log-every 16 \
 	--seed 2026
 ```
 
-The optimizer writes the learned formula coefficients and postprocessing parameters to a TSV file. Eleginus UCI continues to use the coefficients compiled into the source; applying an optimized result therefore requires transferring the selected values into the formula definitions.
+Each optimization epoch shuffles every collected position. `--batch-size` controls the device microbatch. Gradients accumulate across microbatches until a macro batch of 262144 positions is complete, then AdamW performs one update. The schedule first optimizes the five material signals, then all 4164 formula coefficients, and finally all 4178 formula and postprocessing values. The relative stage lengths follow 24, 96 and 450 epochs and scale proportionally when `--epochs` changes.
+
+After the complete optimization run, the candidate plays both colors from each opening against the accepted baseline at `--eval-depth`. The resulting 2000 games form 1000 paired observations. Their five-outcome sample distribution determines a two-sided empirical 95% Elo confidence interval. A positive lower endpoint accepts the candidate and publishes it atomically to `current.pth`. A negative upper endpoint rejects the candidate and restores the accepted coefficients. An interval containing zero retains the candidate and optimizer state for the next cycle. The consumed training positions are released after every arena. Interrupting training leaves the accepted checkpoint unchanged.
+
+The checkpoint contains all 4178 formula and postprocessing values. Optimizer state and training positions remain process-local and are not checkpointed. `--init` starts a candidate from another Eleginus checkpoint while `--out` continues to identify the accepted baseline and publication target.
+
+Eleginus UCI uses the coefficients compiled into `weights.inl`. Export an accepted checkpoint into that source file with:
+
+```bash
+build/eleginus/train \
+	--init models/eleginus/current.pth \
+	--export-inl src/engines/eleginus/weights.inl
+```
 
 Analyze one position with Eleginus search using:
 

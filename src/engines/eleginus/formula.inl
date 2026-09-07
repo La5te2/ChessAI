@@ -441,8 +441,6 @@ FORMULA(endgames) {
 	const auto pure = b.LAND(b.LAND(b.LAND(onefb, oneeb), opposite),
 		b.LAND(b.EQ(nonPawnMaterial(us), b.NUM(3)), b.EQ(nonPawnMaterial(them), b.NUM(3))));
 	const auto mixed = b.LAND(b.LAND(b.LAND(onefb, oneeb), opposite), b.LNOT(pure));
-	b.END({b.ADD(fpawns, epawns), symmetric, asymmetric, pawnEnding, fpawns, epawns, fpassers, epassers, opposite, fpawnless, epawnless, thin, pure, mixed});
-
 	// Pawn count and pawn-file geometry adjust how readily the current advantage converts.
 	b.WIN(b.ADD(fpawns, epawns), symmetric, asymmetric, pawnEnding, strongPawns, b.MUL(opposite, strongPassers), winnable);
 	// Pawnless and opposite-colored-bishop structures contract the complete score toward a draw.

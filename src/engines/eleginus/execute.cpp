@@ -1,8 +1,6 @@
 #include "eleginus/formula.hpp"
-#include "eleginus/atom.hpp"
 #include <algorithm>
 #include <array>
-#include <bit>
 #include <cmath>
 #include <optional>
 #include <span>
@@ -11,8 +9,6 @@
 
 namespace eleginus {
 	namespace {
-		using Word = std::uint64_t;
-
 		struct FormulaParam {
 			float base = 0.0F;
 			std::array<float, 5> material{};
@@ -41,6 +37,13 @@ namespace eleginus {
 			float pawnStep;
 		};
 
+		struct GlobalParam {
+			float pressureCenter = 0.0F;
+			float pressureWidth = 0.0F;
+			std::array<float, 7> winnable{};
+			std::array<float, 5> scale{};
+		};
+
 		class SigmoidCurve {
 		public:
 			static constexpr int scale = 4096;
@@ -61,9 +64,6 @@ namespace eleginus {
 			std::array<std::int32_t, 65> values{};
 		};
 
-		std::int64_t number(Word x) noexcept {
-			return std::bit_cast<std::int64_t>(x);
-		}
 		std::array<Word, atomCount> inputs(const chess::Board &board) {
 			std::array<Word, atomCount> in{};
 			const std::array<Word, 2> byColor{board.us(chess::Color::WHITE).getBits(), board.us(chess::Color::BLACK).getBits()};
@@ -82,12 +82,6 @@ namespace eleginus {
 			return in;
 		}
 
-		std::uint64_t flip(Word x) noexcept {
-			x = ((x & 0x00FF00FF00FF00FFULL) << 8) | ((x >> 8) & 0x00FF00FF00FF00FFULL);
-			x = ((x & 0x0000FFFF0000FFFFULL) << 16) | ((x >> 16) & 0x0000FFFF0000FFFFULL);
-			return (x << 32) | (x >> 32);
-		}
-
 		// Sparse square iteration preserves the fixed coordinate order while visiting occupied squares only.
 		struct Squares {
 			Word mask;
@@ -103,16 +97,6 @@ namespace eleginus {
 			Iterator begin() const { return {mask}; }
 			Iterator end() const { return {0}; }
 		};
-
-		// A signal is the single value representation used throughout the formula algebra.
-		struct Signal {
-			Word bits = 0;
-			Signal() = default;
-			explicit Signal(Word x) : bits(x) {}
-		};
-		// These aliases identify the producing layer.
-		using AtomSignal = Signal;
-		using InterSignal = Signal;
 
 		class ScoreOutput {
 		public:
@@ -136,55 +120,6 @@ namespace eleginus {
 			float total = 0.0F;
 		};
 
-		class FeatureOutput {
-		public:
-			FeatureOutput(std::span<const float> weights, std::span<std::int32_t> values, FormulaContext &context)
-				: weights(weights), values(values), context(context) {
-				if (weights.size() != values.size()) throw std::invalid_argument("formula feature buffer has the wrong size");
-				std::ranges::fill(values, 0);
-			}
-
-			void put(std::uint32_t index, std::int32_t score) {
-				values[index] = score;
-				total = std::fma(weights[index], static_cast<float>(score), total);
-			}
-
-			std::size_t size() const noexcept { return values.size(); }
-			int direction() const noexcept { return (total > 0.0F) - (total < 0.0F); }
-			void winnable(float value) noexcept {
-				if (total > 0.0F) total = std::max(0.0F, total + value);
-				else if (total < 0.0F) total = std::min(0.0F, total - value);
-			}
-			void scale(float value) noexcept { total *= value; }
-			void sigmoid(std::int64_t value) noexcept {
-				if (sigmoidCount < sigmoidInputs.size()) sigmoidInputs[sigmoidCount++] = static_cast<float>(value);
-			}
-			void mark(std::uint32_t index) noexcept {
-				if (sigmoidCount == sigmoidInputs.size()) {
-					context.pressureIndex = index;
-					context.pressure = sigmoidInputs;
-				}
-				sigmoidCount = 0;
-			}
-			void endgame(const std::array<float, 14> &facts) noexcept {
-				const float totalPawns = facts[0];
-				for (std::size_t branch = 0; branch < 2; ++branch) {
-					const float strongPawns = facts[4 + branch];
-					const float strongPassers = facts[6 + branch];
-					context.winnable[branch] = {{totalPawns, facts[1], facts[2], facts[3], strongPawns, facts[8] * strongPassers, 1.0F}};
-					context.scale[branch] = {{facts[9 + branch] * facts[11], facts[12], facts[13], strongPawns, strongPassers}};
-				}
-			}
-
-		private:
-			std::span<const float> weights;
-			std::span<std::int32_t> values;
-			FormulaContext &context;
-			std::array<float, 2> sigmoidInputs{};
-			std::size_t sigmoidCount = 0;
-			float total = 0.0F;
-		};
-
 		std::array<float, 5> materialCoordinates(const chess::Board &board) noexcept {
 			constexpr std::array<float, 5> initial{{16.0F, 4.0F, 4.0F, 4.0F, 2.0F}};
 			std::array<float, 5> coordinate{};
@@ -195,13 +130,13 @@ namespace eleginus {
 			return coordinate;
 		}
 
-		template <class Output> class Runtime {
+		class Runtime : public FormulaAtoms<Runtime> {
 		public:
 			struct Sum {
 				std::int64_t total = 0;
 				void add(InterSignal value) { total += number(value.bits); }
 			};
-			Runtime(const chess::Board &board, Output &out) : in(inputs(board)), occupied(board.occ().getBits()), output(out) {
+			Runtime(const chess::Board &board, ScoreOutput &out) : in(inputs(board)), occupied(board.occ().getBits()), output(out) {
 				// Pure pawn facts share one cache entry and verify both complete pawn bitboards on every hit.
 				thread_local std::array<Pawns, 1024> table{};
 				const Word hash = in[atomIndex(Atom::WP)] * 0x9e3779b97f4a7c15ULL ^ std::rotl(in[atomIndex(Atom::BP)] * 0xbf58476d1ce4e5b9ULL, 29);
@@ -317,67 +252,7 @@ namespace eleginus {
 				attackCache->valid = true;
 			}
 
-			// The Chess-algebra is designed to be expressive and efficient, with a focus on chess-specific computations.
-			// It mainly consists of three layers: Atoms, InterSignals and the final output.
-			// NUM constructs a signed integer signal; BB constructs a raw bitboard signal.
-			AtomSignal NUM(std::int64_t x) const { return AtomSignal(static_cast<Word>(x)); }
-			AtomSignal BB(Word x) const { return AtomSignal(x); }
-
-			// INP reads one irreducible board input.
-			AtomSignal INP(Atom atom) const { return AtomSignal(in[atomIndex(atom)]); }
-
-			// ADD, SUB, MUL, ABS and MIN form the integer arithmetic primitives.
-			AtomSignal ADD(InterSignal a, InterSignal b) const { return NUM(number(a.bits) + number(b.bits)); }
-			AtomSignal SUB(InterSignal a, InterSignal b) const { return NUM(number(a.bits) - number(b.bits)); }
-			AtomSignal MUL(InterSignal a, InterSignal b) const { return NUM(number(a.bits) * number(b.bits)); }
-			AtomSignal ABS(InterSignal a) const { return NUM(std::abs(number(a.bits))); }
-			AtomSignal MIN(InterSignal a, InterSignal b) const { return NUM(std::min(number(a.bits), number(b.bits))); }
-
-			// LAND, LOR and LNOT map logical results to zero and one.
-			AtomSignal LAND(InterSignal a, InterSignal b) const { return NUM(number(a.bits) != 0 && number(b.bits) != 0); }
-			AtomSignal LOR(InterSignal a, InterSignal b) const { return NUM(number(a.bits) != 0 || number(b.bits) != 0); }
-			AtomSignal LNOT(InterSignal a) const { return NUM(number(a.bits) == 0); }
-
-			// EQ, GT, LT, LE and GE compare integer signals and return zero or one.
-			AtomSignal EQ(InterSignal a, InterSignal b) const { return NUM(a.bits == b.bits); }
-			AtomSignal GT(InterSignal a, InterSignal b) const { return NUM(number(a.bits) > number(b.bits)); }
-			AtomSignal LT(InterSignal a, InterSignal b) const { return NUM(number(a.bits) < number(b.bits)); }
-			AtomSignal LE(InterSignal a, InterSignal b) const { return NUM(number(a.bits) <= number(b.bits)); }
-			AtomSignal GE(InterSignal a, InterSignal b) const { return NUM(number(a.bits) >= number(b.bits)); }
-
-			// AND, OR and NOT combine bitboards; POP and ANY reduce them to integers.
-			AtomSignal AND(InterSignal a, InterSignal b) const { return BB(a.bits & b.bits); }
-			AtomSignal OR(InterSignal a, InterSignal b) const { return BB(a.bits | b.bits); }
-			AtomSignal NOT(InterSignal a) const { return BB(~a.bits); }
-			AtomSignal POP(InterSignal a) const { return NUM(std::popcount(a.bits)); }
-			AtomSignal ANY(InterSignal a) const { return NUM(a.bits != 0); }
-
-			// PCS selects a piece set; REL and SQ normalize coordinates; CR exposes rule state.
-			AtomSignal PCS(InterSignal role, int type) const { return BB(in[pieceAtomIndex(color(role), static_cast<std::size_t>(type))]); }
-			AtomSignal REL(InterSignal role, Word mask) const { return BB(color(role) == 0 ? mask : flip(mask)); }
-			AtomSignal SQ(InterSignal role, int square) const { return NUM(square ^ (color(role) == 0 ? 0 : 56)); }
-			AtomSignal CR(InterSignal role, int wing) const { return NUM((in[atomIndex(Atom::CR)] & (1ULL << (2 * color(role) + wing))) != 0); }
-
-			// SH performs one role-relative step: forward, backward, east, west and the four diagonals.
-			AtomSignal SH(InterSignal x, InterSignal role, int direction) const {
-				const Word east = x.bits & 0x7F7F7F7F7F7F7F7FULL, west = x.bits & 0xFEFEFEFEFEFEFEFEULL;
-				const bool white = color(role) == 0;
-				switch (direction) {
-					case 0: return BB(white ? x.bits << 8 : x.bits >> 8);
-					case 1: return BB(white ? x.bits >> 8 : x.bits << 8);
-					case 2: return BB(east << 1);
-					case 3: return BB(west >> 1);
-					case 4: return BB(white ? east << 9 : east >> 7);
-					case 5: return BB(white ? west << 7 : west >> 9);
-					case 6: return BB(white ? east >> 7 : east << 9);
-					case 7: return BB(white ? west >> 9 : west << 7);
-					default: throw std::logic_error("invalid shift direction");
-				}
-			}
-
-			// InterSignal traversal and derived shared calculations follow the primitive set.
-			// It is between Atoms and the final output, and is where most chess-specific logic is implemented.
-			// Atoms and InterSignals forms the Formula of the evaluation, which is then executed by the Runtime to produce a final score.
+			// Derived calculations reuse primitive signals across formulas.
 			InterSignal occ() const { return BB(occupied); }
 			unsigned roleIndex(InterSignal role) const { return color(role); }
 			Squares squares(InterSignal role, int type) const { return {REL(role, PCS(role, type).bits).bits}; }
@@ -514,15 +389,7 @@ namespace eleginus {
 
 			// SIG applies a bounded nonlinear response to an aggregate integer signal.
 			InterSignal SIG(InterSignal value, const SigmoidCurve &curve) const {
-				if constexpr (requires { output.sigmoid(std::int64_t{}); }) output.sigmoid(number(value.bits));
 				return NUM(curve(number(value.bits)));
-			}
-			void END(const std::array<InterSignal, 14> &facts) const {
-				if constexpr (requires { output.endgame(std::array<float, 14>{}); }) {
-					std::array<float, 14> values{};
-					for (std::size_t i = 0; i < values.size(); ++i) values[i] = static_cast<float>(number(facts[i].bits));
-					output.endgame(values);
-				}
 			}
 			// WIN adjusts score magnitude without allowing the preferred side to change.
 			void WIN(InterSignal pawns, InterSignal symmetric, InterSignal asymmetric, InterSignal pawnEnding, InterSignal strongPawns,
@@ -550,7 +417,6 @@ namespace eleginus {
 			}
 			void root(InterSignal score) {
 				const auto value = number(score.bits);
-				if constexpr (requires { output.mark(std::uint32_t{}); }) output.mark(index);
 				if (value != 0) output.put(index, static_cast<std::int32_t>(value));
 				++index;
 			}
@@ -561,6 +427,9 @@ namespace eleginus {
 			void skip(unsigned n) { index += n; }
 
 		private:
+			friend class FormulaAtoms<Runtime>;
+			Word input(Atom atom) const noexcept { return in[atomIndex(atom)]; }
+
 			struct KingPawn {
 				Word king = 0;
 				std::array<int, 7> values{}; // Shelter/storm at three distances, then open king files.
@@ -615,12 +484,12 @@ namespace eleginus {
 			std::array<Word, atomCount> in;
 			std::array<std::array<Word, 2>, 2> fixedAttacks{};
 			Word occupied;
-			Output &output;
+			ScoreOutput &output;
 			unsigned index = 0;
 		};
 
-		template <class Backend> class Formulas {
-			using Sum = typename Backend::Sum;
+		class Formulas {
+			using Sum = Runtime::Sum;
 			using Pair = std::array<std::optional<InterSignal>, 2>;
 
 			#define FORMULA(name) void name()
@@ -657,7 +526,7 @@ namespace eleginus {
 			}();
 
 		public:
-			explicit Formulas(Backend runtime) : b(std::move(runtime)) {
+			explicit Formulas(Runtime runtime) : b(std::move(runtime)) {
 				z = b.NUM(0);
 				o = b.NUM(1);
 				us = b.NUM(0);
@@ -712,14 +581,6 @@ namespace eleginus {
 					return entry.values;
 				}
 			}
-
-			static std::vector<FormulaParameter> parameters() {
-				std::vector<FormulaParameter> result;
-				result.reserve(formulaWeights.size());
-				for (const auto &source : formulaWeights) result.push_back({source.base, source.material});
-				return result;
-			}
-			static FormulaGlobals globals() noexcept { return formulaGlobals; }
 
 		private:
 			template <class F> InterSignal shared(Pair &pair, InterSignal role, F &&make) {
@@ -888,7 +749,7 @@ namespace eleginus {
 				return total;
 			}
 
-			Backend b;
+			Runtime b;
 			Pair owned, strongMap, mobilityAreaCache, pushAttack, kingRing, kingFlank;
 			InterSignal z{};
 			InterSignal o{};
@@ -900,23 +761,9 @@ namespace eleginus {
 	} // namespace
 
 	float FormulaSet::score(const chess::Board &board) {
-		ScoreOutput sink(Formulas<Runtime<ScoreOutput>>::weights(board));
+		ScoreOutput sink(Formulas::weights(board));
 		Formulas(Runtime(board, sink)).execute();
 		return sink.finish();
 	}
-
-	void FormulaSet::features(const chess::Board &board, std::span<std::int32_t> signals, FormulaContext &context) {
-		const auto weights = Formulas<Runtime<FeatureOutput>>::weights(board);
-		context = {};
-		FeatureOutput sink(weights, signals, context);
-		Formulas(Runtime(board, sink)).execute();
-		context.material = materialCoordinates(board);
-	}
-
-	std::vector<FormulaParameter> FormulaSet::parameters() {
-		return Formulas<Runtime<ScoreOutput>>::parameters();
-	}
-
-	FormulaGlobals FormulaSet::globals() { return Formulas<Runtime<ScoreOutput>>::globals(); }
 
 } // namespace eleginus

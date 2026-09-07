@@ -727,7 +727,7 @@ namespace eleginus {
 				if (depth < 4 || opts.multipv > 1 || std::abs(previous) >= kMateThreshold) return root(board, depth);
 				int margin = 32;
 				int alpha = std::max(-kInfinity, previous - margin), beta = std::min(kInfinity, previous + margin);
-				for (;;) {
+				for (;;) { // while(true) is intentional; the loop is broken by return statements.
 					auto result = root(board, depth, alpha, beta);
 					// Widen failed bounds without reducing depth; only a completed window is published.
 					if (result.score <= alpha && alpha > -kInfinity) alpha = std::max(-kInfinity, result.score - margin);

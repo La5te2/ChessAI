@@ -1,5 +1,5 @@
 // Learned global postprocessing parameters.
-inline static constexpr FormulaGlobals formulaGlobals{
+inline static constexpr GlobalParam formulaGlobals{
 	13.3833466F, // King-pressure sigmoid center.
 	0.0559015684F, // King-pressure sigmoid width.
 	{{-0.00939294603F, 0.134299397F, 0.144295841F, 0.074325107F, -0.00435332675F, 0.0230372157F, -1.16499794F}}, // Winnability.

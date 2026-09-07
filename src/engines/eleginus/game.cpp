@@ -15,8 +15,4 @@ namespace eleginus {
 		return board.isGameOver().first != chess::GameResultReason::NONE;
 	}
 
-	PackedBoard packBoard(const chess::Board &board) { return chess::Board::Compact::encode(board); }
-
-	chess::Board unpackBoard(const PackedBoard &packed) { return chess::Board::Compact::decode(packed); }
-
 } // namespace eleginus
