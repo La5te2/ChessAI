@@ -1,5 +1,3 @@
-#include "weights.inl"
-
 FORMULA(tempo) {
 	const auto stm = b.INP(Atom::STM);
 	// Tempo: +1 when White moves and -1 when Black moves.
@@ -332,7 +330,6 @@ FORMULA(threats) {
 }
 
 FORMULA(kings) {
-	static const SigmoidCurve pressureCurve{formulaGlobals.pressureCenter, formulaGlobals.pressureWidth};
 	b.prepareKingPawns(us);
 	b.prepareKingPawns(them);
 	// Each attacking piece type emits inner-ring attacks, outer-ring attacks and potential checking moves.
@@ -354,7 +351,7 @@ FORMULA(kings) {
 	const auto fp = b.sum(friendly);
 	const auto ep = b.sum(enemy);
 	// Total king pressure follows a smooth bounded response instead of discrete thresholds.
-	F(diff(b.SIG(fp, pressureCurve), b.SIG(ep, pressureCurve)));
+	F(diff(b.SIG(fp), b.SIG(ep)));
 	// King escape squares not occupied by friendly pieces or controlled by the opponent.
 	F(diff(escapes(us, them), escapes(them, us)));
 	// Pawn shelter and enemy pawn storm at distances one through three.
@@ -406,10 +403,6 @@ FORMULA(kings) {
 }
 
 FORMULA(endgames) {
-	static constexpr WinnableParams winnable{formulaGlobals.winnable[0], formulaGlobals.winnable[1], formulaGlobals.winnable[2],
-		formulaGlobals.winnable[3], formulaGlobals.winnable[4], formulaGlobals.winnable[5], formulaGlobals.winnable[6]};
-	static constexpr EndgameScaleParams scale{formulaGlobals.scale[0], formulaGlobals.scale[1], formulaGlobals.scale[2], formulaGlobals.scale[3],
-		formulaGlobals.scale[4]};
 	// Conversion and draw scaling follow the favored side selected by the complete preceding HCE score.
 	constexpr std::uint64_t light = 0x55AA55AA55AA55AAULL;
 	const auto onefb = b.EQ(b.POP(b.PCS(us, 2)), o);
@@ -441,8 +434,9 @@ FORMULA(endgames) {
 	const auto pure = b.LAND(b.LAND(b.LAND(onefb, oneeb), opposite),
 		b.LAND(b.EQ(nonPawnMaterial(us), b.NUM(3)), b.EQ(nonPawnMaterial(them), b.NUM(3))));
 	const auto mixed = b.LAND(b.LAND(b.LAND(onefb, oneeb), opposite), b.LNOT(pure));
+	b.END({b.ADD(fpawns, epawns), symmetric, asymmetric, pawnEnding, fpawns, epawns, fpassers, epassers, opposite, fpawnless, epawnless, thin, pure, mixed});
 	// Pawn count and pawn-file geometry adjust how readily the current advantage converts.
-	b.WIN(b.ADD(fpawns, epawns), symmetric, asymmetric, pawnEnding, strongPawns, b.MUL(opposite, strongPassers), winnable);
+	b.WIN(b.ADD(fpawns, epawns), symmetric, asymmetric, pawnEnding, strongPawns, b.MUL(opposite, strongPassers));
 	// Pawnless and opposite-colored-bishop structures contract the complete score toward a draw.
-	b.SCALE(thinPawnless, pure, mixed, strongPawns, strongPassers, scale);
+	b.SCALE(thinPawnless, pure, mixed, strongPawns, strongPassers);
 }

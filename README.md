@@ -279,59 +279,57 @@ The [UCI](#uci) section describes runtime options, output fields and time manage
 
 ### Eleginus
 
-Eleginus is a self-contained HCE engine. Let $x_i(s)$ denote formula signal $i$, $b_i$ its base coefficient, $r_i$ its five material-response coefficients and $m(s)$ the normalized material coordinates. Its White-perspective linear score is
+Eleginus is an HCE engine with fixed source-defined formulas and externally stored parameters. Let $x_i(s)$ denote formula signal $i$, $b_i$ its base coefficient, $r_i$ its five material-response coefficients and $m(s)$ the normalized material coordinates. Its White-perspective linear score is
 
 $$
 H_0(s)=\sum_{i=1}^{N}\left(b_i+r_i^{\mathsf T}m(s)\right)x_i(s).
 $$
 
-Here, $N$ is the number of formulas compiled into the engine. King-pressure, winnability and endgame-scaling formulas transform $H_0(s)$ into the final score $H(s)$. The compiled formula set contains 694 signals and 4178 trainable values: 694 base coefficients, 3470 material responses and 14 postprocessing parameters.
+King-pressure, winnability and endgame-scaling adjustments transform $H_0(s)$ into the final score $H(s)$. The formula set contains 694 signals. Its parameter set contains 4178 FP32 values: 694 base coefficients, 3470 material responses and 14 postprocessing parameters.
 
-Training generates complete games from the 1000 leaf positions in `data/openings.gen.bin`. Each visited position receives the final White expected score $y\in\{0,\tfrac12,1\}$ and contributes one sample. Before each optimization run, the tuner fits a positive scale $K$ for the candidate and minimizes
+Each training iteration uses one accepted parameter set. Every generated game starts from the standard position, samples eight random legal plies and then uses fixed-depth search for both sides. Positions from the ninth ply onward provide formula values, terminal-result targets, adjacent-position TD targets and periodically sampled deeper root-search targets. Games ending during the random prefix or reaching `--max-plies` without a rule result are discarded.
 
-$$
-L(\theta)=\frac1M\sum_{n=1}^{M}\left[\sigma\!\left(KH_\theta(s_n)\right)-y_n\right]^2.
-$$
-
-Self-play search and formula extraction run on CPU workers. AdamW runs on the device selected by `--device`; `auto` selects CUDA when available and otherwise selects CPU. The accepted baseline generates `--eval-every` games by traversing the 1000 opening leaves repeatedly in order. Every traversal uses independent game seeds; `--eval-every 1000` covers the book once, while `--eval-every 10000` covers it ten times. When `--exploration` triggers, move selection is limited to the first four root moves whose score is within 50 cp of the best move; ordinary plies use the best move. Completed games form the training set, while games that reach `--max-plies` without a result are discarded.
+Complete games are divided into optimization and validation sets. AdamW optimizes a dense parameter delta on the device selected by `--device`; `auto` selects CUDA when available and otherwise selects CPU. Counterfactual samples form the primary objective when present, while validation requires the terminal-result and TD losses not to increase. Candidate selection tests fixed interpolation factors between the accepted and optimized parameter vectors.
 
 ```bash
 build/eleginus/train \
 	--out models/eleginus/current.pth \
 	--opening-book data/openings.gen.bin \
-	--depth 2 \
+	--games 1000 \
+	--random-plies 8 \
+	--depth 1 \
+	--counterfactual-depth 2 \
+	--counterfactual-every 16 \
 	--eval-depth 4 \
-	--eval-every 10000 \
-	--epochs 450 \
 	--max-plies 320 \
 	--workers 4 \
 	--hash 16 \
+	--epochs 2 \
 	--batch-size 4096 \
+	--iterations 0 \
 	--device cuda \
-	--lr 0.001 \
-	--exploration 0.08 \
+	--lr 0.0001 \
+	--weight-decay 0.000001 \
+	--grad-clip 0.25 \
 	--log-every 16 \
 	--seed 2026
 ```
 
-Each optimization epoch shuffles every collected position. `--batch-size` controls the device microbatch. Gradients accumulate across microbatches until a macro batch of 262144 positions is complete, then AdamW performs one update. The schedule first optimizes the five material signals, then all 4164 formula coefficients, and finally all 4178 formula and postprocessing values. The relative stage lengths follow 24, 96 and 450 epochs and scale proportionally when `--epochs` changes.
+After candidate selection, the candidate and accepted parameter sets play both colors from each of the 1000 leaf positions in `data/openings.gen.bin`. A positive lower endpoint of the 95% Hoeffding score bound accepts the candidate. Acceptance atomically replaces `--out`; rejection and interruption leave the accepted file unchanged. `--iterations 0` repeats this process until interrupted.
 
-After the complete optimization run, the candidate plays both colors from each opening against the accepted baseline at `--eval-depth`. The resulting 2000 games form 1000 paired observations. Their five-outcome sample distribution determines a two-sided empirical 95% Elo confidence interval. A positive lower endpoint accepts the candidate and publishes it atomically to `current.pth`. A negative upper endpoint rejects the candidate and restores the accepted coefficients. An interval containing zero retains the candidate and optimizer state for the next cycle. The consumed training positions are released after every arena. Interrupting training leaves the accepted checkpoint unchanged.
+`--init` selects the starting parameter file. Without `--init`, training reads `--out` when that file exists and otherwise initializes from `weights.inl`. Parameter files contain the 4178 coefficients only; optimizer state and generated positions remain process-local.
 
-The checkpoint contains all 4178 formula and postprocessing values. Optimizer state and training positions remain process-local and are not checkpointed. `--init` starts a candidate from another Eleginus checkpoint while `--out` continues to identify the accepted baseline and publication target.
-
-Eleginus UCI uses the coefficients compiled into `weights.inl`. Export an accepted checkpoint into that source file with:
+Export the source-defined initial parameters with:
 
 ```bash
-build/eleginus/train \
-	--init models/eleginus/current.pth \
-	--export-inl src/engines/eleginus/weights.inl
+build/eleginus/train --export-initial --out models/eleginus/eleginus.pth
 ```
 
-Analyze one position with Eleginus search using:
+Analyze one position with an explicit parameter file using:
 
 ```bash
 build/eleginus/search \
+	--parameters models/eleginus/eleginus.pth \
 	--fen "startpos" \
 	--depth 10 \
 	--hash 64 \
@@ -339,18 +337,16 @@ build/eleginus/search \
 	--multipv 1
 ```
 
-`--fen` accepts a complete FEN or the value `startpos`. A positive `--nodes` value stops the search at the requested node count, while `0` leaves the node count unbounded. `--multipv` selects the number of root lines to search and report.
+Without `--parameters`, search reads `eleginus.pth` beside its executable. `--fen` accepts a complete FEN or `startpos`. A positive `--nodes` value stops search at the requested node count, while `0` leaves the node count unbounded. `--multipv` selects the number of root lines.
 
-Launch the Eleginus UCI engine on Windows with:
+Launch Eleginus UCI with `eleginus.pth` beside the executable, or select another file explicitly:
 
 ```powershell
-build\eleginus\uci.exe
+build\eleginus\uci.exe --parameters models\eleginus\eleginus.pth
 ```
 
-The corresponding Linux command is:
-
 ```bash
-build/eleginus/uci
+build/eleginus/uci --parameters models/eleginus/eleginus.pth
 ```
 
 The [UCI](#uci) section describes runtime options, output fields and time management.
@@ -488,7 +484,7 @@ setoption name MultiPV value 5
 
 ### Eleginus
 
-The Eleginus UCI executable contains its formulas and weights and starts without an external model.
+Eleginus loads `eleginus.pth` beside the executable when `isready` or `go` first requires evaluation. The `--parameters` command-line argument and `ParametersPath` UCI option select another parameter file. Changing `ParametersPath` releases the prepared evaluator and loads the selected parameters before the next search.
 
 Search runs on a worker thread so the protocol loop can process `stop`. A `position`, `setoption` or `ucinewgame` command first stops and joins an active search before changing engine state. Closing the UCI process also joins the worker.
 
@@ -513,10 +509,11 @@ t_{\mathrm{search}}=
 \right).
 $$
 
-When a command supplies more than one applicable limit, the search stops at the first reached limit. `go infinite` removes the clock deadline and leaves the search bounded by its maximum supported iterative depth or a subsequent `stop` command.
+When a command supplies more than one applicable limit, search stops at the first reached limit. `go infinite` removes the clock deadline and leaves search bounded by its maximum supported iterative depth or a subsequent `stop` command.
 
 Eleginus exposes these options:
 
+- `ParametersPath` selects the parameter file.
 - `Hash` sets the combined cache budget in MiB and defaults to `64`. The engine rounds a requested value down to the nearest power of two. A value of `0` disables both caches, a value of `1` assigns one MiB to the transposition table, and every larger effective budget is divided equally between the transposition table and the static-evaluation cache.
 - `Move Overhead` reserves time for communication and move submission and defaults to `10`.
 - `MultiPV` sets the number of searched and reported root lines and defaults to `1`.
@@ -526,6 +523,7 @@ Both caches belong to one `go` command. The transposition table stores depth-qua
 A UCI client may configure Eleginus with commands such as:
 
 ```text
+setoption name ParametersPath value models/eleginus/eleginus.pth
 setoption name Hash value 256
 setoption name Move Overhead value 10
 setoption name MultiPV value 4
@@ -537,11 +535,12 @@ The `scripts/` directory contains the Windows and Linux build launchers, checkpo
 
 ### Checkpoint Inspection
 
-`scripts/check.py` performs a read-only inspection of a Gadus or Melano checkpoint. Reports include heads, architecture dimensions, parameter counts, tensor data types, tensor memory, devices and finite-value status. Every report also includes the detected architecture, file size and SHA-256 digest.
+`scripts/check.py` performs a read-only inspection of Gadus, Melano and Eleginus checkpoints. Reports include the detected architecture, parameter count, data type, parameter memory, finite-value status, file size and SHA-256 digest. Neural checkpoints additionally report module and device information.
 
 ```bash
 python scripts/check.py models/gadus/gadus.pth
 python scripts/check.py models/melano/melano.pth
+python scripts/check.py models/eleginus/eleginus.pth
 ```
 
 ## Graphics

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import math
+import struct
 import sys
 from collections import Counter
 from pathlib import Path
@@ -18,6 +20,10 @@ ARCHITECTURES = {
         "fields": ("type_id", "channels", "blocks", "action_size"),
     },
 }
+
+ELEGINUS_MAGIC = b"ELEGINUS"
+ELEGINUS_HEADER = struct.Struct("=8sII")
+ELEGINUS_ARCHITECTURE = 3
 
 
 def load_torch():
@@ -134,33 +140,72 @@ def inspect_libtorch(path: Path) -> dict[str, object]:
     }
 
 
-def inspect_model(path: Path) -> dict[str, object]:
-    return inspect_libtorch(path)
+def inspect_eleginus(path: Path) -> dict[str, object] | None:
+    """Inspect the fixed Eleginus parameter payload without importing PyTorch."""
+    with path.open("rb") as stream:
+        header = stream.read(ELEGINUS_HEADER.size)
+        if len(header) < 8 or header[:8] != ELEGINUS_MAGIC:
+            return None
+        if len(header) != ELEGINUS_HEADER.size:
+            raise ValueError("Eleginus checkpoint header is truncated")
+        magic, architecture, formulas = ELEGINUS_HEADER.unpack(header)
+        if magic != ELEGINUS_MAGIC or architecture != ELEGINUS_ARCHITECTURE:
+            raise ValueError("Eleginus checkpoint has invalid architecture metadata")
+        parameters = 6 * formulas + 14
+        payload = stream.read()
+        if len(payload) != 4 * parameters:
+            raise ValueError("Eleginus checkpoint parameter payload has the wrong size")
+        values = struct.unpack(f"={parameters}f", payload)
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("Eleginus checkpoint contains a nonfinite parameter")
+        if values[6 * formulas + 1] <= 0.0:
+            raise ValueError("Eleginus checkpoint pressure width must be positive")
+    return {
+        "architecture": "eleginus",
+        "heads": "value",
+        "arch": {"type_id": architecture, "formulas": formulas},
+        "model_children": "none",
+        "parameters": parameters,
+        "trainable_parameters": parameters,
+        "parameter_tensors": 1,
+        "buffers": 0,
+        "tensor_memory": len(payload),
+        "dtypes": "float32 (1)",
+        "devices": "portable",
+        "finite": True,
+    }
+
+
+def inspect_checkpoint(path: Path) -> dict[str, object]:
+    """Dispatch by file magic so all architectures share one command."""
+    eleginus = inspect_eleginus(path)
+    return eleginus if eleginus is not None else inspect_libtorch(path)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Inspect a Gadus or Melano checkpoint and detect its architecture."
+        description="Inspect a Gadus, Melano or Eleginus checkpoint and detect its architecture."
     )
-    parser.add_argument("model", type=Path, metavar="checkpoint")
+    parser.add_argument("checkpoint", type=Path)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    path = args.model.resolve()
+    path = args.checkpoint.resolve()
     if not path.is_file():
-        raise FileNotFoundError(f"model not found: {path}")
+        raise FileNotFoundError(f"checkpoint not found: {path}")
 
-    info = inspect_model(path)
-    print(f"model: {path}")
+    info = inspect_checkpoint(path)
+    print(f"checkpoint: {path}")
     print(f"file_size: {format_mib(path.stat().st_size)}")
     print(f"sha256: {sha256(path)}")
     print(f"architecture: {info['architecture']}")
     print(f"heads: {info['heads']}")
     for name, value in info["arch"].items():
         print(f"arch.{name}: {value}")
-    print(f"model_children: {info['model_children']}")
+    if info["model_children"] != "none":
+        print(f"model_children: {info['model_children']}")
     print(f"parameters: {info['parameters']}")
     print(f"trainable_parameters: {info['trainable_parameters']}")
     print(f"parameter_tensors: {info['parameter_tensors']}")

@@ -26,6 +26,7 @@ namespace eleginus {
 	enum class Atom : std::uint8_t { WP, WN, WB, WR, WQ, WK, BP, BN, BB, BR, BQ, BK, STM, CR, COUNT };
 
 	inline constexpr std::size_t atomCount = static_cast<std::size_t>(Atom::COUNT);
+	inline constexpr std::size_t formulaCount = 694;
 	inline constexpr std::size_t atomIndex(Atom atom) noexcept { return static_cast<std::size_t>(atom); }
 	inline constexpr std::size_t pieceAtomIndex(std::size_t color, std::size_t type) noexcept { return 6 * color + type; }
 
@@ -102,11 +103,6 @@ namespace eleginus {
 			value = ((value & 0x0000FFFF0000FFFFULL) << 16) | ((value >> 16) & 0x0000FFFF0000FFFFULL);
 			return (value << 32) | (value >> 32);
 		}
-	};
-
-	class FormulaSet {
-	public:
-		static float score(const chess::Board &board);
 	};
 
 } // namespace eleginus

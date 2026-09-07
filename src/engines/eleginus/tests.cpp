@@ -1,4 +1,4 @@
-#include "eleginus/formula.hpp"
+#include "eleginus/evaluate.hpp"
 #include "eleginus/search.hpp"
 #include <algorithm>
 #include <array>
@@ -12,7 +12,7 @@ namespace {
 		if (!ok) throw std::runtime_error(message);
 	}
 
-	void checkFormulas() {
+	void checkFormulas(const eleginus::Evaluator &evaluator) {
 		// Repeated pawn keys must not retain king/occupancy/turn-dependent results.
 		const std::array<chess::Board, 11> positions{
 			chess::Board(),
@@ -29,7 +29,13 @@ namespace {
 		};
 		for (int repeat = 0; repeat < 3; ++repeat) {
 			for (const auto &board : positions) {
-				require(std::isfinite(eleginus::FormulaSet::score(board)), "formula evaluation produced a nonfinite score");
+				const float direct = evaluator.score(board);
+				const auto values = evaluator.extract(board);
+				require(std::isfinite(direct), "formula evaluation produced a nonfinite score");
+				require(values.signals.size() == eleginus::formulaCount, "formula extraction returned the wrong number of signals");
+				require(values.pressure.formula < values.signals.size(), "formula extraction omitted the king-pressure signal");
+				const float recombined = evaluator.score(values);
+				require(std::abs(direct - recombined) < 1.0e-5F, "formula values and parameters did not reproduce the direct score");
 			}
 		}
 
@@ -40,54 +46,56 @@ namespace {
 				chess::Board("8/8/5k2/4p3/1p1pP1K1/3P4/2P5/8 b - - 12 42")},
 		}};
 		for (const auto &[board, mirror] : mirrors) {
-			const float sum = eleginus::FormulaSet::score(board) + eleginus::FormulaSet::score(mirror);
+			const float sum = evaluator.score(board) + evaluator.score(mirror);
 			require(std::abs(sum) < 1.0e-5F, "formula evaluation lost color-mirror antisymmetry");
 		}
 
 		// External FEN can be structurally invalid; formula evaluation must remain memory-safe.
-		require(std::isfinite(eleginus::FormulaSet::score(chess::Board("4k3/P1P1P1P1/1P1P1P1P/P1P1P1P1/1P1P1P1P/P7/8/1B2K3 w - - 0 1"))),
+		require(std::isfinite(evaluator.score(chess::Board("4k3/P1P1P1P1/1P1P1P1P/P1P1P1P1/1P1P1P1P/P7/8/1B2K3 w - - 0 1"))),
 			"malformed position escaped formula evaluation");
 	}
 
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
 	try {
-		checkFormulas();
+		if (argc != 2) throw std::invalid_argument("usage: eleginustests parameters.pth");
+		const eleginus::Evaluator evaluator(eleginus::loadParameters(argv[1]));
+		checkFormulas(evaluator);
 
 		eleginus::SearchOptions options;
 		options.depth = 4;
 		options.hash_mb = 1;
 		chess::Board mate("7k/5Q2/6K1/8/8/8/8/8 w - - 0 1");
-		const auto result = eleginus::Searcher(options).search(mate);
+		const auto result = eleginus::Searcher(evaluator, options).search(mate);
 		require(result.move.move() != chess::Move::NO_MOVE, "search returned no move in a nonterminal position");
 		mate.makeMove(result.move);
 		chess::Movelist replies;
 		chess::movegen::legalmoves(replies, mate);
 		require(mate.inCheck() && replies.empty(), "search missed an immediate checkmate");
 		require(result.root.front().move == result.move, "reported PV differs from bestmove");
-		const auto lastPlyMate = eleginus::Searcher(options).search(chess::Board("7k/6Q1/6K1/8/8/8/8/8 b - - 100 1"));
+		const auto lastPlyMate = eleginus::Searcher(evaluator, options).search(chess::Board("7k/6Q1/6K1/8/8/8/8/8 b - - 100 1"));
 		require(lastPlyMate.move.move() == chess::Move::NO_MOVE && lastPlyMate.score_cp < 0, "fifty-move adjudication overrode checkmate");
 
 		options.depth = 4;
 		options.quiescence_depth = 0;
 		options.multipv = 256;
-		const auto rows = eleginus::Searcher(options).search(chess::Board("7k/5K2/8/6Q1/8/8/8/8 w - - 0 1")).root;
+		const auto rows = eleginus::Searcher(evaluator, options).search(chess::Board("7k/5K2/8/6Q1/8/8/8/8 w - - 0 1")).root;
 		const auto draw = std::find_if(rows.begin(), rows.end(), [](const auto &row) { return chess::uci::moveToUci(row.move) == "g5g6"; });
 		require(draw != rows.end() && draw->score_cp == 0, "qsearch evaluated a stalemate as a nonterminal position");
 
 		// This low-material tree has no LMR; single-PV windows and full candidate scores must agree.
 		const chess::Board ending("8/8/4k3/2p5/2P5/3K4/8/8 w - - 0 1");
 		options.depth = 4;
-		const auto full = eleginus::Searcher(options).search(ending);
+		const auto full = eleginus::Searcher(evaluator, options).search(ending);
 		options.multipv = 2;
-		const auto pair = eleginus::Searcher(options).search(ending);
+		const auto pair = eleginus::Searcher(evaluator, options).search(ending);
 		require(pair.root.size() == 2, "MultiPV returned the wrong number of root lines");
 		require(std::equal(pair.root.begin(), pair.root.end(), full.root.begin(),
 					[](const auto &left, const auto &right) { return left.move == right.move && left.score_cp == right.score_cp; }),
 			"selective MultiPV differs from exhaustive root search in a fixed tree");
 		options.multipv = 1;
-		const auto narrow = eleginus::Searcher(options).search(ending);
+		const auto narrow = eleginus::Searcher(evaluator, options).search(ending);
 		require(narrow.score_cp == full.score_cp, "aspiration changed a fixed-tree score");
 
 		options.depth = 8;
@@ -100,7 +108,7 @@ int main() {
 			completedMove = r.move;
 		};
 		const auto cancel = [&] { return published >= 3 && ++probes >= 3; };
-		const auto interrupted = eleginus::Searcher(options).search(chess::Board(), progress, cancel);
+		const auto interrupted = eleginus::Searcher(evaluator, options).search(chess::Board(), progress, cancel);
 		const bool retained = interrupted.depth == 3 && interrupted.score_cp == completedScore && interrupted.move == completedMove;
 		require(retained, "interruption published an incomplete iteration");
 

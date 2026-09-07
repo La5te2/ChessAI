@@ -56,8 +56,10 @@ VERIFY_TORCH=OFF
 VERIFY_HDF5=OFF
 VERIFY_ZLIB=OFF
 VERIFY_JSON=OFF
-if [[ "${BUILD_GADUS}" == "ON" || "${BUILD_MELANO}" == "ON" ]]; then
+if [[ "${BUILD_GADUS}" == "ON" || "${BUILD_MELANO}" == "ON" || "${BUILD_ELEGINUS}" == "ON" ]]; then
 	VERIFY_TORCH=ON
+fi
+if [[ "${BUILD_GADUS}" == "ON" || "${BUILD_MELANO}" == "ON" ]]; then
 	VERIFY_HDF5=ON
 	VERIFY_ZLIB=ON
 	VERIFY_JSON=ON
@@ -138,7 +140,7 @@ fi
 if [[ "${BUILD_ELEGINUS}" == "ON" ]]; then
 	rm -rf -- "${PUBLISH_DIR}/eleginus"
 	mkdir -p "${PUBLISH_DIR}/eleginus"
-	for executable in search uci; do
+	for executable in train search uci; do
 		test -x "${WORK_DIR}/eleginus/${executable}"
 		cp "${WORK_DIR}/eleginus/${executable}" "${PUBLISH_DIR}/eleginus/"
 	done

@@ -7,6 +7,7 @@
 #include <vector>
 
 namespace eleginus {
+	class Evaluator;
 
 	struct SearchOptions {
 		int depth = 6;
@@ -39,16 +40,17 @@ namespace eleginus {
 
 	class Searcher {
 	public:
-		explicit Searcher(SearchOptions options = {});
+		// Validate the options and allocate the persistent transposition table.
+		Searcher(const Evaluator &evaluator, SearchOptions options = {});
 		~Searcher();
-		Searcher(Searcher &&) noexcept;
-		Searcher &operator=(Searcher &&) noexcept;
 		Searcher(const Searcher &) = delete;
 		Searcher &operator=(const Searcher &) = delete;
 
+		// Search one board by iterative deepening and report each completed depth through progress.
 		SearchResult search(const chess::Board &board, const SearchProgress &progress = {}, const SearchCancel &cancel = {});
 
 	private:
+		const Evaluator *evaluator;
 		SearchOptions opts;
 		std::unique_ptr<SearchState> state;
 	};

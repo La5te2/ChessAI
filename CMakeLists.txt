@@ -12,7 +12,7 @@ if(NOT GADIDAE_BUILD_GADUS AND NOT GADIDAE_BUILD_MELANO AND NOT GADIDAE_BUILD_EL
 endif()
 
 set(GADIDAE_NEEDS_TORCH OFF)
-if(GADIDAE_BUILD_GADUS OR GADIDAE_BUILD_MELANO)
+if(GADIDAE_BUILD_GADUS OR GADIDAE_BUILD_MELANO OR GADIDAE_BUILD_ELEGINUS)
 	set(GADIDAE_NEEDS_TORCH ON)
 endif()
 set(GADIDAE_NEEDS_HDF5 OFF)
@@ -111,7 +111,7 @@ if(MSVC AND GADIDAE_NEEDS_TORCH)
 		message(FATAL_ERROR "No LibTorch runtime DLLs found in ${GADIDAE_TORCH_DIR}/lib")
 	endif()
 	add_custom_target(torchruntime ALL COMMENT "Copying LibTorch runtime")
-	foreach(architecture IN ITEMS gadus melano)
+	foreach(architecture IN ITEMS gadus melano eleginus)
 		string(TOUPPER "${architecture}" architecture_upper)
 		if(GADIDAE_BUILD_${architecture_upper})
 			add_custom_command(TARGET torchruntime POST_BUILD
@@ -126,9 +126,9 @@ endif()
 if(GADIDAE_BUILD_ELEGINUS)
 
 add_library(eleginus
-	src/engines/eleginus/execute.cpp
-	src/engines/eleginus/formula.inl
+	src/engines/eleginus/evaluate.cpp
 	src/engines/eleginus/game.cpp
+	src/engines/eleginus/parameters.cpp
 	src/engines/eleginus/searcher.cpp
 )
 set_target_properties(eleginus PROPERTIES
@@ -166,7 +166,12 @@ function(eleginusexecutable name source)
 endfunction()
 
 eleginusexecutable(search src/engines/eleginus/search.cpp)
+eleginusexecutable(train src/engines/eleginus/train.cpp)
 eleginusexecutable(uci src/engines/eleginus/uci.cpp)
+target_link_libraries(eleginustrain PRIVATE ${TORCH_LIBRARIES})
+if(MSVC)
+	add_dependencies(eleginustrain torchruntime)
+endif()
 
 add_executable(eleginustests src/engines/eleginus/tests.cpp)
 set_target_properties(eleginustests PROPERTIES
@@ -176,7 +181,13 @@ set_target_properties(eleginustests PROPERTIES
 	PDB_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/eleginus"
 )
 target_link_libraries(eleginustests PRIVATE eleginus)
-add_test(NAME eleginustests COMMAND eleginustests)
+add_test(
+	NAME eleginusinitial
+	COMMAND eleginustrain --export-initial --out "${CMAKE_BINARY_DIR}/eleginus/eleginus-test.pth"
+)
+set_tests_properties(eleginusinitial PROPERTIES FIXTURES_SETUP eleginusparameters)
+add_test(NAME eleginustests COMMAND eleginustests "${CMAKE_BINARY_DIR}/eleginus/eleginus-test.pth")
+set_tests_properties(eleginustests PROPERTIES FIXTURES_REQUIRED eleginusparameters)
 
 endif()
 

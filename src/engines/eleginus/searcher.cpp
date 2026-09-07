@@ -1,5 +1,5 @@
 #include "eleginus/game.hpp"
-#include "eleginus/formula.hpp"
+#include "eleginus/evaluate.hpp"
 #include "eleginus/search.hpp"
 #include <algorithm>
 #include <array>
@@ -15,6 +15,8 @@
 namespace eleginus {
 
 	namespace {
+		// ---------------------------- Search constants -----------------------------------
+		// Score limits, piece values and fixed search thresholds.
 
 		using Clock = std::chrono::steady_clock;
 
@@ -29,6 +31,7 @@ namespace eleginus {
 		constexpr std::array<int, 6> kPieceValues{100, 320, 330, 500, 900, 0};
 		constexpr std::size_t kBytesPerMiB = 1024U * 1024U;
 
+		// Convert an HCE score to the bounded integer scale used by search.
 		int centipawns(float score) {
 			if (!std::isfinite(score)) throw std::runtime_error("nonfinite Eleginus evaluation");
 			const float scaled = std::clamp(kCentipawnsPerLogit * score, -25000.0F, 25000.0F);
@@ -36,6 +39,9 @@ namespace eleginus {
 		}
 
 		enum class Bound : std::uint8_t { exact, lower, upper };
+
+		// ----------------------------- Search tables -------------------------------------
+		// Compact transposition and static-evaluation entries.
 
 		struct Entry {
 			std::uint64_t key = 0;
@@ -72,7 +78,7 @@ namespace eleginus {
 			static constexpr std::uint64_t kValid = 1ULL << 63;
 			std::uint64_t data = 0;
 
-			// The table index supplies key bits 0-16; data stores bits 17-63 and the signed score.
+			// Store the upper 47 hash bits and signed score in one 64-bit word.
 			bool matches(std::uint64_t key) const noexcept {
 				return (data & kValid) != 0 && ((data >> 16) & ((1ULL << 47) - 1)) == (key >> 17);
 			}
@@ -140,6 +146,9 @@ namespace eleginus {
 
 	} // namespace
 
+	// -------------------------- Persistent search state -------------------------------
+	// Transposition, history and killer data retained across searches.
+
 	class SearchState {
 	public:
 		explicit SearchState(std::size_t hashMegabytes) : table(hashMegabytes <= 1 ? hashMegabytes : hashMegabytes / 2) {}
@@ -150,6 +159,8 @@ namespace eleginus {
 	};
 
 	namespace {
+		// ----------------------------- Search utilities ----------------------------------
+		// Position keys, terminal scores and tactical exchange evaluation.
 
 		struct Interrupted final {};
 
@@ -180,6 +191,7 @@ namespace eleginus {
 			return score;
 		}
 
+		// Return the score of a fifty-move, insufficient-material or repeated position.
 		std::optional<int> terminalScore(const chess::Board &board, int ply, bool repetition, bool repeated) {
 			if (board.isHalfMoveDraw()) return board.getHalfMoveDrawType().second == chess::GameResult::LOSE ? -kMateScore + ply : 0;
 			if (board.isInsufficientMaterial() || (repetition && repeated && board.isRepetition(2))) return 0;
@@ -199,7 +211,7 @@ namespace eleginus {
 			return index >= 0 && index < 6 ? kPieceValues[static_cast<std::size_t>(index)] : 0;
 		}
 
-		// Least-valuable legal recaptures on one square. SEE is a selective-search heuristic, not a proven bound.
+		// Estimate a capture sequence using least-valuable legal recaptures on the target square.
 		int see(const chess::Board &board, chess::Move move) {
 			if (move.typeOf() == chess::Move::CASTLING) return 0;
 			using Bits = std::uint64_t;
@@ -250,7 +262,7 @@ namespace eleginus {
 						pieces[side][placed] |= target;
 						pieces[side ^ 1][victim] &= ~target;
 						occupied &= ~source;
-						// Reject pinned recapturers and king captures onto an attacked square.
+						// Keep recaptures that leave the moving side's king unattacked.
 						if (attackers(std::countr_zero(pieces[side][5]), side ^ 1)) {
 							pieces[side][type] |= source;
 							pieces[side][placed] &= ~target;
@@ -299,6 +311,7 @@ namespace eleginus {
 			history += bonus - history * std::abs(bonus) / limit;
 		}
 
+		// Calculate the late-move reduction from depth, move order and search context.
 		int reductionFor(int depth, std::size_t index, bool pv, bool improving, int history) noexcept {
 			static const auto reductions = [] {
 				std::array<std::array<int, kMaximumLegalMoves>, 65> table{};
@@ -319,6 +332,7 @@ namespace eleginus {
 			int gain = 0;
 		};
 
+		// Select the highest-priority remaining move on each call.
 		class MovePicker {
 		public:
 			void add(chess::Move move, int order, int gain = 0) { items[count++] = {move, order, gain}; }
@@ -339,11 +353,12 @@ namespace eleginus {
 			std::size_t cursor = 0, count = 0;
 		};
 
+		// Generate captures and promotions for quiescence search.
 		void tacticalMoves(chess::Movelist &moves, const chess::Board &board) {
 			chess::movegen::legalmoves<chess::movegen::MoveGenType::CAPTURE>(moves, board);
 			const auto rank = board.sideToMove() == chess::Color::WHITE ? 0x00FF000000000000ULL : 0x000000000000FF00ULL;
 			if (!(board.pieces(chess::PieceType::PAWN, board.sideToMove()).getBits() & rank)) return;
-			// CAPTURE excludes non-capturing promotions, including underpromotions.
+			// Add non-capturing promotions omitted by CAPTURE generation.
 			chess::Movelist pawns;
 			chess::movegen::legalmoves<chess::movegen::MoveGenType::QUIET>(pawns, board, chess::PieceGenType::PAWN);
 			for (const auto move : pawns) {
@@ -357,11 +372,14 @@ namespace eleginus {
 			std::vector<RootMove> root;
 		};
 
+		// ----------------------------- Recursive search ----------------------------------
+		// Per-search caches, counters and recursive alpha-beta state.
+
 		class Context {
 		public:
-			Context(const SearchOptions &options, SearchState &state, SearchCancel cancel)
+			Context(const Evaluator &evaluator, const SearchOptions &options, SearchState &state, SearchCancel cancel)
 				: evals(options.hash_mb / 2 * kBytesPerMiB / sizeof(EvalEntry)), opts(options), state(state),
-				cancelled(std::move(cancel)), started(Clock::now()) {}
+				evaluator(evaluator), cancelled(std::move(cancel)), started(Clock::now()) {}
 
 			void advance() noexcept { state.table.advance(); }
 			std::uint64_t elapsed_ms() const noexcept {
@@ -377,6 +395,7 @@ namespace eleginus {
 				if (cancelled && (force || (nodes & 255U) == 0U) && cancelled()) throw Interrupted{};
 			}
 
+			// Assign move-order scores from the transposition move, SEE, killers and history.
 			MovePicker ordered(
 				const chess::Board &board, const chess::Movelist &moves, int ply, chess::Move preferred = chess::Move(chess::Move::NO_MOVE)) {
 				MovePicker output;
@@ -403,9 +422,10 @@ namespace eleginus {
 				return output;
 			}
 
+			// Return the static score from the side-to-move perspective, using the evaluation cache.
 			int evaluate(const chess::Board &board) {
 				const auto staticScore = [&] {
-					const float white = FormulaSet::score(board);
+					const float white = evaluator.score(board);
 					return centipawns(board.sideToMove() == chess::Color::WHITE ? white : -white);
 				};
 				if (evals.empty()) {
@@ -437,6 +457,7 @@ namespace eleginus {
 				board.unmakeNullMove();
 			}
 
+			// Stabilize leaf scores by searching evasions, tactical moves and one legal-move ply in pawn endings.
 			int quiescence(chess::Board &board, int ply, int remaining, int alpha, int beta) {
 				visit(ply);
 				const bool repeated = !nullSearch && board.isRepetition(1);
@@ -478,6 +499,7 @@ namespace eleginus {
 				return best;
 			}
 
+			// Search one subtree with principal variation search, pruning and transposition reuse.
 			int pvs(chess::Board &board, int depth, int ply, int alpha, int beta) {
 				if (depth <= 0) return quiescence(board, ply, opts.quiescence_depth, alpha, beta);
 				visit(ply);
@@ -488,7 +510,7 @@ namespace eleginus {
 				const bool pv = beta - alpha > 1;
 				const auto key = nullSearch ? 0 : tableKey(board, repeated);
 				chess::Move preferred(chess::Move::NO_MOVE);
-				// Artificial null lines neither read nor publish ordinary transposition bounds.
+				// Restrict transposition access to positions reached by legal moves.
 				if (const auto *entry = nullSearch ? nullptr : state.table.probe(key)) {
 					preferred = entry->bestMove();
 					if (entry->depth >= depth) {
@@ -499,7 +521,7 @@ namespace eleginus {
 						if (alpha >= beta) return cached;
 					}
 				}
-				// A deep node without a transposition move has no principal candidate from earlier work.
+				// Reduce deep nodes lacking a transposition move by one ply.
 				if (preferred.move() == chess::Move::NO_MOVE && depth >= 5) --depth;
 				const int originalAlpha = alpha;
 				const int originalBeta = beta;
@@ -510,7 +532,7 @@ namespace eleginus {
 				const int staticScore = inCheck ? -kInfinity : evaluate(board);
 				const bool improving = ply >= 2 && staticScores[ply - 2] != -kInfinity && staticScore > staticScores[ply - 2];
 				staticScores[ply] = staticScore;
-				// Forward pruning is selective: never use it on the PV, in check, near mate bounds or in sparse endings.
+				// Enable forward pruning at non-PV, non-check nodes outside pawn endings and mate-score windows.
 				const bool prune = !pv && !inCheck && !pawnEnding && board.halfMoveClock() < 90 && std::abs(beta) < kMateThreshold;
 				if (prune && ply >= nullBan) {
 					const int margin = (improving ? 70 : 100) * depth;
@@ -524,7 +546,7 @@ namespace eleginus {
 						nullSearch = false;
 						if (score >= beta && score < kMateThreshold) {
 							if (depth < 10) return chess::movegen::anylegalmoves(board) ? score : 0;
-							// Verify deep null cutoffs using real moves with null pruning disabled over this subtree.
+							// Verify a deep null-move cutoff with legal moves over the reduced subtree.
 							const int saved = nullBan;
 							nullBan = ply + depth;
 							const int verified = pvs(board, depth - reduction, ply, beta - 1, beta);
@@ -629,6 +651,8 @@ namespace eleginus {
 				return best;
 			}
 
+			// ------------------------------- Root search -------------------------------------
+			// Search and rank the requested number of independent MultiPV root lines.
 			Iteration rootLines(chess::Board &board, int depth, const chess::Movelist &moves, chess::Move preferred, std::size_t lineCount) {
 				Iteration result;
 				std::vector<chess::Move> selected;
@@ -666,6 +690,7 @@ namespace eleginus {
 				return result;
 			}
 
+			// Search one root depth inside the supplied score window.
 			Iteration root(chess::Board &board, int depth, int alpha = -kInfinity, int beta = kInfinity) {
 				Iteration result;
 				staticScores.fill(-kInfinity);
@@ -714,7 +739,7 @@ namespace eleginus {
 				}
 				std::sort(result.root.begin(), result.root.end(), [&](const RootMove &left, const RootMove &right) {
 					if (left.score_cp != right.score_cp) return left.score_cp > right.score_cp;
-					// A tied upper bound from a null-window search must not replace the actual PV move.
+					// Rank the principal move first when null-window bounds are tied.
 					if ((left.move == result.move) != (right.move == result.move)) return left.move == result.move;
 					return left.move.move() < right.move.move();
 				});
@@ -723,13 +748,14 @@ namespace eleginus {
 				return result;
 			}
 
+			// Repeat one root depth until its score fits the aspiration window.
 			Iteration deepen(chess::Board &board, int depth, int previous) {
 				if (depth < 4 || opts.multipv > 1 || std::abs(previous) >= kMateThreshold) return root(board, depth);
 				int margin = 32;
 				int alpha = std::max(-kInfinity, previous - margin), beta = std::min(kInfinity, previous + margin);
-				for (;;) { // while(true) is intentional; the loop is broken by return statements.
+				for (;;) {
 					auto result = root(board, depth, alpha, beta);
-					// Widen failed bounds without reducing depth; only a completed window is published.
+					// Widen the failed bound while retaining the current depth.
 					if (result.score <= alpha && alpha > -kInfinity) alpha = std::max(-kInfinity, result.score - margin);
 					else if (result.score >= beta && beta < kInfinity) beta = std::min(kInfinity, result.score + margin);
 					else return result;
@@ -750,6 +776,7 @@ namespace eleginus {
 			std::vector<EvalEntry> evals;
 			const SearchOptions &opts;
 			SearchState &state;
+			const Evaluator &evaluator;
 			SearchCancel cancelled;
 			Clock::time_point started;
 			std::array<int, 128> staticScores{};
@@ -759,7 +786,9 @@ namespace eleginus {
 
 	} // namespace
 
-	Searcher::Searcher(SearchOptions options) : opts(options) {
+	// ------------------------------- Public search -------------------------------------
+	// Validate search options and prepare persistent search state.
+	Searcher::Searcher(const Evaluator &evaluator, SearchOptions options) : evaluator(&evaluator), opts(options) {
 		if (options.depth <= 0 || options.depth > 64 || options.quiescence_depth < 0 || options.quiescence_depth > 32 || options.hash_mb > 4096 ||
 			options.multipv <= 0 || options.multipv > 256) {
 			throw std::invalid_argument("Eleginus search options are outside the supported range");
@@ -769,9 +798,8 @@ namespace eleginus {
 	}
 
 	Searcher::~Searcher() = default;
-	Searcher::Searcher(Searcher &&) noexcept = default;
-	Searcher &Searcher::operator=(Searcher &&) noexcept = default;
 
+	// Run iterative deepening and return the deepest completed iteration.
 	SearchResult Searcher::search(const chess::Board &board, const SearchProgress &progress, const SearchCancel &cancel) {
 		SearchResult result;
 		if (const auto terminal = terminalScore(board, 0)) {
@@ -783,7 +811,7 @@ namespace eleginus {
 			return result;
 		}
 		chess::Board root = board;
-		Context context(opts, *state, cancel);
+		Context context(*evaluator, opts, *state, cancel);
 		for (int depth = 1; depth <= opts.depth; ++depth) {
 			context.advance();
 			try {
