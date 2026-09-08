@@ -287,11 +287,11 @@ $$
 
 King-pressure, winnability and endgame-scaling adjustments transform $H_0(s)$ into the final score $H(s)$. The formula set contains 694 signals. Its parameter set contains 4178 FP32 values: 694 base coefficients, 3470 material responses and 14 postprocessing parameters.
 
-Each training cycle freezes one accepted parameter set and generates the number of completed self-play games selected by `--games`. Every game starts from the standard position, samples `--random-plies` random legal plies and then uses fixed-depth search for both sides. Games ending during the random prefix or reaching `--max-plies` without a rule result are discarded.
+One training run generates the number of completed self-play games selected by `--games` with one fixed parameter set. Every game starts from the standard position, samples `--random-plies` random legal plies and then uses fixed-depth search for both sides. Games ending during the random prefix or reaching `--max-plies` without a rule result are discarded.
 
-Every retained main-line position contributes two equally weighted targets: the terminal result and the reference evaluator's value for the following position. At each interval selected by `--counterfactual-every`, a root search evaluates every legal move at `--counterfactual-depth`; every resulting child position contributes one additional target. All retained targets participate in optimization.
+Every retained main-line position contributes the completed game's White-perspective result. The trainer calibrates one fixed sigmoid scale against up to 1048576 evenly sampled initial evaluations, then retains the generated formula values as one fixed data set for all optimization epochs.
 
-Samples are packed into bounded memory blocks. One AdamW optimizer and one candidate parameter delta persist across the complete cycle, and every target is visited once per `--epochs` pass. Formula extraction and self-play run on CPU, while `--device` selects the device used for batched evaluation, loss calculation, gradients and parameter updates. `auto` selects CUDA when available and otherwise selects CPU.
+The generated data remains in compact host memory. Complete games are assigned deterministically to a 95% fitting set and a 5% validation set. Every fitting epoch visits its complete set once, and the trainer retains the parameter set with the lowest validation loss. The Texel objective is the mean squared error between the completed result and the sigmoid-mapped evaluation. One Adam optimizer updates the complete parameter set, with gradients averaged over 262144 positions before each update and the `--lr` value decayed automatically across epochs. Formula extraction and self-play run on CPU, while `--device` selects the device used for batched evaluation, loss, gradients and parameter updates. `--batch-size` controls the device microbatch size. `auto` selects CUDA when available and otherwise selects CPU.
 
 ```bash
 build/eleginus/train \
@@ -300,24 +300,19 @@ build/eleginus/train \
 	--games 100000 \
 	--random-plies 8 \
 	--depth 1 \
-	--counterfactual-depth 2 \
-	--counterfactual-every 16 \
 	--eval-depth 4 \
 	--max-plies 320 \
 	--workers 4 \
 	--hash 64 \
-	--epochs 2 \
+	--epochs 100 \
 	--batch-size 4096 \
-	--iterations 0 \
 	--device cuda \
-	--lr 0.0001 \
-	--weight-decay 0.000001 \
-	--grad-clip 0.25 \
+	--lr 0.001 \
 	--log-every 1000 \
 	--seed 2026
 ```
 
-After the complete generation and optimization cycle, the candidate and accepted parameter sets play both colors from each of the 1000 leaf positions in `data/openings.gen.bin`. A positive lower endpoint of the 95% Hoeffding score bound accepts the candidate. Acceptance atomically replaces `--out`; rejection and interruption leave the accepted file unchanged. `--iterations 0` starts another complete cycle after each acceptance decision.
+After all optimization epochs, the candidate and accepted parameter sets play both colors from each of the 1000 leaf positions in `data/openings.gen.bin`. A positive lower endpoint of the 95% Hoeffding score bound accepts the candidate. Acceptance atomically replaces `--out`; rejection and interruption leave the accepted file unchanged.
 
 `--init` selects the starting parameter file. Without `--init`, training reads `--out` when that file exists and otherwise initializes from `weights.inl`. Parameter files contain the 4178 coefficients only; optimizer state and generated samples remain process-local.
 
