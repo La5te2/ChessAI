@@ -91,7 +91,7 @@ build/melano/uci
 
 build/eleginus/train
 build/eleginus/search
-build/eleginus/uci
+build/eleginus/generator
 ```
 
 
@@ -287,15 +287,17 @@ $$
 
 King-pressure, winnability and endgame-scaling adjustments transform $H_0(s)$ into the final score $H(s)$. The formula set contains 694 signals. Its parameter set contains 4178 FP32 values: 694 base coefficients, 3470 material responses and 14 postprocessing parameters.
 
-Each training iteration uses one accepted parameter set. Every generated game starts from the standard position, samples eight random legal plies and then uses fixed-depth search for both sides. Positions from the ninth ply onward provide formula values, terminal-result targets, adjacent-position TD targets and periodically sampled deeper root-search targets. Games ending during the random prefix or reaching `--max-plies` without a rule result are discarded.
+Each training cycle freezes one accepted parameter set and generates the number of completed self-play games selected by `--games`. Every game starts from the standard position, samples `--random-plies` random legal plies and then uses fixed-depth search for both sides. Games ending during the random prefix or reaching `--max-plies` without a rule result are discarded.
 
-Complete games are divided into optimization and validation sets. AdamW optimizes a dense parameter delta on the device selected by `--device`; `auto` selects CUDA when available and otherwise selects CPU. Counterfactual samples form the primary objective when present, while validation requires the terminal-result and TD losses not to increase. Candidate selection tests fixed interpolation factors between the accepted and optimized parameter vectors.
+Every retained main-line position contributes two equally weighted targets: the terminal result and the reference evaluator's value for the following position. At each interval selected by `--counterfactual-every`, a root search evaluates every legal move at `--counterfactual-depth`; every resulting child position contributes one additional target. All retained targets participate in optimization.
+
+Samples are packed into bounded memory blocks. One AdamW optimizer and one candidate parameter delta persist across the complete cycle, and every target is visited once per `--epochs` pass. Formula extraction and self-play run on CPU, while `--device` selects the device used for batched evaluation, loss calculation, gradients and parameter updates. `auto` selects CUDA when available and otherwise selects CPU.
 
 ```bash
 build/eleginus/train \
 	--out models/eleginus/current.pth \
 	--opening-book data/openings.gen.bin \
-	--games 1000 \
+	--games 100000 \
 	--random-plies 8 \
 	--depth 1 \
 	--counterfactual-depth 2 \
@@ -303,7 +305,7 @@ build/eleginus/train \
 	--eval-depth 4 \
 	--max-plies 320 \
 	--workers 4 \
-	--hash 16 \
+	--hash 64 \
 	--epochs 2 \
 	--batch-size 4096 \
 	--iterations 0 \
@@ -311,18 +313,18 @@ build/eleginus/train \
 	--lr 0.0001 \
 	--weight-decay 0.000001 \
 	--grad-clip 0.25 \
-	--log-every 16 \
+	--log-every 1000 \
 	--seed 2026
 ```
 
-After candidate selection, the candidate and accepted parameter sets play both colors from each of the 1000 leaf positions in `data/openings.gen.bin`. A positive lower endpoint of the 95% Hoeffding score bound accepts the candidate. Acceptance atomically replaces `--out`; rejection and interruption leave the accepted file unchanged. `--iterations 0` repeats this process until interrupted.
+After the complete generation and optimization cycle, the candidate and accepted parameter sets play both colors from each of the 1000 leaf positions in `data/openings.gen.bin`. A positive lower endpoint of the 95% Hoeffding score bound accepts the candidate. Acceptance atomically replaces `--out`; rejection and interruption leave the accepted file unchanged. `--iterations 0` starts another complete cycle after each acceptance decision.
 
-`--init` selects the starting parameter file. Without `--init`, training reads `--out` when that file exists and otherwise initializes from `weights.inl`. Parameter files contain the 4178 coefficients only; optimizer state and generated positions remain process-local.
+`--init` selects the starting parameter file. Without `--init`, training reads `--out` when that file exists and otherwise initializes from `weights.inl`. Parameter files contain the 4178 coefficients only; optimizer state and generated samples remain process-local.
 
-Export the source-defined initial parameters with:
+Generate a standalone engine with the source-defined initial parameters:
 
 ```bash
-build/eleginus/train --export-initial --out models/eleginus/eleginus.pth
+build/eleginus/generator
 ```
 
 Analyze one position with an explicit parameter file using:
@@ -339,15 +341,17 @@ build/eleginus/search \
 
 Without `--parameters`, search reads `eleginus.pth` beside its executable. `--fen` accepts a complete FEN or `startpos`. A positive `--nodes` value stops search at the requested node count, while `0` leaves the node count unbounded. `--multipv` selects the number of root lines.
 
-Launch Eleginus UCI with `eleginus.pth` beside the executable, or select another file explicitly:
+Generate a standalone engine with a saved parameter set:
 
 ```powershell
-build\eleginus\uci.exe --parameters models\eleginus\eleginus.pth
+build\eleginus\generator.exe models\eleginus\eleginus.pth
 ```
 
 ```bash
-build/eleginus/uci --parameters models/eleginus/eleginus.pth
+build/eleginus/generator models/eleginus/eleginus.pth
 ```
+
+The generator writes `eleginus.exe` on Windows and `eleginus` on Linux beside itself. That generated executable is the UCI engine.
 
 The [UCI](#uci) section describes runtime options, output fields and time management.
 
@@ -484,7 +488,7 @@ setoption name MultiPV value 5
 
 ### Eleginus
 
-Eleginus loads `eleginus.pth` beside the executable when `isready` or `go` first requires evaluation. The `--parameters` command-line argument and `ParametersPath` UCI option select another parameter file. Changing `ParametersPath` releases the prepared evaluator and loads the selected parameters before the next search.
+The generator embeds one parameter set into each Eleginus executable. The generated engine uses that parameter set for every evaluation.
 
 Search runs on a worker thread so the protocol loop can process `stop`. A `position`, `setoption` or `ucinewgame` command first stops and joins an active search before changing engine state. Closing the UCI process also joins the worker.
 
@@ -513,7 +517,6 @@ When a command supplies more than one applicable limit, search stops at the firs
 
 Eleginus exposes these options:
 
-- `ParametersPath` selects the parameter file.
 - `Hash` sets the combined cache budget in MiB and defaults to `64`. The engine rounds a requested value down to the nearest power of two. A value of `0` disables both caches, a value of `1` assigns one MiB to the transposition table, and every larger effective budget is divided equally between the transposition table and the static-evaluation cache.
 - `Move Overhead` reserves time for communication and move submission and defaults to `10`.
 - `MultiPV` sets the number of searched and reported root lines and defaults to `1`.
@@ -523,7 +526,6 @@ Both caches belong to one `go` command. The transposition table stores depth-qua
 A UCI client may configure Eleginus with commands such as:
 
 ```text
-setoption name ParametersPath value models/eleginus/eleginus.pth
 setoption name Hash value 256
 setoption name Move Overhead value 10
 setoption name MultiPV value 4

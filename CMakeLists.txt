@@ -167,7 +167,43 @@ endfunction()
 
 eleginusexecutable(search src/engines/eleginus/search.cpp)
 eleginusexecutable(train src/engines/eleginus/train.cpp)
-eleginusexecutable(uci src/engines/eleginus/uci.cpp)
+eleginusexecutable(runtime src/engines/eleginus/engine.cpp)
+set_target_properties(eleginusruntime PROPERTIES OUTPUT_NAME "eleginus" SUFFIX ".template")
+
+set(ELEGINUS_RUNTIME_IMAGE "${CMAKE_BINARY_DIR}/generated/eleginus_runtime.cpp")
+set(ELEGINUS_EMBED_SCRIPT "${CMAKE_BINARY_DIR}/generated/embed_eleginus_runtime.cmake")
+file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/generated")
+file(WRITE "${ELEGINUS_EMBED_SCRIPT}" [=[
+if(NOT DEFINED INPUT OR NOT DEFINED OUTPUT)
+	message(FATAL_ERROR "INPUT and OUTPUT are required")
+endif()
+
+file(READ "${INPUT}" bytes HEX)
+string(LENGTH "${bytes}" digits)
+math(EXPR count "${digits} / 2")
+string(REGEX REPLACE "([0-9a-fA-F][0-9a-fA-F])" "0x\\1," values "${bytes}")
+
+file(WRITE "${OUTPUT}"
+"#include <span>\n\n"
+"namespace eleginus::runtime {\n"
+"\tnamespace {\n"
+"\t\tconst unsigned char runtime[${count}] = {${values}};\n"
+"\t}\n\n"
+"\tstd::span<const unsigned char> image() { return {runtime, sizeof(runtime)}; }\n"
+"}\n")
+]=])
+add_custom_command(
+	OUTPUT "${ELEGINUS_RUNTIME_IMAGE}"
+	COMMAND ${CMAKE_COMMAND}
+		"-DINPUT=$<TARGET_FILE:eleginusruntime>"
+		"-DOUTPUT=${ELEGINUS_RUNTIME_IMAGE}"
+		-P "${ELEGINUS_EMBED_SCRIPT}"
+	DEPENDS eleginusruntime "${ELEGINUS_EMBED_SCRIPT}"
+	VERBATIM
+)
+eleginusexecutable(generator src/engines/eleginus/engine.cpp)
+target_compile_definitions(eleginusgenerator PRIVATE ELEGINUS_GENERATOR)
+target_sources(eleginusgenerator PRIVATE "${ELEGINUS_RUNTIME_IMAGE}")
 target_link_libraries(eleginustrain PRIVATE ${TORCH_LIBRARIES})
 if(MSVC)
 	add_dependencies(eleginustrain torchruntime)
@@ -181,13 +217,7 @@ set_target_properties(eleginustests PROPERTIES
 	PDB_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/eleginus"
 )
 target_link_libraries(eleginustests PRIVATE eleginus)
-add_test(
-	NAME eleginusinitial
-	COMMAND eleginustrain --export-initial --out "${CMAKE_BINARY_DIR}/eleginus/eleginus-test.pth"
-)
-set_tests_properties(eleginusinitial PROPERTIES FIXTURES_SETUP eleginusparameters)
 add_test(NAME eleginustests COMMAND eleginustests "${CMAKE_BINARY_DIR}/eleginus/eleginus-test.pth")
-set_tests_properties(eleginustests PROPERTIES FIXTURES_REQUIRED eleginusparameters)
 
 endif()
 

@@ -37,16 +37,8 @@ FORMULA(bishopPair) {
 
 FORMULA(pawns) {
 	// Pawn ranks: ten signals for each normalized rank 2 through 7.
-	const auto fp = b.PCS(us, 0);
-	const auto ep = b.PCS(them, 0);
-	const auto fpass = passedPawns(us, them);
-	const auto epass = passedPawns(them, us);
-	const auto fatt = pawnAttacks(us);
-	const auto eatt = pawnAttacks(them);
-	const auto ffiles = files(us);
-	const auto efiles = files(them);
-	const auto fneighbours = b.OR(b.SH(ffiles, us, 2), b.SH(ffiles, us, 3));
-	const auto eneighbours = b.OR(b.SH(efiles, them, 2), b.SH(efiles, them, 3));
+	const auto fpass = passedPawns(us);
+	const auto epass = passedPawns(them);
 	struct PawnSignals {
 		std::array<int, 6> passed{};
 		std::array<int, 6> safeSpan{};
@@ -63,11 +55,8 @@ FORMULA(pawns) {
 		int doubled = 0;
 		int isolated = 0;
 	};
-	const auto collect = [&](InterSignal role, InterSignal opponent, InterSignal pawns, InterSignal passed, InterSignal att, InterSignal neighbours) {
+	const auto collect = [&](InterSignal role, InterSignal opponent, InterSignal passed) {
 		PawnSignals signals;
-		(void)pawns;
-		(void)att;
-		(void)neighbours;
 		const auto &structure = b.pawnStructure(role);
 		signals.passed = structure.passed;
 		signals.supportedPasser = structure.supported;
@@ -108,8 +97,8 @@ FORMULA(pawns) {
 		}
 		return signals;
 	};
-	const auto friendly = collect(us, them, fp, fpass, fatt, fneighbours);
-	const auto enemy = collect(them, us, ep, epass, eatt, eneighbours);
+	const auto friendly = collect(us, them, fpass);
+	const auto enemy = collect(them, us, epass);
 	for (int rank = 0; rank < 6; ++rank) {
 		// Passed pawns and their path safety on each normalized rank from 2 through 7.
 		F(diff(b.NUM(friendly.passed[rank]), b.NUM(enemy.passed[rank])));
@@ -356,8 +345,8 @@ FORMULA(kings) {
 	F(diff(escapes(us, them), escapes(them, us)));
 	// Pawn shelter and enemy pawn storm at distances one through three.
 	for (int distance = 1; distance <= 3; ++distance) {
-		F(diff(kingPawns(us, them, distance, true), kingPawns(them, us, distance, true)));
-		F(diff(kingPawns(them, us, distance, false), kingPawns(us, them, distance, false)));
+		F(diff(kingPawns(us, distance, true), kingPawns(them, distance, true)));
+		F(diff(kingPawns(them, distance, false), kingPawns(us, distance, false)));
 	}
 	// Open files crossing the king's three-file neighborhood.
 	F(diff(kingOpenFiles(us), kingOpenFiles(them)));
@@ -425,8 +414,8 @@ FORMULA(endgames) {
 	const auto symmetric = b.NUM(std::popcount(ffiles.bits & efiles.bits) >> 3);
 	const auto asymmetric = b.NUM(std::popcount(ffiles.bits ^ efiles.bits) >> 3);
 	const auto pawnEnding = b.LAND(b.EQ(nonPawnMaterial(us), z), b.EQ(nonPawnMaterial(them), z));
-	const auto fpassers = b.POP(passedPawns(us, them));
-	const auto epassers = b.POP(passedPawns(them, us));
+	const auto fpassers = b.POP(passedPawns(us));
+	const auto epassers = b.POP(passedPawns(them));
 	const auto strongPawns = b.ADD(b.MUL(positive, fpawns), b.MUL(negative, epawns));
 	const auto strongPassers = b.ADD(b.MUL(positive, fpassers), b.MUL(negative, epassers));
 	const auto favoredPawnless = b.LOR(b.LAND(positive, fpawnless), b.LAND(negative, epawnless));

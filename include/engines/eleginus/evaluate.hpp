@@ -1,6 +1,7 @@
 #pragma once
 
 #include "eleginus/parameters.hpp"
+#include "chess.hpp"
 #include <array>
 #include <cstdint>
 #include <memory>

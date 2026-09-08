@@ -147,13 +147,16 @@ namespace eleginus {
 	} // namespace
 
 	// -------------------------- Persistent search state -------------------------------
-	// Transposition, history and killer data retained across searches.
+	// Transposition, evaluation, history and killer data retained across searches.
 
 	class SearchState {
 	public:
-		explicit SearchState(std::size_t hashMegabytes) : table(hashMegabytes <= 1 ? hashMegabytes : hashMegabytes / 2) {}
+		explicit SearchState(std::size_t hashMegabytes)
+			: table(hashMegabytes <= 1 ? hashMegabytes : hashMegabytes / 2),
+			evals(hashMegabytes / 2 * kBytesPerMiB / sizeof(EvalEntry)) {}
 
 		Table table;
+		std::vector<EvalEntry> evals;
 		std::array<std::array<int, 64 * 64>, 2> history{};
 		std::array<std::array<chess::Move, 2>, 64> killers{};
 	};
@@ -373,23 +376,22 @@ namespace eleginus {
 		};
 
 		// ----------------------------- Recursive search ----------------------------------
-		// Per-search caches, counters and recursive alpha-beta state.
+		// Per-search counters, limits and recursive alpha-beta state.
 
 		class Context {
 		public:
 			Context(const Evaluator &evaluator, const SearchOptions &options, SearchState &state, SearchCancel cancel)
-				: evals(options.hash_mb / 2 * kBytesPerMiB / sizeof(EvalEntry)), opts(options), state(state),
-				evaluator(evaluator), cancelled(std::move(cancel)), started(Clock::now()) {}
+				: opts(options), state(state), evaluator(evaluator), cancelled(std::move(cancel)), started(Clock::now()) {}
 
 			void advance() noexcept { state.table.advance(); }
-			std::uint64_t elapsed_ms() const noexcept {
+			std::uint64_t elapsedMs() const noexcept {
 				return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started).count());
 			}
 
 			void checkStop(bool force = false) const {
-				if (opts.node_limit > 0 && nodes >= opts.node_limit) throw Interrupted{};
-				if (opts.movetime_ms > 0 && (force || (nodes & 255U) == 0U) &&
-					std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started).count() >= opts.movetime_ms) {
+				if (opts.nodeLimit > 0 && nodes >= opts.nodeLimit) throw Interrupted{};
+				if (opts.moveTimeMs > 0 && (force || (nodes & 255U) == 0U) &&
+					std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started).count() >= opts.moveTimeMs) {
 					throw Interrupted{};
 				}
 				if (cancelled && (force || (nodes & 255U) == 0U) && cancelled()) throw Interrupted{};
@@ -428,11 +430,11 @@ namespace eleginus {
 					const float white = evaluator.score(board);
 					return centipawns(board.sideToMove() == chess::Color::WHITE ? white : -white);
 				};
-				if (evals.empty()) {
+				if (state.evals.empty()) {
 					return staticScore();
 				}
 				const auto key = board.hash();
-				auto &entry = evals[key & (evals.size() - 1)];
+				auto &entry = state.evals[key & (state.evals.size() - 1)];
 				if (entry.matches(key)) {
 					return entry.score();
 				}
@@ -465,7 +467,7 @@ namespace eleginus {
 				if (mateBounds(ply, alpha, beta)) return alpha;
 				const bool inCheck = board.inCheck();
 				const bool pawnEnding = !board.hasNonPawnMaterial(chess::Color::WHITE) && !board.hasNonPawnMaterial(chess::Color::BLACK);
-				const bool probeMoves = !inCheck && remaining == opts.quiescence_depth && pawnEnding;
+				const bool probeMoves = !inCheck && remaining == opts.quiescenceDepth && pawnEnding;
 				int standPat = -kInfinity;
 				int best = -kInfinity;
 				if (!inCheck) {
@@ -501,7 +503,7 @@ namespace eleginus {
 
 			// Search one subtree with principal variation search, pruning and transposition reuse.
 			int pvs(chess::Board &board, int depth, int ply, int alpha, int beta) {
-				if (depth <= 0) return quiescence(board, ply, opts.quiescence_depth, alpha, beta);
+				if (depth <= 0) return quiescence(board, ply, opts.quiescenceDepth, alpha, beta);
 				visit(ply);
 				const bool repeated = !nullSearch && board.isRepetition(1);
 				if (const auto terminal = terminalScore(board, ply, !nullSearch, repeated)) return *terminal;
@@ -557,7 +559,7 @@ namespace eleginus {
 					}
 				}
 				if (prune && depth <= 3 && staticScore + 220 * depth <= alpha) {
-					const int score = quiescence(board, ply, opts.quiescence_depth, alpha, beta);
+					const int score = quiescence(board, ply, opts.quiescenceDepth, alpha, beta);
 					if (score <= alpha) return score;
 				}
 				if (prune && !nullSearch && depth >= 5 && staticScore >= beta - 300) {
@@ -568,7 +570,7 @@ namespace eleginus {
 					for (auto move = candidates.next(); move.move() != chess::Move::NO_MOVE; move = candidates.next()) {
 						if (candidates.gain() < 0) continue;
 						make(board, move);
-						int score = -quiescence(board, ply + 1, opts.quiescence_depth, -probBeta, -probBeta + 1);
+						int score = -quiescence(board, ply + 1, opts.quiescenceDepth, -probBeta, -probBeta + 1);
 						if (score >= probBeta) score = -pvs(board, depth - 4, ply + 1, -probBeta, -probBeta + 1);
 						unmake(board, move);
 						if (score >= probBeta) return score;
@@ -660,7 +662,7 @@ namespace eleginus {
 				result.root.reserve(lineCount);
 				for (std::size_t line = 0; line < lineCount; ++line) {
 					RootMove best;
-					best.score_cp = -kInfinity;
+					best.scoreCp = -kInfinity;
 					auto candidates = ordered(board, moves, 0, preferred);
 					std::size_t index = 0;
 					for (auto move = candidates.next(); move.move() != chess::Move::NO_MOVE; move = candidates.next()) {
@@ -671,21 +673,21 @@ namespace eleginus {
 						if (index++ == 0) {
 							score = -pvs(board, depth - 1, 1, -kInfinity, kInfinity);
 						} else {
-							score = -pvs(board, depth - 1, 1, -best.score_cp - 1, -best.score_cp);
-							if (score > best.score_cp) score = -pvs(board, depth - 1, 1, -kInfinity, -best.score_cp);
+							score = -pvs(board, depth - 1, 1, -best.scoreCp - 1, -best.scoreCp);
+							if (score > best.scoreCp) score = -pvs(board, depth - 1, 1, -kInfinity, -best.scoreCp);
 						}
 						unmake(board, move);
-						if (score > best.score_cp) best = {move, score};
+						if (score > best.scoreCp) best = {move, score};
 					}
 					selected.push_back(best.move);
 					result.root.push_back(best);
 					preferred = chess::Move(chess::Move::NO_MOVE);
 				}
 				std::sort(result.root.begin(), result.root.end(), [](const RootMove &left, const RootMove &right) {
-					return left.score_cp != right.score_cp ? left.score_cp > right.score_cp : left.move.move() < right.move.move();
+					return left.scoreCp != right.scoreCp ? left.scoreCp > right.scoreCp : left.move.move() < right.move.move();
 				});
 				result.move = result.root.front().move;
-				result.score = result.root.front().score_cp;
+				result.score = result.root.front().scoreCp;
 				state.table.store(tableKey(board), depth, scoreToTable(result.score, 0), Bound::exact, result.move);
 				return result;
 			}
@@ -738,7 +740,7 @@ namespace eleginus {
 					}
 				}
 				std::sort(result.root.begin(), result.root.end(), [&](const RootMove &left, const RootMove &right) {
-					if (left.score_cp != right.score_cp) return left.score_cp > right.score_cp;
+					if (left.scoreCp != right.scoreCp) return left.scoreCp > right.scoreCp;
 					// Rank the principal move first when null-window bounds are tied.
 					if ((left.move == result.move) != (right.move == result.move)) return left.move == result.move;
 					return left.move.move() < right.move.move();
@@ -764,16 +766,15 @@ namespace eleginus {
 			}
 
 			std::uint64_t nodes = 0;
-			int selective_depth = 0;
+			int selectiveDepth = 0;
 
 		private:
 			void visit(int ply) {
 				++nodes;
-				selective_depth = std::max(selective_depth, ply);
+				selectiveDepth = std::max(selectiveDepth, ply);
 				checkStop();
 			}
 
-			std::vector<EvalEntry> evals;
 			const SearchOptions &opts;
 			SearchState &state;
 			const Evaluator &evaluator;
@@ -787,14 +788,14 @@ namespace eleginus {
 	} // namespace
 
 	// ------------------------------- Public search -------------------------------------
-	// Validate search options and prepare persistent search state.
+	// Validate search options and allocate persistent search state.
 	Searcher::Searcher(const Evaluator &evaluator, SearchOptions options) : evaluator(&evaluator), opts(options) {
-		if (options.depth <= 0 || options.depth > 64 || options.quiescence_depth < 0 || options.quiescence_depth > 32 || options.hash_mb > 4096 ||
+		if (options.depth <= 0 || options.depth > 64 || options.quiescenceDepth < 0 || options.quiescenceDepth > 32 || options.hashMiB > 4096 ||
 			options.multipv <= 0 || options.multipv > 256) {
 			throw std::invalid_argument("Eleginus search options are outside the supported range");
 		}
-		opts.hash_mb = std::bit_floor(opts.hash_mb);
-		state = std::make_unique<SearchState>(opts.hash_mb);
+		opts.hashMiB = std::bit_floor(opts.hashMiB);
+		state = std::make_unique<SearchState>(opts.hashMiB);
 	}
 
 	Searcher::~Searcher() = default;
@@ -803,11 +804,11 @@ namespace eleginus {
 	SearchResult Searcher::search(const chess::Board &board, const SearchProgress &progress, const SearchCancel &cancel) {
 		SearchResult result;
 		if (const auto terminal = terminalScore(board, 0)) {
-			result.score_cp = *terminal;
+			result.scoreCp = *terminal;
 			return result;
 		}
 		if (legalmoves(board).empty()) {
-			result.score_cp = emptyScore(board, 0);
+			result.scoreCp = emptyScore(board, 0);
 			return result;
 		}
 		chess::Board root = board;
@@ -815,22 +816,22 @@ namespace eleginus {
 		for (int depth = 1; depth <= opts.depth; ++depth) {
 			context.advance();
 			try {
-				const auto iteration = context.deepen(root, depth, result.score_cp);
+				const auto iteration = context.deepen(root, depth, result.scoreCp);
 				result.move = iteration.move;
-				result.score_cp = iteration.score;
+				result.scoreCp = iteration.score;
 				result.depth = depth;
 				result.root = iteration.root;
 				result.nodes = context.nodes;
-				result.selective_depth = context.selective_depth;
-				result.elapsed_ms = context.elapsed_ms();
+				result.selectiveDepth = context.selectiveDepth;
+				result.elapsedMs = context.elapsedMs();
 				if (progress) progress(result);
 			} catch (const Interrupted &) {
 				break;
 			}
 		}
 		result.nodes = context.nodes;
-		result.selective_depth = context.selective_depth;
-		result.elapsed_ms = context.elapsed_ms();
+		result.selectiveDepth = context.selectiveDepth;
+		result.elapsedMs = context.elapsedMs();
 		return result;
 	}
 

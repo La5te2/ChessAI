@@ -34,6 +34,8 @@ namespace eleginus {
 
 	// Require finite coefficients and a positive king-pressure sigmoid width.
 	void validateParameters(const FormulaParameters &parameters);
+	// Return the source-defined starting parameters.
+	FormulaParameters initialParameters();
 
 	// Convert between structured parameters and the formula-major order used by files and tensors.
 	ParameterValues flattenParameters(const FormulaParameters &parameters);

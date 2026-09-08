@@ -1,6 +1,5 @@
 #pragma once
 
-#include "chess.hpp"
 #include <bit>
 #include <cstddef>
 #include <cstdint>

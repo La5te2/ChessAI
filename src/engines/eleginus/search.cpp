@@ -2,10 +2,18 @@
 #include "eleginus/evaluate.hpp"
 #include "eleginus/search.hpp"
 #include <algorithm>
+#include <array>
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <system_error>
+#ifdef _WIN32
+	#define NOMINMAX
+	#define WIN32_LEAN_AND_MEAN
+	#include <windows.h>
+#endif
 
 namespace {
 
@@ -14,17 +22,28 @@ namespace {
 		return argv[++index];
 	}
 
-	// Locate the default parameter file beside the executable.
+	// Locate the default parameter file beside the analysis executable.
 	std::filesystem::path defaultParametersPath(const char *executable) {
-		std::error_code error;
-		auto path = std::filesystem::absolute(executable == nullptr ? "" : executable, error);
-		if (error) path = executable == nullptr ? std::filesystem::path() : executable;
+		#ifdef _WIN32
+		std::array<wchar_t, 32768> buffer{};
+		const DWORD length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+		if (length > 0 && length < static_cast<DWORD>(buffer.size())) {
+			return std::filesystem::path(std::wstring_view(buffer.data(), length)).parent_path() / "eleginus.pth";
+		}
+		#elif defined(__linux__)
+		std::error_code linkError;
+		auto link = std::filesystem::read_symlink("/proc/self/exe", linkError);
+		if (!linkError) return link.parent_path() / "eleginus.pth";
+		#endif
+		std::error_code absoluteError;
+		auto path = std::filesystem::absolute(executable == nullptr ? "" : executable, absoluteError);
+		if (absoluteError) path = executable == nullptr ? std::filesystem::path() : executable;
 		return path.parent_path() / "eleginus.pth";
 	}
 
 } // namespace
 
-// Run the standalone position-search command and print each completed depth.
+// Search one position and print each completed depth.
 int main(int argc, char **argv) {
 	try {
 		std::string fen = chess::constants::STARTPOS;
@@ -39,9 +58,9 @@ int main(int argc, char **argv) {
 			} else if (argument == "--depth") {
 				options.depth = std::stoi(valueAfter(argc, argv, index));
 			} else if (argument == "--hash") {
-				options.hash_mb = std::stoull(valueAfter(argc, argv, index));
+				options.hashMiB = std::stoull(valueAfter(argc, argv, index));
 			} else if (argument == "--nodes") {
-				options.node_limit = std::stoull(valueAfter(argc, argv, index));
+				options.nodeLimit = std::stoull(valueAfter(argc, argv, index));
 			} else if (argument == "--multipv") {
 				options.multipv = std::stoi(valueAfter(argc, argv, index));
 			} else if (argument == "--help") {
@@ -55,10 +74,10 @@ int main(int argc, char **argv) {
 		const eleginus::Evaluator evaluator(eleginus::loadParameters(parameters));
 		eleginus::Searcher searcher(evaluator, options);
 		const auto result = searcher.search(board, [](const eleginus::SearchResult &partial) {
-			const auto elapsed = std::max<std::uint64_t>(1, partial.elapsed_ms);
+			const auto elapsed = std::max<std::uint64_t>(1, partial.elapsedMs);
 			const auto nps = static_cast<std::uint64_t>(1000.0 * static_cast<double>(partial.nodes) / static_cast<double>(elapsed));
-			std::cout << "depth=" << partial.depth << " score_cp=" << partial.score_cp << " nodes=" << partial.nodes << " nps=" << nps;
-			std::cout << " time_ms=" << partial.elapsed_ms;
+			std::cout << "depth=" << partial.depth << " score_cp=" << partial.scoreCp << " nodes=" << partial.nodes << " nps=" << nps;
+			std::cout << " time_ms=" << partial.elapsedMs;
 			std::cout << " bestmove=" << (partial.move.move() == chess::Move::NO_MOVE ? "0000" : eleginus::moveToUci(partial.move)) << '\n';
 		});
 		std::cout << "bestmove " << (result.move.move() == chess::Move::NO_MOVE ? "0000" : eleginus::moveToUci(result.move)) << '\n';

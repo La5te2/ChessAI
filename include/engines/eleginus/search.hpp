@@ -1,6 +1,7 @@
 #pragma once
 
 #include "chess.hpp"
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -11,25 +12,25 @@ namespace eleginus {
 
 	struct SearchOptions {
 		int depth = 6;
-		int quiescence_depth = 8;
-		std::size_t hash_mb = 64;
-		std::uint64_t node_limit = 0;
-		int movetime_ms = 0;
+		int quiescenceDepth = 8;
+		std::size_t hashMiB = 64;
+		std::uint64_t nodeLimit = 0;
+		int moveTimeMs = 0;
 		int multipv = 1;
 	};
 
 	struct RootMove {
 		chess::Move move{chess::Move::NO_MOVE};
-		int score_cp = 0;
+		int scoreCp = 0;
 	};
 
 	struct SearchResult {
 		chess::Move move{chess::Move::NO_MOVE};
-		int score_cp = 0;
+		int scoreCp = 0;
 		int depth = 0;
-		int selective_depth = 0;
+		int selectiveDepth = 0;
 		std::uint64_t nodes = 0;
-		std::uint64_t elapsed_ms = 0;
+		std::uint64_t elapsedMs = 0;
 		std::vector<RootMove> root;
 	};
 

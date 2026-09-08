@@ -115,7 +115,7 @@ if "%BUILD_MELANO%"=="ON" (
 )
 
 if "%BUILD_ELEGINUS%"=="ON" (
-	for %%F in (train search uci) do (
+	for %%F in (train search generator) do (
 		if not exist "%WORK_DIR%\eleginus\%%F.exe" goto :failed
 		copy /y "%WORK_DIR%\eleginus\%%F.exe" "%PUBLISH_DIR%\eleginus\%%F.exe" >nul || goto :failed
 	)

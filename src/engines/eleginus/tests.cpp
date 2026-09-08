@@ -13,6 +13,12 @@ namespace {
 	}
 
 	void checkFormulas(const eleginus::Evaluator &evaluator) {
+		auto alternateParameters = eleginus::initialParameters();
+		alternateParameters.formulas[0].base += 0.25F;
+		alternateParameters.formulas[1].material[0] -= 0.125F;
+		alternateParameters.adjustments.pressureCenter += 0.5F;
+		const eleginus::Evaluator alternate(std::move(alternateParameters));
+
 		// Repeated pawn keys must not retain king/occupancy/turn-dependent results.
 		const std::array<chess::Board, 11> positions{
 			chess::Board(),
@@ -36,6 +42,8 @@ namespace {
 				require(values.pressure.formula < values.signals.size(), "formula extraction omitted the king-pressure signal");
 				const float recombined = evaluator.score(values);
 				require(std::abs(direct - recombined) < 1.0e-5F, "formula values and parameters did not reproduce the direct score");
+				require(std::abs(alternate.score(board) - alternate.score(values)) < 1.0e-5F,
+					"extracted formula values depend on the evaluator parameter set");
 			}
 		}
 
@@ -60,12 +68,16 @@ namespace {
 int main(int argc, char **argv) {
 	try {
 		if (argc != 2) throw std::invalid_argument("usage: eleginustests parameters.pth");
-		const eleginus::Evaluator evaluator(eleginus::loadParameters(argv[1]));
+		const auto initial = eleginus::initialParameters();
+		eleginus::saveParameters(argv[1], initial);
+		const auto loaded = eleginus::loadParameters(argv[1]);
+		require(eleginus::flattenParameters(initial) == eleginus::flattenParameters(loaded), "parameter file changed its payload during round-trip");
+		const eleginus::Evaluator evaluator(loaded);
 		checkFormulas(evaluator);
 
 		eleginus::SearchOptions options;
 		options.depth = 4;
-		options.hash_mb = 1;
+		options.hashMiB = 1;
 		chess::Board mate("7k/5Q2/6K1/8/8/8/8/8 w - - 0 1");
 		const auto result = eleginus::Searcher(evaluator, options).search(mate);
 		require(result.move.move() != chess::Move::NO_MOVE, "search returned no move in a nonterminal position");
@@ -75,14 +87,14 @@ int main(int argc, char **argv) {
 		require(mate.inCheck() && replies.empty(), "search missed an immediate checkmate");
 		require(result.root.front().move == result.move, "reported PV differs from bestmove");
 		const auto lastPlyMate = eleginus::Searcher(evaluator, options).search(chess::Board("7k/6Q1/6K1/8/8/8/8/8 b - - 100 1"));
-		require(lastPlyMate.move.move() == chess::Move::NO_MOVE && lastPlyMate.score_cp < 0, "fifty-move adjudication overrode checkmate");
+		require(lastPlyMate.move.move() == chess::Move::NO_MOVE && lastPlyMate.scoreCp < 0, "fifty-move adjudication overrode checkmate");
 
 		options.depth = 4;
-		options.quiescence_depth = 0;
+		options.quiescenceDepth = 0;
 		options.multipv = 256;
 		const auto rows = eleginus::Searcher(evaluator, options).search(chess::Board("7k/5K2/8/6Q1/8/8/8/8 w - - 0 1")).root;
 		const auto draw = std::find_if(rows.begin(), rows.end(), [](const auto &row) { return chess::uci::moveToUci(row.move) == "g5g6"; });
-		require(draw != rows.end() && draw->score_cp == 0, "qsearch evaluated a stalemate as a nonterminal position");
+		require(draw != rows.end() && draw->scoreCp == 0, "qsearch evaluated a stalemate as a nonterminal position");
 
 		// This low-material tree has no LMR; single-PV windows and full candidate scores must agree.
 		const chess::Board ending("8/8/4k3/2p5/2P5/3K4/8/8 w - - 0 1");
@@ -92,11 +104,11 @@ int main(int argc, char **argv) {
 		const auto pair = eleginus::Searcher(evaluator, options).search(ending);
 		require(pair.root.size() == 2, "MultiPV returned the wrong number of root lines");
 		require(std::equal(pair.root.begin(), pair.root.end(), full.root.begin(),
-					[](const auto &left, const auto &right) { return left.move == right.move && left.score_cp == right.score_cp; }),
+					[](const auto &left, const auto &right) { return left.move == right.move && left.scoreCp == right.scoreCp; }),
 			"selective MultiPV differs from exhaustive root search in a fixed tree");
 		options.multipv = 1;
 		const auto narrow = eleginus::Searcher(evaluator, options).search(ending);
-		require(narrow.score_cp == full.score_cp, "aspiration changed a fixed-tree score");
+		require(narrow.scoreCp == full.scoreCp, "aspiration changed a fixed-tree score");
 
 		options.depth = 8;
 		int published = 0, probes = 0;
@@ -104,12 +116,12 @@ int main(int argc, char **argv) {
 		chess::Move completedMove;
 		const auto progress = [&](const auto &r) {
 			published = r.depth;
-			completedScore = r.score_cp;
+			completedScore = r.scoreCp;
 			completedMove = r.move;
 		};
 		const auto cancel = [&] { return published >= 3 && ++probes >= 3; };
 		const auto interrupted = eleginus::Searcher(evaluator, options).search(chess::Board(), progress, cancel);
-		const bool retained = interrupted.depth == 3 && interrupted.score_cp == completedScore && interrupted.move == completedMove;
+		const bool retained = interrupted.depth == 3 && interrupted.scoreCp == completedScore && interrupted.move == completedMove;
 		require(retained, "interruption published an incomplete iteration");
 
 		std::cout << "Eleginus tests passed\n";

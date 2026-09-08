@@ -14,7 +14,6 @@
 #include <future>
 #include <iostream>
 #include <limits>
-#include <numeric>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -30,20 +29,13 @@
 
 namespace {
 	// -------------------------- Training configuration -------------------------------
-	// Command-line controls, initial parameters and interruption handling.
+	// Command-line controls and interruption handling.
 
 	std::atomic_bool halt{false};
-	// Convert counterfactual search scores from centipawns to the internal HCE scale.
+	// Convert search scores from centipawns to the internal HCE scale.
 	constexpr float cpScale = 150.0F;
 	// Number of opening positions used by each paired acceptance match.
 	constexpr int openingPairs = 1000;
-
-	// Source-defined parameters used for initial export and first-run initialization.
-	namespace seed {
-		using eleginus::AdjustmentWeights;
-		using eleginus::FormulaWeights;
-		#include "weights.inl"
-	}
 
 	// Set the shared stop flag from process and console interrupts.
 	void interrupt(int) noexcept { halt.store(true, std::memory_order_relaxed); }
@@ -57,13 +49,13 @@ namespace {
 	}
 	#endif
 
-	// Command-line controls for generation, optimization, validation and acceptance.
+	// Command-line controls for generation, optimization and acceptance.
 	struct Options {
 		std::filesystem::path out = "models/eleginus/current.pth";
 		std::filesystem::path init;
 		std::filesystem::path book = "data/openings.gen.bin";
 		std::string device = "auto";
-		int games = 1000;
+		int games = 100000;
 		int randomPlies = 8;
 		int depth = 1;
 		int counterfactualDepth = 2;
@@ -75,12 +67,11 @@ namespace {
 		int epochs = 2;
 		int batch = 4096;
 		int iterations = 0;
-		int log = 16;
+		int log = 1000;
 		float lr = 1.0e-4F;
 		float decay = 1.0e-6F;
 		float clip = 0.25F;
 		std::uint64_t seed = 2026;
-		bool exportInitial = false;
 	};
 
 	std::string valueAfter(int argc, char **argv, int &index) {
@@ -95,16 +86,12 @@ namespace {
 			const std::string argument = argv[index];
 			if (argument == "--help") {
 				std::cout << "usage: train [--out current.pth] [--init parameters.pth] [options]\n";
-				std::cout << "  --opening-book openings.gen.bin --games 1000 --random-plies 8 --depth 1\n";
+				std::cout << "  --opening-book openings.gen.bin --games 100000 --random-plies 8 --depth 1\n";
 				std::cout << "  --counterfactual-depth 2 --counterfactual-every 16 --eval-depth 4\n";
 				std::cout << "  --max-plies 320 --workers 4 --hash 16 --epochs 2 --batch-size 4096\n";
 				std::cout << "  --device auto --lr 0.0001 --weight-decay 0.000001 --grad-clip 0.25\n";
-				std::cout << "  --iterations 0 --log-every 16 --seed 2026 --export-initial\n";
+				std::cout << "  --iterations 0 --log-every 1000 --seed 2026\n";
 				std::exit(0);
-			}
-			if (argument == "--export-initial") {
-				options.exportInitial = true;
-				continue;
 			}
 			const auto value = valueAfter(argc, argv, index);
 			if (argument == "--out") options.out = value;
@@ -144,11 +131,6 @@ namespace {
 		return options;
 	}
 
-	// Return the parameter values compiled into weights.inl.
-	eleginus::FormulaParameters initialParameters() {
-		return {seed::formulaWeights, seed::formulaGlobals};
-	}
-
 	// Derive a deterministic random seed from the run seed and game id.
 	std::uint64_t gameSeed(std::uint64_t seedValue, std::uint64_t game) noexcept {
 		auto value = seedValue + 0x9e3779b97f4a7c15ULL * (game + 1);
@@ -160,28 +142,34 @@ namespace {
 	// Map an HCE score to the [-1, 1] target range.
 	float bounded(float score) noexcept { return std::tanh(score); }
 
-	// Formula values and targets for one retained position. Perspective converts White's score to the
-	// side-to-move view.
+	// Formula values and up to two independent targets for one board position.
 	struct Sample {
 		eleginus::FormulaValues values;
+		std::array<float, 2> targets{};
 		float perspective = 1.0F;
-		float mc = 0.0F;
-		float td = 0.0F;
-		float cf = 0.0F;
-		bool hasCf = false;
+		std::uint8_t targetCount = 0;
 	};
 
-	// All retained positions and the terminal result of one completed game.
+	// Main-line and alternative positions retained from one completed game.
 	struct Game {
-		std::uint64_t id = 0;
-		std::vector<Sample> samples;
+		std::vector<Sample> main;
+		std::vector<Sample> alternatives;
 		int result = -1;
 	};
 
-	// Play one game after a random legal prefix and create targets for each retained position.
+	// Convert a board and one side-to-move target into a training sample.
+	Sample sample(const eleginus::Evaluator &evaluator, const chess::Board &board, float target) {
+		Sample result;
+		result.values = evaluator.extract(board);
+		result.targets[0] = target;
+		result.perspective = board.sideToMove() == chess::Color::WHITE ? 1.0F : -1.0F;
+		result.targetCount = 1;
+		return result;
+	}
+
+	// Play one complete game and retain every main-line position plus every legal alternative at sampled roots.
 	Game play(const eleginus::Evaluator &evaluator, const Options &options, std::uint64_t id) {
 		Game game;
-		game.id = id;
 		chess::Board board;
 		std::mt19937_64 random(gameSeed(options.seed, id));
 		for (int ply = 0; ply < options.randomPlies; ++ply) {
@@ -193,146 +181,55 @@ namespace {
 
 		eleginus::SearchOptions limits;
 		limits.depth = options.depth;
-		limits.hash_mb = static_cast<std::size_t>(options.hash);
-		limits.multipv = 1;
+		limits.hashMiB = static_cast<std::size_t>(options.hash);
 		eleginus::Searcher searcher(evaluator, limits);
+		std::vector<chess::Board> roots;
 		for (int ply = options.randomPlies; ply < options.maximumPlies && !stopped() && !eleginus::isGameOver(board); ++ply) {
-			Sample sample;
-			sample.values = evaluator.extract(board);
-			sample.perspective = board.sideToMove() == chess::Color::WHITE ? 1.0F : -1.0F;
+			Sample position;
+			position.values = evaluator.extract(board);
+			position.perspective = board.sideToMove() == chess::Color::WHITE ? 1.0F : -1.0F;
 			const auto result = searcher.search(board, {}, stopped);
-			if (stopped() || result.move.move() == chess::Move::NO_MOVE) return Game{id};
-			if (game.samples.size() % static_cast<std::size_t>(options.counterfactualEvery) == 0) {
-				auto counterfactual = limits;
-				counterfactual.depth = options.counterfactualDepth;
-				counterfactual.multipv = 256;
-				const auto expanded = eleginus::Searcher(evaluator, counterfactual).search(board, {}, stopped);
-				if (stopped()) return Game{id};
-				sample.cf = bounded(static_cast<float>(expanded.score_cp) / cpScale);
-				sample.hasCf = true;
-			}
-			game.samples.push_back(std::move(sample));
+			if (stopped() || result.move.move() == chess::Move::NO_MOVE) return Game{};
+			if (game.main.size() % static_cast<std::size_t>(options.counterfactualEvery) == 0) roots.push_back(board);
+			game.main.push_back(std::move(position));
 			board.makeMove(result.move);
 		}
+
 		const auto [reason, result] = board.isGameOver();
-		if (stopped() || reason == chess::GameResultReason::NONE) return Game{id};
+		if (stopped() || reason == chess::GameResultReason::NONE) return Game{};
 		if (result == chess::GameResult::DRAW) game.result = 1;
 		else {
 			const auto winner = result == chess::GameResult::WIN ? board.sideToMove() : ~board.sideToMove();
 			game.result = winner == chess::Color::WHITE ? 2 : 0;
 		}
+
 		const float whiteResult = static_cast<float>(game.result - 1);
-		for (std::size_t index = 0; index < game.samples.size(); ++index) {
-			auto &sample = game.samples[index];
-			sample.mc = sample.perspective * whiteResult;
-			if (index + 1 < game.samples.size()) {
-				const auto &next = game.samples[index + 1];
-				sample.td = -bounded(next.perspective * evaluator.score(next.values));
+		for (std::size_t index = 0; index < game.main.size(); ++index) {
+			auto &position = game.main[index];
+			position.targets[0] = position.perspective * whiteResult;
+			if (index + 1 < game.main.size()) {
+				const auto &next = game.main[index + 1];
+				position.targets[1] = -bounded(next.perspective * evaluator.score(next.values));
 			} else {
-				sample.td = sample.mc;
+				position.targets[1] = position.targets[0];
+			}
+			position.targetCount = 2;
+		}
+
+		auto expandedLimits = limits;
+		expandedLimits.depth = options.counterfactualDepth;
+		expandedLimits.multipv = 256;
+		eleginus::Searcher expandedSearcher(evaluator, expandedLimits);
+		for (const auto &root : roots) {
+			const auto expanded = expandedSearcher.search(root, {}, stopped);
+			if (stopped() || expanded.root.empty()) return Game{};
+			for (const auto &line : expanded.root) {
+				auto child = root;
+				child.makeMove(line.move);
+				game.alternatives.push_back(sample(evaluator, child, -bounded(static_cast<float>(line.scoreCp) / cpScale)));
 			}
 		}
 		return game;
-	}
-
-	// Generate the requested number of completed games in parallel.
-	std::vector<Game> generate(const eleginus::Evaluator &evaluator, const Options &options, std::uint64_t iteration) {
-		std::vector<Game> games;
-		games.reserve(static_cast<std::size_t>(options.games));
-		std::uint64_t attempted = 0;
-		std::uint64_t discarded = 0;
-		while (games.size() < static_cast<std::size_t>(options.games) && !stopped()) {
-			const int count = std::min<int>(options.workers, options.games - static_cast<int>(games.size()));
-			std::vector<std::future<Game>> jobs;
-			jobs.reserve(static_cast<std::size_t>(count));
-			for (int worker = 0; worker < count; ++worker) {
-				const auto id = iteration * 1000000000ULL + attempted + static_cast<std::uint64_t>(worker);
-				jobs.push_back(std::async(std::launch::async, [&evaluator, &options, id] { return play(evaluator, options, id); }));
-			}
-			attempted += static_cast<std::uint64_t>(count);
-			for (auto &job : jobs) {
-				auto game = job.get();
-				if (game.result < 0) ++discarded;
-				else games.push_back(std::move(game));
-			}
-			if (attempted % static_cast<std::uint64_t>(options.log) < static_cast<std::uint64_t>(count) ||
-				games.size() == static_cast<std::size_t>(options.games)) {
-				std::size_t positions = 0;
-				for (const auto &game : games) positions += game.samples.size();
-				std::cout << "generation step: games=" << games.size() << "/" << options.games << " discarded=" << discarded;
-				std::cout << " positions=" << positions << std::endl;
-			}
-		}
-		return games;
-	}
-
-	// ------------------------- Targets and validation ---------------------------------
-	// References to samples assigned to optimization and validation.
-	struct Sets {
-		std::vector<const Sample *> train;
-		std::vector<const Sample *> validation;
-	};
-
-	// Split complete games into 90% optimization and 10% validation partitions.
-	Sets split(const std::vector<Game> &games) {
-		Sets sets;
-		for (const auto &game : games) {
-			auto &target = game.id % 10 == 0 ? sets.validation : sets.train;
-			for (const auto &sample : game.samples) target.push_back(&sample);
-		}
-		if (sets.train.empty() || sets.validation.empty()) throw std::runtime_error("training split produced an empty partition");
-		return sets;
-	}
-
-	// Terminal-result, next-position and deeper-search target kinds.
-	enum class Target { mc, td, cf };
-
-	float target(const Sample &sample, Target kind) {
-		if (kind == Target::mc) return sample.mc;
-		if (kind == Target::td) return sample.td;
-		return sample.cf;
-	}
-
-	// Return all retained positions for MC and TD, or sampled counterfactual positions for CF.
-	std::vector<const Sample *> select(const std::vector<const Sample *> &samples, Target kind) {
-		if (kind != Target::cf) return samples;
-		std::vector<const Sample *> result;
-		for (const auto *sample : samples) {
-			if (sample->hasCf) result.push_back(sample);
-		}
-		return result;
-	}
-
-	// Calculate Huber loss with a unit transition between quadratic and linear regions.
-	float huber(float difference) noexcept {
-		const float absolute = std::abs(difference);
-		return absolute < 1.0F ? 0.5F * difference * difference : absolute - 0.5F;
-	}
-
-	struct Losses {
-		double mc = 0.0;
-		double td = 0.0;
-		double cf = std::numeric_limits<double>::infinity();
-	};
-
-	// Calculate mean MC, TD and available CF losses for one evaluator.
-	Losses measure(const eleginus::Evaluator &evaluator, const std::vector<const Sample *> &samples) {
-		Losses losses;
-		std::size_t cf = 0;
-		for (const auto *sample : samples) {
-			const float value = bounded(sample->perspective * evaluator.score(sample->values));
-			losses.mc += huber(value - sample->mc);
-			losses.td += huber(value - sample->td);
-			if (sample->hasCf) {
-				if (cf == 0) losses.cf = 0.0;
-				losses.cf += huber(value - sample->cf);
-				++cf;
-			}
-		}
-		losses.mc /= samples.size();
-		losses.td /= samples.size();
-		if (cf != 0) losses.cf /= cf;
-		return losses;
 	}
 
 	// ----------------------------- Tensor optimizer -----------------------------------
@@ -351,11 +248,12 @@ namespace {
 		torch::Tensor endgame;
 		torch::Tensor perspective;
 		torch::Tensor targets;
+		torch::Tensor mask;
 		std::size_t pressureFormula = eleginus::formulaCount;
 	};
 
-	// Pack a sample range into contiguous float tensors.
-	Batch batch(const std::vector<const Sample *> &samples, std::size_t first, std::size_t count, Target kind, bool pinned) {
+	// Pack a sample range and its active targets into contiguous float tensors.
+	Batch batch(const std::vector<Sample> &samples, std::size_t first, std::size_t count, bool pinned) {
 		const auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU).pinned_memory(pinned);
 		Batch result{
 			torch::empty({static_cast<std::int64_t>(count), static_cast<std::int64_t>(eleginus::formulaCount)}, options),
@@ -363,7 +261,8 @@ namespace {
 			torch::empty({static_cast<std::int64_t>(count), 2}, options),
 			torch::empty({static_cast<std::int64_t>(count), 14}, options),
 			torch::empty({static_cast<std::int64_t>(count)}, options),
-			torch::empty({static_cast<std::int64_t>(count)}, options),
+			torch::zeros({static_cast<std::int64_t>(count), 2}, options),
+			torch::zeros({static_cast<std::int64_t>(count), 2}, options),
 		};
 		auto *signals = result.signals.data_ptr<float>();
 		auto *material = result.material.data_ptr<float>();
@@ -371,8 +270,9 @@ namespace {
 		auto *endgame = result.endgame.data_ptr<float>();
 		auto *perspective = result.perspective.data_ptr<float>();
 		auto *targets = result.targets.data_ptr<float>();
+		auto *mask = result.mask.data_ptr<float>();
 		for (std::size_t row = 0; row < count; ++row) {
-			const auto &sample = *samples[first + row];
+			const auto &sample = samples[first + row];
 			const auto &values = sample.values;
 			if (result.pressureFormula == eleginus::formulaCount) result.pressureFormula = values.pressure.formula;
 			if (values.pressure.formula != result.pressureFormula) throw std::runtime_error("inconsistent king-pressure formula index");
@@ -391,10 +291,19 @@ namespace {
 				static_cast<float>(value.mixedOppositeBishops)}};
 			std::copy(facts.begin(), facts.end(), endgame + row * facts.size());
 			perspective[row] = sample.perspective;
-			targets[row] = target(sample, kind);
+			for (std::size_t target = 0; target < sample.targetCount; ++target) {
+				targets[2 * row + target] = sample.targets[target];
+				mask[2 * row + target] = 1.0F;
+			}
 		}
 		return result;
 	}
+
+	struct TrainStats {
+		double loss = 0.0;
+		std::uint64_t constraints = 0;
+		std::uint64_t steps = 0;
+	};
 
 	// Optimize a dense parameter delta from one accepted parameter vector.
 	class Solver {
@@ -417,7 +326,7 @@ namespace {
 			const auto parameters = origin + delta;
 			const auto formula = parameters.slice(0, 0, static_cast<std::int64_t>(6 * eleginus::formulaCount))
 				.view({static_cast<std::int64_t>(eleginus::formulaCount), 6});
-			auto signals = source.signals.to(device, torch::kFloat32, device.is_cuda(), false).clone();
+			auto signals = source.signals.to(device, torch::kFloat32, device.is_cuda(), true);
 			const auto material = source.material.to(device, torch::kFloat32, device.is_cuda(), false);
 			const auto pressure = source.pressure.to(device, torch::kFloat32, device.is_cuda(), false);
 			const auto facts = source.endgame.to(device, torch::kFloat32, device.is_cuda(), false);
@@ -454,29 +363,36 @@ namespace {
 			return torch::tanh(total * torch::clamp(factor, 0.0F, 1.0F) * perspective);
 		}
 
-		// Shuffle and optimize every selected sample once per epoch.
-		double train(std::vector<const Sample *> samples, Target kind, const Options &options, std::mt19937_64 &random) {
-			if (samples.empty()) throw std::runtime_error("selected training objective has no samples");
-			double sum = 0.0;
-			std::size_t steps = 0;
+		// Optimize every active target in the supplied sample block once per epoch.
+		TrainStats train(std::vector<Sample> &samples, const Options &options, std::mt19937_64 &random) {
+			TrainStats stats;
 			for (int epoch = 0; epoch < options.epochs && !stopped(); ++epoch) {
 				std::shuffle(samples.begin(), samples.end(), random);
 				for (std::size_t first = 0; first < samples.size() && !stopped(); first += static_cast<std::size_t>(options.batch)) {
 					const auto count = std::min(static_cast<std::size_t>(options.batch), samples.size() - first);
-					auto data = batch(samples, first, count, kind, device.is_cuda());
+					std::uint64_t constraints = 0;
+					for (std::size_t row = 0; row < count; ++row) constraints += samples[first + row].targetCount;
+					auto data = batch(samples, first, count, device.is_cuda());
 					const auto expected = data.targets.to(device, torch::kFloat32, device.is_cuda(), false);
-					const auto loss = torch::nn::functional::smooth_l1_loss(forward(data), expected);
+					const auto mask = data.mask.to(device, torch::kFloat32, device.is_cuda(), false);
+					const auto difference = forward(data).unsqueeze(1) - expected;
+					const auto absolute = torch::abs(difference);
+					const auto elements = torch::where(absolute.lt(1.0F), 0.5F * difference * difference, absolute - 0.5F);
+					const auto active = mask.sum();
+					const auto loss = (elements * mask).sum() / active;
 					optimizer->zero_grad();
 					loss.backward();
 					torch::nn::utils::clip_grad_norm_(std::vector<torch::Tensor>{delta}, clip);
 					optimizer->step();
 					const double value = loss.item<double>();
 					if (!std::isfinite(value)) throw std::runtime_error("training produced a nonfinite loss");
-					sum += value;
-					++steps;
+					stats.loss += value * static_cast<double>(constraints);
+					stats.constraints += constraints;
+					++stats.steps;
 				}
 			}
-			return sum / std::max<std::size_t>(1, steps);
+			if (stats.constraints != 0) stats.loss /= static_cast<double>(stats.constraints);
+			return stats;
 		}
 
 		// Return the optimized parameter vector with a valid sigmoid width.
@@ -497,38 +413,69 @@ namespace {
 		std::unique_ptr<torch::optim::AdamW> optimizer;
 	};
 
-	// Interpolate between two complete parameter vectors.
-	eleginus::FormulaParameters interpolate(
-		const eleginus::FormulaParameters &first, const eleginus::FormulaParameters &second, float alpha) {
-		auto left = eleginus::flattenParameters(first);
-		const auto right = eleginus::flattenParameters(second);
-		for (std::size_t i = 0; i < left.size(); ++i) left[i] += alpha * (right[i] - left[i]);
-		return eleginus::expandParameters(left);
+	struct CycleStats {
+		std::uint64_t games = 0;
+		std::uint64_t discarded = 0;
+		std::uint64_t positions = 0;
+		std::uint64_t counterfactual = 0;
+		std::uint64_t targets = 0;
+		std::uint64_t steps = 0;
+		double loss = 0.0;
+	};
+
+	// Train and release one bounded block while preserving one optimizer across the complete generation cycle.
+	void flush(std::vector<Sample> &samples, Solver &solver, const Options &options, std::mt19937_64 &random, CycleStats &stats) {
+		if (samples.empty()) return;
+		const auto trained = solver.train(samples, options, random);
+		stats.loss += trained.loss * static_cast<double>(trained.constraints);
+		stats.steps += trained.steps;
+		samples.clear();
 	}
 
-	// Select the largest tested interpolation that lowers the primary loss and preserves MC and TD losses.
-	std::optional<eleginus::FormulaParameters> selectCandidate(
-		const eleginus::FormulaParameters &reference, const eleginus::FormulaParameters &trained, const Sets &sets) {
-		const eleginus::Evaluator baseline(reference);
-		const auto before = measure(baseline, sets.validation);
-		const bool hasCounterfactual = std::isfinite(before.cf);
-		const double primaryBefore = hasCounterfactual ? before.cf : before.mc;
-		std::optional<eleginus::FormulaParameters> selected;
-		double best = primaryBefore;
-		for (float alpha : {1.0F, 0.5F, 0.25F, 0.125F, 0.0625F, 0.03125F}) {
-			auto parameters = interpolate(reference, trained, alpha);
-			const eleginus::Evaluator evaluator(parameters);
-			const auto after = measure(evaluator, sets.validation);
-			const double primary = hasCounterfactual ? after.cf : after.mc;
-			if (after.mc <= before.mc + 1.0e-9 && after.td <= before.td + 1.0e-9 && primary < best) {
-				best = primary;
-				selected = std::move(parameters);
+	// Generate independent games under one reference parameter set and optimize every retained target.
+	CycleStats optimize(const eleginus::Evaluator &reference, Solver &solver, const Options &options, std::uint64_t iteration,
+		std::mt19937_64 &random) {
+		CycleStats stats;
+		std::uint64_t attempted = 0;
+		std::uint64_t nextLog = static_cast<std::uint64_t>(options.log);
+		const std::size_t blockSize = static_cast<std::size_t>(options.batch) * 8;
+		std::vector<Sample> samples;
+		samples.reserve(blockSize);
+
+		while (stats.games < static_cast<std::uint64_t>(options.games) && !stopped()) {
+			const int count = std::min<int>(options.workers, options.games - static_cast<int>(stats.games));
+			std::vector<std::future<Game>> jobs;
+			jobs.reserve(static_cast<std::size_t>(count));
+			for (int worker = 0; worker < count; ++worker) {
+				const auto id = iteration * 1000000000ULL + attempted + static_cast<std::uint64_t>(worker);
+				jobs.push_back(std::async(std::launch::async, [&reference, &options, id] { return play(reference, options, id); }));
+			}
+			attempted += static_cast<std::uint64_t>(count);
+			for (auto &job : jobs) {
+				auto game = job.get();
+				if (game.result < 0) {
+					++stats.discarded;
+					continue;
+				}
+				++stats.games;
+				stats.positions += game.main.size();
+				stats.counterfactual += game.alternatives.size();
+				stats.targets += 2 * game.main.size() + game.alternatives.size();
+				for (auto &position : game.main) samples.push_back(std::move(position));
+				for (auto &position : game.alternatives) samples.push_back(std::move(position));
+				if (samples.size() >= blockSize) flush(samples, solver, options, random, stats);
+			}
+			if (stats.games >= nextLog || stats.games == static_cast<std::uint64_t>(options.games)) {
+				std::cout << "generation step: games=" << stats.games << '/' << options.games << " discarded=" << stats.discarded;
+				std::cout << " positions=" << stats.positions << " counterfactual=" << stats.counterfactual;
+				std::cout << " targets=" << stats.targets << std::endl;
+				while (nextLog <= stats.games) nextLog += static_cast<std::uint64_t>(options.log);
 			}
 		}
-		std::cout << "validation result: mc=" << before.mc << " td=" << before.td << " primary=" << primaryBefore;
-		if (selected) std::cout << " candidate_primary=" << best;
-		std::cout << " feasible=" << (selected ? "yes" : "no") << std::endl;
-		return selected;
+		flush(samples, solver, options, random, stats);
+		const auto totalConstraints = static_cast<double>(options.epochs) * static_cast<double>(stats.targets);
+		if (totalConstraints != 0.0) stats.loss /= totalConstraints;
+		return stats;
 	}
 
 	// -------------------------- Paired-match acceptance -------------------------------
@@ -588,7 +535,7 @@ namespace {
 		const Options &options) {
 		eleginus::SearchOptions limits;
 		limits.depth = options.evaluationDepth;
-		limits.hash_mb = static_cast<std::size_t>(options.hash);
+		limits.hashMiB = static_cast<std::size_t>(options.hash);
 		eleginus::Searcher candidateSearch(candidate, limits);
 		eleginus::Searcher baselineSearch(baseline, limits);
 		for (int ply = 0; ply < options.maximumPlies && !stopped(); ++ply) {
@@ -652,7 +599,7 @@ namespace {
 
 
 // ------------------------------- Training loop -------------------------------------
-// Generate games, optimize a candidate, validate it and publish it after paired-match acceptance.
+// Generate a large sample cycle, optimize every target and publish the candidate after one paired match.
 int main(int argc, char **argv) {
 	try {
 		const auto options = parse(argc, argv);
@@ -663,35 +610,26 @@ int main(int argc, char **argv) {
 			throw std::runtime_error("cannot install console interrupt handler");
 		}
 		#endif
-		if (options.exportInitial) {
-			eleginus::saveParameters(options.out, initialParameters());
-			std::cout << "exported initial parameters: " << options.out.string() << std::endl;
-			return 0;
-		}
 		auto current = !options.init.empty() ? eleginus::loadParameters(options.init)
-			: (std::filesystem::exists(options.out) ? eleginus::loadParameters(options.out) : initialParameters());
+			: (std::filesystem::exists(options.out) ? eleginus::loadParameters(options.out) : eleginus::initialParameters());
 		const auto book = openings(options.book);
 		std::mt19937_64 random(options.seed);
 		std::cout << "training start: out=" << options.out.string() << " formulas=" << eleginus::formulaCount;
 		std::cout << " parameters=" << eleginus::parameterCount << " games=" << options.games << " device=" << options.device;
-		std::cout << " depth=" << options.depth << " eval_depth=" << options.evaluationDepth << std::endl;
+		std::cout << " depth=" << options.depth << " counterfactual_depth=" << options.counterfactualDepth;
+		std::cout << " eval_depth=" << options.evaluationDepth << std::endl;
 		for (int iteration = 0; !stopped() && (options.iterations == 0 || iteration < options.iterations); ++iteration) {
 			const eleginus::Evaluator reference(current);
-			auto games = generate(reference, options, static_cast<std::uint64_t>(iteration));
-			if (stopped()) break;
-			const auto sets = split(games);
-			const auto counterfactual = select(sets.train, Target::cf);
-			const Target primary = counterfactual.empty() ? Target::mc : Target::cf;
 			Solver solver(current, options);
-			const double loss = solver.train(primary == Target::cf ? counterfactual : sets.train, primary, options, random);
-			std::cout << "optimization result: iteration=" << iteration << " loss=" << loss;
-			std::cout << " device=" << solver.trainingDevice() << std::endl;
-			const auto candidateParameters = selectCandidate(current, solver.parameters(), sets);
-			if (!candidateParameters) continue;
-			const eleginus::Evaluator candidate(*candidateParameters);
+			const auto stats = optimize(reference, solver, options, static_cast<std::uint64_t>(iteration), random);
+			if (stopped()) break;
+			std::cout << "optimization result: iteration=" << iteration << " loss=" << stats.loss << " targets=" << stats.targets;
+			std::cout << " steps=" << stats.steps << " device=" << solver.trainingDevice() << std::endl;
+			const auto candidateParameters = solver.parameters();
+			const eleginus::Evaluator candidate(candidateParameters);
 			if (accept(candidate, reference, book, options) && !stopped()) {
-				eleginus::saveParameters(options.out, *candidateParameters);
-				current = *candidateParameters;
+				eleginus::saveParameters(options.out, candidateParameters);
+				current = candidateParameters;
 				std::cout << "published parameters: " << options.out.string() << std::endl;
 			}
 		}
