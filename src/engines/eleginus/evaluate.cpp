@@ -115,7 +115,6 @@ namespace eleginus {
 		class ScoreAccumulator {
 		public:
 			explicit ScoreAccumulator(const std::array<float, formulaCount> &coefficients) : coefficients(coefficients) {}
-
 			// Add one weighted formula signal.
 			void add(std::uint32_t index, std::int32_t signal) {
 				total = std::fma(coefficients[index], static_cast<float>(signal), total);
