@@ -21,7 +21,7 @@ Eleginus is a formula-based handcrafted evaluation engine that maps explicit che
 - $E(x)$ is the final White-perspective Eleginus evaluation.
 - $C(x)$ is the bounded integer score used by negamax search from the perspective of the side to move.
 - $V(x,d,\alpha,\beta)$ is the depth-$d$ search value of state $x$ inside window $[\alpha,\beta)$.
-- $\operatorname{clip}_{[l,u]}(y)=\min(u,\max(l,y))$ restricts scalar $y$ to the closed interval $[l,u]$.
+- $\mathrm{clip}_{[l,u]}(y)=\min(u,\max(l,y))$ restricts scalar $y$ to the closed interval $[l,u]$.
 
 ## 2. Formula Evaluation
 
@@ -44,7 +44,7 @@ Formula evaluation uses White and Black as two role values. A role-relative vert
 
 ### 2.2 Formula Algebra
 
-Every formula is an expression over square sets, signed integers and Boolean relations. The mathematical notation maps directly to the source-level primitives:
+Every formula is an expression over square sets, signed integers and Boolean relations. The mathematical notation maps directly to the formula primitives:
 
 | Mathematical notation | Meaning | Source primitive |
 | --- | --- | --- |
@@ -355,13 +355,13 @@ The ordered formula set contains 694 scalar signals:
 | Threats | 42 | Hanging targets, pawn attacks, minor-piece attacks, rook attacks, pawn-push attacks, active-side threats, king threats and queen pressure |
 | King safety | 96 | Inner and outer king-zone attacks, potential checks, smooth pressure, escape squares, shelter, storms, open files, flank control, castling rights and queen presence |
 
-The index order is part of the parameter contract. The sum of the group sizes is
+The group sizes satisfy
 
 $$
 1+5+384+1+78+64+23+42+96=694.
 $$
 
-Each formula emits one integer. Sparse piece-square signals advance directly across empty coordinates, while every occupied coordinate contributes its signed role-relative indicator.
+Each indexed formula emits one integer signal. A piece-square formula contributes its signed role-relative indicator when its normalized square contains the selected piece type and contributes zero otherwise.
 
 ### 2.5 Material-Responsive Coefficients
 
@@ -389,9 +389,9 @@ $$
 H(x)=\sum_{i\in\mathcal I_E}w_i(x)\phi_i(B(x)).
 $$
 
-This construction gives every formula its own affine material response. Material, king safety, mobility, pawn structure and endgame signals can therefore respond along distinct material directions.
+This construction gives every formula its own affine material response, so material, king safety, mobility, pawn structure and endgame signals can vary along distinct material directions.
 
-The formula coefficients contribute $6\times694=4164$ scalar parameters. Fourteen adjustment parameters complete the 4178-value parameter set.
+Each formula uses one base coefficient and five material-response coefficients, so the 694 formulas require $694(1+5)=4164$ scalar coefficients. The king-pressure response uses a center and width. The winnability adjustment uses seven coefficients, and endgame scaling uses five coefficients. Together, these fourteen adjustment parameters bring the complete parameter set to $4164+14=4178$ scalar values.
 
 ### 2.6 King-Pressure Response
 
@@ -399,7 +399,7 @@ King pressure aggregates the number of attacked squares in the defending king's 
 
 $$
 S(q)=
-\operatorname{round}
+\mathrm{round}
 \left(
 \frac{4096}{1+\exp(-(q-c_P)/s_P)}
 \right),
@@ -436,7 +436,7 @@ Its sign-preserving application is
 
 $$
 H_W(x)=
-\operatorname{sgn}(H(x))
+\mathrm{sgn}(H(x))
 \max\left(0,|H(x)|+u(x)\right).
 $$
 
@@ -460,15 +460,17 @@ $$
 s_2+s_3q_+.
 $$
 
-The active structural scales form a minimum, followed by clamping:
+Let $\mathcal S(x)$ contain the scale values whose structural conditions hold in state $x$. The thin pawnless condition contributes $s_0$. A pure opposite-colored-bishop condition contributes $s_1+s_4p_++s_3q_+$, and a mixed opposite-colored-bishop condition contributes $s_2+s_3q_+$. The scale is
 
 $$
 \lambda(x)=
-\operatorname{clip}_{[0,1]}
+\mathrm{clip}_{[0,1]}
 \left(
-\min\bigl(1,\text{active structural scales}\bigr)
+\min\left(\{1\}\cup\mathcal S(x)\right)
 \right).
 $$
+
+When no structural condition holds, $\mathcal S(x)$ is empty and $\lambda(x)=1$.
 
 The final evaluation is
 
@@ -484,10 +486,10 @@ This final contraction maps drawish pawnless and opposite-colored-bishop structu
 
 One evaluation builds each broadly reused board quantity once. Pawn attacks feed passed-pawn detection, mobility areas, outposts, threats, space and king safety. Piece attack maps feed mobility, contested-square, threat and king-zone formulas. King regions feed pressure, escape and flank-control formulas.
 
-Formula execution follows the fixed parameter order and accumulates each active signal directly with fused multiply-add:
+Formula execution follows the fixed coefficient order and accumulates each active signal directly with fused multiply-add:
 
 $$
-H\leftarrow\operatorname{fma}(w_i,\phi_i,H).
+H\leftarrow\mathrm{fma}(w_i,\phi_i,H).
 $$
 
 Zero-valued formula roots advance the index and leave the accumulator unchanged. Piece-square tables visit occupied normalized squares and advance across the remaining fixed coordinates.
@@ -500,7 +502,7 @@ Attack reuse tracks the twelve piece sets and occupied squares. Knight and king 
 
 Mobility reuse tracks piece locations, target areas, guard areas, occupied squares and prior reach. A matching dependency state supplies the primary and secondary mobility histograms.
 
-A thread-local 16-entry coefficient table keys the five total piece counts packed into one material signature. Each entry begins with the 694 base coefficients and refreshes the formulas carrying material responses. The evaluator assigns each parameter set a unique serial so cache entries remain associated with their coefficient owner.
+A thread-local 16-entry coefficient table keys the five total piece counts packed into one material signature. Each entry begins with the 694 base coefficients and refreshes the formulas carrying material responses when its material signature changes.
 
 ## 4. Search
 
@@ -520,9 +522,9 @@ The search score is
 
 $$
 C(x)=
-\operatorname{round}
+\mathrm{round}
 \left(
-\operatorname{clip}_{[-25000,25000]}
+\mathrm{clip}_{[-25000,25000]}
 \left(150\,\eta(x)E(x)\right)
 \right).
 $$

@@ -380,8 +380,8 @@ namespace eleginus {
 
 		class Context {
 		public:
-			Context(const Evaluator &evaluator, const SearchOptions &options, SearchState &state, SearchCancel cancel)
-				: opts(options), state(state), evaluator(evaluator), cancelled(std::move(cancel)), started(Clock::now()) {}
+			Context(const SearchOptions &options, SearchState &state, SearchCancel cancel)
+				: opts(options), state(state), cancelled(std::move(cancel)), started(Clock::now()) {}
 
 			void advance() noexcept { state.table.advance(); }
 			std::uint64_t elapsedMs() const noexcept {
@@ -427,7 +427,7 @@ namespace eleginus {
 			// Return the static score from the side-to-move perspective, using the evaluation cache.
 			int evaluate(const chess::Board &board) {
 				const auto staticScore = [&] {
-					const float white = evaluator.score(board);
+					const float white = eleginus::evaluate(board);
 					return centipawns(board.sideToMove() == chess::Color::WHITE ? white : -white);
 				};
 				if (state.evals.empty()) {
@@ -441,22 +441,6 @@ namespace eleginus {
 				const int score = staticScore();
 				entry.assign(key, score);
 				return score;
-			}
-
-			void make(chess::Board &board, chess::Move move) {
-				board.makeMove(move);
-			}
-
-			void unmake(chess::Board &board, chess::Move move) {
-				board.unmakeMove(move);
-			}
-
-			void makeNull(chess::Board &board) {
-				board.makeNullMove();
-			}
-
-			void unmakeNull(chess::Board &board) {
-				board.unmakeNullMove();
 			}
 
 			// Stabilize leaf scores by searching evasions, tactical moves and one legal-move ply in pawn endings.
@@ -491,9 +475,9 @@ namespace eleginus {
 						const int gain = pieceValue(board.getCapturing<chess::PieceType>(move));
 						if (standPat + gain + 120 < alpha || candidates.gain() < 0) continue;
 					}
-					make(board, move);
+					board.makeMove(move);
 					const int score = -quiescence(board, ply + 1, remaining - 1, -beta, -alpha);
-					unmake(board, move);
+					board.unmakeMove(move);
 					if (score > best) best = score;
 					if (score >= beta) return score;
 					alpha = std::max(alpha, score);
@@ -542,9 +526,9 @@ namespace eleginus {
 					if (!nullSearch && !sparse && depth >= 3 && staticScore >= beta && board.hasNonPawnMaterial(board.sideToMove())) {
 						const int reduction = std::min(depth, 3 + depth / 4 + std::min(3, (staticScore - beta) / 200));
 						nullSearch = true;
-						makeNull(board);
+						board.makeNullMove();
 						const int score = -pvs(board, depth - reduction, ply + 1, -beta, -beta + 1);
-						unmakeNull(board);
+						board.unmakeNullMove();
 						nullSearch = false;
 						if (score >= beta && score < kMateThreshold) {
 							if (depth < 10) return chess::movegen::anylegalmoves(board) ? score : 0;
@@ -569,10 +553,10 @@ namespace eleginus {
 					auto candidates = ordered(board, tactical, ply, preferred);
 					for (auto move = candidates.next(); move.move() != chess::Move::NO_MOVE; move = candidates.next()) {
 						if (candidates.gain() < 0) continue;
-						make(board, move);
+						board.makeMove(move);
 						int score = -quiescence(board, ply + 1, opts.quiescenceDepth, -probBeta, -probBeta + 1);
 						if (score >= probBeta) score = -pvs(board, depth - 4, ply + 1, -probBeta, -probBeta + 1);
-						unmake(board, move);
+						board.unmakeMove(move);
 						if (score >= probBeta) return score;
 					}
 				}
@@ -607,7 +591,7 @@ namespace eleginus {
 						if (depth <= 4 && currentQuiet >= static_cast<std::size_t>(3 + depth * depth + (improving ? depth * depth : 0))) continue;
 						if (depth <= 3 && staticScore + 100 + 100 * depth <= alpha && history <= 0) continue;
 					}
-					make(board, move);
+					board.makeMove(move);
 					int score;
 					if (index == 0) {
 						score = -pvs(board, depth - 1, ply + 1, -beta, -alpha);
@@ -623,7 +607,7 @@ namespace eleginus {
 						}
 						if (score > alpha && score < beta) score = -pvs(board, depth - 1, ply + 1, -beta, -alpha);
 					}
-					unmake(board, move);
+					board.unmakeMove(move);
 					if (score > best) {
 						best = score;
 						bestMove = move;
@@ -668,7 +652,7 @@ namespace eleginus {
 					for (auto move = candidates.next(); move.move() != chess::Move::NO_MOVE; move = candidates.next()) {
 						if (std::find(selected.begin(), selected.end(), move) != selected.end()) continue;
 						checkStop(true);
-						make(board, move);
+						board.makeMove(move);
 						int score;
 						if (index++ == 0) {
 							score = -pvs(board, depth - 1, 1, -kInfinity, kInfinity);
@@ -676,7 +660,7 @@ namespace eleginus {
 							score = -pvs(board, depth - 1, 1, -best.scoreCp - 1, -best.scoreCp);
 							if (score > best.scoreCp) score = -pvs(board, depth - 1, 1, -kInfinity, -best.scoreCp);
 						}
-						unmake(board, move);
+						board.unmakeMove(move);
 						if (score > best.scoreCp) best = {move, score};
 					}
 					selected.push_back(best.move);
@@ -720,7 +704,7 @@ namespace eleginus {
 				std::size_t index = 0;
 				for (auto move = candidates.next(); move.move() != chess::Move::NO_MOVE; move = candidates.next(), ++index) {
 					checkStop(true);
-					make(board, move);
+					board.makeMove(move);
 					int score;
 					if (multipleLines || index == 0) {
 						score = -pvs(board, depth - 1, 1, -beta, -alpha);
@@ -728,7 +712,7 @@ namespace eleginus {
 						score = -pvs(board, depth - 1, 1, -alpha - 1, -alpha);
 						if (score > alpha && score < beta) score = -pvs(board, depth - 1, 1, -beta, -alpha);
 					}
-					unmake(board, move);
+					board.unmakeMove(move);
 					result.root.push_back({move, score});
 					if (score > result.score) {
 						result.score = score;
@@ -777,7 +761,6 @@ namespace eleginus {
 
 			const SearchOptions &opts;
 			SearchState &state;
-			const Evaluator &evaluator;
 			SearchCancel cancelled;
 			Clock::time_point started;
 			std::array<int, 128> staticScores{};
@@ -789,7 +772,7 @@ namespace eleginus {
 
 	// ------------------------------- Public search -------------------------------------
 	// Validate search options and allocate persistent search state.
-	Searcher::Searcher(const Evaluator &evaluator, SearchOptions options) : evaluator(&evaluator), opts(options) {
+	Searcher::Searcher(SearchOptions options) : opts(options) {
 		if (options.depth <= 0 || options.depth > 64 || options.quiescenceDepth < 0 || options.quiescenceDepth > 32 || options.hashMiB > 4096 ||
 			options.multipv <= 0 || options.multipv > 256) {
 			throw std::invalid_argument("Eleginus search options are outside the supported range");
@@ -812,7 +795,7 @@ namespace eleginus {
 			return result;
 		}
 		chess::Board root = board;
-		Context context(*evaluator, opts, *state, cancel);
+		Context context(opts, *state, cancel);
 		for (int depth = 1; depth <= opts.depth; ++depth) {
 			context.advance();
 			try {

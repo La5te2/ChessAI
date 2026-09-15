@@ -12,7 +12,7 @@ if(NOT GADIDAE_BUILD_GADUS AND NOT GADIDAE_BUILD_MELANO AND NOT GADIDAE_BUILD_EL
 endif()
 
 set(GADIDAE_NEEDS_TORCH OFF)
-if(GADIDAE_BUILD_GADUS OR GADIDAE_BUILD_MELANO OR GADIDAE_BUILD_ELEGINUS)
+if(GADIDAE_BUILD_GADUS OR GADIDAE_BUILD_MELANO)
 	set(GADIDAE_NEEDS_TORCH ON)
 endif()
 set(GADIDAE_NEEDS_HDF5 OFF)
@@ -111,7 +111,7 @@ if(MSVC AND GADIDAE_NEEDS_TORCH)
 		message(FATAL_ERROR "No LibTorch runtime DLLs found in ${GADIDAE_TORCH_DIR}/lib")
 	endif()
 	add_custom_target(torchruntime ALL COMMENT "Copying LibTorch runtime")
-	foreach(architecture IN ITEMS gadus melano eleginus)
+	foreach(architecture IN ITEMS gadus melano)
 		string(TOUPPER "${architecture}" architecture_upper)
 		if(GADIDAE_BUILD_${architecture_upper})
 			add_custom_command(TARGET torchruntime POST_BUILD
@@ -128,7 +128,6 @@ if(GADIDAE_BUILD_ELEGINUS)
 add_library(eleginus
 	src/engines/eleginus/evaluate.cpp
 	src/engines/eleginus/game.cpp
-	src/engines/eleginus/parameters.cpp
 	src/engines/eleginus/searcher.cpp
 )
 set_target_properties(eleginus PROPERTIES
@@ -166,48 +165,7 @@ function(eleginusexecutable name source)
 endfunction()
 
 eleginusexecutable(search src/engines/eleginus/search.cpp)
-eleginusexecutable(train src/engines/eleginus/train.cpp)
-eleginusexecutable(runtime src/engines/eleginus/engine.cpp)
-set_target_properties(eleginusruntime PROPERTIES OUTPUT_NAME "eleginus" SUFFIX ".template")
-
-set(ELEGINUS_RUNTIME_IMAGE "${CMAKE_BINARY_DIR}/generated/eleginus_runtime.cpp")
-set(ELEGINUS_EMBED_SCRIPT "${CMAKE_BINARY_DIR}/generated/embed_eleginus_runtime.cmake")
-file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/generated")
-file(WRITE "${ELEGINUS_EMBED_SCRIPT}" [=[
-if(NOT DEFINED INPUT OR NOT DEFINED OUTPUT)
-	message(FATAL_ERROR "INPUT and OUTPUT are required")
-endif()
-
-file(READ "${INPUT}" bytes HEX)
-string(LENGTH "${bytes}" digits)
-math(EXPR count "${digits} / 2")
-string(REGEX REPLACE "([0-9a-fA-F][0-9a-fA-F])" "0x\\1," values "${bytes}")
-
-file(WRITE "${OUTPUT}"
-"#include <span>\n\n"
-"namespace eleginus::runtime {\n"
-"\tnamespace {\n"
-"\t\tconst unsigned char runtime[${count}] = {${values}};\n"
-"\t}\n\n"
-"\tstd::span<const unsigned char> image() { return {runtime, sizeof(runtime)}; }\n"
-"}\n")
-]=])
-add_custom_command(
-	OUTPUT "${ELEGINUS_RUNTIME_IMAGE}"
-	COMMAND ${CMAKE_COMMAND}
-		"-DINPUT=$<TARGET_FILE:eleginusruntime>"
-		"-DOUTPUT=${ELEGINUS_RUNTIME_IMAGE}"
-		-P "${ELEGINUS_EMBED_SCRIPT}"
-	DEPENDS eleginusruntime "${ELEGINUS_EMBED_SCRIPT}"
-	VERBATIM
-)
-eleginusexecutable(generator src/engines/eleginus/engine.cpp)
-target_compile_definitions(eleginusgenerator PRIVATE ELEGINUS_GENERATOR)
-target_sources(eleginusgenerator PRIVATE "${ELEGINUS_RUNTIME_IMAGE}")
-target_link_libraries(eleginustrain PRIVATE ${TORCH_LIBRARIES})
-if(MSVC)
-	add_dependencies(eleginustrain torchruntime)
-endif()
+eleginusexecutable(uci src/engines/eleginus/engine.cpp)
 
 add_executable(eleginustests src/engines/eleginus/tests.cpp)
 set_target_properties(eleginustests PROPERTIES
@@ -217,7 +175,7 @@ set_target_properties(eleginustests PROPERTIES
 	PDB_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/eleginus"
 )
 target_link_libraries(eleginustests PRIVATE eleginus)
-add_test(NAME eleginustests COMMAND eleginustests "${CMAKE_BINARY_DIR}/eleginus/eleginus-test.pth")
+add_test(NAME eleginustests COMMAND eleginustests)
 
 endif()
 

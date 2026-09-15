@@ -8,8 +8,6 @@
 #include <vector>
 
 namespace eleginus {
-	class Evaluator;
-
 	struct SearchOptions {
 		int depth = 6;
 		int quiescenceDepth = 8;
@@ -41,8 +39,8 @@ namespace eleginus {
 
 	class Searcher {
 	public:
-		// Validate the options and allocate the persistent transposition table.
-		Searcher(const Evaluator &evaluator, SearchOptions options = {});
+		// Validate the options and allocate the search caches.
+		explicit Searcher(SearchOptions options = {});
 		~Searcher();
 		Searcher(const Searcher &) = delete;
 		Searcher &operator=(const Searcher &) = delete;
@@ -51,7 +49,6 @@ namespace eleginus {
 		SearchResult search(const chess::Board &board, const SearchProgress &progress = {}, const SearchCancel &cancel = {});
 
 	private:
-		const Evaluator *evaluator;
 		SearchOptions opts;
 		std::unique_ptr<SearchState> state;
 	};

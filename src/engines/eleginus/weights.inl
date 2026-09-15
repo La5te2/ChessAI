@@ -1,4 +1,4 @@
-// Learned global postprocessing parameters.
+// Global score-adjustment parameters.
 constexpr AdjustmentWeights formulaGlobals{
 	13.3833466F, // King-pressure sigmoid center.
 	0.0559015684F, // King-pressure sigmoid width.
@@ -7,7 +7,7 @@ constexpr AdjustmentWeights formulaGlobals{
 };
 
 // FormulaWeights columns: base, pawn, knight, bishop, rook and queen material response.
-constexpr std::array<FormulaWeights, 694> formulaWeights{{
+constexpr std::array<FormulaWeights, formulaCount> formulaWeights{{
 	// tempo: [0, 1).
 	FormulaWeights{0.272100866F, -0.0952648148F, -0.0396811031F, 0.00590907782F, -0.0244869236F, 0.0504143424F},
 	// material: [1, 6).

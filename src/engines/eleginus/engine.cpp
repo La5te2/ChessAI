@@ -1,6 +1,4 @@
 #include "eleginus/game.hpp"
-#include "eleginus/evaluate.hpp"
-#include "eleginus/parameters.hpp"
 #include "eleginus/search.hpp"
 #include <algorithm>
 #include <array>
@@ -8,121 +6,15 @@
 #include <bit>
 #include <cctype>
 #include <cstdint>
-#include <filesystem>
-#include <fstream>
 #include <iostream>
-#include <memory>
 #include <mutex>
-#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include <string_view>
-#include <system_error>
 #include <thread>
 #include <vector>
-#ifdef _WIN32
-	#define NOMINMAX
-	#define WIN32_LEAN_AND_MEAN
-	#include <windows.h>
-#endif
 
 namespace {
-	// Return the running generator or engine path independently of the launch directory.
-	std::filesystem::path executablePath(const char *argument) {
-		#ifdef _WIN32
-		std::array<wchar_t, 32768> buffer{};
-		const DWORD length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
-		if (length == 0) throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "cannot locate Eleginus");
-		if (length >= static_cast<DWORD>(buffer.size())) throw std::runtime_error("Eleginus executable path is too long");
-		return std::filesystem::path(std::wstring_view(buffer.data(), length));
-		#elif defined(__linux__)
-		std::error_code linkError;
-		auto link = std::filesystem::read_symlink("/proc/self/exe", linkError);
-		if (!linkError) return link;
-		#endif
-		if (argument == nullptr || *argument == '\0') throw std::runtime_error("cannot locate Eleginus");
-		std::error_code absoluteError;
-		auto path = std::filesystem::absolute(argument, absoluteError);
-		if (absoluteError) throw std::system_error(absoluteError, "cannot locate Eleginus");
-		return path;
-	}
-}
-
-#if defined(ELEGINUS_GENERATOR)
-
-namespace eleginus::runtime {
-	std::span<const unsigned char> image();
-}
-
-namespace {
-	// Write a complete engine to a sibling temporary file, then replace the requested output.
-	void generateEngine(
-		const std::filesystem::path &generator,
-		const std::filesystem::path &output,
-		const eleginus::FormulaParameters &parameters) {
-		auto temporary = output;
-		temporary += ".tmp";
-		try {
-			std::ofstream stream(temporary, std::ios::binary | std::ios::trunc);
-			if (!stream) throw std::runtime_error("cannot create the Eleginus executable: " + temporary.string());
-
-			const auto image = eleginus::runtime::image();
-			const auto values = eleginus::flattenParameters(parameters);
-			stream.write(reinterpret_cast<const char *>(image.data()), static_cast<std::streamsize>(image.size()));
-			stream.write(reinterpret_cast<const char *>(values.data()), sizeof(values));
-			stream.close();
-			if (!stream) throw std::runtime_error("cannot write the Eleginus executable: " + temporary.string());
-
-			std::filesystem::permissions(temporary, std::filesystem::status(generator).permissions());
-			#ifdef _WIN32
-			if (!MoveFileExW(temporary.c_str(), output.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-				throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "cannot replace the Eleginus executable");
-			}
-			#else
-			std::filesystem::rename(temporary, output);
-			#endif
-		} catch (...) {
-			std::error_code ignored;
-			std::filesystem::remove(temporary, ignored);
-			throw;
-		}
-	}
-}
-
-// Generate a standalone Eleginus engine from initial or saved parameters.
-int main(int argc, char **argv) {
-	try {
-		if (argc > 2) throw std::invalid_argument("usage: generator [parameters.pth]");
-		const auto parameters = argc == 2 ? eleginus::loadParameters(argv[1]) : eleginus::initialParameters();
-		const auto generator = executablePath(argc > 0 ? argv[0] : nullptr);
-		const auto directory = generator.parent_path();
-		const auto output = directory / (std::string("eleginus") + generator.extension().string());
-		generateEngine(generator, output, parameters);
-		std::cout << "generated Eleginus engine: " << output.string() << '\n';
-		return 0;
-	} catch (const std::exception &error) {
-		std::cerr << "generator error: " << error.what() << '\n';
-		return 1;
-	}
-}
-
-#else
-
-namespace {
-	// Read the fixed-size parameter payload appended to this executable.
-	eleginus::FormulaParameters embeddedParameters(const std::filesystem::path &path) {
-		std::ifstream stream(path, std::ios::binary | std::ios::ate);
-		if (!stream) throw std::runtime_error("cannot read the Eleginus executable: " + path.string());
-		const auto payloadSize = static_cast<std::streamoff>(sizeof(eleginus::ParameterValues));
-		if (stream.tellg() < payloadSize) throw std::runtime_error("Eleginus executable has no embedded parameters");
-		stream.seekg(-payloadSize, std::ios::end);
-		eleginus::ParameterValues values{};
-		stream.read(reinterpret_cast<char *>(values.data()), payloadSize);
-		if (!stream) throw std::runtime_error("embedded Eleginus parameters are incomplete");
-		return eleginus::expandParameters(values);
-	}
-
 	// Remove protocol whitespace while preserving spaces inside FEN and option values.
 	std::string trim(std::string value) {
 		const auto first = value.find_first_not_of(" \t\r\n");
@@ -181,11 +73,9 @@ namespace {
 		bool infinite = false;
 	};
 
-	// Engine owns protocol state, the evaluator and at most one search worker.
+	// Engine owns protocol state and at most one search worker.
 	class Engine {
 	public:
-		explicit Engine(eleginus::FormulaParameters parameters)
-			: evaluator(std::make_shared<eleginus::Evaluator>(std::move(parameters))) {}
 		~Engine() { stop(); }
 
 		// Read UCI commands serially while searches execute on the managed worker thread.
@@ -362,11 +252,10 @@ namespace {
 			searchOptions.nodeLimit = limits.nodes;
 			searchOptions.moveTimeMs = allocatedTime(limits);
 			const auto position = board;
-			const auto activeEvaluator = evaluator;
 			stopRequested = false;
-			worker = std::thread([this, position, searchOptions, activeEvaluator] {
+			worker = std::thread([this, position, searchOptions] {
 				try {
-					eleginus::Searcher searcher(*activeEvaluator, searchOptions);
+					eleginus::Searcher searcher(searchOptions);
 					const auto result = searcher.search(
 						position, [this](const eleginus::SearchResult &partial) { emitInfo(partial); }, [this] { return stopRequested.load(); });
 					print("bestmove " + (result.move.move() == chess::Move::NO_MOVE ? fallbackMove() : eleginus::moveToUci(result.move)));
@@ -384,7 +273,6 @@ namespace {
 		}
 
 		eleginus::SearchOptions options;
-		const std::shared_ptr<const eleginus::Evaluator> evaluator;
 		chess::Board board;
 		int moveOverhead = 10;
 		std::atomic_bool stopRequested{false};
@@ -393,17 +281,13 @@ namespace {
 
 } // namespace
 
-// Run the UCI protocol with the parameter set embedded by the generator.
-int main(int argc, char **argv) {
+// Run the UCI protocol with the source-defined formula parameters.
+int main() {
 	try {
-		if (argc != 1) throw std::invalid_argument("usage: eleginus");
-		auto parameters = embeddedParameters(executablePath(argc > 0 ? argv[0] : nullptr));
-		Engine(std::move(parameters)).loop();
+		Engine().loop();
 		return 0;
 	} catch (const std::exception &error) {
 		std::cerr << "eleginus error: " << error.what() << '\n';
 		return 1;
 	}
 }
-
-#endif

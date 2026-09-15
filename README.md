@@ -2,7 +2,7 @@
 
 Gadidae is a family of experimental chess engines.
 
-This README explains installation, commands and user-facing interfaces. [Gadus.md](Gadus.md) and [Melano.md](Melano.md) specify their architectures, training methods and search algorithms.
+This README explains installation, commands and user-facing interfaces. [Gadus.md](Gadus.md) and [Melano.md](Melano.md) specify their architectures, training methods and search algorithms. [Eleginus.md](Eleginus.md) specifies its formula evaluation and search.
 
 ## Dependencies
 
@@ -89,9 +89,8 @@ build/melano/train
 build/melano/search
 build/melano/uci
 
-build/eleginus/train
 build/eleginus/search
-build/eleginus/generator
+build/eleginus/uci
 ```
 
 
@@ -104,7 +103,6 @@ The preprocessing, training and search entry points provide their current argume
 ```bash
 build/gadus/search --help
 build/melano/train --help
-build/eleginus/train --help
 build/eleginus/search --help
 ```
 
@@ -279,54 +277,18 @@ The [UCI](#uci) section describes runtime options, output fields and time manage
 
 ### Eleginus
 
-Eleginus is an HCE engine with fixed source-defined formulas and externally stored parameters. Let $x_i(s)$ denote formula signal $i$, $b_i$ its base coefficient, $r_i$ its five material-response coefficients and $m(s)$ the normalized material coordinates. Its White-perspective linear score is
+Eleginus is an HCE engine with fixed source-defined formulas and coefficients compiled into its executables. Let $x_i(s)$ denote formula signal $i$, $b_i$ its base coefficient, $r_i$ its five material-response coefficients and $m(s)$ the normalized material coordinates. Its White-perspective linear score is
 
 $$
 H_0(s)=\sum_{i=1}^{N}\left(b_i+r_i^{\mathsf T}m(s)\right)x_i(s).
 $$
 
-King-pressure, winnability and endgame-scaling adjustments transform $H_0(s)$ into the final score $H(s)$. The formula set contains 694 signals. Its parameter set contains 4178 FP32 values: 694 base coefficients, 3470 material responses and 14 postprocessing parameters.
+King-pressure, winnability and endgame-scaling adjustments transform $H_0(s)$ into the final score $H(s)$. The formula set contains 694 signals. Its coefficient table contains 4178 FP32 values: 694 base coefficients, 3470 material responses and 14 score-adjustment values. Formula definitions live in `src/engines/eleginus/formula.inl`, while their coefficients live in `src/engines/eleginus/weights.inl`.
 
-One training run generates the number of completed self-play games selected by `--games` with one fixed parameter set. Every game starts from the standard position, samples `--random-plies` random legal plies and then uses fixed-depth search for both sides. Games ending during the random prefix or reaching `--max-plies` without a rule result are discarded.
-
-Every retained main-line position contributes the completed game's White-perspective result. The trainer calibrates one fixed sigmoid scale against up to 1048576 evenly sampled initial evaluations, then retains the generated formula values as one fixed data set for all optimization epochs.
-
-The generated data remains in compact host memory. Complete games are assigned deterministically to a 95% fitting set and a 5% validation set. Every fitting epoch visits its complete set once, and the trainer retains the parameter set with the lowest validation loss. The Texel objective is the mean squared error between the completed result and the sigmoid-mapped evaluation. One Adam optimizer updates the complete parameter set, with gradients averaged over 262144 positions before each update and the `--lr` value decayed automatically across epochs. Formula extraction and self-play run on CPU, while `--device` selects the device used for batched evaluation, loss, gradients and parameter updates. `--batch-size` controls the device microbatch size. `auto` selects CUDA when available and otherwise selects CPU.
-
-```bash
-build/eleginus/train \
-	--out models/eleginus/current.pth \
-	--opening-book data/openings.gen.bin \
-	--games 100000 \
-	--random-plies 8 \
-	--depth 1 \
-	--eval-depth 4 \
-	--max-plies 320 \
-	--workers 4 \
-	--hash 64 \
-	--epochs 100 \
-	--batch-size 4096 \
-	--device cuda \
-	--lr 0.001 \
-	--log-every 1000 \
-	--seed 2026
-```
-
-After all optimization epochs, the candidate and accepted parameter sets play both colors from each of the 1000 leaf positions in `data/openings.gen.bin`. A positive lower endpoint of the 95% Hoeffding score bound accepts the candidate. Acceptance atomically replaces `--out`; rejection and interruption leave the accepted file unchanged.
-
-`--init` selects the starting parameter file. Without `--init`, training reads `--out` when that file exists and otherwise initializes from `weights.inl`. Parameter files contain the 4178 coefficients only; optimizer state and generated samples remain process-local.
-
-Generate a standalone engine with the source-defined initial parameters:
-
-```bash
-build/eleginus/generator
-```
-
-Analyze one position with an explicit parameter file using:
+Analyze one position using:
 
 ```bash
 build/eleginus/search \
-	--parameters models/eleginus/eleginus.pth \
 	--fen "startpos" \
 	--depth 10 \
 	--hash 64 \
@@ -334,19 +296,7 @@ build/eleginus/search \
 	--multipv 1
 ```
 
-Without `--parameters`, search reads `eleginus.pth` beside its executable. `--fen` accepts a complete FEN or `startpos`. A positive `--nodes` value stops search at the requested node count, while `0` leaves the node count unbounded. `--multipv` selects the number of root lines.
-
-Generate a standalone engine with a saved parameter set:
-
-```powershell
-build\eleginus\generator.exe models\eleginus\eleginus.pth
-```
-
-```bash
-build/eleginus/generator models/eleginus/eleginus.pth
-```
-
-The generator writes `eleginus.exe` on Windows and `eleginus` on Linux beside itself. That generated executable is the UCI engine.
+`--fen` accepts a complete FEN or `startpos`. A positive `--nodes` value stops search at the requested node count, while `0` leaves the node count unbounded. `--multipv` selects the number of root lines. `build/eleginus/uci` is the directly runnable UCI engine.
 
 The [UCI](#uci) section describes runtime options, output fields and time management.
 
@@ -483,7 +433,7 @@ setoption name MultiPV value 5
 
 ### Eleginus
 
-The generator embeds one parameter set into each Eleginus executable. The generated engine uses that parameter set for every evaluation.
+The UCI executable uses the formula coefficients compiled from `weights.inl` for every evaluation.
 
 Search runs on a worker thread so the protocol loop can process `stop`. A `position`, `setoption` or `ucinewgame` command first stops and joins an active search before changing engine state. Closing the UCI process also joins the worker.
 
@@ -528,16 +478,15 @@ setoption name MultiPV value 4
 
 ## Scripts
 
-The `scripts/` directory contains the Windows and Linux build launchers, checkpoint inspection and graphical piece preparation.
+The `scripts/` directory contains the Windows and Linux build launchers, neural-checkpoint inspection and graphical piece preparation.
 
 ### Checkpoint Inspection
 
-`scripts/check.py` performs a read-only inspection of Gadus, Melano and Eleginus checkpoints. Reports include the detected architecture, parameter count, data type, parameter memory, finite-value status, file size and SHA-256 digest. Neural checkpoints additionally report module and device information.
+`scripts/check.py` performs a read-only inspection of Gadus and Melano checkpoints. Reports include the detected architecture, parameter count, data type, parameter memory, finite-value status, file size and SHA-256 digest.
 
 ```bash
 python scripts/check.py models/gadus/gadus.pth
 python scripts/check.py models/melano/melano.pth
-python scripts/check.py models/eleginus/eleginus.pth
 ```
 
 ## Graphics

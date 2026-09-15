@@ -247,7 +247,7 @@ FORMULA(threats) {
 		const auto hangingPieces = b.AND(b.AND(weak, nonpawns), b.AND(attacked, b.OR(undefended, b.doubleAttacks(role))));
 		const auto minor = b.AND(b.OR(weak, defended), b.OR(b.attacks(role, 1), b.attacks(role, 2)));
 		const auto rook = b.AND(weak, b.attacks(role, 3));
-		const auto pushatt = shared(pushAttack, role, [&] {
+		const auto pushatt = shared(pawnPushAttacks, role, [&] {
 			const auto pushed = b.AND(b.SH(b.PCS(role, 0), role, 0), b.NOT(occ));
 			return b.OR(b.SH(pushed, role, 4), b.SH(pushed, role, 5));
 		});
@@ -423,7 +423,6 @@ FORMULA(endgames) {
 	const auto pure = b.LAND(b.LAND(b.LAND(onefb, oneeb), opposite),
 		b.LAND(b.EQ(nonPawnMaterial(us), b.NUM(3)), b.EQ(nonPawnMaterial(them), b.NUM(3))));
 	const auto mixed = b.LAND(b.LAND(b.LAND(onefb, oneeb), opposite), b.LNOT(pure));
-	b.END({b.ADD(fpawns, epawns), symmetric, asymmetric, pawnEnding, fpawns, epawns, fpassers, epassers, opposite, fpawnless, epawnless, thin, pure, mixed});
 	// Pawn count and pawn-file geometry adjust how readily the current advantage converts.
 	b.WIN(b.ADD(fpawns, epawns), symmetric, asymmetric, pawnEnding, strongPawns, b.MUL(opposite, strongPassers));
 	// Pawnless and opposite-colored-bishop structures contract the complete score toward a draw.

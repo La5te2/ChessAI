@@ -1,17 +1,34 @@
 #include "eleginus/evaluate.hpp"
+#include "eleginus/formula.hpp"
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <cmath>
 #include <optional>
-#include <ranges>
-#include <span>
 #include <stdexcept>
 #include <utility>
 #include <vector>
 
 namespace eleginus {
-	namespace {
+	namespace evaluation {
+		// ------------------------------ Fixed parameters --------------------------------
+		// Compile-time formula and score-adjustment coefficients.
+
+		struct FormulaWeights {
+			float base = 0.0F;
+			std::array<float, 5> material{};
+		};
+
+		struct AdjustmentWeights {
+			float pressureCenter = 0.0F;
+			float pressureWidth = 1.0F;
+			std::array<float, 7> winnability{};
+			std::array<float, 5> scaling{};
+		};
+
+		namespace fixed {
+			#include "weights.inl"
+		}
+
 		// -------------------------- King-pressure response -----------------------------
 		// Precomputed sigmoid response used by king-pressure formulas.
 
@@ -92,19 +109,18 @@ namespace eleginus {
 		}
 
 		// --------------------------- Formula result handling -----------------------------
-		// Output policies for direct scoring and formula-value extraction.
+		// Accumulate formula signals with their effective coefficients.
 
 		// Accumulate emitted formula signals directly into a score.
-		class ScoreOutput {
+		class ScoreAccumulator {
 		public:
-			explicit ScoreOutput(std::span<const float> coefficients) : coefficients(coefficients) {}
+			explicit ScoreAccumulator(const std::array<float, formulaCount> &coefficients) : coefficients(coefficients) {}
 
 			// Add one weighted formula signal.
-			void put(std::uint32_t index, std::int32_t score) {
-				total = std::fma(coefficients[index], static_cast<float>(score), total);
+			void add(std::uint32_t index, std::int32_t signal) {
+				total = std::fma(coefficients[index], static_cast<float>(signal), total);
 			}
-			std::size_t size() const noexcept { return coefficients.size(); }
-			float finish() const noexcept { return total; }
+			float value() const noexcept { return total; }
 			int direction() const noexcept { return (total > 0.0F) - (total < 0.0F); }
 			// Apply the winnability adjustment while preserving the score sign.
 			void winnable(float value) noexcept {
@@ -114,59 +130,30 @@ namespace eleginus {
 			void scale(float value) noexcept { total *= value; }
 
 		private:
-			std::span<const float> coefficients;
+			const std::array<float, formulaCount> &coefficients;
 			float total = 0.0F;
-		};
-
-		// Record formula signals and adjustment inputs for later evaluation.
-		class ValuesOutput {
-		public:
-			// Store one parameter-independent formula signal.
-			void put(std::uint32_t index, std::int32_t value) { result.signals[index] = value; }
-			// Associate the recorded king-attack counts with their formula index.
-			void mark(std::uint32_t index) noexcept {
-				if (pressureCount == result.pressure.attacks.size()) {
-					result.pressure.formula = index;
-					pressureCount = 0;
-				}
-			}
-			std::size_t size() const noexcept { return formulaCount; }
-			// Sign-dependent adjustments select their side when a parameter set scores these values.
-			int direction() const noexcept { return 0; }
-			// Record one king-attack count before sigmoid conversion.
-			void sigmoid(std::int64_t value) noexcept {
-				if (pressureCount < result.pressure.attacks.size()) {
-					result.pressure.attacks[pressureCount++] = static_cast<std::int32_t>(value);
-				}
-			}
-			void endgame(const EndgameValues &values) noexcept { result.endgame = values; }
-			FormulaValues finish() { return std::move(result); }
-
-		private:
-			FormulaValues result;
-			std::size_t pressureCount = 0;
 		};
 
 		// -------------------------- Formula evaluation runtime ---------------------------
 		// Board facts, caches and operations used by formula definitions.
 
-		// Prepare shared board facts and send formula results to one output policy.
-		template <class Output> class Runtime : public FormulaAtoms<Runtime<Output>> {
+		// Prepare shared board facts and send formula results to the score accumulator.
+		class Runtime : public FormulaAtoms<Runtime> {
 		public:
-			using FormulaAtoms<Runtime<Output>>::BB;
-			using FormulaAtoms<Runtime<Output>>::NUM;
-			using FormulaAtoms<Runtime<Output>>::OR;
-			using FormulaAtoms<Runtime<Output>>::PCS;
-			using FormulaAtoms<Runtime<Output>>::REL;
+			using FormulaAtoms<Runtime>::BB;
+			using FormulaAtoms<Runtime>::NUM;
+			using FormulaAtoms<Runtime>::OR;
+			using FormulaAtoms<Runtime>::PCS;
+			using FormulaAtoms<Runtime>::REL;
 
 			struct Sum {
 				std::int64_t total = 0;
 				void add(InterSignal value) { total += number(value.bits); }
 			};
 			// Select or compute the pawn and attack data for this board.
-			Runtime(const chess::Board &board, const std::array<Word, atomCount> &inputs, Output &out, const AdjustmentWeights &adjustments,
+			Runtime(const chess::Board &board, const std::array<Word, atomCount> &inputs, ScoreAccumulator &score, const AdjustmentWeights &adjustments,
 				const SigmoidCurve &curve)
-				: in(inputs), occupied(board.occ().getBits()), output(out), adjustments(adjustments), curve(curve) {
+				: in(inputs), occupied(board.occ().getBits()), score(score), adjustments(adjustments), curve(curve) {
 				// Reuse pawn structure data keyed by both pawn bitboards.
 				thread_local std::array<Pawns, 1024> table{};
 				const Word hash = in[atomIndex(Atom::WP)] * 0x9e3779b97f4a7c15ULL ^ std::rotl(in[atomIndex(Atom::BP)] * 0xbf58476d1ce4e5b9ULL, 29);
@@ -226,12 +213,12 @@ namespace eleginus {
 				}
 				// Build pawn and king attack maps from their piece bitboards.
 				for (unsigned color = 0; color < 2; ++color) {
-					fixedAttacks[color][0] = pawnCache->attacks[color];
+					pawnKingAttacks[color][0] = pawnCache->attacks[color];
 					Word kings = in[6 * color + 5];
 					while (kings) {
 						const int square = std::countr_zero(kings);
 						kings &= kings - 1;
-						fixedAttacks[color][1] |= chess::attacks::king(chess::Square(square)).getBits();
+						pawnKingAttacks[color][1] |= chess::attacks::king(chess::Square(square)).getBits();
 					}
 				}
 				thread_local Attacks attacks;
@@ -253,10 +240,10 @@ namespace eleginus {
 								const Word west = in[i] & 0xFEFEFEFEFEFEFEFEULL;
 								const Word left = color == 0 ? east << 9 : east >> 7;
 								const Word right = color == 0 ? west << 7 : west >> 9;
-								map = fixedAttacks[color][0];
+								map = pawnKingAttacks[color][0];
 								overlap = left & right;
 							} else if (type == 5) {
-								map = fixedAttacks[color][1];
+								map = pawnKingAttacks[color][1];
 								overlap = 0;
 							} else {
 								map = overlap = 0;
@@ -320,7 +307,7 @@ namespace eleginus {
 
 			// Return one piece-type attack union or the complete attack union of a side.
 			InterSignal attacks(InterSignal role, int type = 6) const {
-				if (type == 0 || type == 5) return BB(fixedAttacks[color(role)][type == 0 ? 0 : 1]);
+				if (type == 0 || type == 5) return BB(pawnKingAttacks[color(role)][type == 0 ? 0 : 1]);
 				return BB(attackCache->maps[color(role)][type]);
 			}
 			// Return cached aggregate attack and pawn-structure data.
@@ -434,63 +421,44 @@ namespace eleginus {
 			// Convert a widened sum to an intermediate signal.
 			InterSignal sum(const Sum &terms) const { return NUM(terms.total); }
 
-			// Record raw king pressure during extraction or apply the sigmoid during direct scoring.
-			InterSignal SIG(InterSignal value) const {
-				if constexpr (requires { output.sigmoid(std::int64_t{}); }) {
-					output.sigmoid(number(value.bits));
-					return NUM(0);
-				}
-				return NUM(curve(number(value.bits)));
-			}
-			// Pass endgame facts to an output that records formula values.
-			void END(const std::array<InterSignal, 14> &facts) const {
-				if constexpr (requires { output.endgame(EndgameValues{}); }) {
-					const auto value = [&](std::size_t i) { return static_cast<std::int32_t>(number(facts[i].bits)); };
-					output.endgame({value(0), value(1), value(2), value(3), {{value(4), value(5)}}, {{value(6), value(7)}}, value(8),
-						{{value(9), value(10)}}, value(11), value(12), value(13)});
-				}
-			}
+			// Map a king-attack count through the fixed sigmoid response.
+			InterSignal SIG(InterSignal value) const { return NUM(curve(number(value.bits))); }
 			// Apply the winnability coefficients to the favored side's score magnitude.
 			void WIN(InterSignal pawns, InterSignal symmetric, InterSignal asymmetric, InterSignal pawnEnding, InterSignal strongPawns,
 				InterSignal oppositePassers) {
-				if constexpr (requires { output.winnable(float{}); }) {
-					const auto &params = adjustments.winnability;
-					const float value = params[6] + params[0] * static_cast<float>(number(pawns.bits)) +
-						params[1] * static_cast<float>(number(symmetric.bits)) + params[2] * static_cast<float>(number(asymmetric.bits)) +
-						params[3] * static_cast<float>(number(pawnEnding.bits)) + params[4] * static_cast<float>(number(strongPawns.bits)) +
-						params[5] * static_cast<float>(number(oppositePassers.bits));
-					output.winnable(value);
-				}
+				const auto &params = adjustments.winnability;
+				const float value = params[6] + params[0] * static_cast<float>(number(pawns.bits)) +
+					params[1] * static_cast<float>(number(symmetric.bits)) + params[2] * static_cast<float>(number(asymmetric.bits)) +
+					params[3] * static_cast<float>(number(pawnEnding.bits)) + params[4] * static_cast<float>(number(strongPawns.bits)) +
+					params[5] * static_cast<float>(number(oppositePassers.bits));
+				score.winnable(value);
 			}
 			// Scale the score for pawnless and opposite-bishop endings.
 			void SCALE(InterSignal thinPawnless, InterSignal pureOpposite, InterSignal mixedOpposite, InterSignal strongPawns,
 				InterSignal strongPassers) {
-				if constexpr (requires { output.scale(float{}); }) {
-					const auto &params = adjustments.scaling;
-					float factor = 1.0F;
-					if (number(thinPawnless.bits) != 0) factor = std::min(factor, params[0]);
-					if (number(pureOpposite.bits) != 0) {
-						factor = std::min(factor, params[1] + params[4] * static_cast<float>(number(strongPawns.bits)) +
-							params[3] * static_cast<float>(number(strongPassers.bits)));
-					} else if (number(mixedOpposite.bits) != 0) {
-						factor = std::min(factor, params[2] + params[3] * static_cast<float>(number(strongPassers.bits)));
-					}
-					output.scale(std::clamp(factor, 0.0F, 1.0F));
+				const auto &params = adjustments.scaling;
+				float factor = 1.0F;
+				if (number(thinPawnless.bits) != 0) factor = std::min(factor, params[0]);
+				if (number(pureOpposite.bits) != 0) {
+					factor = std::min(factor, params[1] + params[4] * static_cast<float>(number(strongPawns.bits)) +
+						params[3] * static_cast<float>(number(strongPassers.bits)));
+				} else if (number(mixedOpposite.bits) != 0) {
+					factor = std::min(factor, params[2] + params[3] * static_cast<float>(number(strongPassers.bits)));
 				}
+				score.scale(std::clamp(factor, 0.0F, 1.0F));
 			}
 			// Emit one formula signal and advance its parameter index.
-			void root(InterSignal score) {
-				const auto value = number(score.bits);
-				if constexpr (requires { output.mark(std::uint32_t{}); }) output.mark(index);
-				if (value != 0) output.put(index, static_cast<std::int32_t>(value));
+			void root(InterSignal signal) {
+				const auto value = number(signal.bits);
+				if (value != 0) score.add(index, static_cast<std::int32_t>(value));
 				++index;
 			}
 			// Verify that formula execution consumed every formula coefficient.
 			void complete() const {
-				if (index != output.size()) throw std::logic_error("formula and weight counts differ");
+				if (index != formulaCount) throw std::logic_error("formula and weight counts differ");
 			}
 			// Return the sign of the accumulated score.
-			InterSignal direction() const { return NUM(output.direction()); }
+			InterSignal direction() const { return NUM(score.direction()); }
 			// Advance over zero-valued entries in a fixed formula table.
 			void skip(unsigned n) { index += n; }
 
@@ -545,7 +513,7 @@ namespace eleginus {
 				std::array<std::array<Ray, 64>, 2> rays{};
 			};
 
-			friend class FormulaAtoms<Runtime<Output>>;
+			friend class FormulaAtoms<Runtime>;
 			// Return one encoded board atom.
 			Word input(Atom atom) const noexcept { return in[atomIndex(atom)]; }
 			// Convert a role signal to its color index.
@@ -554,9 +522,9 @@ namespace eleginus {
 			Attacks *attackCache;
 			Rays *rayCache;
 			std::array<Word, atomCount> in;
-			std::array<std::array<Word, 2>, 2> fixedAttacks{};
+			std::array<std::array<Word, 2>, 2> pawnKingAttacks{};
 			Word occupied;
-			Output &output;
+			ScoreAccumulator &score;
 			const AdjustmentWeights &adjustments;
 			const SigmoidCurve &curve;
 			unsigned index = 0;
@@ -565,15 +533,14 @@ namespace eleginus {
 		// ----------------------------- Formula execution ---------------------------------
 		// Fixed formula groups and intermediate values shared within one board evaluation.
 
-		// Evaluate the complete formula set through a selected output policy.
-		template <class Output> class Formulas {
-			using FormulaRuntime = Runtime<Output>;
-			using Sum = typename FormulaRuntime::Sum;
-			using Pair = std::array<std::optional<InterSignal>, 2>;
+		// Evaluate the complete formula set.
+		class Formulas {
+			using Sum = Runtime::Sum;
+			using SideSignals = std::array<std::optional<InterSignal>, 2>;
 
 		public:
 			// Initialize side constants and occupied squares.
-			explicit Formulas(FormulaRuntime runtime) : b(std::move(runtime)) {
+			explicit Formulas(Runtime runtime) : b(std::move(runtime)) {
 				z = b.NUM(0);
 				o = b.NUM(1);
 				us = b.NUM(0);
@@ -606,8 +573,8 @@ namespace eleginus {
 			#undef FORMULA
 
 			// Cache one side-specific intermediate signal for this board evaluation.
-			template <class F> InterSignal shared(Pair &pair, InterSignal role, F &&make) {
-				auto &value = pair[b.roleIndex(role)];
+			template <class F> InterSignal shared(SideSignals &signals, InterSignal role, F &&make) {
+				auto &value = signals[b.roleIndex(role)];
 				if (!value) value = make();
 				return *value;
 			}
@@ -655,7 +622,7 @@ namespace eleginus {
 
 			// Return and cache all occupied squares of one side.
 			InterSignal own(InterSignal role) {
-				return shared(owned, role, [&] {
+				return shared(occupancyBySide, role, [&] {
 					InterSignal result = b.PCS(role, 0);
 					for (int type = 1; type < 6; ++type) {
 						result = b.OR(result, b.PCS(role, type));
@@ -678,7 +645,7 @@ namespace eleginus {
 			// Return squares controlled by enemy pawns or controlled twice only by the enemy.
 			InterSignal strongSquares(InterSignal role, InterSignal opponent) {
 				return shared(
-					strongMap, role, [&] { return b.OR(pawnAttacks(opponent), b.AND(b.doubleAttacks(opponent), b.NOT(b.doubleAttacks(role)))); });
+					strongMaps, role, [&] { return b.OR(pawnAttacks(opponent), b.AND(b.doubleAttacks(opponent), b.NOT(b.doubleAttacks(role)))); });
 			}
 
 			// Emit one formula signal.
@@ -686,7 +653,7 @@ namespace eleginus {
 
 			// Return the mobility area after removing blocked pawns, undeveloped pawns and enemy pawn attacks.
 			InterSignal mobilityArea(InterSignal role, InterSignal opponent) {
-				return shared(mobilityAreaCache, role, [&] {
+				return shared(mobilityAreas, role, [&] {
 					const auto pawns = b.PCS(role, 0);
 					const auto blocked = b.AND(pawns, b.SH(occ, role, 1));
 					const auto early = b.AND(pawns, b.REL(role, rankMask(1) | rankMask(2)));
@@ -754,7 +721,7 @@ namespace eleginus {
 
 			// Return and cache the king's distance-two ring or four-file flank.
 			InterSignal kingRegion(InterSignal role, bool flank) {
-				return shared(flank ? kingFlank : kingRing, role, [&] {
+				return shared(flank ? kingFlanks : kingRings, role, [&] {
 					InterSignal mask = b.BB(0);
 					for (int square : b.squares(role, 5)) {
 						Word region = ringMask(square, 2);
@@ -787,8 +754,8 @@ namespace eleginus {
 				return total;
 			}
 
-			FormulaRuntime b;
-			Pair owned, strongMap, mobilityAreaCache, pushAttack, kingRing, kingFlank;
+			Runtime b;
+			SideSignals occupancyBySide, strongMaps, mobilityAreas, pawnPushAttacks, kingRings, kingFlanks;
 			InterSignal z{};
 			InterSignal o{};
 			InterSignal us{};
@@ -796,129 +763,72 @@ namespace eleginus {
 			InterSignal occ{};
 		};
 
-		// Validate parameters before constructing dependent lookup tables.
-		FormulaParameters validated(FormulaParameters parameters) {
-			validateParameters(parameters);
-			return parameters;
-		}
-
 		// Calculate one material-adjusted formula coefficient.
-		float coefficient(const FormulaWeights &parameter, const std::array<float, 5> &material) noexcept {
-			float value = parameter.base;
-			for (std::size_t type = 0; type < material.size(); ++type) value = std::fma(parameter.material[type], material[type], value);
+		float coefficient(const FormulaWeights &weights, const std::array<float, 5> &material) noexcept {
+			float value = weights.base;
+			for (std::size_t type = 0; type < material.size(); ++type) value = std::fma(weights.material[type], material[type], value);
 			return value;
 		}
-	}
 
-	// ---------------------------- Prepared evaluation state ----------------------------
-	// Stores parameters, base coefficients, material-dependent formula indices and the king-pressure table.
-	class Evaluator::State {
-	public:
-		explicit State(FormulaParameters source)
-			: parameters(validated(std::move(source))), curve(parameters.adjustments.pressureCenter, parameters.adjustments.pressureWidth), serial(nextSerial()) {
-			for (std::size_t i = 0; i < formulaCount; ++i) {
-				base[i] = parameters.formulas[i].base;
-				if (std::ranges::any_of(parameters.formulas[i].material, [](float value) { return value != 0.0F; })) {
-					materialFormulas.push_back(static_cast<std::uint16_t>(i));
+		// ---------------------------- Prepared evaluation state ----------------------------
+		// Prepare fixed coefficients, material-dependent formula indices and the king-pressure table.
+		class State {
+		public:
+			State() : curve(fixed::formulaGlobals.pressureCenter, fixed::formulaGlobals.pressureWidth) {
+				for (std::size_t i = 0; i < formulaCount; ++i) {
+					base[i] = fixed::formulaWeights[i].base;
+					const auto &material = fixed::formulaWeights[i].material;
+					if (std::any_of(material.begin(), material.end(), [](float value) { return value != 0.0F; })) {
+						materialFormulas.push_back(static_cast<std::uint16_t>(i));
+					}
 				}
 			}
-		}
 
-		// Return formula coefficients for the board's material signature. The per-thread cache keys five
-		// piece counts packed into six-bit fields and recomputes material-dependent coefficients on a miss.
-		std::span<const float> coefficients(const std::array<Word, atomCount> &in) const noexcept {
-			if (materialFormulas.empty()) return base;
-			struct Entry {
-				std::uint64_t owner = 0;
+			// Return formula coefficients for the board's material signature. The per-thread cache keys five
+			// piece counts packed into six-bit fields and recomputes material-dependent coefficients on a miss.
+			const std::array<float, formulaCount> &coefficients(const std::array<Word, atomCount> &in) const noexcept {
+				if (materialFormulas.empty()) return base;
+				struct Entry {
+					std::uint32_t signature = 0;
+					std::array<float, formulaCount> values{};
+					bool valid = false;
+				};
+				thread_local std::array<Entry, 16> cache{};
 				std::uint32_t signature = 0;
-				std::array<float, formulaCount> values{};
-			};
-			thread_local std::array<Entry, 16> cache{};
-			std::uint32_t signature = 0;
-			for (std::size_t type = 0; type < 5; ++type) {
-				signature |= pieceCount(in, type) << (6 * type);
-			}
-			auto &entry = cache[(signature * 0x9e3779b9U) >> 28];
-			if (entry.owner != serial || entry.signature != signature) {
-				const auto coordinate = materialCoordinates(in);
-				entry.values = base;
-				for (std::uint16_t index : materialFormulas) {
-					entry.values[index] = coefficient(parameters.formulas[index], coordinate);
+				for (std::size_t type = 0; type < 5; ++type) {
+					signature |= pieceCount(in, type) << (6 * type);
 				}
-				entry.owner = serial;
-				entry.signature = signature;
+				auto &entry = cache[(signature * 0x9e3779b9U) >> 28];
+				if (!entry.valid || entry.signature != signature) {
+					const auto coordinate = materialCoordinates(in);
+					entry.values = base;
+					for (std::uint16_t index : materialFormulas) {
+						entry.values[index] = coefficient(fixed::formulaWeights[index], coordinate);
+					}
+					entry.signature = signature;
+					entry.valid = true;
+				}
+				return entry.values;
 			}
-			return entry.values;
+
+			std::array<float, formulaCount> base{};
+			std::vector<std::uint16_t> materialFormulas;
+			SigmoidCurve curve;
+		};
+
+		const State &evaluationState() {
+			static const State value;
+			return value;
 		}
-
-		FormulaParameters parameters;
-		std::array<float, formulaCount> base{};
-		std::vector<std::uint16_t> materialFormulas;
-		SigmoidCurve curve;
-		std::uint64_t serial;
-
-	private:
-		// Assign this parameter set a unique owner id for the shared thread-local coefficient cache.
-		static std::uint64_t nextSerial() noexcept {
-			static std::atomic_uint64_t value{0};
-			return value.fetch_add(1, std::memory_order_relaxed) + 1;
-		}
-	};
-
-	// Prepare one parameter set for repeated board evaluations.
-	Evaluator::Evaluator(FormulaParameters parameters) : state(std::make_unique<State>(std::move(parameters))) {}
-	Evaluator::~Evaluator() = default;
+	} // namespace evaluation
 
 	// Evaluate a board by accumulating each emitted formula signal directly into its score.
-	float Evaluator::score(const chess::Board &board) const {
-		const auto in = inputs(board);
-		ScoreOutput output(state->coefficients(in));
-		Formulas<ScoreOutput>(Runtime<ScoreOutput>(board, in, output, state->parameters.adjustments, state->curve)).execute();
-		return output.finish();
-	}
-
-	// Extract formula signals and adjustment inputs from one board.
-	FormulaValues Evaluator::extract(const chess::Board &board) const {
-		const auto in = inputs(board);
-		ValuesOutput output;
-		Formulas<ValuesOutput>(Runtime<ValuesOutput>(board, in, output, state->parameters.adjustments, state->curve)).execute();
-		auto result = output.finish();
-		result.material = materialCoordinates(in);
-		return result;
-	}
-
-	// Evaluate extracted board values and apply sign-dependent winnability and scaling adjustments.
-	float Evaluator::score(const FormulaValues &values) const {
-		if (values.pressure.formula >= formulaCount) throw std::invalid_argument("king-pressure formula is missing");
-		float total = 0.0F;
-		for (std::size_t i = 0; i < formulaCount; ++i) {
-			const float weight = coefficient(state->parameters.formulas[i], values.material);
-			const auto signal = i == values.pressure.formula
-				? state->curve(values.pressure.attacks[0]) - state->curve(values.pressure.attacks[1])
-				: values.signals[i];
-			total = std::fma(weight, static_cast<float>(signal), total);
-		}
-		const auto &endgame = values.endgame;
-		const std::size_t favored = total < 0.0F ? 1 : 0;
-		const auto &adjustments = state->parameters.adjustments;
-		const float winnability = adjustments.winnability[6] + adjustments.winnability[0] * static_cast<float>(endgame.pawns) +
-			adjustments.winnability[1] * static_cast<float>(endgame.symmetricFiles) +
-			adjustments.winnability[2] * static_cast<float>(endgame.asymmetricFiles) +
-			adjustments.winnability[3] * static_cast<float>(endgame.pawnEnding) +
-			adjustments.winnability[4] * static_cast<float>(endgame.sidePawns[favored]) +
-			adjustments.winnability[5] * static_cast<float>(endgame.oppositeBishops * endgame.sidePassers[favored]);
-		if (total > 0.0F) total = std::max(0.0F, total + winnability);
-		else if (total < 0.0F) total = std::min(0.0F, total - winnability);
-
-		float factor = 1.0F;
-		if (endgame.pawnless[favored] != 0 && endgame.thinMaterial != 0) factor = std::min(factor, adjustments.scaling[0]);
-		if (endgame.pureOppositeBishops != 0) {
-			factor = std::min(factor, adjustments.scaling[1] + adjustments.scaling[4] * static_cast<float>(endgame.sidePawns[favored]) +
-				adjustments.scaling[3] * static_cast<float>(endgame.sidePassers[favored]));
-		} else if (endgame.mixedOppositeBishops != 0) {
-			factor = std::min(factor, adjustments.scaling[2] + adjustments.scaling[3] * static_cast<float>(endgame.sidePassers[favored]));
-		}
-		return total * std::clamp(factor, 0.0F, 1.0F);
+	float evaluate(const chess::Board &board) {
+		const auto &prepared = evaluation::evaluationState();
+		const auto in = evaluation::inputs(board);
+		evaluation::ScoreAccumulator score(prepared.coefficients(in));
+		evaluation::Formulas(evaluation::Runtime(board, in, score, evaluation::fixed::formulaGlobals, prepared.curve)).execute();
+		return score.value();
 	}
 
 } // namespace eleginus
