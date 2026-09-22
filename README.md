@@ -450,7 +450,7 @@ Search may replace this finite score with a mate score. NPS is $1000n/t$, where 
 
 $$
 t_{\mathrm{search}}=
-\operatorname{clamp}\left(
+\mathrm{clamp}\left(
 \left\lfloor\frac{t}{30}\right\rfloor+
 \left\lfloor\frac{i}{2}\right\rfloor-o,
 1,
