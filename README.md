@@ -440,8 +440,8 @@ Search runs on a worker thread so the protocol loop can process `stop`. A `posit
 Eleginus reports MultiPV rows containing the completed iterative depth, the greatest visited ply as `seldepth`, the root-side score, visited nodes, NPS, elapsed time and a one-move principal variation. The static evaluator maps its White-perspective score $H(s)$ to centipawns by
 
 $$
-\operatorname{cp}(s)=
-\operatorname{round}\left(\operatorname{clip}\left(150H(s),-25000,25000\right)\right).
+\mathrm{cp}(s)=
+\mathrm{round}\left(\mathrm{clip}\left(150H(s),-25000,25000\right)\right).
 $$
 
 Search may replace this finite score with a mate score. NPS is $1000n/t$, where $n$ is the number of visited principal and quiescence nodes and $t$ is elapsed time in milliseconds with a denominator of at least one millisecond.
