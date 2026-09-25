@@ -2,8 +2,6 @@
 
 Gadidae is a family of experimental chess engines.
 
-This README explains installation, commands and user-facing interfaces. [Gadus.md](Gadus.md) and [Melano.md](Melano.md) specify their architectures, training methods and search algorithms. [Eleginus.md](Eleginus.md) specifies its formula evaluation and search.
-
 ## Dependencies
 
 ### Python
