@@ -355,12 +355,6 @@ The ordered formula set contains 694 scalar signals:
 | Threats | 42 | Hanging targets, pawn attacks, minor-piece attacks, rook attacks, pawn-push attacks, active-side threats, king threats and queen pressure |
 | King safety | 96 | Inner and outer king-zone attacks, potential checks, smooth pressure, escape squares, shelter, storms, open files, flank control, castling rights and queen presence |
 
-The group sizes satisfy
-
-$$
-1+5+384+1+78+64+23+42+96=694.
-$$
-
 Each indexed formula emits one integer signal. A piece-square formula contributes its signed role-relative indicator when its normalized square contains the selected piece type and contributes zero otherwise.
 
 ### 2.5 Material-Responsive Coefficients
